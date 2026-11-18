@@ -1,0 +1,27 @@
+# Your own signing settings (team ID, bundle ID): copy App/Config/Signing.xcconfig.example
+App/Config/Signing.xcconfig
+
+# Xcode / build output
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+*.dSYM.zip
+*.dSYM
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+App/HermesMobile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+
+# Secrets that must never be committed
+.env
+*.env
+*.p8
+*.p12
+*.mobileprovision
+AuthKey_*.p8
+
+# Python / OS noise
+__pycache__/
+*.pyc
+.DS_Store

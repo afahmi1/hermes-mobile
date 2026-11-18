@@ -1,0 +1,8 @@
+// Copy this file to Signing.xcconfig (same folder) and fill in your own values.
+// Signing.xcconfig is git-ignored, so your team ID never ends up in the repo.
+
+// Your 10-character Apple Developer Team ID (Xcode > Settings > Accounts, or developer.apple.com > Membership).
+DEVELOPMENT_TEAM = ABCDE12345
+
+// A bundle ID you own, e.g. com.yourname.hermesmobile. It must match the app record in App Store Connect.
+HERMES_BUNDLE_ID = com.yourname.hermesmobile
