@@ -98,12 +98,21 @@ def profile_home(pid):
     return HERMES if pid == "default" else HERMES / "profiles" / pid
 
 
+# Hermes's own rule (hermes_constants.named_profile_is_live): a folder under profiles/ is a bot when it
+# carries an identity marker and has no deletion tombstone. A brand-new bot has no config.yaml yet.
+_PROFILE_MARKERS = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db")
+
+
+def is_live_profile(home):
+    return (home.is_dir() and not home.name.startswith(".")
+            and any((home / m).is_file() or (home / m).is_symlink() for m in _PROFILE_MARKERS)
+            and not (home.parent / ".deleted" / home.name).exists())
+
 def profile_ids():
     out = ["default"]
     pdir = HERMES / "profiles"
     if pdir.is_dir():
-        out += sorted(p.name for p in pdir.iterdir() if p.is_dir() and PROFILE_RE.match(p.name)
-                      and (p / "config.yaml").exists())
+        out += sorted(p.name for p in pdir.iterdir() if PROFILE_RE.match(p.name) and is_live_profile(p))
     return out
 
 
@@ -125,8 +134,140 @@ def bots():
             nm, blurb = meta.get(pid, ("", ""))
             name = nm or pid.replace("-", " ").replace("_", " ").title().replace("Captains", "Captain's")
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
-                    "reachable": bool(key_for(pid)), "front": pid == "default"})
+                    "reachable": bool(key_for(pid)), "served": pid in served_profiles(),
+                    "front": pid == "default"})
     return out
+
+
+def served_profiles():
+    """Profiles the running gateway serves (it hot-serves new ones on its own; see gateway_state.json)."""
+    try:
+        return set(json.loads((HERMES / "gateway_state.json").read_text()).get("served_profiles") or [])
+    except Exception:
+        return set()
+
+
+# ---------- new bots: give them an API key so the phone can reach them ----------
+AUTO_KEYS = os.environ.get("HERMES_MOBILE_AUTO_KEYS", "1") != "0"
+KEY_SETTLE_S = 30  # leave a bot's .env alone until nothing has written to it for this long
+
+
+OPT_OUT = "# hermes-mobile: no-key"
+KEYS_STATE = STATE_DIR / "auto_keys.json"
+
+
+def _keys_state():
+    try:
+        d = json.loads(KEYS_STATE.read_text())
+        return {"had_key": set(d.get("had_key") or []), "given": set(d.get("given") or [])}
+    except Exception:
+        return {"had_key": set(), "given": set()}
+
+
+def _save_keys_state(st):
+    tmp = KEYS_STATE.with_name(".auto_keys.%s" % secrets.token_hex(4))
+    tmp.write_text(json.dumps({k: sorted(v) for k, v in st.items()}))
+    os.replace(tmp, KEYS_STATE)
+
+
+def ensure_profile_keys():
+    """A bot created after setup has no API_SERVER_KEY, and the gateway's API server refuses a profile
+    without one, so the phone couldn't list or open its chats. For each bot the gateway already serves,
+    back up its .env and append a fresh key (the gateway notices .env changes and picks it up live).
+
+    Only ever for a bot that has never had a key, and only once: a key you remove stays removed.
+    Opt a bot out with a line `# hermes-mobile: no-key` in its .env, or all of them with
+    HERMES_MOBILE_AUTO_KEYS=0."""
+    if not AUTO_KEYS:
+        return []
+    added = []
+    served = served_profiles()
+    st = _keys_state()
+    before = {k: set(v) for k, v in st.items()}
+    for pid in profile_ids():
+        if pid == "default":
+            continue
+        if key_for(pid):
+            st["had_key"].add(pid)
+            continue
+        if pid not in served or pid in st["had_key"] or pid in st["given"]:
+            continue
+        env = profile_home(pid) / ".env"
+        try:
+            if env.is_symlink():
+                continue  # managed elsewhere; never write through a link
+            if env.exists() and OPT_OUT in env.read_text():
+                continue
+            if env.exists() and time.time() - env.stat().st_mtime < KEY_SETTLE_S:
+                continue  # Hermes may still be setting the bot up
+            backup = HERMES / "backups" / "hermes-mobile-auto" / time.strftime("%Y%m%d-%H%M%S") / pid
+            backup.mkdir(parents=True, exist_ok=True)
+            old = env.read_text() if env.exists() else ""
+            if env.exists():
+                (backup / ".env").write_text(old)
+                os.chmod(backup / ".env", 0o600)
+            sep = "" if not old or old.endswith("\n") else "\n"
+            with open(env, "a") as f:
+                f.write("%s\n# Added by Hermes Mobile %s so the phone app can reach this bot\nAPI_SERVER_KEY=%s\n"
+                        % (sep, time.strftime("%Y-%m-%d"), secrets.token_hex(32)))
+            os.chmod(env, 0o600)
+            st["given"].add(pid)
+            added.append(pid)
+            log("gave new bot %r an API_SERVER_KEY (backup in %s)" % (pid, backup))
+        except Exception as e:
+            log("could not add an API key for %r: %s" % (pid, e))
+    if st != before:
+        try:
+            _save_keys_state(st)
+        except Exception as e:
+            log("could not save %s: %s" % (KEYS_STATE, e))
+    return added
+
+
+def _key_watcher():
+    while True:
+        try:
+            ensure_profile_keys()
+        except Exception as e:
+            log("key watcher: %s" % e)
+        time.sleep(20)
+
+
+# ---------- status (the Mac status dashboard's data, for the phone) ----------
+STATUS_URL = os.environ.get("HERMES_STATUS_URL", "http://127.0.0.1:9230/api/status")
+
+
+def status_payload(refresh_providers=False):
+    """The status dashboard's /api/status (bots, cron jobs, what's running, providers, what's new),
+    plus the turns the phone itself has running through this bridge."""
+    url = STATUS_URL + ("?refresh=providers" if refresh_providers else "")
+    parts = urlsplit(url)
+    c = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=90)
+    try:
+        c.request("GET", parts.path + ("?" + parts.query if parts.query else ""))
+        r = c.getresponse()
+        raw = r.read()
+        if r.status != 200:
+            return None
+        d = json.loads(raw)
+    finally:
+        c.close()
+    if turns is not None:
+        agents = d.setdefault("agents", [])
+        for t in turns.live_turns():
+            if t["done"]:
+                continue
+            same = next((a for a in agents if a.get("profile") == t["profile"]
+                         and a.get("session_id") == t["session_id"]), None)
+            if same:
+                same["kind"] = "phone"  # the gateway's own lease for this turn
+            else:
+                agents.append({"kind": "phone", "profile": t["profile"], "session_id": t["session_id"],
+                               "title": "Reply started from the phone", "age_s": t["age"]})
+                for b in d.get("bots") or []:
+                    if b.get("id") == t["profile"]:
+                        b["running"] = (b.get("running") or 0) + 1
+    return d
 
 
 # ---------- auth ----------
@@ -467,6 +608,16 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, health())
             if path == "/m/bots":
                 return self.send(200, {"bots": bots()})
+            if path == "/m/status":
+                why = "it answered with an error"
+                try:
+                    d = status_payload(q.get("refresh") == "providers")
+                except Exception as e:
+                    d, why = None, "%s: %s" % (type(e).__name__, str(e)[:120])
+                if d is None:
+                    return self.send(503, {"error": "The Hermes status dashboard on your Mac (%s) isn't answering: %s."
+                                                    % (STATUS_URL, why)})
+                return self.send(200, d)
             if path == "/m/sessions":
                 limit = max(1, min(int(q.get("limit", "40") or 40), 100))
                 only = set(q["profile"].split(",")) if q.get("profile") else None
@@ -671,6 +822,7 @@ if __name__ == "__main__":
         # Pair a device without typing the password: prints a token to paste into the app.
         print(make_token(sys.argv[2] if len(sys.argv) > 2 else "paired-device"))
         sys.exit(0)
+    threading.Thread(target=_key_watcher, name="key-watcher", daemon=True).start()
     srv = ThreadingHTTPServer((os.environ.get("HERMES_MOBILE_BIND", "127.0.0.1"), PORT), H)
     srv.daemon_threads = True
     log("Hermes Mobile bridge on http://%s:%d -> gateway %s:%d" % (srv.server_address[0], PORT, *UPSTREAM))

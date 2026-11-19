@@ -108,6 +108,14 @@ final class API: @unchecked Sendable {
     // MARK: reads
 
     func health() async throws -> HealthInfo { try await get("/m/health", as: HealthInfo.self) }
+
+    /// Everything the Mac's status dashboard shows (bots, cron jobs, running agents, providers, what's new).
+    func status(refreshProviders: Bool = false) async throws -> JV {
+        var r = try request("/m/status" + (refreshProviders ? "?refresh=providers" : ""))
+        r.timeoutInterval = 100  // a provider refresh asks each provider for its usage
+        let data = try await send(r)
+        return JV(try JSONSerialization.jsonObject(with: data))
+    }
     func bots() async throws -> [Bot] {
         struct R: Decodable { let bots: [Bot] }
         return try await get("/m/bots", as: R.self).bots

@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Status</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2322a06b'/></svg>">
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --panel-2:#f1f3f6; --line:#e3e6eb;
+  --text:#14171c; --muted:#5d6673; --faint:#8a929e;
+  --good:#1f9d63; --good-bg:#e5f5ed; --warn:#b7791f; --warn-bg:#fbf1de;
+  --bad:#d14343; --bad-bg:#fbe7e7; --info:#3b6fd8; --info-bg:#e6eefc;
+  --track:#e7eaef; --shadow:0 1px 2px rgba(16,24,40,.05);
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0e1116; --panel:#161a21; --panel-2:#1c212a; --line:#272d38;
+  --text:#e6e9ee; --muted:#9aa3b0; --faint:#6c7584;
+  --good:#3cc58a; --good-bg:#12291f; --warn:#e0a643; --warn-bg:#2d2414;
+  --bad:#f07070; --bad-bg:#311819; --info:#7aa2f7; --info-bg:#17223a;
+  --track:#262c37; --shadow:none;
+}}
+:root[data-theme="dark"]{
+  --bg:#0e1116; --panel:#161a21; --panel-2:#1c212a; --line:#272d38;
+  --text:#e6e9ee; --muted:#9aa3b0; --faint:#6c7584;
+  --good:#3cc58a; --good-bg:#12291f; --warn:#e0a643; --warn-bg:#2d2414;
+  --bad:#f07070; --bad-bg:#311819; --info:#7aa2f7; --info-bg:#17223a;
+  --track:#262c37; --shadow:none;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1360px;margin:0 auto;padding:20px 16px 48px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+header h1{font-size:20px;margin:0;font-weight:650;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:12.5px}
+.spacer{flex:1}
+.live-dot{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12.5px}
+.live-dot i{width:7px;height:7px;border-radius:50%;background:var(--good);display:inline-block}
+.live-dot.stale i{background:var(--bad)}
+.live-dot.pulse i{animation:pulse 1s ease-out}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--good) 60%,transparent)}100%{box-shadow:0 0 0 8px transparent}}
+button{font:inherit;font-size:12.5px;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:5px 10px;cursor:pointer}
+button:hover{background:var(--panel-2)}
+button:disabled{opacity:.55;cursor:default}
+
+.banner{border-radius:10px;padding:10px 14px;margin-bottom:14px;font-weight:550;background:var(--bad-bg);color:var(--bad);border:1px solid color-mix(in srgb,var(--bad) 30%,transparent)}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;box-shadow:var(--shadow);min-width:0}
+.kpi .l{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.kpi .v{font-size:24px;font-weight:650;margin-top:4px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .s{font-size:12px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.v.good{color:var(--good)}.v.warn{color:var(--warn)}.v.bad{color:var(--bad)}
+
+.grid{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:16px;align-items:start}
+.col{display:flex;flex-direction:column;gap:16px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);min-width:0}
+.card>h2{display:flex;align-items:center;gap:8px;margin:0;padding:12px 14px;font-size:13.5px;font-weight:650;border-bottom:1px solid var(--line)}
+.card>h2 .count{font-weight:500;color:var(--muted)}
+.card>h2 .right{margin-left:auto;font-weight:400;color:var(--muted);font-size:12px}
+.body{padding:12px 14px}
+.empty{color:var(--muted);padding:14px;font-size:13px}
+
+.tabs{display:flex;gap:4px;margin-left:auto}
+.tabs button{border:none;background:transparent;color:var(--muted);padding:3px 8px;border-radius:6px;font-weight:550}
+.tabs button.on{background:var(--panel-2);color:var(--text)}
+
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.03em;padding:8px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+th.num{text-align:right}
+.name{font-weight:550}
+.meta{color:var(--muted);font-size:12px}
+.mono{font-family:var(--mono);font-size:12px}
+.nowrap{white-space:nowrap}
+
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.pill.good{color:var(--good);background:var(--good-bg)}
+.pill.warn{color:var(--warn);background:var(--warn-bg)}
+.pill.bad{color:var(--bad);background:var(--bad-bg)}
+.pill.info{color:var(--info);background:var(--info-bg)}
+.pill.mute{color:var(--muted);background:var(--panel-2)}
+.tag{display:inline-block;font-size:11px;color:var(--muted);background:var(--panel-2);border-radius:5px;padding:1px 6px;margin-right:4px;white-space:nowrap}
+
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;min-width:0;overflow-wrap:anywhere}
+.plat{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+.plat:first-child{border-top:none}
+.plat .n{font-weight:550}
+.plat .r{margin-left:auto;text-align:right}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.sect{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin:14px 0 6px}
+
+.prov{padding:12px 14px;border-top:1px solid var(--line)}
+.prov:first-of-type{border-top:none}
+.prov-h{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.prov-h .n{font-weight:650;font-size:14px}
+.prov-h .bal{margin-left:auto;font-weight:650;font-size:15px;font-variant-numeric:tabular-nums}
+.meter{margin-top:9px}
+.meter .top{display:flex;justify-content:space-between;gap:10px;font-size:12.5px}
+.meter .top b{font-variant-numeric:tabular-nums}
+.bar{height:7px;background:var(--track);border-radius:99px;margin-top:5px;overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:99px;background:var(--good)}
+.bar>i.warn{background:var(--warn)}.bar>i.bad{background:var(--bad)}
+.note{font-size:12px;color:var(--muted);margin-top:6px}
+.err{color:var(--bad);font-size:12px;margin-top:4px;overflow-wrap:anywhere}
+.new{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:var(--info);background:var(--info-bg);border-radius:99px;padding:1px 7px;margin-left:6px;vertical-align:1px}
+.bot{display:flex;gap:10px;align-items:flex-start;padding:10px 14px;border-top:1px solid var(--line)}
+.bot:first-child{border-top:none}
+.bot .n{font-weight:650}
+.bot .r{margin-left:auto;text-align:right;white-space:nowrap}
+.ev{display:flex;gap:10px;align-items:baseline;padding:8px 14px;border-top:1px solid var(--line);font-size:13px}
+.ev:first-child{border-top:none}
+.ev .when{margin-left:auto;color:var(--faint);font-size:12px;white-space:nowrap}
+
+@media (max-width:1100px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}.grid{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:560px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.hide-sm{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Hermes</h1>
+    <span class="sub" id="ver">—</span>
+    <span class="spacer"></span>
+    <span class="live-dot" id="live"><i></i><span id="updated">connecting…</span></span>
+    <button id="refreshProv" title="Re-query every provider's usage now">Refresh providers</button>
+  </header>
+
+  <div id="estop"></div>
+  <section class="kpis" id="kpis"></section>
+
+  <div class="grid">
+    <div class="col">
+      <div class="card"><h2>Running now <span class="count" id="agentCount"></span><span class="right">chats · subagents · cron</span></h2><div id="agents"></div></div>
+      <div class="card"><h2>Live jobs <span class="count" id="liveCount"></span><span class="right" id="liveRight"></span></h2><div id="liveJobs"></div></div>
+      <div class="card">
+        <h2>Scheduled jobs <span class="count" id="jobCount"></span>
+          <span class="tabs" id="jobTabs">
+            <button data-f="all" class="on">All</button><button data-f="active">Active</button><button data-f="paused">Paused</button><button data-f="failing">Failing</button>
+          </span>
+        </h2>
+        <div class="tbl-wrap" id="jobs"></div>
+      </div>
+      <div class="card"><h2>Open incidents <span class="count" id="incCount"></span></h2><div id="incidents"></div></div>
+      <div class="card"><h2>Recent runs <span class="right">all profiles</span></h2><div class="tbl-wrap" id="recent"></div></div>
+    </div>
+    <div class="col">
+      <div class="card"><h2>What's new <span class="right">bots &amp; cron jobs</span></h2><div id="changes"></div></div>
+      <div class="card"><h2>Bots <span class="count" id="botCount"></span><span class="right" id="botRight"></span></h2><div id="bots"></div></div>
+      <div class="card"><h2>Gateway <span class="right" id="gwRight"></span></h2><div class="body" id="gateway"></div></div>
+      <div class="card"><h2>Providers <span class="right" id="provRight"></span></h2><div id="providers"></div></div>
+      <div class="card"><h2>Cron token use · 24h</h2><div class="tbl-wrap" id="tokens"></div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let state = null, jobFilter = "all", lastOk = 0;
+try { jobFilter = localStorage.getItem("hermes.jobFilter") || "all"; } catch {}
+
+function rel(iso){
+  if(!iso) return "—";
+  const t = new Date(iso).getTime(); if(isNaN(t)) return "—";
+  const d = (t - Date.now())/1000, a = Math.abs(d);
+  const f = a<60 ? `${Math.round(a)}s` : a<3600 ? `${Math.round(a/60)}m` : a<86400 ? `${(a/3600).toFixed(a<36000?1:0)}h` : `${Math.round(a/86400)}d`;
+  return d>=0 ? `in ${f}` : `${f} ago`;
+}
+function nextRel(iso){
+  if(!iso) return "—";
+  const late = (Date.now() - new Date(iso).getTime())/1000;
+  if(late <= 0) return rel(iso);
+  return late < 300 ? "due now" : `<span class="pill warn">overdue ${dur(late)}</span>`;
+}
+function dur(sec){ if(sec==null) return "—"; sec=Math.max(0,sec);
+  const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
+  return d? `${d}d ${h}h` : h? `${h}h ${m}m` : m? `${m}m` : `${Math.round(sec)}s`; }
+function abs(iso){ if(!iso) return ""; const d=new Date(iso); return isNaN(d)?"":d.toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}); }
+const fmtN = n => n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:1)+"M" : n>=1e3 ? (n/1e3).toFixed(n>=1e4?0:1)+"k" : String(n);
+const money = (v,c="USD") => (c==="USD"?"$":"") + Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) + (c!=="USD"?" "+c:"");
+
+function statusPill(s){
+  const map = {ok:"good",completed:"good",delivered:"good",connected:"good",running:"info",claimed:"info",scheduled:"mute",
+               failed:"bad",error:"bad",missed:"warn",cancelled:"mute",unknown:"warn",paused:"warn",suppressed:"mute",disconnected:"bad"};
+  return s ? `<span class="pill ${map[s]||"mute"}">${esc(s)}</span>` : `<span class="meta">—</span>`;
+}
+
+function kpi(l, v, s, cls=""){ return `<div class="kpi"><div class="l">${esc(l)}</div><div class="v ${cls}">${v}</div><div class="s">${s}</div></div>`; }
+
+function render(){
+  const s = state; if(!s) return;
+  const g = s.gateway||{}, J = s.jobs||{}, P = s.providers||{};
+  const jobs = J.jobs||[];
+  const paused = jobs.filter(j=>j.paused), active = jobs.filter(j=>!j.paused);
+  const failing = jobs.filter(j=>j.failure_streak>0 || ["failed","error"].includes(j.last_status));
+  const nextJob = active.filter(j=>j.next_run_at).sort((a,b)=>new Date(a.next_run_at)-new Date(b.next_run_at))[0];
+  const tok = (J.tokens_24h||[]).reduce((a,t)=>a+t.prompt+t.completion,0);
+  const tokRuns = (J.tokens_24h||[]).reduce((a,t)=>a+t.runs,0);
+  const healthCls = {healthy:"good",degraded:"warn",down:"bad"}[g.health]||"";
+  const uptime = g.started_at ? (Date.now()-new Date(g.started_at))/1000 : null;
+
+  $("ver").textContent = g.version ? `v${g.version} · ${g.sha} · ${(g.served_profiles||[]).length} profiles` : "";
+  $("estop").innerHTML = (g.estop||[]).length ? `<div class="banner">Emergency stop engaged — cron dispatch and new gateway turns are paused. Run <span class="mono">hermes resume</span> to lift it.</div>` : "";
+
+  $("kpis").innerHTML =
+    kpi("Gateway", esc((g.health||"unknown").replace(/^./,c=>c.toUpperCase())), g.alive ? `up ${dur(uptime)} · pid ${esc(g.pid)}` : "process not running", healthCls) +
+    kpi("Bots", (s.bots||[]).length, `${(s.bots||[]).filter(b=>b.served).length} served${(s.bots||[]).some(b=>b.new)?" · new bot":""}`) +
+    kpi("Running now", (s.agents||[]).length, `${(J.live||[]).length} cron · ${g.active_agents??0} gateway agent${g.active_agents==1?"":"s"}`, (s.agents||[]).length?"good":"") +
+    kpi("Paused jobs", paused.length, paused.length ? esc([...new Set(paused.map(j=>j.profile))].join(", ")) : "none", paused.length?"warn":"") +
+    kpi("Scheduled", active.length, nextJob ? `next ${esc(nextJob.name)} ${nextRel(nextJob.next_run_at).replace(/<[^>]+>/g,"")}` : "nothing upcoming") +
+    kpi("Incidents", (J.incidents||[]).length, failing.length ? `${failing.length} job${failing.length>1?"s":""} failing` : "all jobs healthy", (J.incidents||[]).length||failing.length?"bad":"good") +
+    kpi("Cron tokens 24h", fmtN(tok), `${tokRuns} agent runs`);
+
+  // running now (agents)
+  const AG = s.agents||[];
+  const kindTag = {chat:"chat", subagent:"subagent", cron:"cron"};
+  $("agentCount").textContent = AG.length ? `· ${AG.length}` : "";
+  $("agents").innerHTML = AG.length ? `<div class="tbl-wrap"><table><tbody>${AG.map(a=>`<tr>
+      <td><div class="name">${esc(a.title||"—")}</div><div class="meta"><span class="tag">${esc(a.profile)}</span><span class="tag">${esc(kindTag[a.kind]||a.kind)}</span>${a.model?esc(a.model):""}${a.source?` · ${esc(a.source)}`:""}</div></td>
+      <td class="nowrap">${statusPill(a.kind==="cron"?(a.status||"running"):"running")}<div class="meta">started ${rel(a.started_at)}</div>${a.pid_alive===false?' <span class="pill bad">dead pid</span>':""}</td></tr>`).join("")}</tbody></table></div>`
+    : `<div class="empty">Nothing running right now.</div>`;
+
+  // bots
+  const B = s.bots||[];
+  $("botCount").textContent = B.length ? `· ${B.length}` : "";
+  $("botRight").textContent = B.some(b=>!b.served) ? `${B.filter(b=>!b.served).length} not served` : "all served";
+  $("bots").innerHTML = B.length ? B.map(b=>`<div class="bot">
+      <div><div class="n">${esc(b.name)}${b.new?'<span class="new">new</span>':""} <span class="meta mono">${esc(b.id)}</span></div>
+        ${b.blurb?`<div class="meta">${esc(b.blurb)}</div>`:""}
+        <div class="meta">${esc(b.model)} · ${esc(b.provider)} · ${b.sessions} chat${b.sessions==1?"":"s"} · ${b.jobs} cron job${b.jobs==1?"":"s"}${b.jobs_paused?` (${b.jobs_paused} paused)`:""}</div></div>
+      <div class="r">${b.running?`<span class="pill good">${b.running} running</span>`:""}
+        ${b.parked?'<span class="pill warn">parked</span>':b.served?"":'<span class="pill warn">not served</span>'}
+        ${b.jobs_failing?`<span class="pill bad">${b.jobs_failing} failing</span>`:""}
+        <div class="meta">${b.last_active?`active ${rel(b.last_active)}`:"no chats yet"}</div></div></div>`).join("")
+    : `<div class="empty">${esc(s.bots_error||"No bots found.")}</div>`;
+
+  // what's new
+  const EV = (s.changes||{}).events||[];
+  $("changes").innerHTML = EV.length ? EV.slice(0,12).map(e=>`<div class="ev">
+      <span class="pill ${e.type==="added"?"good":e.type==="renamed"?"info":"mute"}">${esc(e.type)}</span>
+      <span><b>${esc(e.name)}</b> <span class="meta">${esc(e.kind)}${e.kind!=="bot"?` · ${esc(e.profile)}`:""}${e.old_name?` · was ${esc(e.old_name)}`:""}</span></span>
+      <span class="when">${rel(e.at)}</span></div>`).join("")
+    : `<div class="empty">No bots or cron jobs created or removed since the dashboard started watching${(s.changes||{}).baseline_only?" (just now)":""}.</div>`;
+
+  // live jobs
+  const live = J.live||[];
+  $("liveCount").textContent = live.length ? `· ${live.length}` : "";
+  $("liveRight").textContent = nextJob ? `next: ${nextJob.name} ${nextRel(nextJob.next_run_at).replace(/<[^>]+>/g,"")}` : "";
+  $("liveJobs").innerHTML = live.length ? `<div class="tbl-wrap"><table><thead><tr><th>Job</th><th>Status</th><th>Started</th><th class="hide-sm">Last progress</th><th>PID</th></tr></thead><tbody>${
+    live.map(r=>`<tr><td><div class="name">${esc(r.name)}</div><div class="meta"><span class="tag">${esc(r.profile)}</span>${esc(r.source||"")}</div></td>
+      <td>${statusPill(r.status)}</td><td class="nowrap">${rel(r.started_at||r.claimed_at)}</td><td class="hide-sm nowrap">${rel(r.progress_at)}</td>
+      <td class="mono">${esc(r.pid??"—")}${r.pid_alive===false?` <span class="pill bad">dead</span>`:""}</td></tr>`).join("")
+  }</tbody></table></div>` : `<div class="empty">Nothing running right now.</div>`;
+
+  // jobs table
+  const filt = {all:jobs, active, paused, failing}[jobFilter]||jobs;
+  document.querySelectorAll("#jobTabs button").forEach(b=>b.classList.toggle("on", b.dataset.f===jobFilter));
+  $("jobCount").textContent = `· ${jobs.length}`;
+  const sorted = [...filt].sort((a,b)=> (a.paused-b.paused) || (new Date(a.next_run_at||8.64e15)-new Date(b.next_run_at||8.64e15)));
+  $("jobs").innerHTML = sorted.length ? `<table><thead><tr><th>Job</th><th>Schedule</th><th>Next run</th><th>Last run</th><th class="num hide-sm">Runs</th></tr></thead><tbody>${
+    sorted.map(j=>`<tr>
+      <td><div class="name">${esc(j.name)}${j.new?'<span class="new">new</span>':""}</div><div class="meta"><span class="tag">${esc(j.profile)}</span>${j.script_only?'<span class="tag">script</span>':""}${j.paused?`<span class="pill warn">paused ${j.paused_at?esc(rel(j.paused_at)):""}</span>`:""}${j.failure_streak?` <span class="pill bad">${j.failure_streak}× failing</span>`:""}</div>
+        ${j.paused_reason?`<div class="meta">${esc(j.paused_reason)}</div>`:""}${j.last_error?`<div class="err">${esc(String(j.last_error).slice(0,180))}</div>`:""}</td>
+      <td class="meta">${esc(j.schedule)}</td>
+      <td class="nowrap">${j.paused?'<span class="meta">—</span>':`${nextRel(j.next_run_at)}<div class="meta">${abs(j.next_run_at)}</div>`}</td>
+      <td class="nowrap">${statusPill(j.last_status)}<div class="meta">${rel(j.last_run_at)}</div></td>
+      <td class="num hide-sm">${j.completed??"—"}</td></tr>`).join("")
+  }</tbody></table>` : `<div class="empty">No ${jobFilter==="all"?"":jobFilter+" "}jobs.</div>`;
+
+  // incidents
+  const inc = J.incidents||[];
+  $("incCount").textContent = inc.length ? `· ${inc.length}` : "";
+  $("incidents").innerHTML = inc.length ? `<table><tbody>${inc.map(i=>`<tr><td><div class="name">${esc(i.name)}</div><div class="meta"><span class="tag">${esc(i.profile)}</span>${esc(i.failure_type)} · first ${rel(i.first_seen_at)} · last ${rel(i.last_seen_at)}</div><div class="err">${esc(String(i.error).slice(0,240))}</div></td><td>${statusPill(i.state)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">No open incidents.</div>`;
+
+  // recent runs
+  const rec = J.recent||[];
+  $("recent").innerHTML = rec.length ? `<table><thead><tr><th>Job</th><th>Status</th><th>When</th><th class="num">Took</th><th class="hide-sm">Delivery</th></tr></thead><tbody>${
+    rec.slice(0,15).map(r=>{ const took = r.started_at&&r.finished_at ? (new Date(r.finished_at)-new Date(r.started_at))/1000 : null;
+      return `<tr><td><div class="name">${esc(r.name)}</div><div class="meta"><span class="tag">${esc(r.profile)}</span></div>${r.error?`<div class="err">${esc(String(r.error).slice(0,160))}</div>`:""}</td>
+      <td>${statusPill(r.status)}</td><td class="nowrap">${rel(r.claimed_at)}</td><td class="num">${took==null?"—":took<10?took.toFixed(1)+"s":dur(took)}</td><td class="hide-sm">${statusPill(r.delivery_outcome)}</td></tr>`;}).join("")
+  }</tbody></table>` : `<div class="empty">No runs recorded.</div>`;
+
+  // gateway
+  $("gwRight").innerHTML = g.health ? statusPill(g.health==="healthy"?"ok":g.health==="down"?"error":"degraded").replace(/>(ok|error|degraded)</, `>${esc(g.health)}<`) : "";
+  const plats = (g.platforms||[]).map(p=>{
+    const m = p.metrics?.metrics_today;
+    const extra = p.listener ? `<div class="meta mono">${esc(p.listener)}</div>` : "";
+    const today = m ? `<div class="meta">today: ${m.requests} req · ${fmtN(m.tokens||0)} tok${m.latency_p95_ms?` · p95 ${m.latency_p95_ms}ms`:""}</div>` : "";
+    return `<div class="plat"><div><div class="n">${esc(p.name)}</div>${extra}${p.error?`<div class="err">${esc(p.error)}</div>`:""}</div>
+      <div class="r">${statusPill(p.needs_attention?"error":p.state)}${today}<div class="meta">updated ${rel(p.updated_at)}</div></div></div>`;}).join("");
+  const tick = (g.ticker||[]);
+  const staleTick = tick.filter(t=>t.heartbeat && (Date.now()-new Date(t.heartbeat))/1000 > 180);
+  const parked = Object.keys(g.parked_profiles||{});
+  $("gateway").innerHTML = `
+    <dl class="kv">
+      <dt>Process</dt><dd>${g.alive?`pid ${esc(g.pid)}`:'<span class="pill bad">not running</span>'}</dd>
+      <dt>State</dt><dd>${statusPill(g.state)}${g.restart_requested?' <span class="pill warn">restart requested</span>':""}</dd>
+      <dt>Uptime</dt><dd>${dur(uptime)}</dd>
+      <dt>Heartbeat</dt><dd>${g.heartbeat_age_s==null?"—":`${dur(g.heartbeat_age_s)} ago`}${g.heartbeat_age_s>120?' <span class="pill warn">stale</span>':""}</dd>
+      <dt>Session store</dt><dd>${statusPill(g.session_store)}</dd>
+      <dt>Cron tickers</dt><dd>${tick.length} profiles${staleTick.length?` · <span class="pill warn">${staleTick.length} stale</span>`:' · all beating'}</dd>
+      ${g.exit_reason?`<dt>Exit reason</dt><dd class="err">${esc(g.exit_reason)}</dd>`:""}
+    </dl>
+    <div class="sect">Platforms</div>${plats||'<div class="meta">none</div>'}
+    <div class="sect">Served profiles</div><div class="chips">${(g.served_profiles||[]).map(p=>`<span class="tag">${esc(p)}</span>`).join("")}${parked.map(p=>`<span class="pill warn">${esc(p)} parked</span>`).join("")}</div>`;
+
+  // providers
+  const provs = P.providers||[];
+  $("provRight").textContent = (P.refreshing||P.loading) ? "refreshing…" : P.fetched_at ? `checked ${rel(P.fetched_at)}` : (P.error||"");
+  $("providers").innerHTML = provs.length ? provs.map(p=>{
+    const u = p.usage||{};
+    const creds = p.credentials||[];
+    const bal = u.balance ? `<span class="bal">${money(u.balance.remaining, u.balance.currency)}<span class="meta"> left</span></span>` : "";
+    const meters = (u.windows||[]).map(w=>{
+      const used = Math.max(0,Math.min(100,w.used_percent??0)), left = 100-used;
+      const cls = left<15?"bad":left<35?"warn":"";
+      return `<div class="meter"><div class="top"><span>${esc(w.label)}</span><span><b>${left.toFixed(left%1?1:0)}% left</b>${w.resets_at?` <span class="meta">· resets ${rel(w.resets_at)}</span>`:""}</span></div>
+        <div class="bar"><i class="${cls}" style="width:${used}%"></i></div>${w.detail?`<div class="note">${esc(w.detail)}</div>`:""}</div>`;}).join("");
+    const det = (u.details||[]).map(d=>`<div class="note">${esc(d)}</div>`).join("");
+    const na = (u.unavailable_reason && !u.balance && !(u.windows||[]).length ? `<div class="note">${esc(u.unavailable_reason)}</div>` : "")
+      + (u.stale ? `<div class="note"><span class="pill warn">stale</span> reading from ${rel(u.stale_since)}; latest check ${rel(u.checked_at)} failed (provider rate limit or outage), retrying</div>` : "");
+    return `<div class="prov"><div class="prov-h"><span class="n">${esc(p.provider)}</span>${p.is_default?'<span class="pill info">default</span>':""}${u.plan?`<span class="tag">${esc(u.plan)}</span>`:""}${bal}</div>
+      <div class="meta">${creds.length} credential${creds.length==1?"":"s"}: ${creds.map(c=>`${esc(c.label)} <span class="faint">(${esc(c.type)})</span>${c.active?" ←":""}`).join(", ")}</div>
+      ${meters}${det}${na}</div>`;}).join("") : `<div class="empty">${esc(P.error||"Loading provider usage…")}</div>`;
+
+  // tokens
+  const T = J.tokens_24h||[];
+  $("tokens").innerHTML = T.length ? `<table><thead><tr><th>Model</th><th class="num">Runs</th><th class="num">Prompt</th><th class="num">Output</th></tr></thead><tbody>${
+    T.map(t=>`<tr><td class="mono">${esc(t.model)}${t.errors?` <span class="pill bad">${t.errors} err</span>`:""}</td><td class="num">${t.runs}</td><td class="num">${fmtN(t.prompt)}</td><td class="num">${fmtN(t.completion)}</td></tr>`).join("")
+  }</tbody></table>` : `<div class="empty">No cron agent runs in the last 24h.</div>`;
+}
+
+async function load(force){
+  try{
+    const r = await fetch("/api/status"+(force?"?refresh=providers":""), {cache:"no-store"});
+    state = await r.json(); lastOk = Date.now();
+    const el = $("live"); el.classList.remove("stale","pulse"); void el.offsetWidth; el.classList.add("pulse");
+    render();
+  }catch(e){ $("live").classList.add("stale"); }
+  tickLabel();
+}
+function tickLabel(){
+  if(!lastOk){ $("updated").textContent = "server unreachable"; return; }
+  const a = (Date.now()-lastOk)/1000;
+  $("updated").textContent = a < 15 ? `live · updated ${Math.round(a)}s ago` : `stale · last update ${dur(a)} ago`;
+  $("live").classList.toggle("stale", a >= 15);
+}
+$("jobTabs").addEventListener("click", e=>{ const f=e.target.dataset?.f; if(!f) return; jobFilter=f; try{localStorage.setItem("hermes.jobFilter",f)}catch{} render(); });
+$("refreshProv").addEventListener("click", async e=>{ e.target.disabled=true; e.target.textContent="Refreshing…"; await load(true); e.target.disabled=false; e.target.textContent="Refresh providers"; });
+load(); setInterval(load, 5000); setInterval(tickLabel, 1000);
+</script>
+</body>
+</html>

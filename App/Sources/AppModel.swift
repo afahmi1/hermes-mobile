@@ -21,6 +21,8 @@ final class AppModel {
     var signedIn = API.shared.isSignedIn
     var bots: [Bot] = []
     var health: HealthInfo?
+    /// The Mac's status dashboard data, polled for the app's lifetime (see StatusModel.poll).
+    let status = StatusModel()
     var loadError: String?
     private var catalogs: [String: ModelCatalog] = [:]
     private var chats: [String: ChatModel] = [:]
@@ -81,6 +83,7 @@ final class AppModel {
 
     func signOut() {
         API.shared.signOut()
+        status.reset()
         signedIn = false
         chats = [:]
         catalogs = [:]

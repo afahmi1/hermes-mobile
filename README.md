@@ -4,8 +4,17 @@ A native SwiftUI iPhone app for [Hermes Agent](https://github.com/NousResearch/h
 (profile) on your Mac, lets you continue any of them, and switches model, provider and reasoning effort per chat. The
 switch is saved on the chat inside Hermes, so the desktop app sees the same setting.
 
-The app has no server of its own. Each person who installs it points it at **their own Mac**, which runs Hermes plus a
-small bridge (`Bridge/`) that the app talks to over Tailscale.
+It also has a **Status** tab, the same view as the Mac status dashboard (`Status/`, a web page on port 9230). It shows:
+- what's running right now: chats, subagents and cron runs;
+- every bot and every cron job;
+- incidents, recent runs, provider usage, and a "What's new" log.
+
+Both the Mac page and the phone re-discover everything on each refresh, so a bot or cron job you create shows up within
+seconds, with a "new" badge for a day. Removals and renames show up too. The phone refreshes every 5 s while the Status
+tab is open and every 30 s otherwise, badges the tab, and shows a banner when something is created or removed.
+
+The app has no server of its own. Each person who installs it points it at **their own Mac**, which runs Hermes, a
+small bridge (`Bridge/`) that the app talks to over Tailscale, and the status dashboard.
 
 ```
 iPhone app  ──HTTPS over your tailnet──▶  Bridge on your Mac (127.0.0.1:9131, exposed with `tailscale serve`)
@@ -99,12 +108,18 @@ Everyone needs their own Mac running Hermes. The app only ever talks to the addr
        password: a-long-password
    ```
 
-4. Install the bridge (a per-user launch agent on port 9131 that starts at login):
+4. Install the bridge (a per-user launch agent on port 9131 that starts at login) and the status dashboard (port 9230):
 
    ```bash
-   cd Bridge
-   ./install.sh               # ./install.sh --uninstall removes it
+   Bridge/install.sh          # each one takes --uninstall to remove it
+   Status/install.sh          # then open http://127.0.0.1:9230 on the Mac
    ```
+
+   **New bots work on the phone automatically.** Hermes's API server refuses a bot without an `API_SERVER_KEY`, so when
+   a bot appears that the gateway serves but that has never had a key, the bridge backs up its `.env` to
+   `~/.hermes/backups/hermes-mobile-auto/` and adds one, once the `.env` has been unchanged for 30 s. Each bot gets this
+   once only: a key you remove later stays removed. To opt one bot out, add a line `# hermes-mobile: no-key` to its
+   `.env`. To turn the feature off entirely, set `HERMES_MOBILE_AUTO_KEYS=0` for the bridge.
 
 5. Make it reachable from your phone with [Tailscale](https://tailscale.com). This is tailnet-only with a real HTTPS
    certificate, and nothing is exposed to the internet:
@@ -135,6 +150,8 @@ on the phone appear in the desktop app's Recents.
 | `Bridge/hermes_mobile_bridge.py` | The bridge: login tokens, merged session list across profiles, read-only state.db queries, pass-through to the gateway. |
 | `Bridge/bridge_turns.py` | Runs chat turns through Hermes's gateway session protocol (the desktop app's), so any chat can be continued and model/effort switches are saved on the session. |
 | `Bridge/install.sh` | Installs the bridge as a launch agent. |
+| `Status/hermes_status_server.py`, `Status/dashboard.html` | The status dashboard: gateway, bots, cron jobs, running agents, incidents, provider usage, and what's new. It is read-only toward Hermes; its only state is `~/Library/Application Support/hermes-status/seen.json` (what it has seen, for the "new" badges). |
+| `Status/install.sh` | Installs the dashboard as a launch agent on port 9230. The bridge's `/m/status` reads it (`HERMES_STATUS_URL` overrides the address). |
 
 ### Development tips
 
