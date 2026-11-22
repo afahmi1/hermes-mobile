@@ -58,8 +58,7 @@ struct ChatScreen: View {
                     .accessibilityHint("Change model, provider and effort")
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button { showRuntime = true } label: { Image(systemName: "slider.horizontal.3") }
-                    .accessibilityLabel("Model and effort")
+                ConnectionBadge()
             }
         }
         .sheet(isPresented: $showRuntime) {

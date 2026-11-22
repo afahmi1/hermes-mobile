@@ -23,7 +23,7 @@ struct RootView: View {
     var body: some View {
         if app.signedIn {
             MainTabs()
-                .task { await app.refreshBots(); await app.refreshHealth() }
+                .task { await app.refreshBots() }
         } else {
             SignInView()
         }
@@ -31,6 +31,7 @@ struct RootView: View {
 }
 
 struct MainTabs: View {
+    @Environment(\.scenePhase) private var phase
     @Environment(AppModel.self) private var app
 
     var body: some View {
@@ -44,6 +45,14 @@ struct MainTabs: View {
                 .badge(app.status.badge)
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+        }
+        .task(id: phase) {
+            guard phase == .active else { return }
+            app.checkedConnection = false
+            while !Task.isCancelled {
+                await app.refreshHealth()
+                try? await Task.sleep(for: .seconds(15))
+            }
         }
         .task { await app.status.poll(app: app) }  // keeps the badge and bot lists current from any tab
         .overlay(alignment: .top) { Announcement(text: app.status.announcement, tick: app.status.announceTick) }
@@ -76,5 +85,29 @@ private struct Announcement: View {
             try? await Task.sleep(for: .seconds(4))
             if !Task.isCancelled { shown = false }
         }
+    }
+}
+
+/// An authenticated health probe checks both the bridge and the Hermes gateway.
+struct ConnectionBadge: View {
+    @Environment(AppModel.self) private var app
+
+    private var state: (String, Color) {
+        guard app.checkedConnection else { return ("Checking", .secondary) }
+        guard let health = app.health else { return ("Offline", .red) }
+        guard health.ok else { return ("Gateway down", .orange) }
+        if let state = health.gatewayState, !["running", "healthy", "ok", "ready"].contains(state.lowercased()) {
+            return (state.capitalized, .orange)
+        }
+        return ("Online", .green)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle().fill(state.1).frame(width: 7, height: 7)
+            Text(state.0).font(.caption.weight(.medium))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Hermes connection, " + state.0)
     }
 }

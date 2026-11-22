@@ -6,6 +6,7 @@ struct ChatListView: View {
     @State private var filter: Filter = .chats
     @State private var sessions: [SessionSummary] = []
     @State private var cursor: String?
+    @State private var generation = UUID()
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
@@ -15,7 +16,7 @@ struct ChatListView: View {
     var profile: String? = nil
 
     enum Filter: String, CaseIterable, Identifiable {
-        case chats = "Chats", all = "Everything", archived = "Archived"
+        case chats = "Chats", all = "Everything", telegram = "Telegram", archived = "Archived"
         var id: String { rawValue }
     }
 
@@ -25,8 +26,9 @@ struct ChatListView: View {
                 .navigationTitle(profile.map { app.botName($0) } ?? "Chats")
                 .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
                 .searchable(text: $query, prompt: "Search titles and messages")
-                .task(id: query) { await runSearch() }
+                .task(id: [query, filter.rawValue]) { await runSearch() }
                 .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { ConnectionBadge() }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button { startNew() } label: { Image(systemName: "square.and.pencil") }
                             .accessibilityLabel("New chat")
@@ -39,9 +41,13 @@ struct ChatListView: View {
                     }
                 }
                 .refreshable { await reload() }
-                .task { if sessions.isEmpty { await reload() } }
+                .task(id: filter) {
+                    sessions = []
+                    cursor = nil
+                    await reload()
+                }
                 .task { await autoRefresh() }
-                .onChange(of: filter) { _, _ in Task { await reload() } }
+
         }
     }
 
@@ -119,36 +125,47 @@ struct ChatListView: View {
     private var exclude: [String] { filter == .chats ? ["cron", "oneshot", "subagent", "tool"] : [] }
 
     private func reload() async {
+        let request = UUID()
+        generation = request
+        let requestedFilter = filter
         loading = true
-        defer { loading = false }
+        defer { if generation == request { loading = false } }
         do {
             if filter == .archived && profile == nil {
-                sessions = try await API.shared.search("", archived: true)
+                let archived = try await API.shared.search("", archived: true)
+                guard !Task.isCancelled, generation == request, requestedFilter == filter else { return }
+                sessions = archived
                 cursor = nil
             } else {
-                let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude)
+                let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, telegram: filter == .telegram)
+                guard !Task.isCancelled, generation == request, requestedFilter == filter else { return }
                 sessions = dedupe(page.data)
                 cursor = page.next
             }
             error = nil
         } catch {
+            guard !Task.isCancelled, generation == request, requestedFilter == filter else { return }
             self.error = error.localizedDescription
             if case APIError.http(401, _) = error { app.signOut() }
         }
     }
 
     private func loadMore() async {
+        let request = generation
+        let requestedFilter = filter
         guard var c = cursor else { return }
-        while loading { try? await Task.sleep(for: .milliseconds(150)) }  // a refresh in flight: wait, don't drop the page
-        guard cursor == c else { return }
+        while loading && !Task.isCancelled { try? await Task.sleep(for: .milliseconds(150)) }  // a refresh in flight: wait, don't drop the page
+        guard !Task.isCancelled, generation == request, filter == requestedFilter, cursor == c else { return }
         loading = true
-        defer { loading = false }
+        defer { if generation == request { loading = false } }
         // Keep going while pages come back empty but more remain (all-cron stretches on the Chats filter).
         for _ in 0..<5 {
-            guard let page = try? await API.shared.sessions(cursor: c, profile: profile, exclude: exclude) else {
+            guard let page = try? await API.shared.sessions(cursor: c, profile: profile, exclude: exclude, telegram: filter == .telegram) else {
+                guard !Task.isCancelled, generation == request, filter == requestedFilter else { return }
                 error = "Couldn't load older chats. Pull down to retry."
                 return
             }
+            guard !Task.isCancelled, generation == request, filter == requestedFilter else { return }
             sessions = dedupe(sessions + page.data)
             cursor = page.next
             guard page.data.isEmpty, let next = page.next else { return }
@@ -160,8 +177,13 @@ struct ChatListView: View {
     private func autoRefresh() async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(15))
-            guard results == nil, filter != .archived, !loading,
-                  let page = try? await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude) else { continue }
+            let request = generation
+            let requestedFilter = filter
+            guard !Task.isCancelled, results == nil, filter != .archived, !loading,
+                  let page = try? await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, telegram: filter == .telegram) else { continue }
+            guard !Task.isCancelled, request == generation, requestedFilter == filter else { continue }
+            error = nil
+            if sessions.isEmpty { cursor = page.next }
             let fresh = page.data
             let rest = sessions.filter { s in !fresh.contains { $0.key == s.key } }
             withAnimation { sessions = dedupe(fresh + rest).sorted(by: Self.order) }
@@ -183,8 +205,16 @@ struct ChatListView: View {
         guard !q.isEmpty else { results = nil; return }
         try? await Task.sleep(for: .milliseconds(300))
         guard !Task.isCancelled else { return }
-        let found = (try? await API.shared.search(q)) ?? []
-        results = profile.map { p in found.filter { $0.profile == p } } ?? found
+        do {
+            let found = try await API.shared.search(q, archived: filter == .archived, profile: profile, telegram: filter == .telegram)
+            guard !Task.isCancelled else { return }
+            results = profile.map { p in found.filter { $0.profile == p } } ?? found
+            error = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            results = nil
+            self.error = error.localizedDescription
+        }
     }
 
     private func setFlag(_ s: SessionSummary, _ flag: String, _ value: Bool) async {

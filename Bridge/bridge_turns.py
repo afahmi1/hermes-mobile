@@ -17,6 +17,7 @@ the app; the turn keeps going and the phone re-attaches to the buffered event lo
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 import time
 import uuid
@@ -53,7 +54,9 @@ def _endpoint(home: Path):
 async def connect(home: Path):
     from hermes_cli.gateway_client import connect_gateway
     ep = await asyncio.to_thread(_endpoint, home)
-    async with connect_gateway(endpoint=ep, max_size=64 * 1024 * 1024) as c:
+    # Older Hermes clients own their WebSocket frame limit internally.
+    options = {"max_size": 64 * 1024 * 1024} if "max_size" in inspect.signature(connect_gateway).parameters else {}
+    async with connect_gateway(endpoint=ep, **options) as c:
         yield c
 
 
@@ -218,9 +221,10 @@ def _settle(turn, pl):
     ``unknown`` (a lost worker), ``failed`` or any error status is reported as a failure."""
     status = str(pl.get("status") or "").lower()
     outcome = str(pl.get("outcome") or "").lower()
-    kind = _STATUS_OUTCOME.get(status) or _STATUS_OUTCOME.get(outcome)
-    if outcome in ("unknown", "failed", "error") or (status and kind is None):
-        kind = "failed"
+    # Both fields describe the same terminal event. An unknown or conflicting value
+    # cannot confirm that a reply completed.
+    kinds = {_STATUS_OUTCOME.get(value, "failed") for value in (status, outcome) if value}
+    kind = kinds.pop() if len(kinds) == 1 else "failed"
     if kind == "cancelled":
         turn.push("run.cancelled", output=pl.get("content") or pl.get("text") or "")
     elif kind == "failed":
@@ -247,8 +251,12 @@ async def _recover_gap(c, turn):
     except TurnError:
         receipt = {}
     result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
-    _settle(turn, {**result, "status": result.get("status") or ("complete" if receipt.get("status") == "terminal" else "error"),
-                   "outcome": result.get("outcome") or receipt.get("outcome") or ""})
+    if receipt.get("status") in ("started", "queued"):
+        return False
+    # "terminal" includes cancellation and worker loss. The admission's outcome
+    # determines which event the phone should paint after a gap.
+    outcome = receipt.get("outcome") if receipt.get("status") == "terminal" else "unknown"
+    _settle(turn, {**result, "status": result.get("status") or "", "outcome": outcome or "unknown"})
     return True
 
 

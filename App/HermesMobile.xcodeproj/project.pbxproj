@@ -22,6 +22,7 @@
 		C6254CDC81B9E435FBB3B981 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77BE1304B3824EAD4CAE8086 /* SignInView.swift */; };
 		CE8872AD244AC2FE04FB85DB /* API.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1476455C52D00777817E0CF2 /* API.swift */; };
 		DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2964B8E32E7A6E7CAE8E6CD /* Models.swift */; };
+		ED1266216A5741C7D9F1F39B /* StreamRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84E690DA9F04A70286E6A83B /* StreamRecovery.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,6 +35,7 @@
 		77BE1304B3824EAD4CAE8086 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
 		785C4DB8C31E64EB728F4674 /* StatusModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusModel.swift; sourceTree = "<group>"; };
 		81D8AF5D872DE5BB11D76FA3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		84E690DA9F04A70286E6A83B /* StreamRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamRecovery.swift; sourceTree = "<group>"; };
 		8E0CEC74256653C26970ED7B /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		AA8AF41DA7F59809B8B46AA5 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
 		B2964B8E32E7A6E7CAE8E6CD /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
@@ -55,6 +57,7 @@
 				6686DC90CF4C5218AD9EE3C5 /* HermesMobileApp.swift */,
 				B2964B8E32E7A6E7CAE8E6CD /* Models.swift */,
 				785C4DB8C31E64EB728F4674 /* StatusModel.swift */,
+				84E690DA9F04A70286E6A83B /* StreamRecovery.swift */,
 				FD05A63C1F8FBADBE8115E39 /* Views */,
 			);
 			path = Sources;
@@ -195,6 +198,7 @@
 				C6254CDC81B9E435FBB3B981 /* SignInView.swift in Sources */,
 				4F01CC9DBF27354A9230DABF /* StatusModel.swift in Sources */,
 				A361553D096D10E613B2CFEE /* StatusView.swift in Sources */,
+				ED1266216A5741C7D9F1F39B /* StreamRecovery.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

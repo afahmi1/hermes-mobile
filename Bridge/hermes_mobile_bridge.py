@@ -17,7 +17,7 @@ import base64, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, 
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 HOME = Path.home()
 HERMES = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
@@ -336,7 +336,7 @@ def _ro(pid):
     db = profile_home(pid) / "state.db"
     if not db.exists():
         return None
-    con = sqlite3.connect("file:%s?mode=ro" % quote(str(db)), uri=True, timeout=5)
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     return con
 
@@ -356,7 +356,7 @@ def _ts(s):
     return s.get("last_active") or s.get("started_at") or 0
 
 
-def _page_round(offsets, pids, limit, exclude, first_page):
+def _page_round(offsets, pids, limit, exclude, first_page, telegram=False):
     """One fetch round across profiles. Returns (rows, pins, new_offsets, done, errors, more_left)."""
     exhausted = set(offsets.get("_done", []))
     live = [p for p in pids if p not in exhausted]
@@ -364,6 +364,20 @@ def _page_round(offsets, pids, limit, exclude, first_page):
 
     def fetch(pid):
         off = int(offsets.get(pid, 0))
+        if telegram:
+            try:
+                con = _ro(pid)
+                if con is None:
+                    return pid, ([], [], False), None
+                try:
+                    rows = con.execute("SELECT " + SESSION_COLS + " FROM sessions WHERE source='telegram' "
+                                       "AND coalesce(hidden,0)=0 AND coalesce(archived,0)=0 "
+                                       "ORDER BY last_active DESC, id LIMIT ? OFFSET ?", (batch + 1, off)).fetchall()
+                    return pid, ([dict(row, archived=False) for row in rows[:batch]], [], len(rows) > batch), None
+                finally:
+                    con.close()
+            except sqlite3.Error as error:
+                return pid, None, type(error).__name__
         try:
             st, d = gw("GET", pid, "/api/sessions?limit=%d&offset=%d" % (batch, off))
         except Exception as e:
@@ -416,7 +430,7 @@ def _page_round(offsets, pids, limit, exclude, first_page):
     return page, pins, new_off, done, errors, more_left
 
 
-def all_sessions(limit, cursor, only=None, exclude=()):
+def all_sessions(limit, cursor, only=None, exclude=(), telegram=False):
     """Merge every profile's /api/sessions (each sorted by last activity) into one page.
 
     The cursor holds a per-profile offset. Excluded sources (cron, one-shot...) are skipped but still
@@ -427,7 +441,7 @@ def all_sessions(limit, cursor, only=None, exclude=()):
     pids = [p for p in profile_ids() if (not only or p in only) and key_for(p)]
     page, pins, errors, more_left = [], [], {}, True
     for _ in range(6):
-        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page)
+        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page, telegram)
         page += rows
         pins += round_pins
         errors.update(errs)
@@ -447,11 +461,13 @@ SESSION_COLS = ("id, source, model, title, started_at, ended_at, message_count, 
                 "coalesce(last_activity_at, started_at) AS last_active, parent_session_id")
 
 
-def search_sessions(q, archived=False, limit=40):
+def search_sessions(q, archived=False, limit=40, profile=None, source=None):
     """Title/preview search (and the archived list) straight from each state.db, read-only."""
     out = []
     like = "%" + q.replace("%", "").replace("_", "") + "%" if q else None
     for pid in profile_ids():
+        if profile is not None and pid != profile:
+            continue
         try:
             con = _ro(pid)
         except Exception:
@@ -462,6 +478,9 @@ def search_sessions(q, archived=False, limit=40):
             where = ["coalesce(hidden,0)=0", "archived=%d" % (1 if archived else 0),
                      "source NOT IN ('subagent','tool')"]
             args = []
+            if source:
+                where.append("source=?")
+                args.append(source)
             if like:
                 where.append("(title LIKE ? OR id IN (SELECT session_id FROM messages WHERE role='user' AND content LIKE ? "
                              "ORDER BY id DESC LIMIT 400))")
@@ -618,13 +637,13 @@ class H(BaseHTTPRequestHandler):
                     return self.send(503, {"error": "The Hermes status dashboard on your Mac (%s) isn't answering: %s."
                                                     % (STATUS_URL, why)})
                 return self.send(200, d)
-            if path == "/m/sessions":
+            if path in ("/m/sessions", "/m/telegram"):
                 limit = max(1, min(int(q.get("limit", "40") or 40), 100))
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
-                return self.send(200, all_sessions(limit, q.get("cursor"), only, exclude))
+                return self.send(200, all_sessions(limit, q.get("cursor"), only, exclude, telegram=path == "/m/telegram"))
             if path == "/m/search":
-                return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1")})
+                return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"))})
             m = re.match(r"^/m/runtime/([^/]+)/([^/]+)$", path)
             if m:
                 d = session_runtime(m.group(1), m.group(2)) if (m.group(1) == "default" or PROFILE_RE.match(m.group(1))) else None

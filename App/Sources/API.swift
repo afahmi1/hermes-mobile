@@ -107,7 +107,11 @@ final class API: @unchecked Sendable {
 
     // MARK: reads
 
-    func health() async throws -> HealthInfo { try await get("/m/health", as: HealthInfo.self) }
+    func health() async throws -> HealthInfo {
+        var probe = try request("/m/health")
+        probe.timeoutInterval = 8
+        return try JSONDecoder().decode(HealthInfo.self, from: try await send(probe))
+    }
 
     /// Everything the Mac's status dashboard shows (bots, cron jobs, running agents, providers, what's new).
     func status(refreshProviders: Bool = false) async throws -> JV {
@@ -120,19 +124,29 @@ final class API: @unchecked Sendable {
         struct R: Decodable { let bots: [Bot] }
         return try await get("/m/bots", as: R.self).bots
     }
-    func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], limit: Int = 40) async throws -> SessionPage {
+    func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], telegram: Bool = false, limit: Int = 40) async throws -> SessionPage {
         var q = ["limit=\(limit)"]
         if let cursor { q.append("cursor=\(cursor)") }
         if let profile { q.append("profile=\(Self.esc(profile))") }
         if !exclude.isEmpty { q.append("exclude=\(exclude.joined(separator: ","))") }
-        return try await get("/m/sessions?" + q.joined(separator: "&"), as: SessionPage.self)
+        let path = telegram ? "/m/telegram?" : "/m/sessions?"
+        return try await get(path + q.joined(separator: "&"), as: SessionPage.self)
     }
-    func search(_ text: String, archived: Bool = false) async throws -> [SessionSummary] {
-        let q = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        return try await get("/m/search?q=\(q)\(archived ? "&archived=1" : "")", as: SearchPage.self).data
+    func search(_ text: String, archived: Bool = false, profile: String? = nil, telegram: Bool = false) async throws -> [SessionSummary] {
+        var components = URLComponents()
+        components.path = "/m/search"
+        var query = [URLQueryItem(name: "q", value: text)]
+        if archived { query.append(URLQueryItem(name: "archived", value: "1")) }
+        if let profile { query.append(URLQueryItem(name: "profile", value: profile)) }
+        if telegram { query.append(URLQueryItem(name: "source", value: "telegram")) }
+        components.queryItems = query
+        // Form-style query decoders interpret literal plus signs as spaces.
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        guard let path = components.string else { throw APIError.badResponse }
+        return try await get(path, as: SearchPage.self).data
     }
     func messages(profile: String, session: String) async throws -> [StoredMessage] {
-        try await get(p(profile, "/api/sessions/\(Self.esc(session))/messages?limit=500"), as: MessagesPage.self).data
+        try await get(p(profile, "/api/sessions/\(Self.esc(session))/messages?limit=500&order=latest"), as: MessagesPage.self).data
     }
     func catalog(profile: String) async throws -> ModelCatalog {
         try await get(p(profile, "/api/model/options"), as: ModelCatalog.self)

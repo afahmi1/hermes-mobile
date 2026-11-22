@@ -159,3 +159,5 @@ on the phone appear in the desktop app's Recents.
   Simulator. Get a token with `~/.hermes/hermes-agent/.venv/bin/python Bridge/hermes_mobile_bridge.py --issue-token sim`.
 - The bridge keeps nothing but a signing secret (`~/.hermes/mobile/secret`) and its log (`~/.hermes/mobile/bridge.log`).
   Every chat and setting lives in Hermes's own `state.db`.
+
+The [mobile engine and beta plan](docs/mobile-engine.md) covers native Windows setup, Telegram history, gateway compatibility, recovery tests and the proposed Rust transport evaluation.

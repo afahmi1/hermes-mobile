@@ -49,7 +49,27 @@ def read_json(path: Path, default=None):
 
 def pid_alive(pid) -> bool:
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            # Signal zero on Windows is a termination request. A wait-only handle
+            # lets us check whether the process is still running.
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if not handle:
+                return ctypes.get_last_error() == 5  # access denied
+            try:
+                return kernel.WaitForSingleObject(handle, 0) == 258  # WAIT_TIMEOUT
+            finally:
+                kernel.CloseHandle(handle)
+        os.kill(pid, 0)
         return True
     except PermissionError:
         return True
@@ -72,7 +92,7 @@ def ro_query(db: Path, sql: str, params=()):
     if not db.exists():
         return []
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
         con.row_factory = sqlite3.Row
         try:
             return [dict(r) for r in con.execute(sql, params)]

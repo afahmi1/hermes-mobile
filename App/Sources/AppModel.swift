@@ -21,6 +21,7 @@ final class AppModel {
     var signedIn = API.shared.isSignedIn
     var bots: [Bot] = []
     var health: HealthInfo?
+    var checkedConnection = false
     /// The Mac's status dashboard data, polled for the app's lifetime (see StatusModel.poll).
     let status = StatusModel()
     var loadError: String?
@@ -32,7 +33,9 @@ final class AppModel {
         // Simulator / automation hook (debug builds only): `-HMServer <url> -HMToken <token>` signs in
         // without a password. Tokens come from `hermes_mobile_bridge.py --issue-token <name>` on the Mac.
         let d = UserDefaults.standard
-        if let s = d.string(forKey: "HMServer"), let url = URL(string: s), let t = d.string(forKey: "HMToken"), !t.isEmpty {
+        let env = ProcessInfo.processInfo.environment
+        if let s = env["HMServer"] ?? d.string(forKey: "HMServer"), let url = URL(string: s),
+           let t = env["HMToken"] ?? d.string(forKey: "HMToken"), !t.isEmpty {
             API.shared.baseURL = url
             API.shared.token = t
             signedIn = true
@@ -53,7 +56,12 @@ final class AppModel {
         }
     }
 
-    func refreshHealth() async { health = try? await API.shared.health() }
+    func refreshHealth() async {
+        let latest = try? await API.shared.health()
+        guard !Task.isCancelled, signedIn else { return }
+        health = latest
+        checkedConnection = true
+    }
 
     func catalog(for profile: String) async -> ModelCatalog? {
         if let c = catalogs[profile] { return c }
@@ -84,6 +92,9 @@ final class AppModel {
     func signOut() {
         API.shared.signOut()
         status.reset()
+        health = nil
+        checkedConnection = false
+        bots = []
         signedIn = false
         chats = [:]
         catalogs = [:]

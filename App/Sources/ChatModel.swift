@@ -41,11 +41,12 @@ final class ChatModel {
     var failedTick = 0
 
     private weak var app: AppModel?
+    private var recovery = StreamRecovery()
     private var runId: String?
-    private var lastSeq: Int?
     private var streamTask: Task<Void, Never>?
     private var streamingIndex: Int?
     private var lastLoadedCount = 0
+    private var lastLoadedMessage: StoredMessage?
     /// The user picked a model/effort on this phone for this chat; it rides every turn until another
     /// device changes the session's setting.
     private var picked = false
@@ -62,15 +63,16 @@ final class ChatModel {
 
     // MARK: loading
 
-    func load(quiet: Bool = false) async {
+    func load(quiet: Bool = false, resumeLive: Bool = true) async {
         guard let sid = sessionId else { return }
         if !quiet { isLoading = items.isEmpty }
         defer { isLoading = false }
         do {
             let msgs = try await API.shared.messages(profile: profile, session: sid)
             if isRunning { return }  // the live stream owns the tail; reload when it ends
-            if !(quiet && msgs.count == lastLoadedCount) {
+            if !(quiet && msgs.count == lastLoadedCount && msgs.last == lastLoadedMessage) {
                 lastLoadedCount = msgs.count
+                lastLoadedMessage = msgs.last
                 items = Self.transcript(msgs)
                 error = nil
             }
@@ -78,16 +80,17 @@ final class ChatModel {
             if !quiet { self.error = error.localizedDescription }
         }
         await refreshServed()
-        await reattach()
+        if resumeLive { await reattach() }
     }
 
     /// A turn started earlier (this app before it was killed, or another phone) may still be running.
     private func reattach() async {
         guard !isRunning, let sid = sessionId,
               let live = try? await API.shared.liveTurns(),
-              let t = live.first(where: { $0.sessionId == sid && $0.profile == profile && !$0.done }) else { return }
+              let t = live.first(where: { $0.sessionId == sid && $0.profile == profile && !$0.done }),
+              !isRunning, sessionId == sid else { return }
+        recovery = StreamRecovery()
         runId = t.turnId
-        lastSeq = nil
         isRunning = true
         status = "Still working on your Mac…"
         items = items.filter { $0.kind != .assistant || !$0.streaming }
@@ -179,8 +182,8 @@ final class ChatModel {
             }
             let run = try await API.shared.startRun(profile: profile, session: sessionId!, text: text,
                                                     choice: picked ? choice : .botDefault)
+            recovery = StreamRecovery()
             runId = run
-            lastSeq = nil
             status = "Thinking…"
             follow()
         } catch {
@@ -213,20 +216,16 @@ final class ChatModel {
     }
 
     private func follow() {
-        guard let run = runId else { return }
-        streamTask?.cancel()
+        guard let run = runId, streamTask == nil else { return }
         streamTask = Task { [weak self] in
             guard let self else { return }
             var finished = false
-            var attempts = 0
-            while !finished && !Task.isCancelled && attempts < 6 {
+            while !finished && !Task.isCancelled {
                 do {
-                    for try await ev in API.shared.events(profile: profile, run: run, after: lastSeq) {
-                        if let s = ev.seq { lastSeq = s }
-                        attempts = 0  // progress: only consecutive failures count toward giving up
+                    for try await ev in API.shared.events(profile: profile, run: run, after: recovery.lastSequence) {
+                        guard recovery.accept(ev.seq) else { continue }
                         if handle(ev) { finished = true; break }
                     }
-                    if !finished { attempts += 1; try? await Task.sleep(for: .seconds(1)) }
                 } catch APIError.http(let code, _) where code == 404 || code == 401 {
                     // The turn is gone from the Mac (finished long ago, or the bridge restarted): Hermes's
                     // transcript has the outcome, so reload it instead of retrying.
@@ -234,13 +233,15 @@ final class ChatModel {
                     if code == 401 { app?.signOut() }
                 } catch {
                     if Task.isCancelled { break }
-                    attempts += 1
+                }
+                if !finished && !Task.isCancelled {
+                    guard let delay = recovery.retryDelay() else { break }
                     status = "Reconnecting…"
-                    try? await Task.sleep(for: .seconds(Double(min(attempts * 2, 8))))
+                    try? await Task.sleep(for: .seconds(delay))
                 }
             }
             streamTask = nil
-            if finished || attempts >= 6 { await finishRun(gaveUp: !finished) }
+            if !Task.isCancelled { await finishRun(gaveUp: !finished) }
         }
     }
 
@@ -322,10 +323,10 @@ final class ChatModel {
         status = nil
         approval = nil
         runId = nil
-        if gaveUp { fail("Lost the connection. The reply may still finish on your Mac; pull down to refresh.") }
+        if gaveUp { failedTick += 1 }
         lastLoadedCount = 0
-        await load(quiet: true)  // Hermes's transcript is the source of truth
-        await refreshServed()
+        await load(quiet: true, resumeLive: !gaveUp)
+        if gaveUp { error = "The live connection was lost. Pull down to reconnect." }
     }
 
     private func fail(_ message: String) {
