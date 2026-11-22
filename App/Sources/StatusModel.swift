@@ -73,14 +73,24 @@ final class StatusModel {
     var incidents: Int { payload?["jobs"]["incidents"].array.count ?? 0 }
     var badge: Int { incidents + unseenEvents }
 
+    private var refreshID: UUID?
+    private var forcingRefresh = false
+
     func refresh(force: Bool = false, app: AppModel) async {
+        if refreshID != nil && (!force || forcingRefresh) { return }
+        let id = UUID()
+        refreshID = id
+        forcingRefresh = force
+        defer { if refreshID == id { refreshID = nil; forcingRefresh = false } }
         do {
             let p = try await API.shared.status(refreshProviders: force)
+            guard refreshID == id, !Task.isCancelled, app.signedIn else { return }
             payload = p
             updatedAt = Date()
             error = nil
             noticeChanges(p, app: app)
         } catch {
+            guard refreshID == id, !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
     }
@@ -91,6 +101,8 @@ final class StatusModel {
 
     /// Forget everything from the previous sign-in (it may have been a different Mac).
     func reset() {
+        refreshID = nil
+        forcingRefresh = false
         payload = nil
         updatedAt = nil
         error = nil

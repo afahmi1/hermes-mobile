@@ -18,27 +18,29 @@ struct SignInView: View {
                     VStack(spacing: 10) {
                         Image(systemName: "sparkles").font(.system(size: 40)).foregroundStyle(.tint)
                         Text("Hermes").font(.largeTitle.bold())
-                        Text("Every chat and every bot on your Mac, in your pocket.")
+                        Text("Connect to your Hermes gateway.")
                             .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     }
                     .frame(maxWidth: .infinity).padding(.vertical, 8)
                     .listRowBackground(Color.clear)
                 }
                 Section {
-                    TextField("https://your-mac.tailnet.ts.net:10001", text: $server)
+                    TextField("https://your-server.tailnet.ts.net:10001", text: $server)
                         .keyboardType(.URL).textContentType(.URL).textInputAutocapitalization(.never)
                         .autocorrectionDisabled().focused($focus, equals: .server)
                         .submitLabel(.next).onSubmit { focus = .user }
-                } header: { Text("Your Mac") } footer: {
-                    Text("The Hermes Mobile address Tailscale gives your Mac. Works anywhere your phone is on the tailnet.")
+                } header: { Text("Server address") } footer: {
+                    Text("Enter the HTTPS address of your Hermes Mobile bridge. Connect your phone to the same Tailscale network.")
                 }
-                Section("Dashboard sign-in") {
+                Section {
                     TextField("Username", text: $username)
                         .textContentType(.username).textInputAutocapitalization(.never).autocorrectionDisabled()
                         .focused($focus, equals: .user).submitLabel(.next).onSubmit { focus = .pass }
                     SecureField("Password", text: $password)
                         .textContentType(.password).focused($focus, equals: .pass)
                         .submitLabel(.go).onSubmit { Task { await signIn() } }
+                } header: { Text("Dashboard sign-in") } footer: {
+                    Text("Use the username and password configured for the Hermes dashboard. Google sign-in connects Tailscale.")
                 }
                 if let error {
                     Section { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red) }
@@ -60,7 +62,8 @@ struct SignInView: View {
         var s = server.trimmingCharacters(in: .whitespacesAndNewlines)
         if !s.contains("://") { s = "https://" + s }
         while s.hasSuffix("/") { s.removeLast() }
-        guard let url = URL(string: s) else { error = "That address doesn't look right."; return }
+        guard !busy, let url = URL(string: s), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), url.host?.isEmpty == false else { error = "That address doesn't look right."; return }
         busy = true
         defer { busy = false }
         do {

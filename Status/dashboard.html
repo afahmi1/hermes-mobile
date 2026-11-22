@@ -309,6 +309,7 @@ function render(){
       ${g.exit_reason?`<dt>Exit reason</dt><dd class="err">${esc(g.exit_reason)}</dd>`:""}
     </dl>
     <div class="sect">Platforms</div>${plats||'<div class="meta">none</div>'}
+    ${(g.reasons||[]).map(reason=>`<div class="note">${esc(reason)}</div>`).join("")}
     <div class="sect">Served profiles</div><div class="chips">${(g.served_profiles||[]).map(p=>`<span class="tag">${esc(p)}</span>`).join("")}${parked.map(p=>`<span class="pill warn">${esc(p)} parked</span>`).join("")}</div>`;
 
   // providers
@@ -323,12 +324,17 @@ function render(){
       const cls = left<15?"bad":left<35?"warn":"";
       return `<div class="meter"><div class="top"><span>${esc(w.label)}</span><span><b>${left.toFixed(left%1?1:0)}% left</b>${w.resets_at?` <span class="meta">· resets ${rel(w.resets_at)}</span>`:""}</span></div>
         <div class="bar"><i class="${cls}" style="width:${used}%"></i></div>${w.detail?`<div class="note">${esc(w.detail)}</div>`:""}</div>`;}).join("");
+    const local = p.local_usage;
+    const recorded = local ? `<div class="note">Hermes lifetime · ${fmtN(local.calls)} calls · ${fmtN(local.input_tokens)} input / ${fmtN(local.output_tokens)} output tokens</div>` : "";
+    const coverage = u.key_count ? `<div class="note">${fmtN(u.keys_reporting)} of ${fmtN(u.key_count)} keys reporting</div>` : "";
+    const spend = [["usage_daily","Today"],["usage_monthly","This month"],["usage","All time"]]
+      .filter(([key])=>u.spend?.[key]).map(([key,label])=>`<div class="note">${label}: ${money(u.spend[key].usd,"USD")} · ${fmtN(u.spend[key].reporting)} keys</div>`).join("");
     const det = (u.details||[]).map(d=>`<div class="note">${esc(d)}</div>`).join("");
     const na = (u.unavailable_reason && !u.balance && !(u.windows||[]).length ? `<div class="note">${esc(u.unavailable_reason)}</div>` : "")
       + (u.stale ? `<div class="note"><span class="pill warn">stale</span> reading from ${rel(u.stale_since)}; latest check ${rel(u.checked_at)} failed (provider rate limit or outage), retrying</div>` : "");
     return `<div class="prov"><div class="prov-h"><span class="n">${esc(p.provider)}</span>${p.is_default?'<span class="pill info">default</span>':""}${u.plan?`<span class="tag">${esc(u.plan)}</span>`:""}${bal}</div>
       <div class="meta">${creds.length} credential${creds.length==1?"":"s"}: ${creds.map(c=>`${esc(c.label)} <span class="faint">(${esc(c.type)})</span>${c.active?" ←":""}`).join(", ")}</div>
-      ${meters}${det}${na}</div>`;}).join("") : `<div class="empty">${esc(P.error||"Loading provider usage…")}</div>`;
+      ${u.balance?.label ? `<div class="note">${esc(u.balance.label)}</div>` : ""}${u.scope ? `<div class="note">${esc(u.scope)}</div>` : ""}${recorded}${coverage}${spend}${meters}${det}${na}</div>`;}).join("") : `<div class="empty">${esc(P.error||"Loading provider usage…")}</div>`;
 
   // tokens
   const T = J.tokens_24h||[];

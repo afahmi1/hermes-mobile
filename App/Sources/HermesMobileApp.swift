@@ -23,7 +23,7 @@ struct RootView: View {
     var body: some View {
         if app.signedIn {
             MainTabs()
-                .task { await app.refreshBots(); await app.refreshHealth() }
+                .task { await app.refreshBots() }
         } else {
             SignInView()
         }
@@ -31,6 +31,7 @@ struct RootView: View {
 }
 
 struct MainTabs: View {
+    @Environment(\.scenePhase) private var phase
     @Environment(AppModel.self) private var app
 
     var body: some View {
@@ -45,7 +46,15 @@ struct MainTabs: View {
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
-        .task { await app.status.poll(app: app) }  // keeps the badge and bot lists current from any tab
+        .task(id: phase) {
+            guard phase == .active else { return }
+            while !Task.isCancelled {
+                await app.refreshHealth()
+                let transitioning = ["starting", "restarting", "draining", "stopping", "waiting"].contains(app.health?.phase ?? "")
+                try? await Task.sleep(for: .seconds(transitioning ? 3 : 15))
+            }
+        }
+        .task(id: phase) { if phase == .active { await app.status.poll(app: app) } }  // keeps the badge and bot lists current from any tab
         .overlay(alignment: .top) { Announcement(text: app.status.announcement, tick: app.status.announceTick) }
         .sensoryFeedback(.success, trigger: app.status.announceTick)
     }
@@ -75,6 +84,99 @@ private struct Announcement: View {
             shown = true
             try? await Task.sleep(for: .seconds(4))
             if !Task.isCancelled { shown = false }
+        }
+    }
+}
+
+/// An authenticated health probe checks both the bridge and the Hermes gateway.
+struct ConnectionBadge: View {
+    @State private var detail = false
+    @Environment(AppModel.self) private var app
+
+    private var diagnostic: JV? {
+        guard let at = app.status.updatedAt,
+              Date().timeIntervalSince(at) < 45 else { return nil }
+        return app.status.payload?["gateway"]
+    }
+
+    private var state: (label: String, symbol: String, color: Color) {
+        guard app.checkedConnection else { return ("Checking", "clock.fill", .yellow) }
+        if app.needsLogin { return ("Sign in", "lock.fill", .yellow) }
+        if app.healthFailure != nil { return ("Unreachable", "wifi.slash", .red) }
+        guard let health = app.health else { return ("Offline", "xmark.circle.fill", .red) }
+        switch health.phase {
+        case "starting": return ("Starting", "clock.fill", .yellow)
+        case "restarting": return ("Restarting", "arrow.clockwise.circle.fill", .yellow)
+        case "draining": return ("Finishing work", "clock.fill", .yellow)
+        case "waiting": return ("Waiting", "clock.fill", .yellow)
+        case "stopping": return ("Stopping", "clock.fill", .yellow)
+        case "stopped", "unavailable": return ("Gateway down", "xmark.circle.fill", .red)
+        default: break
+        }
+        let gateway = health.gatewayState?.lowercased() ?? ""
+        if !health.ok || ["stopped", "down", "failed", "offline"].contains(gateway) || diagnostic?["health"].string == "down" {
+            return ("Gateway down", "xmark.circle.fill", .red)
+        }
+        if diagnostic?["health"].string == "degraded" || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
+            return ("Degraded", "exclamationmark.triangle.fill", .yellow)
+        }
+        return ("Online", "checkmark.circle.fill", .green)
+    }
+
+    var body: some View {
+        Button { detail.toggle() } label: {
+            HStack(spacing: 5) {
+                Image(systemName: state.symbol).foregroundStyle(state.color)
+                Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .accessibilityLabel("Hermes connection, " + state.label)
+        .popover(isPresented: $detail) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(state.label).font(.headline)
+                Text(API.shared.baseURL?.host ?? "Hermes gateway").font(.footnote).foregroundStyle(.secondary)
+                if let at = app.lastHealthCheck {
+                    Text("Last response \(at, style: .relative) ago").font(.caption).foregroundStyle(.secondary)
+                }
+                if !app.checkedConnection {
+                    Text("Checking the bridge and gateway.")
+                } else if app.needsLogin {
+                    Button("Sign in again") { app.signOut() }
+                } else if let failure = app.healthFailure {
+                    Text(failure)
+                    if let last = app.health?.phase { Text("Last known gateway state: " + last).font(.caption) }
+                } else if app.health == nil {
+                    Text("Check Tailscale and the bridge address.")
+                } else if ["starting", "restarting", "draining", "stopping", "waiting"].contains(app.health?.phase ?? "") {
+                    Text("The bridge is reachable. This view will update as Hermes becomes ready.")
+                } else if app.health?.ok == false {
+                    Text("The bridge answered. The gateway health check failed.")
+                } else {
+                    ForEach(Array((diagnostic?["reasons"].array ?? []).enumerated()), id: \.offset) { _, reason in
+                        if let text = reason.string { Text(text) }
+                    }
+                }
+                if app.healthFailure == nil, let reason = app.health?.reason { Text(reason).foregroundStyle(.secondary) }
+                if let fallback = app.health?.inboxFallback { Text("Using gateway history · " + fallback).font(.caption) }
+                if let recent = app.health?.recent, recent.count > 1 {
+                    Divider()
+                    Text("Recent gateway changes").font(.caption.weight(.semibold))
+                    ForEach(Array(recent.prefix(3).enumerated()), id: \.offset) { _, change in
+                        HStack { Text(change.phase.capitalized); Spacer(); Text(Date(timeIntervalSince1970: change.at), style: .time) }
+                    }
+                }
+                Button("Check again") {
+                    Task {
+                        async let health: Void = app.refreshHealth()
+                        await app.status.refresh(app: app)
+                        await health
+                    }
+                }
+            }
+            .font(.footnote)
+            .padding().frame(idealWidth: 275, maxWidth: 340, alignment: .leading)
+            .presentationCompactAdaptation(.popover)
         }
     }
 }

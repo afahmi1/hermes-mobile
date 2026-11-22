@@ -14,10 +14,13 @@ chat state. It does three things the gateway API server cannot do for a phone on
 Binds to loopback only; reach it through `tailscale serve`. Stdlib only (system python3).
 """
 import base64, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from datetime import datetime, timezone
+from contextlib import closing
+from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 HOME = Path.home()
 HERMES = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
@@ -72,12 +75,27 @@ def model_default(cfg):
         text = cfg.read_text()
     except OSError:
         return "", ""
-    m = re.search(r"^model:\n((?:(?:[ \t]+.*|[ \t]*#.*|)\n)+)", text, re.M)
-    block = m.group(1) if m else ""
-    d = re.search(r"^[ \t]+(?:default|model):\s*[\"']?([^\"'\n#]+)", block, re.M)
-    p = re.search(r"^[ \t]+provider:\s*[\"']?([^\"'\n#]+)", block, re.M)
-    e = re.search(r"^[ \t]+reasoning_effort:\s*[\"']?([^\"'\n#]+)", text, re.M)
-    return ((d.group(1).strip() if d else ""), (p.group(1).strip() if p else ""))
+    try:
+        import yaml
+        config = yaml.safe_load(text)
+        model = config.get("model") if isinstance(config, dict) else None
+        if isinstance(model, dict):
+            return str(model.get("default") or model.get("model") or ""), str(model.get("provider") or "")
+    except (ImportError, ValueError):
+        pass
+    except Exception:
+        return "", ""
+    # Stdlib-only installations: match direct children of the root model map.
+    match = re.search(r"^model:[ \t]*(?:#[^\n]*)?\n((?:[ \t]+[^\n]*\n?|\n)*)", text, re.M)
+    values = {}
+    indent = None
+    for line in (match.group(1).splitlines() if match else []):
+        field = re.match(r"^( +)([\w-]+):[ \t]*([^#]*)", line)
+        if field:
+            indent = len(field[1]) if indent is None else indent
+            if len(field[1]) == indent:
+                values[field[2]] = field[3].strip().strip("\"'")
+    return values.get("default") or values.get("model", ""), values.get("provider", "")
 
 
 def fleet_meta():
@@ -125,16 +143,17 @@ def key_for(pid):
 def bots():
     meta, front = fleet_meta()
     gmodel, gprov = model_default(HERMES / "config.yaml")
+    served = served_profiles()
     out = []
     for pid in profile_ids():
-        m, pv = model_default(profile_home(pid) / "config.yaml")
+        m, pv = (gmodel, gprov) if pid == "default" else model_default(profile_home(pid) / "config.yaml")
         if pid == "default":
             name, blurb = front, "The front door. Does the work or hands it to the right bot."
         else:
             nm, blurb = meta.get(pid, ("", ""))
             name = nm or pid.replace("-", " ").replace("_", " ").title().replace("Captains", "Captain's")
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
-                    "reachable": bool(key_for(pid)), "served": pid in served_profiles(),
+                    "reachable": bool(key_for(pid)), "served": pid in served,
                     "front": pid == "default"})
     return out
 
@@ -336,7 +355,7 @@ def _ro(pid):
     db = profile_home(pid) / "state.db"
     if not db.exists():
         return None
-    con = sqlite3.connect("file:%s?mode=ro" % quote(str(db)), uri=True, timeout=5)
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     return con
 
@@ -356,14 +375,68 @@ def _ts(s):
     return s.get("last_active") or s.get("started_at") or 0
 
 
-def _page_round(offsets, pids, limit, exclude, first_page):
+# Use Hermes's own visibility, compression lineage and ordering rules. Older
+# installs keep the gateway listing path and its existing cursor format.
+try:
+    runtime = HERMES / "hermes-agent"
+    if runtime.is_dir() and str(runtime) not in sys.path:
+        sys.path.insert(1, str(runtime))
+    from hermes_state import SessionDB
+    from inspect import signature
+    NATIVE_INBOX = ("read_only" in signature(SessionDB).parameters and
+                    {"compact_rows", "include_pinned", "exclude_sources"}.issubset(
+                        signature(SessionDB.list_sessions_rich).parameters))
+    INBOX_FALLBACK = None if NATIVE_INBOX else "Unsupported Hermes listing API"
+except (ImportError, AttributeError, ValueError, TypeError) as exc:
+    NATIVE_INBOX = False
+    INBOX_FALLBACK = type(exc).__name__
+
+
+def native_inbox_window(pid, offset, limit, exclude, first_page):
+    def summary(row):
+        # Native rich rows can contain session metadata private to the gateway.
+        fields = ("id", "source", "model", "title", "preview", "started_at",
+                  "ended_at", "last_active", "message_count")
+        return {**{k: row.get(k) for k in fields}, "pinned": bool(row.get("pinned")),
+                "archived": bool(row.get("archived"))}
+
+    with closing(SessionDB(profile_home(pid) / "state.db", read_only=True)) as db:
+        options = dict(compact_rows=True, exclude_sources=list(exclude), order_by_last_active=True)
+        rows = db.list_sessions_rich(limit=limit + 1, offset=offset, **options)
+        pins = db.list_sessions_rich(limit=0, include_pinned=True, **options) if first_page else []
+    return [summary(r) for r in rows[:limit]], [summary(r) for r in pins], len(rows) > limit
+
+
+def _page_round(offsets, pids, limit, exclude, first_page, telegram=False, native=False):
     """One fetch round across profiles. Returns (rows, pins, new_offsets, done, errors, more_left)."""
     exhausted = set(offsets.get("_done", []))
     live = [p for p in pids if p not in exhausted]
     batch = min(100, limit * (3 if exclude else 1))
+    eligible_profiles = served_profiles() if native else set()
 
     def fetch(pid):
         off = int(offsets.get(pid, 0))
+        if native:
+            try:
+                if pid not in eligible_profiles:
+                    return pid, None, "Profile unavailable"
+                return pid, native_inbox_window(pid, off, limit, exclude, first_page), None
+            except Exception as error:
+                return pid, None, type(error).__name__
+        if telegram:
+            try:
+                con = _ro(pid)
+                if con is None:
+                    return pid, ([], [], False), None
+                try:
+                    rows = con.execute("SELECT " + SESSION_COLS + " FROM sessions WHERE source='telegram' "
+                                       "AND coalesce(hidden,0)=0 AND coalesce(archived,0)=0 "
+                                       "ORDER BY last_active DESC, id LIMIT ? OFFSET ?", (batch + 1, off)).fetchall()
+                    return pid, ([dict(row, archived=False) for row in rows[:batch]], [], len(rows) > batch), None
+                finally:
+                    con.close()
+            except sqlite3.Error as error:
+                return pid, None, type(error).__name__
         try:
             st, d = gw("GET", pid, "/api/sessions?limit=%d&offset=%d" % (batch, off))
         except Exception as e:
@@ -416,18 +489,27 @@ def _page_round(offsets, pids, limit, exclude, first_page):
     return page, pins, new_off, done, errors, more_left
 
 
-def all_sessions(limit, cursor, only=None, exclude=()):
+def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=False):
     """Merge every profile's /api/sessions (each sorted by last activity) into one page.
 
     The cursor holds a per-profile offset. Excluded sources (cron, one-shot...) are skipped but still
     consumed. Rows are only emitted down to the newest point every unfinished profile has reached, so
     paging stays exact while the lists interleave; a round that yields nothing fetches again."""
     offsets = _cursor_decode(cursor)
+    reset = bool(offsets.get("_native")) and not NATIVE_INBOX
+    if reset:
+        offsets = {}
     first_page = not offsets
     pids = [p for p in profile_ids() if (not only or p in only) and key_for(p)]
+    native = compact and not telegram and NATIVE_INBOX and (first_page or offsets.get("_native") == 1)
+    if native:
+        served = served_profiles()
+        if first_page:
+            native = all(p in served and (profile_home(p) / "state.db").is_file() for p in pids)
+
     page, pins, errors, more_left = [], [], {}, True
     for _ in range(6):
-        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page)
+        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page, telegram, native)
         page += rows
         pins += round_pins
         errors.update(errs)
@@ -440,18 +522,22 @@ def all_sessions(limit, cursor, only=None, exclude=()):
         if k not in seen:
             seen.add(k)
             uniq.append(r)
-    return {"data": uniq, "next": _cursor_encode(offsets) if more_left else None, "errors": errors}
+    if native:
+        offsets["_native"] = 1
+    return {"data": uniq, "reset": reset, "next": _cursor_encode(offsets) if more_left else None, "errors": errors}
 
 
 SESSION_COLS = ("id, source, model, title, started_at, ended_at, message_count, archived, "
                 "coalesce(last_activity_at, started_at) AS last_active, parent_session_id")
 
 
-def search_sessions(q, archived=False, limit=40):
+def search_sessions(q, archived=False, limit=40, profile=None, source=None):
     """Title/preview search (and the archived list) straight from each state.db, read-only."""
     out = []
     like = "%" + q.replace("%", "").replace("_", "") + "%" if q else None
     for pid in profile_ids():
+        if profile is not None and pid != profile:
+            continue
         try:
             con = _ro(pid)
         except Exception:
@@ -462,6 +548,9 @@ def search_sessions(q, archived=False, limit=40):
             where = ["coalesce(hidden,0)=0", "archived=%d" % (1 if archived else 0),
                      "source NOT IN ('subagent','tool')"]
             args = []
+            if source:
+                where.append("source=?")
+                args.append(source)
             if like:
                 where.append("(title LIKE ? OR id IN (SELECT session_id FROM messages WHERE role='user' AND content LIKE ? "
                              "ORDER BY id DESC LIMIT 400))")
@@ -532,14 +621,128 @@ def session_runtime(pid, sid):
         con.close()
 
 
-def health():
+_health_history = deque(maxlen=8)
+_health_lock = threading.Lock()
+_last_probe = 0.0
+
+
+def _signal(path):
     try:
-        st, d = gw("GET", "default", "/health/detailed", timeout=6)
-        d = d or {}
-        return {"ok": st == 200, "gateway_state": d.get("gateway_state") or d.get("status"),
-                "version": d.get("version"), "platforms": list((d.get("platforms") or {}).keys())}
-    except Exception as e:
-        return {"ok": False, "error": type(e).__name__}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _recent(value, now):
+    try:
+        age = now - datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        return -5 <= age < 120
+    except (TypeError, AttributeError, ValueError, OverflowError):
+        return False
+
+
+def gateway_phase(ok, api_state, state, life, now):
+    fresh = _recent(state.get("updated_at"), now)
+    state_name = str(state.get("gateway_state") or "").lower()
+    api_state = str(api_state or "").lower()
+    if ok and api_state in ("running", "healthy", "ready", "ok") and state_name != "draining":
+        return "running"
+    if fresh and state.get("restart_requested") is True:
+        return "restarting"
+    if api_state in ("starting", "restarting", "draining", "stopping"):
+        return api_state
+    if ok and api_state not in ("stopped", "down", "failed", "offline"):
+        return "running"
+    if fresh and state_name in ("starting", "restarting", "draining", "stopping"):
+        return state_name
+    if fresh and state_name == "stopped" and life.get("phase") != "running":
+        return "stopped"
+    if life.get("phase") == "exited" and _recent(life.get("exited_at"), now):
+        return "restarting" if "restart" in str(life.get("exit_reason", "")).lower() else "stopped"
+    if life.get("phase") == "running" and _recent(life.get("started_at"), now):
+        return "starting"
+    return "unavailable"
+
+
+def health():
+    global _last_probe
+    started = time.monotonic()
+    try:
+        st, data = gw("GET", "default", "/health/detailed", timeout=4)
+        info = data if isinstance(data, dict) else {}
+        ok = st == 200
+        reason = None if ok else "Gateway health returned HTTP %d" % st
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        info, ok = {}, False
+        reason = "Gateway probe timed out" if isinstance(exc, TimeoutError) else "Gateway did not accept the connection"
+    api_state = info.get("gateway_state") or info.get("status")
+    now = time.time()
+    phase = gateway_phase(ok, api_state, _signal(HERMES / "gateway_state.json"),
+                          _signal(HERMES / "state" / "gateway.lifecycle.json"), now)
+    with _health_lock:
+        # Some supervisors gracefully stop then spawn a replacement without
+        # declaring restart intent. Show that bounded handoff as waiting.
+        if phase in ("unavailable", "stopped") and any(
+            e["phase"] in ("draining", "stopping", "restarting") and 0 <= now - e["at"] < 45
+            for e in _health_history
+        ) and _health_history[-1]["phase"] in ("draining", "stopping", "restarting", "waiting"):
+            phase = "waiting"
+        if started >= _last_probe:
+            _last_probe = started
+            if not _health_history or _health_history[-1]["phase"] != phase:
+                _health_history.append({"phase": phase, "at": now})
+        history = list(reversed(_health_history))
+    return {"ok": ok, "gateway_state": api_state, "phase": phase, "reason": reason,
+            "recent": history, "version": info.get("version"), "platforms": list((info.get("platforms") or {}).keys()),
+            "inbox_reader": "native" if NATIVE_INBOX else "gateway", "inbox_fallback": INBOX_FALLBACK}
+
+
+# Short-lived first-page cache shared by tabs/devices on this single-user bridge.
+# Cursors are always evaluated fresh. Concurrent readers share the upstream fetch.
+_page_lock = threading.Lock()
+_pages = {}
+_pending_pages = {}
+_page_epoch = 0
+
+
+def invalidate_pages():
+    global _page_epoch
+    with _page_lock:
+        _page_epoch += 1
+        _pages.clear()
+
+
+def session_page(limit, cursor, only, exclude, telegram, compact=False):
+    if cursor:
+        return all_sessions(limit, cursor, only, exclude, telegram, compact)
+    key = (limit, tuple(sorted(only or ())), tuple(sorted(exclude)), telegram, compact)
+    with _page_lock:
+        epoch = _page_epoch
+        cached = _pages.get(key)
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+        flight = (_page_epoch, key)
+        future = _pending_pages.get(flight)
+        owner = future is None
+        if owner:
+            future = _pending_pages[flight] = Future()
+    if not owner:
+        return future.result()
+    try:
+        page = all_sessions(limit, None, only, exclude, telegram, compact)
+        with _page_lock:
+            if not page["errors"] and epoch == _page_epoch:
+                if len(_pages) >= 24 and key not in _pages:
+                    del _pages[next(iter(_pages))]
+                _pages[key] = (time.monotonic() + 6, page)
+        future.set_result(page)
+        return page
+    except Exception as error:
+        future.set_exception(error)
+        raise
+    finally:
+        with _page_lock:
+            _pending_pages.pop(flight, None)
 
 
 # ---------- HTTP ----------
@@ -551,6 +754,8 @@ class H(BaseHTTPRequestHandler):
         log(fmt % args)
 
     def send(self, code, body=b"", ctype="application/json", close=False):
+        if self.command in ("POST", "PATCH", "DELETE") and 200 <= code < 300:
+            invalidate_pages()
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
         self.send_response(code)
@@ -618,13 +823,13 @@ class H(BaseHTTPRequestHandler):
                     return self.send(503, {"error": "The Hermes status dashboard on your Mac (%s) isn't answering: %s."
                                                     % (STATUS_URL, why)})
                 return self.send(200, d)
-            if path == "/m/sessions":
+            if path in ("/m/sessions", "/m/telegram"):
                 limit = max(1, min(int(q.get("limit", "40") or 40), 100))
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
-                return self.send(200, all_sessions(limit, q.get("cursor"), only, exclude))
+                return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact"))
             if path == "/m/search":
-                return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1")})
+                return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"))})
             m = re.match(r"^/m/runtime/([^/]+)/([^/]+)$", path)
             if m:
                 d = session_runtime(m.group(1), m.group(2)) if (m.group(1) == "default" or PROFILE_RE.match(m.group(1))) else None
@@ -642,7 +847,7 @@ class H(BaseHTTPRequestHandler):
         try:
             if path == "/m/turns" and self.command == "GET":
                 return self.send(200, {"turns": turns.live_turns()})
-            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval)?$", path)
+            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval|/queue|/steer)?$", path)
             if m:
                 turn = turns.get_turn(m.group(1))
                 if turn is None:
@@ -651,6 +856,9 @@ class H(BaseHTTPRequestHandler):
                 if action == "/events" and self.command == "GET":
                     last = self.headers.get("Last-Event-ID") or q.get("after")
                     return self.tail(turn, int(last) + 1 if last not in (None, "") and str(last).lstrip("-").isdigit() else 0)
+                if action in ("/queue", "/steer") and self.command == "POST":
+                    body = self.json_body()
+                    return self.send(200, turns.follow_up(turn, action[1:], body.get("text"), body.get("submission_id")))
                 if action == "/stop" and self.command == "POST":
                     turns.stop(turn)
                     return self.send(200, {"ok": True})

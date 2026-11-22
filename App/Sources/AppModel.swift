@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 import SwiftUI
@@ -13,6 +14,8 @@ struct ChatRef: Hashable, Identifiable {
         self.sessionId = sessionId
         self.draft = UUID()
     }
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
     var id: String { sessionId.map { "\(profile)/\($0)" } ?? "draft/\(draft.uuidString)" }
 }
 
@@ -21,9 +24,23 @@ final class AppModel {
     var signedIn = API.shared.isSignedIn
     var bots: [Bot] = []
     var health: HealthInfo?
+    var checkedConnection = false
+    var lastHealthCheck: Date?
+    var healthFailure: String?
+    var needsLogin = false
+    private var healthRequest = UUID()
     /// The Mac's status dashboard data, polled for the app's lifetime (see StatusModel.poll).
     let status = StatusModel()
     var loadError: String?
+    @ObservationIgnored var inboxes: [String: InboxSnapshot] = [:]
+    var inboxAccount: String? {
+        guard let url = API.shared.baseURL, let token = API.shared.token else { return nil }
+        return SHA256.hash(data: Data((url.absoluteString + "|" + token).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func inboxKey(profile: String?, filter: String) -> String? {
+        inboxAccount.map { [$0, profile ?? "*", filter].joined(separator: "|") }
+    }
     private var catalogs: [String: ModelCatalog] = [:]
     private var chats: [String: ChatModel] = [:]
 
@@ -32,7 +49,9 @@ final class AppModel {
         // Simulator / automation hook (debug builds only): `-HMServer <url> -HMToken <token>` signs in
         // without a password. Tokens come from `hermes_mobile_bridge.py --issue-token <name>` on the Mac.
         let d = UserDefaults.standard
-        if let s = d.string(forKey: "HMServer"), let url = URL(string: s), let t = d.string(forKey: "HMToken"), !t.isEmpty {
+        let env = ProcessInfo.processInfo.environment
+        if let s = env["HMServer"] ?? d.string(forKey: "HMServer"), let url = URL(string: s),
+           let t = env["HMToken"] ?? d.string(forKey: "HMToken"), !t.isEmpty {
             API.shared.baseURL = url
             API.shared.token = t
             signedIn = true
@@ -53,7 +72,24 @@ final class AppModel {
         }
     }
 
-    func refreshHealth() async { health = try? await API.shared.health() }
+    func refreshHealth() async {
+        let request = UUID()
+        healthRequest = request
+        do {
+            let latest = try await API.shared.health()
+            guard !Task.isCancelled, signedIn, request == healthRequest else { return }
+            health = latest
+            lastHealthCheck = Date()
+            healthFailure = nil
+            needsLogin = false
+        } catch {
+            guard !Task.isCancelled, signedIn, request == healthRequest else { return }
+            needsLogin = false
+            if case APIError.http(401, _) = error { needsLogin = true }
+            healthFailure = error.localizedDescription
+        }
+        checkedConnection = true
+    }
 
     func catalog(for profile: String) async -> ModelCatalog? {
         if let c = catalogs[profile] { return c }
@@ -82,8 +118,17 @@ final class AppModel {
     }
 
     func signOut() {
+        if let account = inboxAccount { Task { await InboxDisk.shared.forget(account) } }
+        inboxes.removeAll()
         API.shared.signOut()
         status.reset()
+        health = nil
+        checkedConnection = false
+        healthRequest = UUID()
+        lastHealthCheck = nil
+        healthFailure = nil
+        needsLogin = false
+        bots = []
         signedIn = false
         chats = [:]
         catalogs = [:]

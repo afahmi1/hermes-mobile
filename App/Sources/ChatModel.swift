@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 struct ChatItem: Identifiable, Hashable {
-    enum Kind: Hashable { case user, assistant, tools, notice }
+    enum Kind: Hashable { case user, assistant, tools, notice, control }
     let id: String
     var kind: Kind
     var text: String
@@ -10,6 +10,7 @@ struct ChatItem: Identifiable, Hashable {
     var streaming = false
     var footer: String?
     var failed = false
+    var timestamp: Double?
 }
 
 struct ApprovalRequest: Identifiable, Hashable {
@@ -41,11 +42,22 @@ final class ChatModel {
     var failedTick = 0
 
     private weak var app: AppModel?
+    private var recovery = StreamRecovery()
     private var runId: String?
-    private var lastSeq: Int?
     private var streamTask: Task<Void, Never>?
+    private var liveToolGroup: Int?
     private var streamingIndex: Int?
-    private var lastLoadedCount = 0
+    private var stored: [StoredMessage] = []
+    private var receipts: [ControlReceipt] = []
+    private var loadedReceipts = false
+    private var receiptKey: String? {
+        guard let sessionId else { return nil }
+        return app?.inboxKey(profile: profile, filter: "control-receipts/" + sessionId)
+    }
+    private var lastPage: [StoredMessage]?
+    private var loadingTranscript = false
+    private(set) var hasOlder = false
+    private(set) var loadingOlder = false
     /// The user picked a model/effort on this phone for this chat; it rides every turn until another
     /// device changes the session's setting.
     private var picked = false
@@ -62,34 +74,69 @@ final class ChatModel {
 
     // MARK: loading
 
-    func load(quiet: Bool = false) async {
-        guard let sid = sessionId else { return }
+    func load(quiet: Bool = false, resumeLive: Bool = true) async {
+        guard let sid = sessionId, !isRunning, !loadingTranscript, !loadingOlder else { return }
+        loadingTranscript = true
+        defer { loadingTranscript = false }
         if !quiet { isLoading = items.isEmpty }
         defer { isLoading = false }
+        if !loadedReceipts, let key = receiptKey {
+            let saved = await InboxDisk.shared.receipts(key)
+            guard !Task.isCancelled, key == receiptKey else { return }
+            let known = Set(receipts.map(\.id))
+            receipts += saved.filter { !known.contains($0.id) }
+            loadedReceipts = true
+        }
         do {
             let msgs = try await API.shared.messages(profile: profile, session: sid)
             if isRunning { return }  // the live stream owns the tail; reload when it ends
-            if !(quiet && msgs.count == lastLoadedCount) {
-                lastLoadedCount = msgs.count
-                items = Self.transcript(msgs)
+            if !quiet || msgs != lastPage {
+                if msgs.count == 100, let anchor = msgs.first?.id,
+                   let index = stored.firstIndex(where: { $0.id == anchor }) {
+                    stored.replaceSubrange(index..., with: msgs)
+                } else {
+                    stored = msgs
+                    hasOlder = msgs.count == 100
+                }
+                lastPage = msgs
+                items = transcriptWithReceipts()
                 error = nil
             }
         } catch {
             if !quiet { self.error = error.localizedDescription }
         }
-        await refreshServed()
-        await reattach()
+        async let runtime: Void = refreshServed()
+        if resumeLive { await reattach() }
+        await runtime
+    }
+
+    func loadOlder() async {
+        guard let sid = sessionId, hasOlder, !loadingOlder, !loadingTranscript, !isRunning else { return }
+        loadingOlder = true
+        defer { loadingOlder = false }
+        let offset = stored.count
+        do {
+            let page = try await API.shared.messages(profile: profile, session: sid, offset: offset)
+            guard !isRunning, !Task.isCancelled, stored.count == offset else { return }
+            let ids = Set(stored.compactMap(\.id))
+            let older = page.filter { row in row.id.map { !ids.contains($0) } ?? true }
+            stored.insert(contentsOf: older, at: 0)
+            hasOlder = page.count == 100
+            items = transcriptWithReceipts()
+        } catch { self.error = error.localizedDescription }
     }
 
     /// A turn started earlier (this app before it was killed, or another phone) may still be running.
     private func reattach() async {
         guard !isRunning, let sid = sessionId,
               let live = try? await API.shared.liveTurns(),
-              let t = live.first(where: { $0.sessionId == sid && $0.profile == profile && !$0.done }) else { return }
+              let t = live.first(where: { $0.sessionId == sid && $0.profile == profile && !$0.done }),
+              !isRunning, sessionId == sid else { return }
+        recovery = StreamRecovery()
+        liveToolGroup = nil
         runId = t.turnId
-        lastSeq = nil
         isRunning = true
-        status = "Still working on your Mac…"
+        status = "Hermes is still working…"
         items = items.filter { $0.kind != .assistant || !$0.streaming }
         follow()
     }
@@ -119,24 +166,37 @@ final class ChatModel {
         return parts.joined(separator: " · ")
     }
 
+    private func transcriptWithReceipts() -> [ChatItem] {
+        var rows = Self.transcript(stored)
+        for receipt in receipts.sorted(by: { $0.at < $1.at }) {
+            let t = receipt.at.timeIntervalSince1970
+            let next = rows.firstIndex { ($0.timestamp ?? 0) > t } ?? rows.endIndex
+            rows.insert(receipt.item, at: next)
+        }
+        return rows
+    }
+
     static func transcript(_ msgs: [StoredMessage]) -> [ChatItem] {
         var out: [ChatItem] = []
+        var toolGroup: Int?
         for (i, m) in msgs.enumerated() {
             let key = m.id.map(String.init) ?? "i\(i)"
             let text = (m.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             switch m.role {
             case "user":
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .user, text: text)) }
+                toolGroup = nil
+                if !text.isEmpty { out.append(ChatItem(id: key, kind: .user, text: text, timestamp: m.timestamp)) }
             case "assistant":
                 let names = (m.toolCalls ?? []).compactMap { $0.function?.name }
                 if !names.isEmpty {
-                    if let last = out.last, last.kind == .tools {
-                        out[out.count - 1].tools += names
+                    if let toolGroup {
+                        out[toolGroup].tools += names
                     } else {
-                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: names))
+                        toolGroup = out.count
+                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: names, timestamp: m.timestamp))
                     }
                 }
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .assistant, text: text)) }
+                if !text.isEmpty { out.append(ChatItem(id: key, kind: .assistant, text: text, timestamp: m.timestamp)) }
             default:
                 continue
             }
@@ -170,7 +230,7 @@ final class ChatModel {
         items.append(ChatItem(id: "local-\(UUID().uuidString)", kind: .user, text: text))
         isRunning = true
         status = "Sending…"
-        if sessionId != nil { await refreshServed() }  // a switch made on the desktop wins over a stale pick
+        if picked && sessionId != nil { await refreshServed() }  // a switch made on the desktop wins over a stale pick
         do {
             if sessionId == nil {
                 let sid = try await API.shared.createSession(profile: profile)
@@ -179,8 +239,9 @@ final class ChatModel {
             }
             let run = try await API.shared.startRun(profile: profile, session: sessionId!, text: text,
                                                     choice: picked ? choice : .botDefault)
+            recovery = StreamRecovery()
+            liveToolGroup = nil
             runId = run
-            lastSeq = nil
             status = "Thinking…"
             follow()
         } catch {
@@ -190,10 +251,44 @@ final class ChatModel {
         }
     }
 
+    var acceptsFollowUp: Bool { isRunning && runId != nil && !sendingFollowUp }
+    private(set) var sendingFollowUp = false
+    private var lastControlAttempt: (run: String, mode: String, text: String, id: UUID)?
+
+    func followUp(_ raw: String, mode: String) async -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard acceptsFollowUp, let run = runId, !text.isEmpty else { return false }
+        sendingFollowUp = true
+        defer { sendingFollowUp = false }
+        let previous = lastControlAttempt
+        let id: UUID
+        if let previous, previous.run == run, previous.mode == mode, previous.text == text { id = previous.id }
+        else { id = UUID() }
+        let key = receiptKey
+        lastControlAttempt = (run, mode, text, id)
+        do {
+            try await API.shared.followUp(run: run, mode: mode, text: text, submission: id)
+            guard let key, receiptKey == key else { return false }
+            let receipt = ControlReceipt(id: id, mode: mode, text: text, at: Date())
+            receipts.removeAll { $0.id == id }
+            receipts.append(receipt)
+            if !items.contains(where: { $0.id == id.uuidString }) { items.append(receipt.item) }
+            lastControlAttempt = nil
+            error = nil
+            do { try await InboxDisk.shared.record(receipt, key: key) }
+            catch { self.error = "Hermes received the instruction. This phone could not save its receipt." }
+            return true
+        } catch {
+            self.error = error.localizedDescription
+            return false
+        }
+    }
+
     func stop() async {
         guard let run = runId else { return }
         status = "Stopping…"
-        try? await API.shared.stopRun(profile: profile, run: run)
+        do { try await API.shared.stopRun(profile: profile, run: run) }
+        catch { status = nil; fail(error.localizedDescription) }
     }
 
     func answer(_ req: ApprovalRequest, choice: String) async {
@@ -213,20 +308,17 @@ final class ChatModel {
     }
 
     private func follow() {
-        guard let run = runId else { return }
-        streamTask?.cancel()
+        guard let run = runId, streamTask == nil else { return }
         streamTask = Task { [weak self] in
             guard let self else { return }
             var finished = false
-            var attempts = 0
-            while !finished && !Task.isCancelled && attempts < 6 {
+            while !finished && !Task.isCancelled {
                 do {
-                    for try await ev in API.shared.events(profile: profile, run: run, after: lastSeq) {
-                        if let s = ev.seq { lastSeq = s }
-                        attempts = 0  // progress: only consecutive failures count toward giving up
+                    for try await ev in API.shared.events(profile: profile, run: run, after: recovery.lastSequence) {
+                        if recovery.hasGap(before: ev.seq) { break }
+                        guard recovery.accept(ev.seq) else { continue }
                         if handle(ev) { finished = true; break }
                     }
-                    if !finished { attempts += 1; try? await Task.sleep(for: .seconds(1)) }
                 } catch APIError.http(let code, _) where code == 404 || code == 401 {
                     // The turn is gone from the Mac (finished long ago, or the bridge restarted): Hermes's
                     // transcript has the outcome, so reload it instead of retrying.
@@ -234,13 +326,15 @@ final class ChatModel {
                     if code == 401 { app?.signOut() }
                 } catch {
                     if Task.isCancelled { break }
-                    attempts += 1
+                }
+                if !finished && !Task.isCancelled {
+                    guard let delay = recovery.retryDelay() else { break }
                     status = "Reconnecting…"
-                    try? await Task.sleep(for: .seconds(Double(min(attempts * 2, 8))))
+                    try? await Task.sleep(for: .seconds(delay))
                 }
             }
             streamTask = nil
-            if finished || attempts >= 6 { await finishRun(gaveUp: !finished) }
+            if !Task.isCancelled { await finishRun(gaveUp: !finished) }
         }
     }
 
@@ -269,9 +363,10 @@ final class ChatModel {
         case "tool.started", "tool.start":
             let name = ev.string("tool_name") ?? ev.string("tool") ?? ev.string("name") ?? "tool"
             closeStreamingBubble()
-            if let last = items.last, last.kind == .tools {
-                items[items.count - 1].tools.append(name)
+            if let i = liveToolGroup, items.indices.contains(i), items[i].kind == .tools {
+                items[i].tools.append(name)
             } else {
+                liveToolGroup = items.count
                 items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name]))
             }
             status = "Using \(name.replacingOccurrences(of: "_", with: " "))…"
@@ -322,10 +417,10 @@ final class ChatModel {
         status = nil
         approval = nil
         runId = nil
-        if gaveUp { fail("Lost the connection. The reply may still finish on your Mac; pull down to refresh.") }
-        lastLoadedCount = 0
-        await load(quiet: true)  // Hermes's transcript is the source of truth
-        await refreshServed()
+        if gaveUp { failedTick += 1 }
+        lastPage = nil
+        await load(quiet: true, resumeLive: !gaveUp)
+        if gaveUp { error = "The live connection was lost. Pull down to reconnect." }
     }
 
     private func fail(_ message: String) {
