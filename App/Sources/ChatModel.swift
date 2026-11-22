@@ -44,9 +44,13 @@ final class ChatModel {
     private var recovery = StreamRecovery()
     private var runId: String?
     private var streamTask: Task<Void, Never>?
+    private var liveToolGroup: Int?
     private var streamingIndex: Int?
-    private var lastLoadedCount = 0
-    private var lastLoadedMessage: StoredMessage?
+    private var stored: [StoredMessage] = []
+    private var lastPage: [StoredMessage]?
+    private var loadingTranscript = false
+    private(set) var hasOlder = false
+    private(set) var loadingOlder = false
     /// The user picked a model/effort on this phone for this chat; it rides every turn until another
     /// device changes the session's setting.
     private var picked = false
@@ -64,23 +68,48 @@ final class ChatModel {
     // MARK: loading
 
     func load(quiet: Bool = false, resumeLive: Bool = true) async {
-        guard let sid = sessionId else { return }
+        guard let sid = sessionId, !isRunning, !loadingTranscript, !loadingOlder else { return }
+        loadingTranscript = true
+        defer { loadingTranscript = false }
         if !quiet { isLoading = items.isEmpty }
         defer { isLoading = false }
         do {
             let msgs = try await API.shared.messages(profile: profile, session: sid)
             if isRunning { return }  // the live stream owns the tail; reload when it ends
-            if !(quiet && msgs.count == lastLoadedCount && msgs.last == lastLoadedMessage) {
-                lastLoadedCount = msgs.count
-                lastLoadedMessage = msgs.last
-                items = Self.transcript(msgs)
+            if !quiet || msgs != lastPage {
+                if msgs.count == 100, let anchor = msgs.first?.id,
+                   let index = stored.firstIndex(where: { $0.id == anchor }) {
+                    stored.replaceSubrange(index..., with: msgs)
+                } else {
+                    stored = msgs
+                    hasOlder = msgs.count == 100
+                }
+                lastPage = msgs
+                items = Self.transcript(stored)
                 error = nil
             }
         } catch {
             if !quiet { self.error = error.localizedDescription }
         }
-        await refreshServed()
+        async let runtime: Void = refreshServed()
         if resumeLive { await reattach() }
+        await runtime
+    }
+
+    func loadOlder() async {
+        guard let sid = sessionId, hasOlder, !loadingOlder, !loadingTranscript, !isRunning else { return }
+        loadingOlder = true
+        defer { loadingOlder = false }
+        let offset = stored.count
+        do {
+            let page = try await API.shared.messages(profile: profile, session: sid, offset: offset)
+            guard !isRunning, !Task.isCancelled, stored.count == offset else { return }
+            let ids = Set(stored.compactMap(\.id))
+            let older = page.filter { row in row.id.map { !ids.contains($0) } ?? true }
+            stored.insert(contentsOf: older, at: 0)
+            hasOlder = page.count == 100
+            items = Self.transcript(stored)
+        } catch { self.error = error.localizedDescription }
     }
 
     /// A turn started earlier (this app before it was killed, or another phone) may still be running.
@@ -90,9 +119,10 @@ final class ChatModel {
               let t = live.first(where: { $0.sessionId == sid && $0.profile == profile && !$0.done }),
               !isRunning, sessionId == sid else { return }
         recovery = StreamRecovery()
+        liveToolGroup = nil
         runId = t.turnId
         isRunning = true
-        status = "Still working on your Mac…"
+        status = "Hermes is still working…"
         items = items.filter { $0.kind != .assistant || !$0.streaming }
         follow()
     }
@@ -124,18 +154,21 @@ final class ChatModel {
 
     static func transcript(_ msgs: [StoredMessage]) -> [ChatItem] {
         var out: [ChatItem] = []
+        var toolGroup: Int?
         for (i, m) in msgs.enumerated() {
             let key = m.id.map(String.init) ?? "i\(i)"
             let text = (m.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             switch m.role {
             case "user":
+                toolGroup = nil
                 if !text.isEmpty { out.append(ChatItem(id: key, kind: .user, text: text)) }
             case "assistant":
                 let names = (m.toolCalls ?? []).compactMap { $0.function?.name }
                 if !names.isEmpty {
-                    if let last = out.last, last.kind == .tools {
-                        out[out.count - 1].tools += names
+                    if let toolGroup {
+                        out[toolGroup].tools += names
                     } else {
+                        toolGroup = out.count
                         out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: names))
                     }
                 }
@@ -172,8 +205,9 @@ final class ChatModel {
         error = nil
         items.append(ChatItem(id: "local-\(UUID().uuidString)", kind: .user, text: text))
         isRunning = true
+        followUpNotice = nil
         status = "Sending…"
-        if sessionId != nil { await refreshServed() }  // a switch made on the desktop wins over a stale pick
+        if picked && sessionId != nil { await refreshServed() }  // a switch made on the desktop wins over a stale pick
         do {
             if sessionId == nil {
                 let sid = try await API.shared.createSession(profile: profile)
@@ -183,6 +217,7 @@ final class ChatModel {
             let run = try await API.shared.startRun(profile: profile, session: sessionId!, text: text,
                                                     choice: picked ? choice : .botDefault)
             recovery = StreamRecovery()
+            liveToolGroup = nil
             runId = run
             status = "Thinking…"
             follow()
@@ -193,10 +228,38 @@ final class ChatModel {
         }
     }
 
+    var acceptsFollowUp: Bool { isRunning && runId != nil && !sendingFollowUp }
+    private(set) var sendingFollowUp = false
+    var followUpNotice: String?
+    private var lastQueueAttempt: (run: String, text: String, id: UUID)?
+
+    func followUp(_ raw: String, mode: String) async -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard acceptsFollowUp, let run = runId, !text.isEmpty else { return false }
+        sendingFollowUp = true
+        defer { sendingFollowUp = false }
+        let previous = lastQueueAttempt
+        let id: UUID
+        if let previous, previous.run == run, previous.text == text { id = previous.id }
+        else { id = UUID() }
+        if mode == "queue" { lastQueueAttempt = (run, text, id) }
+        do {
+            try await API.shared.followUp(run: run, mode: mode, text: text, submission: id)
+            followUpNotice = mode == "queue" ? "Queued for the next turn" : "Steer accepted by Hermes"
+            lastQueueAttempt = nil
+            error = nil
+            return true
+        } catch {
+            self.error = error.localizedDescription
+            return false
+        }
+    }
+
     func stop() async {
         guard let run = runId else { return }
         status = "Stopping…"
-        try? await API.shared.stopRun(profile: profile, run: run)
+        do { try await API.shared.stopRun(profile: profile, run: run) }
+        catch { status = nil; fail(error.localizedDescription) }
     }
 
     func answer(_ req: ApprovalRequest, choice: String) async {
@@ -223,6 +286,7 @@ final class ChatModel {
             while !finished && !Task.isCancelled {
                 do {
                     for try await ev in API.shared.events(profile: profile, run: run, after: recovery.lastSequence) {
+                        if recovery.hasGap(before: ev.seq) { break }
                         guard recovery.accept(ev.seq) else { continue }
                         if handle(ev) { finished = true; break }
                     }
@@ -270,9 +334,10 @@ final class ChatModel {
         case "tool.started", "tool.start":
             let name = ev.string("tool_name") ?? ev.string("tool") ?? ev.string("name") ?? "tool"
             closeStreamingBubble()
-            if let last = items.last, last.kind == .tools {
-                items[items.count - 1].tools.append(name)
+            if let i = liveToolGroup, items.indices.contains(i), items[i].kind == .tools {
+                items[i].tools.append(name)
             } else {
+                liveToolGroup = items.count
                 items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name]))
             }
             status = "Using \(name.replacingOccurrences(of: "_", with: " "))…"
@@ -324,7 +389,7 @@ final class ChatModel {
         approval = nil
         runId = nil
         if gaveUp { failedTick += 1 }
-        lastLoadedCount = 0
+        lastPage = nil
         await load(quiet: true, resumeLive: !gaveUp)
         if gaveUp { error = "The live connection was lost. Pull down to reconnect." }
     }

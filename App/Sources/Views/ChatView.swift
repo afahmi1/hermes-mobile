@@ -24,6 +24,16 @@ struct ChatScreen: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 10) {
+                    if chat.hasOlder && !chat.isRunning {
+                        Button(chat.loadingOlder ? "Loading earlier messages…" : "Load earlier messages") {
+                            let anchor = chat.items.first?.id
+                            Task {
+                                await chat.loadOlder()
+                                if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                            }
+                        }
+                        .font(.footnote).disabled(chat.loadingOlder)
+                    }
                     if chat.items.isEmpty && !chat.isLoading {
                         emptyState.padding(.top, 60)
                     }
@@ -45,7 +55,7 @@ struct ChatScreen: View {
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
             .onChange(of: chat.items.last?.text) { _, _ in withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) } }
-            .onChange(of: chat.items.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            .onChange(of: chat.items.last?.id) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             .overlay { if chat.isLoading { ProgressView() } }
         }
         .safeAreaInset(edge: .bottom) { composer }
@@ -71,6 +81,11 @@ struct ChatScreen: View {
             ApprovalSheet(req: req) { answer in Task { await chat.answer(req, choice: answer) } }
         }
         .sensoryFeedback(.impact(weight: .light), trigger: sendTick)
+        .task(id: chat.followUpNotice) {
+            guard chat.followUpNotice != nil else { return }
+            try? await Task.sleep(for: .seconds(5))
+            if !Task.isCancelled { chat.followUpNotice = nil }
+        }
         .sensoryFeedback(.success, trigger: chat.completedTick)
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
@@ -120,6 +135,10 @@ struct ChatScreen: View {
                 .padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
                 .padding(.horizontal, 12)
             }
+            if let note = chat.followUpNotice {
+                Text(note).font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+            }
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Message \(bot?.name ?? "Hermes")", text: $draft, axis: .vertical)
                     .lineLimit(1...8)
@@ -140,9 +159,25 @@ struct ChatScreen: View {
                 }
             }
             .padding(.horizontal, 12).padding(.bottom, 6)
+            if chat.isRunning && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                HStack(spacing: 20) {
+                    Button { followUp("queue") } label: { Label("Queue next", systemImage: "text.line.last.and.arrowtriangle.forward") }
+                    Button { followUp("steer") } label: { Label("Steer now", systemImage: "arrow.turn.up.right") }
+                    Spacer()
+                }
+                .font(.subheadline.weight(.medium)).disabled(!chat.acceptsFollowUp)
+                .padding(.horizontal, 16).padding(.bottom, 5)
+            }
         }
         .padding(.top, 6)
         .background(.bar)
+    }
+
+    private func followUp(_ mode: String) {
+        let text = draft
+        Task {
+            if await chat.followUp(text, mode: mode), draft == text { draft = "" }
+        }
     }
 
     private func send() {
@@ -159,12 +194,13 @@ struct ChatScreen: View {
     private func poll() async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(8))
-            if !chat.isRunning && chat.sessionId != nil { await chat.load(quiet: true) }
+            if !Task.isCancelled && !chat.isRunning && chat.sessionId != nil { await chat.load(quiet: true) }
         }
     }
 }
 
 struct MessageRow: View {
+    @State private var toolsExpanded = false
     let item: ChatItem
 
     var body: some View {
@@ -181,7 +217,10 @@ struct MessageRow: View {
             .padding(.horizontal, 12)
         case .assistant:
             VStack(alignment: .leading, spacing: 4) {
-                MarkdownText(text: item.text + (item.streaming ? " ▍" : ""))
+                Group {
+                    if item.streaming { Text(verbatim: item.text).textSelection(.enabled) }
+                    else { MarkdownText(text: item.text) }
+                }
                     .padding(.horizontal, 14).padding(.vertical, 10)
                     .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                     .contextMenu {
@@ -196,16 +235,18 @@ struct MessageRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12).padding(.trailing, 28)
         case .tools:
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(Array(item.tools.enumerated()), id: \.offset) { _, t in
-                        Label(t.replacingOccurrences(of: "_", with: " "), systemImage: "wrench.and.screwdriver")
-                            .font(.caption).padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(Color(.tertiarySystemFill), in: Capsule())
+            DisclosureGroup(isExpanded: $toolsExpanded) {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(item.tools.enumerated()), id: \.offset) { _, tool in
+                        Text(tool.replacingOccurrences(of: "_", with: " ")).font(.caption.monospaced())
                     }
-                }
-                .padding(.horizontal, 16)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label("\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")", systemImage: "wrench.and.screwdriver")
+                    .font(.subheadline)
             }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 18)
         case .notice:
             Text(item.text).font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
         }

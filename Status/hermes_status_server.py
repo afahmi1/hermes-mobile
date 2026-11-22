@@ -161,19 +161,22 @@ def gateway_status():
             ticker.append({"profile": name, "heartbeat": iso_from_epoch(beat),
                            "last_success": iso_from_epoch(ok)})
 
+    reasons = []
     if not alive:
-        health = "down"
-    elif st.get("gateway_state") != "running" or estops:
-        health = "degraded"
-    elif any(p["needs_attention"] or p["state"] not in ("connected", "running") for p in platforms):
-        health = "degraded"
-    elif hb_age is not None and hb_age > 120:
-        health = "degraded"
-    else:
-        health = "healthy"
+        reasons.append("Gateway process is unavailable")
+    if st.get("gateway_state") != "running":
+        reasons.append("Gateway state: " + str(st.get("gateway_state") or "unknown"))
+    if estops:
+        reasons.append("Emergency stop is active")
+    for platform in platforms:
+        if platform["needs_attention"] or platform["state"] not in ("connected", "running"):
+            reasons.append("%s: %s" % (platform["name"], platform["error"] or platform["state"] or "needs attention"))
+    if hb_age is not None and hb_age > 120:
+        reasons.append("Last heartbeat was %d seconds ago" % hb_age)
 
     return {
-        "health": health,
+        "health": "down" if not alive else "degraded" if reasons else "healthy",
+        "reasons": reasons,
         "pid": pid,
         "alive": alive,
         "state": st.get("gateway_state"),
@@ -569,7 +572,7 @@ def parse_auth_list(text):
         if m:
             cur = providers.setdefault(m.group(1), {"provider": m.group(1), "credentials": []})
             continue
-        m = re.match(r"^\s+#(\d+)\s+(\S+)\s+(\S+)\s+id=(\S+)\s+priority=(\d+)\s*(.*)$", line)
+        m = re.match(r"^\s+#(\d+)\s+(.+?)\s+(\S+)\s+id=(\S+)\s+priority=(\d+)\s*(.*)$", line)
         if m and cur:
             rest = m.group(6)
             cur["credentials"].append({
@@ -601,7 +604,7 @@ def openrouter_usage():
     key = env_value("OPENROUTER_API_KEY")
     if not key:
         return {"unavailable_reason": "OPENROUTER_API_KEY not set"}
-    out = {"source": "openrouter /credits", "windows": [], "details": []}
+    out = {"scope": "Usage from the environment key and its billing account", "source": "openrouter /credits", "windows": [], "details": []}
     try:
         d = http_json("https://openrouter.ai/api/v1/credits", key)["data"]
         total, used = float(d.get("total_credits") or 0), float(d.get("total_usage") or 0)

@@ -14,7 +14,7 @@ chat state. It does three things the gateway API server cannot do for a phone on
 Binds to loopback only; reach it through `tailscale serve`. Stdlib only (system python3).
 """
 import base64, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -125,16 +125,17 @@ def key_for(pid):
 def bots():
     meta, front = fleet_meta()
     gmodel, gprov = model_default(HERMES / "config.yaml")
+    served = served_profiles()
     out = []
     for pid in profile_ids():
-        m, pv = model_default(profile_home(pid) / "config.yaml")
+        m, pv = (gmodel, gprov) if pid == "default" else model_default(profile_home(pid) / "config.yaml")
         if pid == "default":
             name, blurb = front, "The front door. Does the work or hands it to the right bot."
         else:
             nm, blurb = meta.get(pid, ("", ""))
             name = nm or pid.replace("-", " ").replace("_", " ").title().replace("Captains", "Captain's")
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
-                    "reachable": bool(key_for(pid)), "served": pid in served_profiles(),
+                    "reachable": bool(key_for(pid)), "served": pid in served,
                     "front": pid == "default"})
     return out
 
@@ -561,6 +562,54 @@ def health():
         return {"ok": False, "error": type(e).__name__}
 
 
+# Short-lived first-page cache shared by tabs/devices on this single-user bridge.
+# Cursors are always evaluated fresh. Concurrent readers share the upstream fetch.
+_page_lock = threading.Lock()
+_pages = {}
+_pending_pages = {}
+_page_epoch = 0
+
+
+def invalidate_pages():
+    global _page_epoch
+    with _page_lock:
+        _page_epoch += 1
+        _pages.clear()
+
+
+def session_page(limit, cursor, only, exclude, telegram):
+    if cursor:
+        return all_sessions(limit, cursor, only, exclude, telegram)
+    key = (limit, tuple(sorted(only or ())), tuple(sorted(exclude)), telegram)
+    with _page_lock:
+        epoch = _page_epoch
+        cached = _pages.get(key)
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+        flight = (_page_epoch, key)
+        future = _pending_pages.get(flight)
+        owner = future is None
+        if owner:
+            future = _pending_pages[flight] = Future()
+    if not owner:
+        return future.result()
+    try:
+        page = all_sessions(limit, None, only, exclude, telegram)
+        with _page_lock:
+            if not page["errors"] and epoch == _page_epoch:
+                if len(_pages) >= 24 and key not in _pages:
+                    del _pages[next(iter(_pages))]
+                _pages[key] = (time.monotonic() + 6, page)
+        future.set_result(page)
+        return page
+    except Exception as error:
+        future.set_exception(error)
+        raise
+    finally:
+        with _page_lock:
+            _pending_pages.pop(flight, None)
+
+
 # ---------- HTTP ----------
 class H(BaseHTTPRequestHandler):
     server_version = "HermesMobile/1"
@@ -570,6 +619,8 @@ class H(BaseHTTPRequestHandler):
         log(fmt % args)
 
     def send(self, code, body=b"", ctype="application/json", close=False):
+        if self.command in ("POST", "PATCH", "DELETE") and 200 <= code < 300:
+            invalidate_pages()
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
         self.send_response(code)
@@ -641,7 +692,7 @@ class H(BaseHTTPRequestHandler):
                 limit = max(1, min(int(q.get("limit", "40") or 40), 100))
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
-                return self.send(200, all_sessions(limit, q.get("cursor"), only, exclude, telegram=path == "/m/telegram"))
+                return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram"))
             if path == "/m/search":
                 return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"))})
             m = re.match(r"^/m/runtime/([^/]+)/([^/]+)$", path)
@@ -661,7 +712,7 @@ class H(BaseHTTPRequestHandler):
         try:
             if path == "/m/turns" and self.command == "GET":
                 return self.send(200, {"turns": turns.live_turns()})
-            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval)?$", path)
+            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval|/queue|/steer)?$", path)
             if m:
                 turn = turns.get_turn(m.group(1))
                 if turn is None:
@@ -670,6 +721,9 @@ class H(BaseHTTPRequestHandler):
                 if action == "/events" and self.command == "GET":
                     last = self.headers.get("Last-Event-ID") or q.get("after")
                     return self.tail(turn, int(last) + 1 if last not in (None, "") and str(last).lstrip("-").isdigit() else 0)
+                if action in ("/queue", "/steer") and self.command == "POST":
+                    body = self.json_body()
+                    return self.send(200, turns.follow_up(turn, action[1:], body.get("text"), body.get("submission_id")))
                 if action == "/stop" and self.command == "POST":
                     turns.stop(turn)
                     return self.send(200, {"ok": True})

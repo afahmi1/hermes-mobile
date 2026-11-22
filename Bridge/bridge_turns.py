@@ -146,12 +146,12 @@ def set_runtime(home, sid, choice):
 async def _interrupt(turn):
     """Stop a turn. session.interrupt is generation-fenced; a turn still queued is cancelled instead."""
     async def go(c):
-        snap = await _rpc(c, "session.resume", session_id=turn.sid)
+        snap = await _rpc(c, "session.resume", session_id=turn.canonical_sid)
         gen = turn.generation if turn.generation is not None else snap.get("execution_generation")
         row = next((r for r in snap.get("pending") or [] if r.get("admission_id") == turn.admission), {})
         if turn.admission and row.get("status") == "queued":
-            return await _rpc(c, "prompt.cancel", session_id=turn.sid, admission_id=turn.admission)
-        return await _rpc(c, "session.interrupt", session_id=turn.sid, execution_generation=gen)
+            return await _rpc(c, "prompt.cancel", session_id=turn.canonical_sid, admission_id=turn.admission)
+        return await _rpc(c, "session.interrupt", session_id=turn.canonical_sid, execution_generation=gen)
     if turn.client is not None:
         return await go(turn.client)
     async with connect(turn.home) as c:
@@ -160,14 +160,14 @@ async def _interrupt(turn):
 
 async def _approve(turn, choice, prompt_id, generation):
     async def go(c):
-        res = await _rpc(c, "approval.respond", session_id=turn.sid, execution_generation=generation,
+        res = await _rpc(c, "approval.respond", session_id=turn.canonical_sid, execution_generation=generation,
                          prompt_id=prompt_id, choice=choice)
         turn.push("approval.resolved", request_id=prompt_id, choice=choice)
         return res
     if turn.client is not None:
         return await go(turn.client)
     async with connect(turn.home) as c:
-        await _rpc(c, "session.resume", session_id=turn.sid)
+        await _rpc(c, "session.resume", session_id=turn.canonical_sid)
         return await go(c)
 
 
@@ -182,6 +182,8 @@ class Turn:
         self.done = False
         self.started = time.time()
         self.ended = 0.0
+        self.canonical_sid = sid
+        self.submission = None
         self.admission = None
         self.generation = None
         self.client = None
@@ -242,12 +244,12 @@ def _settle(turn, pl):
 
 async def _recover_gap(c, turn):
     """The event stream lost frames. True when the turn turned out to be finished (and was settled)."""
-    snap = await _rpc(c, "session.resume", session_id=turn.sid)
+    snap = await _rpc(c, "session.resume", session_id=turn.canonical_sid)
     row = next((r for r in snap.get("pending") or [] if r.get("admission_id") == turn.admission), None)
     if row is not None and row.get("status") != "unknown":
         return False  # still queued or running: its completion is still owed to this socket
     try:
-        receipt = await _rpc(c, "prompt.receipt", session_id=turn.sid, admission_id=turn.admission, include_result=True)
+        receipt = await _rpc(c, "prompt.receipt", session_id=turn.canonical_sid, admission_id=turn.admission, include_result=True)
     except TurnError:
         receipt = {}
     result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
@@ -263,22 +265,35 @@ async def _recover_gap(c, turn):
 async def _drive(turn: Turn):
     try:
         async with connect(turn.home) as c:
-            await _rpc(c, "session.resume", session_id=turn.sid)
+            snapshot = await _rpc(c, "session.resume", session_id=turn.sid)
+            turn.canonical_sid = snapshot.get("session_id") or turn.sid
+            following_queue = turn.admission is not None
             applied = await _apply(c, turn.sid, turn.choice) if turn.choice else {}
             params = {"session_id": turn.sid, "submission_id": uuid.uuid4().hex, "text": turn.text}
             if turn.choice.get("model"):
                 params["model_override"] = {k: v for k, v in (
                     ("model", turn.choice.get("model")), ("provider", turn.choice.get("provider")),
                     ("reasoning", turn.choice.get("effort"))) if v}
-            receipt = await _rpc(c, "prompt.submit", **params)
-            turn.admission = receipt.get("admission_id")
-            if receipt.get("execution_generation") is not None:
-                turn.generation = receipt["execution_generation"]
+            if following_queue:
+                if await _recover_gap(c, turn):
+                    return
+            else:
+                params["session_id"] = turn.canonical_sid
+                receipt = await _rpc(c, "prompt.submit", **params)
+                turn.admission = receipt["admission_id"]
+                turn.generation = receipt.get("execution_generation")
             turn.client = c
             turn.push("run.started", requested=turn.choice, applied=bool(applied))
             deadline = time.time() + 3 * 3600
             while time.time() < deadline:
-                frame = await asyncio.wait_for(c.events.get(), 1800)
+                try:
+                    frame = await asyncio.wait_for(c.events.get(), 20 if following_queue else 1800)
+                except asyncio.TimeoutError:
+                    if not following_queue:
+                        raise
+                    if await _recover_gap(c, turn):
+                        return
+                    continue
                 if isinstance(frame, BaseException):
                     # The gateway connection died (restart, sleep, crash): nothing more will arrive here.
                     turn.push("run.failed", error="Lost the connection to Hermes. The reply may still finish on "
@@ -299,6 +314,9 @@ async def _drive(turn: Turn):
                 # one ahead of ours) on the same subscription.
                 admission = p.get("admission_id") or pl.get("admission_id")
                 if turn.admission and admission and admission != turn.admission:
+                    continue
+                if following_queue and not admission and (turn.generation is None or
+                        p.get("execution_generation") != turn.generation) and p.get("type") != "session.replay_gap":
                     continue
                 if p.get("execution_generation") is not None:
                     turn.generation = p["execution_generation"]
@@ -396,3 +414,55 @@ def approve(turn: Turn, choice, prompt_id, generation=None):
         raise TurnError("Missing the approval's id.")
     gen = generation if generation is not None else turn.prompts.get(prompt_id, turn.generation)
     return run(_approve(turn, choice, prompt_id, gen))
+
+
+async def _follow_up(turn, mode, text, submission):
+    if mode == "queue":
+        try:
+            submission = uuid.UUID(str(submission)).hex
+        except ValueError:
+            raise TurnError("A stable submission ID is required.")
+        with TURNS_LOCK:
+            prior = next((t for t in TURNS.values() if t.profile == turn.profile and
+                          t.sid == turn.sid and t.submission == submission), None)
+        if prior:
+            if prior.text != text:
+                raise TurnError("Submission ID already used for another message.", 409)
+            return {"status": "queued", "turn_id": prior.id}
+    client = turn.client
+    if turn.done or client is None:
+        raise TurnError("This turn is no longer accepting input. Refresh the conversation.", 409)
+    if mode == "steer":
+        if turn.generation is None:
+            raise TurnError("The gateway has not started this turn yet.", 409)
+        result = await _rpc(client, "session.steer", session_id=turn.canonical_sid, text=text,
+                            execution_generation=turn.generation)
+        if result.get("status") != "queued":
+            raise TurnError("Hermes declined the steer. Your draft is available to queue.", 409)
+        return {"status": "steer_accepted"}
+
+    receipt = await _rpc(client, "prompt.submit", session_id=turn.canonical_sid,
+                         text=text, submission_id=submission)
+    admission = receipt.get("admission_id")
+    if not admission or receipt.get("status") not in ("queued", "started", "terminal"):
+        raise TurnError("Hermes could not confirm admission. Check the chat before retrying.", 409)
+    with TURNS_LOCK:
+        existing = next((t for t in TURNS.values() if t.admission == admission and t.profile == turn.profile
+                         and t.sid == turn.sid), None)
+        if existing:
+            return {"status": "queued", "turn_id": existing.id}
+        queued = Turn(turn.profile, turn.home, turn.sid, text, {})
+        queued.canonical_sid = turn.canonical_sid
+        queued.admission = admission
+        queued.submission = submission
+        if receipt.get("status") == "started":
+            queued.generation = receipt.get("execution_generation")
+        TURNS[queued.id] = queued
+    asyncio.create_task(_drive(queued))
+    return {"status": "queued", "turn_id": queued.id}
+
+
+def follow_up(turn, mode, text, submission=None):
+    if mode not in ("queue", "steer") or not isinstance(text, str) or not text.strip():
+        raise TurnError("Enter a message to queue or steer.")
+    return run(_follow_up(turn, mode, text.strip(), submission))

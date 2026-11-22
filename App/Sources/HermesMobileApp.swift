@@ -54,7 +54,7 @@ struct MainTabs: View {
                 try? await Task.sleep(for: .seconds(15))
             }
         }
-        .task { await app.status.poll(app: app) }  // keeps the badge and bot lists current from any tab
+        .task(id: phase) { if phase == .active { await app.status.poll(app: app) } }  // keeps the badge and bot lists current from any tab
         .overlay(alignment: .top) { Announcement(text: app.status.announcement, tick: app.status.announceTick) }
         .sensoryFeedback(.success, trigger: app.status.announceTick)
     }
@@ -90,6 +90,7 @@ private struct Announcement: View {
 
 /// An authenticated health probe checks both the bridge and the Hermes gateway.
 struct ConnectionBadge: View {
+    @State private var detail = false
     @Environment(AppModel.self) private var app
 
     private var state: (String, Color) {
@@ -103,11 +104,17 @@ struct ConnectionBadge: View {
     }
 
     var body: some View {
-        HStack(spacing: 5) {
-            Circle().fill(state.1).frame(width: 7, height: 7)
-            Text(state.0).font(.caption.weight(.medium))
+        Button { detail.toggle() } label: {
+            Image(systemName: state.0 == "Online" ? "antenna.radiowaves.left.and.right" :
+                    state.0 == "Checking" ? "ellipsis" : "wifi.exclamationmark")
+                .foregroundStyle(state.0 == "Online" ? Color.secondary : state.1)
         }
-        .accessibilityElement(children: .ignore)
         .accessibilityLabel("Hermes connection, " + state.0)
+        .popover(isPresented: $detail) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(state.0).font(.headline)
+                Text(API.shared.baseURL?.host ?? "Hermes gateway").font(.footnote).foregroundStyle(.secondary)
+            }.padding().presentationCompactAdaptation(.popover)
+        }
     }
 }

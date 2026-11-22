@@ -5,6 +5,7 @@ enum StreamRecoveryTests {
         precondition(state.accept(0))
         precondition(state.retryDelay() != nil)
         precondition(!state.accept(0) && state.failures == 1)
+        precondition(state.hasGap(before: 3) && !state.accept(3) && state.lastSequence == 0)
         precondition(state.accept(1) && state.lastSequence == 1 && state.failures == 0)
         precondition(!state.accept(0) && state.lastSequence == 1)
         for cap in [2.0, 4, 8, 8, 8] {

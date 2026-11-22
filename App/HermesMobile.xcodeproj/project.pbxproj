@@ -23,6 +23,7 @@
 		CE8872AD244AC2FE04FB85DB /* API.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1476455C52D00777817E0CF2 /* API.swift */; };
 		DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2964B8E32E7A6E7CAE8E6CD /* Models.swift */; };
 		ED1266216A5741C7D9F1F39B /* StreamRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84E690DA9F04A70286E6A83B /* StreamRecovery.swift */; };
+		F25287E5F6EA9306198EADD7 /* InboxCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E6169EEAB809871675DAC1 /* InboxCache.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -30,6 +31,7 @@
 		253437064A2D952503C4677C /* ChatModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModel.swift; sourceTree = "<group>"; };
 		2C32D8FB93B9E6002372A230 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		398143EB1C4D7C38BC6B945F /* ChatListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatListView.swift; sourceTree = "<group>"; };
+		44E6169EEAB809871675DAC1 /* InboxCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxCache.swift; sourceTree = "<group>"; };
 		4A6A9D75E969CDFA904BF436 /* RuntimeSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeSheet.swift; sourceTree = "<group>"; };
 		6686DC90CF4C5218AD9EE3C5 /* HermesMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesMobileApp.swift; sourceTree = "<group>"; };
 		77BE1304B3824EAD4CAE8086 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
@@ -55,6 +57,7 @@
 				CBF6F2AB0BD3858AAAAF4FFA /* AppModel.swift */,
 				253437064A2D952503C4677C /* ChatModel.swift */,
 				6686DC90CF4C5218AD9EE3C5 /* HermesMobileApp.swift */,
+				44E6169EEAB809871675DAC1 /* InboxCache.swift */,
 				B2964B8E32E7A6E7CAE8E6CD /* Models.swift */,
 				785C4DB8C31E64EB728F4674 /* StatusModel.swift */,
 				84E690DA9F04A70286E6A83B /* StreamRecovery.swift */,
@@ -191,6 +194,7 @@
 				2D6EC1097BA97174EF7469E1 /* ChatModel.swift in Sources */,
 				8A4FEE22C59ED755F87C1232 /* ChatView.swift in Sources */,
 				569136F100411902E2211011 /* HermesMobileApp.swift in Sources */,
+				F25287E5F6EA9306198EADD7 /* InboxCache.swift in Sources */,
 				2DA9ED00AD66FD68506A0E7F /* MarkdownText.swift in Sources */,
 				DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */,
 				2D4D15E7A8B918383BC236CB /* RuntimeSheet.swift in Sources */,

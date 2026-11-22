@@ -50,3 +50,16 @@ class SessionSourceTests(unittest.TestCase):
     def test_search_scopes_before_the_limit(self):
         rows = self.bridge.search_sessions("matching", profile="secondary", source="telegram", limit=2)
         self.assertEqual([(r["profile"], r["id"]) for r in rows], [("secondary", "6"), ("secondary", "4")])
+
+    def test_first_page_cache_invalidates_after_mutation(self):
+        b = self.bridge
+        b.invalidate_pages()
+        with patch.object(b, "all_sessions", return_value={"data": [], "next": None, "errors": {}}) as fetch:
+            for _ in range(2):
+                b.session_page(16, None, None, (), False)
+            self.assertEqual(fetch.call_count, 1)
+            b.session_page(16, None, None, (), True)
+            self.assertEqual(fetch.call_count, 2)
+            b.invalidate_pages()
+            b.session_page(16, None, None, (), False)
+            self.assertEqual(fetch.call_count, 3)

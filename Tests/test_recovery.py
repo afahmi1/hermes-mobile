@@ -57,3 +57,27 @@ class GatewayCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(engine, "_endpoint", return_value="local"):
                 async with engine.connect(Path(".")) as connection:
                     self.assertEqual(connection, ("local", expected))
+
+
+class FollowUpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_steer_rejection_keeps_failure_visible(self):
+        turn = engine.Turn("default", Path("."), "chat", "", {})
+        turn.client = object()
+        turn.generation = 17
+        rpc = AsyncMock(return_value={"status": "rejected"})
+        with patch.object(engine, "_rpc", rpc), self.assertRaises(engine.TurnError):
+            await engine._follow_up(turn, "steer", "change direction", None)
+        rpc.assert_awaited_once_with(turn.client, "session.steer", session_id="chat",
+                                     execution_generation=17, text="change direction")
+
+    async def test_queue_retry_returns_existing_receipt(self):
+        from uuid import uuid4
+        turn = engine.Turn("default", Path("."), "chat", "", {})
+        queued = engine.Turn("default", Path("."), "chat", "next", {})
+        queued.submission = uuid4().hex
+        with patch.dict(engine.TURNS, {queued.id: queued}, clear=True), patch.object(engine, "_rpc", AsyncMock()) as rpc:
+            result = await engine._follow_up(turn, "queue", "next", queued.submission)
+            self.assertEqual(result, {"status": "queued", "turn_id": queued.id})
+            rpc.assert_not_awaited()
+            with self.assertRaises(engine.TurnError):
+                await engine._follow_up(turn, "queue", "different", queued.submission)

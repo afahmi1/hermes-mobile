@@ -4,9 +4,14 @@ struct StreamRecovery {
     private(set) var failures = 0
     static let attemptLimit = 6
 
+    func hasGap(before sequence: Int?) -> Bool {
+        guard let sequence else { return false }
+        return sequence > (lastSequence ?? -1) + 1
+    }
+
     mutating func accept(_ sequence: Int?) -> Bool {
         if let sequence {
-            if let lastSequence, sequence <= lastSequence { return false }
+            if hasGap(before: sequence) || sequence <= (lastSequence ?? -1) { return false }
             lastSequence = sequence
         }
         failures = 0

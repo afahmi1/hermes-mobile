@@ -7,7 +7,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Mac") {
+                Section("Hermes server") {
                     LabeledContent("Address", value: API.shared.baseURL?.absoluteString ?? "—")
                     LabeledContent("Gateway") {
                         if let h = app.health {
@@ -20,7 +20,7 @@ struct SettingsView: View {
                     LabeledContent("Bots", value: "\(app.bots.filter(\.reachable).count) of \(app.bots.count) reachable")
                 }
                 Section {
-                    Text("Chats, bots and model choices live in Hermes on your Mac, so this phone and the desktop app always show the same thing. Away from home, keep Tailscale connected on this phone.")
+                    Text("Chats, bots and model choices live in Hermes on your server, so this phone and the desktop app always show the same thing. Away from home, keep Tailscale connected on this phone.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section {
@@ -29,7 +29,7 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .refreshable { await app.refreshHealth(); await app.refreshBots() }
-            .confirmationDialog("Sign out of your Mac?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+            .confirmationDialog("Sign out of this server?", isPresented: $confirmSignOut, titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) { app.signOut() }
             }
         }

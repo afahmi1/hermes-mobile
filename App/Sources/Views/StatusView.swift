@@ -23,10 +23,15 @@ struct StatusView: View {
                 }
                 if let p {
                     if !p["gateway"]["estop"].array.isEmpty {
-                        Label("Emergency stop is on: cron and new gateway turns are paused. Run `hermes resume` on the Mac.",
+                        Label("Emergency stop is on: cron and new gateway turns are paused. Run `hermes resume` on the server.",
                               systemImage: "exclamationmark.octagon.fill").foregroundStyle(.red)
                     }
-                    Section { kpis(p) }
+                    Section {
+                        kpis(p)
+                        ForEach(Array(p["gateway"]["reasons"].array.enumerated()), id: \.offset) { _, reason in
+                            if let text = reason.string { Label(text, systemImage: "exclamationmark.triangle").font(.footnote) }
+                        }
+                    }
                     running(p)
                     changes(p)
                     bots(p)
@@ -418,6 +423,9 @@ private struct ProviderRow: View {
                     Text(left, format: .currency(code: u["balance"]["currency"].string ?? "USD")).font(.subheadline.weight(.semibold))
                 }
             }
+            Text("\(provider["credentials"].array.count) configured credentials")
+                .font(.caption).foregroundStyle(.secondary)
+            if let scope = u["scope"].string { Text(scope).font(.caption).foregroundStyle(.secondary) }
             ForEach(Array(u["windows"].array.enumerated()), id: \.offset) { _, w in
                 let used = min(100, max(0, w["used_percent"].double ?? 0))
                 VStack(alignment: .leading, spacing: 3) {

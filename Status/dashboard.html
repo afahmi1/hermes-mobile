@@ -309,6 +309,7 @@ function render(){
       ${g.exit_reason?`<dt>Exit reason</dt><dd class="err">${esc(g.exit_reason)}</dd>`:""}
     </dl>
     <div class="sect">Platforms</div>${plats||'<div class="meta">none</div>'}
+    ${(g.reasons||[]).map(reason=>`<div class="note">${esc(reason)}</div>`).join("")}
     <div class="sect">Served profiles</div><div class="chips">${(g.served_profiles||[]).map(p=>`<span class="tag">${esc(p)}</span>`).join("")}${parked.map(p=>`<span class="pill warn">${esc(p)} parked</span>`).join("")}</div>`;
 
   // providers
@@ -328,7 +329,7 @@ function render(){
       + (u.stale ? `<div class="note"><span class="pill warn">stale</span> reading from ${rel(u.stale_since)}; latest check ${rel(u.checked_at)} failed (provider rate limit or outage), retrying</div>` : "");
     return `<div class="prov"><div class="prov-h"><span class="n">${esc(p.provider)}</span>${p.is_default?'<span class="pill info">default</span>':""}${u.plan?`<span class="tag">${esc(u.plan)}</span>`:""}${bal}</div>
       <div class="meta">${creds.length} credential${creds.length==1?"":"s"}: ${creds.map(c=>`${esc(c.label)} <span class="faint">(${esc(c.type)})</span>${c.active?" ←":""}`).join(", ")}</div>
-      ${meters}${det}${na}</div>`;}).join("") : `<div class="empty">${esc(P.error||"Loading provider usage…")}</div>`;
+      ${u.scope ? `<div class="note">${esc(u.scope)}</div>` : ""}${meters}${det}${na}</div>`;}).join("") : `<div class="empty">${esc(P.error||"Loading provider usage…")}</div>`;
 
   // tokens
   const T = J.tokens_24h||[];

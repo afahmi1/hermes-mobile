@@ -8,10 +8,10 @@ enum APIError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notSignedIn: "Sign in to your Mac first."
-        case .http(401, _): "Your sign-in expired. Sign in again."
-        case .http(let code, let msg): msg.isEmpty ? "The Mac answered \(code)." : msg
-        case .badResponse: "The Mac sent something unexpected."
+        case .notSignedIn: "Sign in to your Hermes server first."
+        case .http(401, let message): message.isEmpty ? "Sign in to Hermes again." : message
+        case .http(let code, let msg): msg.isEmpty ? "The server answered \(code)." : msg
+        case .badResponse: "The server sent something unexpected."
         }
     }
 }
@@ -124,7 +124,8 @@ final class API: @unchecked Sendable {
         struct R: Decodable { let bots: [Bot] }
         return try await get("/m/bots", as: R.self).bots
     }
-    func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], telegram: Bool = false, limit: Int = 40) async throws -> SessionPage {
+    func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], telegram: Bool = false) async throws -> SessionPage {
+        let limit = cursor == nil ? 16 : 40
         var q = ["limit=\(limit)"]
         if let cursor { q.append("cursor=\(cursor)") }
         if let profile { q.append("profile=\(Self.esc(profile))") }
@@ -145,8 +146,8 @@ final class API: @unchecked Sendable {
         guard let path = components.string else { throw APIError.badResponse }
         return try await get(path, as: SearchPage.self).data
     }
-    func messages(profile: String, session: String) async throws -> [StoredMessage] {
-        try await get(p(profile, "/api/sessions/\(Self.esc(session))/messages?limit=500&order=latest"), as: MessagesPage.self).data
+    func messages(profile: String, session: String, limit: Int = 100, offset: Int = 0) async throws -> [StoredMessage] {
+        try await get(p(profile, "/api/sessions/\(Self.esc(session))/messages?limit=\(limit)&offset=\(offset)&order=latest"), as: MessagesPage.self).data
     }
     func catalog(profile: String) async throws -> ModelCatalog {
         try await get(p(profile, "/api/model/options"), as: ModelCatalog.self)
@@ -198,6 +199,13 @@ final class API: @unchecked Sendable {
         let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/send", method: "POST", body: body)
         guard let id = obj["turn_id"] as? String else { throw APIError.badResponse }
         return id
+    }
+
+    func followUp(run: String, mode: String, text: String, submission: UUID) async throws {
+        let result = try await json("/m/turns/\(Self.esc(run))/\(mode)", method: "POST",
+                                    body: ["text": text, "submission_id": submission.uuidString])
+        let expected = mode == "queue" ? "queued" : "steer_accepted"
+        guard result["status"] as? String == expected else { throw APIError.badResponse }
     }
 
     func stopRun(profile: String, run: String) async throws {
