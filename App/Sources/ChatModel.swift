@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 struct ChatItem: Identifiable, Hashable {
-    enum Kind: Hashable { case user, assistant, tools, notice }
+    enum Kind: Hashable { case user, assistant, tools, notice, control }
     let id: String
     var kind: Kind
     var text: String
@@ -10,6 +10,7 @@ struct ChatItem: Identifiable, Hashable {
     var streaming = false
     var footer: String?
     var failed = false
+    var timestamp: Double?
 }
 
 struct ApprovalRequest: Identifiable, Hashable {
@@ -47,6 +48,12 @@ final class ChatModel {
     private var liveToolGroup: Int?
     private var streamingIndex: Int?
     private var stored: [StoredMessage] = []
+    private var receipts: [ControlReceipt] = []
+    private var loadedReceipts = false
+    private var receiptKey: String? {
+        guard let sessionId else { return nil }
+        return app?.inboxKey(profile: profile, filter: "control-receipts/" + sessionId)
+    }
     private var lastPage: [StoredMessage]?
     private var loadingTranscript = false
     private(set) var hasOlder = false
@@ -73,6 +80,13 @@ final class ChatModel {
         defer { loadingTranscript = false }
         if !quiet { isLoading = items.isEmpty }
         defer { isLoading = false }
+        if !loadedReceipts, let key = receiptKey {
+            let saved = await InboxDisk.shared.receipts(key)
+            guard !Task.isCancelled, key == receiptKey else { return }
+            let known = Set(receipts.map(\.id))
+            receipts += saved.filter { !known.contains($0.id) }
+            loadedReceipts = true
+        }
         do {
             let msgs = try await API.shared.messages(profile: profile, session: sid)
             if isRunning { return }  // the live stream owns the tail; reload when it ends
@@ -85,7 +99,7 @@ final class ChatModel {
                     hasOlder = msgs.count == 100
                 }
                 lastPage = msgs
-                items = Self.transcript(stored)
+                items = transcriptWithReceipts()
                 error = nil
             }
         } catch {
@@ -108,7 +122,7 @@ final class ChatModel {
             let older = page.filter { row in row.id.map { !ids.contains($0) } ?? true }
             stored.insert(contentsOf: older, at: 0)
             hasOlder = page.count == 100
-            items = Self.transcript(stored)
+            items = transcriptWithReceipts()
         } catch { self.error = error.localizedDescription }
     }
 
@@ -152,6 +166,16 @@ final class ChatModel {
         return parts.joined(separator: " · ")
     }
 
+    private func transcriptWithReceipts() -> [ChatItem] {
+        var rows = Self.transcript(stored)
+        for receipt in receipts.sorted(by: { $0.at < $1.at }) {
+            let t = receipt.at.timeIntervalSince1970
+            let next = rows.firstIndex { ($0.timestamp ?? 0) > t } ?? rows.endIndex
+            rows.insert(receipt.item, at: next)
+        }
+        return rows
+    }
+
     static func transcript(_ msgs: [StoredMessage]) -> [ChatItem] {
         var out: [ChatItem] = []
         var toolGroup: Int?
@@ -161,7 +185,7 @@ final class ChatModel {
             switch m.role {
             case "user":
                 toolGroup = nil
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .user, text: text)) }
+                if !text.isEmpty { out.append(ChatItem(id: key, kind: .user, text: text, timestamp: m.timestamp)) }
             case "assistant":
                 let names = (m.toolCalls ?? []).compactMap { $0.function?.name }
                 if !names.isEmpty {
@@ -169,10 +193,10 @@ final class ChatModel {
                         out[toolGroup].tools += names
                     } else {
                         toolGroup = out.count
-                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: names))
+                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: names, timestamp: m.timestamp))
                     }
                 }
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .assistant, text: text)) }
+                if !text.isEmpty { out.append(ChatItem(id: key, kind: .assistant, text: text, timestamp: m.timestamp)) }
             default:
                 continue
             }
@@ -205,7 +229,6 @@ final class ChatModel {
         error = nil
         items.append(ChatItem(id: "local-\(UUID().uuidString)", kind: .user, text: text))
         isRunning = true
-        followUpNotice = nil
         status = "Sending…"
         if picked && sessionId != nil { await refreshServed() }  // a switch made on the desktop wins over a stale pick
         do {
@@ -230,24 +253,30 @@ final class ChatModel {
 
     var acceptsFollowUp: Bool { isRunning && runId != nil && !sendingFollowUp }
     private(set) var sendingFollowUp = false
-    var followUpNotice: String?
-    private var lastQueueAttempt: (run: String, text: String, id: UUID)?
+    private var lastControlAttempt: (run: String, mode: String, text: String, id: UUID)?
 
     func followUp(_ raw: String, mode: String) async -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard acceptsFollowUp, let run = runId, !text.isEmpty else { return false }
         sendingFollowUp = true
         defer { sendingFollowUp = false }
-        let previous = lastQueueAttempt
+        let previous = lastControlAttempt
         let id: UUID
-        if let previous, previous.run == run, previous.text == text { id = previous.id }
+        if let previous, previous.run == run, previous.mode == mode, previous.text == text { id = previous.id }
         else { id = UUID() }
-        if mode == "queue" { lastQueueAttempt = (run, text, id) }
+        let key = receiptKey
+        lastControlAttempt = (run, mode, text, id)
         do {
             try await API.shared.followUp(run: run, mode: mode, text: text, submission: id)
-            followUpNotice = mode == "queue" ? "Queued for the next turn" : "Steer accepted by Hermes"
-            lastQueueAttempt = nil
+            guard let key, receiptKey == key else { return false }
+            let receipt = ControlReceipt(id: id, mode: mode, text: text, at: Date())
+            receipts.removeAll { $0.id == id }
+            receipts.append(receipt)
+            if !items.contains(where: { $0.id == id.uuidString }) { items.append(receipt.item) }
+            lastControlAttempt = nil
             error = nil
+            do { try await InboxDisk.shared.record(receipt, key: key) }
+            catch { self.error = "Hermes received the instruction. This phone could not save its receipt." }
             return true
         } catch {
             self.error = error.localizedDescription

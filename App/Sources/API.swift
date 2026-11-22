@@ -126,7 +126,7 @@ final class API: @unchecked Sendable {
     }
     func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], telegram: Bool = false) async throws -> SessionPage {
         let limit = cursor == nil ? 16 : 40
-        var q = ["limit=\(limit)"]
+        var q = ["limit=\(limit)", "view=compact"]
         if let cursor { q.append("cursor=\(cursor)") }
         if let profile { q.append("profile=\(Self.esc(profile))") }
         if !exclude.isEmpty { q.append("exclude=\(exclude.joined(separator: ","))") }

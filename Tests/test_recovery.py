@@ -81,3 +81,17 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             rpc.assert_not_awaited()
             with self.assertRaises(engine.TurnError):
                 await engine._follow_up(turn, "queue", "different", queued.submission)
+
+    async def test_simultaneous_steers_share_the_gateway_ack(self):
+        import asyncio
+        from uuid import uuid4
+        turn = engine.Turn("default", Path("."), "chat", "", {})
+        turn.client, turn.generation = object(), 3
+        submission = uuid4().hex
+        with patch.object(engine, "_rpc", AsyncMock(return_value={"status":"queued"})) as rpc:
+            a,b = await asyncio.gather(*(engine._follow_up(turn, "steer","guide",submission) for _ in range(2)))
+            self.assertEqual(a,b)
+            self.assertEqual(a["execution_generation"],3)
+            self.assertEqual(rpc.await_count,1)
+            with self.assertRaises(engine.TurnError):
+                await engine._follow_up(turn, "steer","changed",submission)

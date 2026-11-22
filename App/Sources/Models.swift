@@ -57,6 +57,12 @@ struct SessionSummary: Codable, Identifiable, Hashable {
 }
 
 struct SessionPage: Codable {
+    let errors: [String: String]?
+    let reset: Bool?
+    var partialWarning: String? {
+        guard let errors, !errors.isEmpty else { return nil }
+        return "Couldn’t refresh " + errors.keys.sorted().joined(separator: ", ") + ". Pull down to retry."
+    }
     let data: [SessionSummary]
     let next: String?
 }
@@ -208,10 +214,15 @@ struct LiveTurn: Codable, Hashable {
 }
 
 struct HealthInfo: Codable {
+    struct Transition: Codable { let phase: String; let at: Double }
+    let phase: String?
+    let recent: [Transition]?
+    let reason: String?
+    let inboxFallback: String?
     let ok: Bool
     let gatewayState: String?
     let version: String?
-    enum CodingKeys: String, CodingKey { case ok, version, gatewayState = "gateway_state" }
+    enum CodingKeys: String, CodingKey { case ok, version, phase, recent, reason, inboxFallback = "inbox_fallback", gatewayState = "gateway_state" }
 }
 
 // MARK: - Live run events

@@ -18,7 +18,7 @@ struct StatusView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                if let e = status.error, p == nil {
+                if let e = status.error {
                     Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
                 }
                 if let p {
@@ -39,7 +39,7 @@ struct StatusView: View {
                     incidents(p)
                     recent(p)
                     gateway(p)
-                    providers(p)
+                    ProviderUsageSection()
                     tokens(p)
                 } else if status.error == nil {
                     HStack { Spacer(); ProgressView(); Spacer() }.listRowBackground(Color.clear)
@@ -48,7 +48,7 @@ struct StatusView: View {
             .listStyle(.insetGrouped)
             .navigationTitle("Status")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { liveDot }
+                ToolbarItem(placement: .topBarLeading) { ConnectionBadge() }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task {
@@ -76,17 +76,6 @@ struct StatusView: View {
     }
 
     // MARK: header
-
-    private var liveDot: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { ctx in
-            let age = status.updatedAt.map { ctx.date.timeIntervalSince($0) }
-            HStack(spacing: 5) {
-                Circle().fill(age.map { $0 < 15 } == true ? Color.green : Color.red).frame(width: 7, height: 7)
-                Text(age.map { $0 < 15 ? "Live" : "Stale \(Int($0))s" } ?? "Connecting")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
 
     private func kpis(_ p: JV) -> some View {
         let g = p["gateway"], J = p["jobs"]
@@ -244,20 +233,6 @@ struct StatusView: View {
         }
     }
 
-    @ViewBuilder private func providers(_ p: JV) -> some View {
-        let provs = p["providers"]["providers"].array
-        Section {
-            if provs.isEmpty { Text(p["providers"]["error"].string ?? "Loading provider usage…").foregroundStyle(.secondary) }
-            ForEach(Array(provs.enumerated()), id: \.offset) { _, pv in ProviderRow(provider: pv) }
-        } header: {
-            HStack {
-                Text("Providers")
-                Spacer()
-                if let at = p["providers"]["fetched_at"].date { Text("checked ").font(.caption) + Text(at, style: .relative).font(.caption) }
-            }
-        }
-    }
-
     @ViewBuilder private func tokens(_ p: JV) -> some View {
         let t = p["jobs"]["tokens_24h"].array
         if !t.isEmpty {
@@ -307,7 +282,7 @@ struct StatusPill: View {
         case "ok", "completed", "delivered", "connected", "healthy": .green
         case "running", "claimed": .blue
         case "failed", "error", "disconnected", "down": .red
-        case "missed", "paused", "unknown", "degraded": .orange
+        case "missed", "paused", "unknown", "degraded", "starting", "restarting", "draining", "waiting", "stopping": .orange
         default: .secondary
         }
         Text(label ?? t).font(.caption2.weight(.semibold)).padding(.horizontal, 7).padding(.vertical, 2)
@@ -407,43 +382,5 @@ private struct JobRow: View {
             if let err = job["last_error"].string { Text(err).font(.caption).foregroundStyle(.red).lineLimit(2) }
             if let why = job["paused_reason"].string { Text(why).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
         }
-    }
-}
-
-private struct ProviderRow: View {
-    let provider: JV
-    var body: some View {
-        let u = provider["usage"]
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(provider["provider"].string ?? "—").font(.subheadline.weight(.semibold))
-                if provider["is_default"].bool { StatusPill(text: "default") }
-                Spacer()
-                if let left = u["balance"]["remaining"].double {
-                    Text(left, format: .currency(code: u["balance"]["currency"].string ?? "USD")).font(.subheadline.weight(.semibold))
-                }
-            }
-            Text("\(provider["credentials"].array.count) configured credentials")
-                .font(.caption).foregroundStyle(.secondary)
-            if let scope = u["scope"].string { Text(scope).font(.caption).foregroundStyle(.secondary) }
-            ForEach(Array(u["windows"].array.enumerated()), id: \.offset) { _, w in
-                let used = min(100, max(0, w["used_percent"].double ?? 0))
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text(w["label"].string ?? "").font(.caption)
-                        Spacer()
-                        Text("\(Int((100 - used).rounded()))% left").font(.caption.weight(.semibold))
-                        if let r = w["resets_at"].date { Text("· resets").font(.caption).foregroundStyle(.secondary) + Text(r, style: .relative).font(.caption).foregroundStyle(.secondary) }
-                    }
-                    ProgressView(value: used, total: 100)
-                        .tint(100 - used < 15 ? .red : 100 - used < 35 ? .orange : .green)
-                }
-            }
-            if u["stale"].bool { Text("Showing an older reading; the latest check failed.").font(.caption).foregroundStyle(.orange) }
-            if u["windows"].array.isEmpty, u["balance"].isNull, let why = u["unavailable_reason"].string {
-                Text(why).font(.caption).foregroundStyle(.secondary)
-            }
-        }
-        .padding(.vertical, 2)
     }
 }

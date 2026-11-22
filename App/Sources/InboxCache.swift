@@ -9,6 +9,19 @@ struct InboxSnapshot: Codable {
     let savedAt: Date
 }
 
+struct ControlReceipt: Codable, Identifiable {
+    let id: UUID
+    let mode: String
+    let text: String
+    let at: Date
+
+    var item: ChatItem {
+        ChatItem(id: id.uuidString, kind: .control, text: text,
+                 footer: mode == "queue" ? "Queued for the next turn" : "Steer received by Hermes",
+                 timestamp: at.timeIntervalSince1970)
+    }
+}
+
 actor InboxDisk {
     static let shared = InboxDisk()
 
@@ -30,6 +43,19 @@ actor InboxDisk {
     func read(_ key: String) -> InboxSnapshot? {
         guard !forgotten.contains(account(key)), let data = try? Data(contentsOf: location(key)) else { return nil }
         return try? JSONDecoder().decode(InboxSnapshot.self, from: data)
+    }
+
+    func receipts(_ key: String) -> [ControlReceipt] {
+        guard !forgotten.contains(account(key)), let data = try? Data(contentsOf: location(key)) else { return [] }
+        return (try? JSONDecoder().decode([ControlReceipt].self, from: data)) ?? []
+    }
+
+    func record(_ receipt: ControlReceipt, key: String) throws {
+        guard !forgotten.contains(account(key)) else { return }
+        let url = location(key)
+        let rows = receipts(key).filter { $0.id != receipt.id } + [receipt]
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(Array(rows.suffix(80))).write(to: url, options: [.atomic, .completeFileProtection])
     }
 
     func save(_ page: InboxSnapshot, key: String) {

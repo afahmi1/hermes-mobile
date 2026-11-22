@@ -25,6 +25,10 @@ final class AppModel {
     var bots: [Bot] = []
     var health: HealthInfo?
     var checkedConnection = false
+    var lastHealthCheck: Date?
+    var healthFailure: String?
+    var needsLogin = false
+    private var healthRequest = UUID()
     /// The Mac's status dashboard data, polled for the app's lifetime (see StatusModel.poll).
     let status = StatusModel()
     var loadError: String?
@@ -69,9 +73,21 @@ final class AppModel {
     }
 
     func refreshHealth() async {
-        let latest = try? await API.shared.health()
-        guard !Task.isCancelled, signedIn else { return }
-        health = latest
+        let request = UUID()
+        healthRequest = request
+        do {
+            let latest = try await API.shared.health()
+            guard !Task.isCancelled, signedIn, request == healthRequest else { return }
+            health = latest
+            lastHealthCheck = Date()
+            healthFailure = nil
+            needsLogin = false
+        } catch {
+            guard !Task.isCancelled, signedIn, request == healthRequest else { return }
+            needsLogin = false
+            if case APIError.http(401, _) = error { needsLogin = true }
+            healthFailure = error.localizedDescription
+        }
         checkedConnection = true
     }
 
@@ -108,6 +124,10 @@ final class AppModel {
         status.reset()
         health = nil
         checkedConnection = false
+        healthRequest = UUID()
+        lastHealthCheck = nil
+        healthFailure = nil
+        needsLogin = false
         bots = []
         signedIn = false
         chats = [:]

@@ -16,11 +16,13 @@ import json
 import os
 import re
 import sqlite3
+import shutil
 import subprocess
 import threading
 import time
 import urllib.request
 import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,8 +31,8 @@ HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 HERE = Path(__file__).resolve().parent
 HERMES_BIN = os.environ.get("HERMES_BIN", str(Path.home() / ".local/bin/hermes"))
 PROVIDER_TTL = 60  # seconds between `hermes auth list` refreshes
-USAGE_TTL = {"anthropic": 600, "openai-codex": 300}  # per-provider poll interval (default 120s)
-FORCE_FLOOR = {"anthropic": 300, "openai-codex": 60}  # min gap even on manual refresh (default 15s)
+USAGE_TTL = {"openrouter": 300, "anthropic": 600, "openai-codex": 300}  # per-provider poll interval (default 120s)
+FORCE_FLOOR = {"openrouter": 60, "anthropic": 300, "openai-codex": 60}  # min gap even on manual refresh (default 15s)
 USAGE_PROVIDERS = {"anthropic", "openai-codex"}  # supported by `hermes usage`
 # Change tracking ("What's new"): the dashboard's own memory of which bots and cron jobs it has seen.
 STATE_FILE = Path(os.environ.get("HERMES_STATUS_STATE",
@@ -162,6 +164,12 @@ def gateway_status():
                            "last_success": iso_from_epoch(ok)})
 
     reasons = []
+    try:
+        free_mib = shutil.disk_usage(HOME).free // (1024 * 1024)
+        if free_mib < 512:
+            reasons.append("Hermes storage has %d MiB free. Saving chat history may fail." % free_mib)
+    except OSError:
+        pass
     if not alive:
         reasons.append("Gateway process is unavailable")
     if st.get("gateway_state") != "running":
@@ -297,11 +305,27 @@ def _model_default(cfg: Path):
         text = cfg.read_text()
     except Exception:
         return "", ""
-    m = re.search(r"^model:\n((?:(?:[ \t]+.*|[ \t]*#.*|)\n)+)", text, re.M)
-    block = m.group(1) if m else ""
-    d = re.search(r"^[ \t]+(?:default|model):\s*[\"']?([^\"'\n#]+)", block, re.M)
-    p = re.search(r"^[ \t]+provider:\s*[\"']?([^\"'\n#]+)", block, re.M)
-    return (d.group(1).strip() if d else ""), (p.group(1).strip() if p else "")
+    try:
+        import yaml
+        config = yaml.safe_load(text)
+        model = config.get("model") if isinstance(config, dict) else None
+        if isinstance(model, dict):
+            return str(model.get("default") or model.get("model") or ""), str(model.get("provider") or "")
+    except (ImportError, ValueError):
+        pass
+    except Exception:
+        return "", ""
+    # Stdlib-only installations: match direct children of the root model map.
+    match = re.search(r"^model:[ \t]*(?:#[^\n]*)?\n((?:[ \t]+[^\n]*\n?|\n)*)", text, re.M)
+    values = {}
+    indent = None
+    for line in (match.group(1).splitlines() if match else []):
+        field = re.match(r"^( +)([\w-]+):[ \t]*([^#]*)", line)
+        if field:
+            indent = len(field[1]) if indent is None else indent
+            if len(field[1]) == indent:
+                values[field[2]] = field[3].strip().strip("\"'")
+    return values.get("default") or values.get("model", ""), values.get("provider", "")
 
 
 def _fleet_meta():
@@ -593,47 +617,58 @@ def env_value(key):
     return os.environ.get(key)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # Usage requests carry a provider credential.
+
+
 def http_json(url, key, timeout=10):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}",
                                                "User-Agent": "hermes-status-dashboard"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    with urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout) as r:
+        return json.load(r)
 
 
 def openrouter_usage():
-    key = env_value("OPENROUTER_API_KEY")
-    if not key:
-        return {"unavailable_reason": "OPENROUTER_API_KEY not set"}
-    out = {"scope": "Usage from the environment key and its billing account", "source": "openrouter /credits", "windows": [], "details": []}
-    try:
-        d = http_json("https://openrouter.ai/api/v1/credits", key)["data"]
-        total, used = float(d.get("total_credits") or 0), float(d.get("total_usage") or 0)
-        out["balance"] = {"remaining": round(total - used, 4), "total": total,
-                          "used": used, "currency": "USD"}
-        if total > 0:
-            out["windows"].append({"label": "Credits used", "used_percent": round(used / total * 100, 1),
-                                   "resets_at": None, "detail": f"${total - used:,.2f} of ${total:,.2f} left"})
-    except Exception:
-        pass  # /credits needs a management key; fall back to the key's own limit below
-    try:
-        k = http_json("https://openrouter.ai/api/v1/key", key)["data"]
-        limit, left = k.get("limit"), k.get("limit_remaining")
-        if limit and "balance" not in out:
-            left = float(left if left is not None else limit)
-            out["balance"] = {"remaining": left, "total": float(limit), "currency": "USD",
-                              "label": "key limit"}
-            out["windows"].append({"label": "Key spend limit", "resets_at": None,
-                                   "used_percent": round((limit - left) / limit * 100, 1),
-                                   "detail": f"${left:,.2f} of ${limit:,.2f} left"
-                                             + (f" · resets {k['limit_reset']}" if k.get("limit_reset") else "")})
-        if k.get("usage_daily") is not None:
-            out["details"].append(f"Spent today ${k['usage_daily']:,.4f} · this month "
-                                  f"${k.get('usage_monthly') or 0:,.2f} · all-time ${k.get('usage') or 0:,.2f}")
-        if k.get("is_free_tier"):
-            out["details"].append("Free tier key")
-    except Exception as e:
-        if "balance" not in out:
-            out["unavailable_reason"] = f"key fetch failed: {type(e).__name__}"
+    env_key = env_value("OPENROUTER_API_KEY")
+    pool = (read_json(HOME / "auth.json", {}) or {}).get("credential_pool", {}).get("openrouter", [])
+    keys = dict.fromkeys(row.get("access_token") for row in pool if isinstance(row, dict)
+                         and row.get("base_url") in (None, "", "https://openrouter.ai/api/v1",
+                                                     "https://openrouter.ai/api/v1/"))
+    if env_key:
+        keys[env_key] = None
+    keys.pop(None, None)
+    keys.pop("", None)
+    if not keys:
+        return {"unavailable_reason": "No native OpenRouter credentials found"}
+
+    def check(key):
+        try:
+            key_data = http_json("https://openrouter.ai/api/v1/key", key, timeout=5)["data"]
+            return {field: key_data[field] for field in ("usage_daily", "usage_monthly", "usage")
+                    if isinstance(key_data.get(field), (int, float))}
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+
+    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+        readings = list(ex.map(check, keys))
+    out = {"source": "OpenRouter", "scope": "Spend across distinct keys in the default profile",
+           "key_count": len(keys), "keys_reporting": sum(bool(r) for r in readings),
+           "spend": {}, "windows": [], "details": []}
+    for field in ("usage_daily", "usage_monthly", "usage"):
+        amounts = [row[field] for row in readings if field in row]
+        if amounts:
+            out["spend"][field] = {"usd": sum(amounts), "reporting": len(amounts)}
+    if not out["keys_reporting"]:
+        out["unavailable_reason"] = "OpenRouter returned no key usage readings"
+    if env_key:
+        try:
+            account = http_json("https://openrouter.ai/api/v1/credits", env_key, timeout=5)["data"]
+            total, used = float(account["total_credits"]), float(account["total_usage"])
+            out["balance"] = {"remaining": round(total - used, 4), "total": total, "used": used,
+                              "currency": "USD", "label": "Environment key’s billing account"}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     return out
 
 
@@ -672,7 +707,7 @@ _usage_lock = threading.Lock()
 
 
 def _usable(d):
-    return bool(d and (d.get("windows") or d.get("balance")))
+    return bool(d and (d.get("windows") or d.get("balance") or d.get("spend")))
 
 
 def cached_usage(name, force=False):
@@ -740,6 +775,36 @@ def _kick_provider_refresh(force=False):
     threading.Thread(target=go, name="provider-refresh", daemon=True).start()
 
 
+def provider_ledger(homes):
+    totals, read_count, missing = {}, 0, 0
+    seen = set()
+    for _, home in homes:
+        path = (home / "state.db").resolve()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        try:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+                rows = db.execute("""
+                    SELECT COALESCE(NULLIF(billing_provider, ''), 'unattributed'),
+                           COUNT(DISTINCT session_id), SUM(api_call_count), SUM(input_tokens),
+                           SUM(output_tokens), MAX(last_seen)
+                      FROM session_model_usage GROUP BY 1
+                """).fetchall()
+        except sqlite3.Error:
+            missing += 1
+            continue
+        read_count += 1
+        for name, sessions, calls, inputs, outputs, latest in rows:
+            record = totals.setdefault(name, dict(sessions=0, calls=0, input_tokens=0, output_tokens=0))
+            for field, amount in (("sessions", sessions), ("calls", calls), ("input_tokens", inputs),
+                                  ("output_tokens", outputs)):
+                record[field] += amount or 0
+            if isinstance(latest, (int, float)):
+                record["last_seen"] = max(latest, record.get("last_seen", 0))
+    return totals, {"profiles_read": read_count, "profiles_unavailable": missing}
+
+
 def _refresh_providers(force):
     provs = {}
     for attempt in range(3):
@@ -747,21 +812,19 @@ def _refresh_providers(force):
         provs = parse_auth_list(text) if code == 0 else {}
         if provs:
             break
-        print(f"auth list attempt {attempt + 1} failed (exit {code}): {text.strip()[-200:]}", flush=True)
+        print(f"auth list attempt {attempt + 1} failed (exit {code})", flush=True)
         time.sleep(2)
+    inventory_error = None
     if not provs:
+        inventory_error = "Hermes credential inventory is unavailable"
         with _prov_lock:
-            prev = _prov_cache["data"]
-        if prev and prev.get("providers"):
-            _prov_cache["at"] = time.time() - PROVIDER_TTL + 15  # retry soon, keep last good list
-            return prev
-    cfg_default = None
-    try:
-        m = re.search(r"^model:\s*\n(?:\s+.*\n)*?\s+provider:\s*(\S+)",
-                      (HOME / "config.yaml").read_text(), re.M)
-        cfg_default = m.group(1).strip("'\"") if m else None
-    except Exception:
-        pass
+            previous = _prov_cache["data"]
+            if previous and previous.get("providers"):
+                _prov_cache.update(at=time.time() - PROVIDER_TTL + 15,
+                                   data=dict(previous, error=inventory_error, stale=True))
+                return
+    _, cfg_default = _model_default(HOME / "config.yaml")
+    ledger, coverage = provider_ledger(profile_homes())
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         futs = {n: ex.submit(cached_usage, n, force) for n in provs}
         for n, f in futs.items():
@@ -771,7 +834,10 @@ def _refresh_providers(force):
                 u = {"unavailable_reason": str(e)}
             provs[n]["usage"] = u
             provs[n]["is_default"] = n == cfg_default
-    data = {"fetched_at": datetime.now(timezone.utc).isoformat(), "default_provider": cfg_default,
+    for name, local in ledger.items():
+        provs.setdefault(name, {"provider": name, "historical_only": True, "credentials": [],
+                                "is_default": name == cfg_default})["local_usage"] = local
+    data = {"ledger": coverage, "error": inventory_error, "fetched_at": datetime.now(timezone.utc).isoformat(), "default_provider": cfg_default,
             "providers": sorted(provs.values(), key=lambda p: (not p["is_default"], p["provider"]))}
     with _prov_lock:
         _prov_cache.update(at=time.time(), data=data)

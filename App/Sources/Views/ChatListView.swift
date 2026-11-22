@@ -156,6 +156,12 @@ struct ChatListView: View {
             } else {
                 let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, telegram: filter == .telegram)
                 guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
+                if let warning = page.partialWarning {
+                    sessions = dedupe(page.data + sessions)
+                    cursor = nil
+                    error = warning
+                    return
+                }
                 sessions = dedupe(page.data)
                 cursor = page.next
             }
@@ -192,7 +198,12 @@ struct ChatListView: View {
                 return
             }
             guard !Task.isCancelled, generation == request, filter == requestedFilter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
-            sessions = dedupe(sessions + page.data)
+            if let warning = page.partialWarning {
+                error = warning
+                cursor = nil
+                return
+            }
+            sessions = page.reset == true ? dedupe(page.data) : dedupe(sessions + page.data)
             cursor = page.next
             if sessions.count <= 220, let key {
                 app.inboxes[key] = InboxSnapshot(sessions: sessions, cursor: cursor, savedAt: Date())
@@ -212,6 +223,7 @@ struct ChatListView: View {
             guard !Task.isCancelled, results == nil, filter != .archived, !loading,
                   let page = try? await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, telegram: filter == .telegram) else { continue }
             guard !Task.isCancelled, request == generation, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { continue }
+            if let warning = page.partialWarning { error = warning; continue }
             error = nil
             if sessions.isEmpty { cursor = page.next }
             let fresh = page.data

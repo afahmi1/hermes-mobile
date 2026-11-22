@@ -63,3 +63,40 @@ class SessionSourceTests(unittest.TestCase):
             b.invalidate_pages()
             b.session_page(16, None, None, (), False)
             self.assertEqual(fetch.call_count, 3)
+
+    def test_filtered_capsule_preserves_pin_visibility_and_cursor_offsets(self):
+        b = self.bridge
+        data = {pid: [dict(id=str(i), pinned=False, source="gui", last_active=i) for i in range(n,0,-1)]
+                for pid,n in [("default",15),("secondary",8)]}
+        def native(pid, offset, limit, exclude, first):
+            self.assertEqual(exclude, ("cron",))
+            src = data[pid]
+            return ([r.copy() for r in src[offset:offset+limit]],
+                    [dict(id="pin", pinned=True, source="gui", last_active=0)] if first else [],
+                    offset+limit < len(src))
+        with patch.object(b, "NATIVE_INBOX", True), patch.object(b, "served_profiles", return_value=set(data)), patch.object(b, "native_inbox_window", side_effect=native):
+            cursor, seen = None, []
+            while True:
+                page = b.all_sessions(4, cursor, exclude=("cron",), compact=True)
+                seen.extend((r["profile"], r["id"]) for r in page["data"])
+                cursor = page["next"]
+                if not cursor: break
+            self.assertEqual(len(seen), 25)
+            self.assertEqual(len(set(seen)),25)
+
+    def test_new_cursor_restarts_after_bridge_downgrade(self):
+        b = self.bridge
+        with patch.object(b, "NATIVE_INBOX", False), patch.object(b, "profile_ids", return_value=[]):
+            page = b.all_sessions(4, b._cursor_encode({"default":40, "_native":1}), compact=True)
+            self.assertTrue(page["reset"])
+
+    def test_restart_signal_expires_and_health_is_independent(self):
+        from datetime import datetime, timezone
+        now = 1740000000
+        fresh = datetime.fromtimestamp(now-3,timezone.utc).isoformat()
+        stale = datetime.fromtimestamp(now-500,timezone.utc).isoformat()
+        phase = self.bridge.gateway_phase
+        self.assertEqual(phase(False,None,{"restart_requested":True,"updated_at":fresh},{},now),"restarting")
+        self.assertEqual(phase(False,None,{"restart_requested":True,"updated_at":stale},{},now),"unavailable")
+        self.assertEqual(phase(False,None,{},{"phase":"running","started_at":fresh},now),"starting")
+        self.assertEqual(phase(True,"running",{},{},now),"running")

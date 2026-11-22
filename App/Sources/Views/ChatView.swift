@@ -81,11 +81,6 @@ struct ChatScreen: View {
             ApprovalSheet(req: req) { answer in Task { await chat.answer(req, choice: answer) } }
         }
         .sensoryFeedback(.impact(weight: .light), trigger: sendTick)
-        .task(id: chat.followUpNotice) {
-            guard chat.followUpNotice != nil else { return }
-            try? await Task.sleep(for: .seconds(5))
-            if !Task.isCancelled { chat.followUpNotice = nil }
-        }
         .sensoryFeedback(.success, trigger: chat.completedTick)
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
@@ -135,10 +130,6 @@ struct ChatScreen: View {
                 .padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
                 .padding(.horizontal, 12)
             }
-            if let note = chat.followUpNotice {
-                Text(note).font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-            }
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Message \(bot?.name ?? "Hermes")", text: $draft, axis: .vertical)
                     .lineLimit(1...8)
@@ -161,8 +152,8 @@ struct ChatScreen: View {
             .padding(.horizontal, 12).padding(.bottom, 6)
             if chat.isRunning && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 HStack(spacing: 20) {
-                    Button { followUp("queue") } label: { Label("Queue next", systemImage: "text.line.last.and.arrowtriangle.forward") }
-                    Button { followUp("steer") } label: { Label("Steer now", systemImage: "arrow.turn.up.right") }
+                    Button { followUp("queue") } label: { Label("Send next", systemImage: "text.line.last.and.arrowtriangle.forward") }
+                    Button { followUp("steer") } label: { Label("Guide this reply", systemImage: "arrow.turn.up.right") }
                     Spacer()
                 }
                 .font(.subheadline.weight(.medium)).disabled(!chat.acceptsFollowUp)
@@ -234,6 +225,19 @@ struct MessageRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12).padding(.trailing, 28)
+        case .control:
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(item.text).textSelection(.enabled)
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.turn.up.right")
+                    Text(item.footer ?? "Received")
+                    if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
+                }.font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+            .frame(maxWidth: .infinity, alignment: .trailing).padding(.horizontal, 14)
+            .accessibilityElement(children: .combine)
         case .tools:
             DisclosureGroup(isExpanded: $toolsExpanded) {
                 VStack(alignment: .leading, spacing: 6) {

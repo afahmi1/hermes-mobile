@@ -187,6 +187,7 @@ class Turn:
         self.admission = None
         self.generation = None
         self.client = None
+        self.steer_receipts = {}
         self.prompts: dict = {}  # prompt_id -> execution_generation of approvals still open
         self.served = {}
 
@@ -429,17 +430,35 @@ async def _follow_up(turn, mode, text, submission):
             if prior.text != text:
                 raise TurnError("Submission ID already used for another message.", 409)
             return {"status": "queued", "turn_id": prior.id}
+    steer_id = None
+    if mode == "steer" and submission is not None:
+        try:
+            steer_id = uuid.UUID(str(submission)).hex
+        except ValueError:
+            raise TurnError("Invalid steer submission ID.")
+        prior = turn.steer_receipts.get(steer_id)
+        if prior:
+            if prior[0] != text:
+                raise TurnError("Submission ID already used for another steer.", 409)
+            return await asyncio.shield(prior[1])
     client = turn.client
     if turn.done or client is None:
         raise TurnError("This turn is no longer accepting input. Refresh the conversation.", 409)
     if mode == "steer":
         if turn.generation is None:
             raise TurnError("The gateway has not started this turn yet.", 409)
-        result = await _rpc(client, "session.steer", session_id=turn.canonical_sid, text=text,
-                            execution_generation=turn.generation)
-        if result.get("status") != "queued":
-            raise TurnError("Hermes declined the steer. Your draft is available to queue.", 409)
-        return {"status": "steer_accepted"}
+        async def steer(generation):
+            result = await _rpc(client, "session.steer", session_id=turn.canonical_sid, text=text,
+                                execution_generation=generation)
+            if result.get("status") != "queued":
+                raise TurnError("Hermes declined this instruction. You can send it as the next turn.", 409)
+            return {"status": "steer_accepted", "execution_generation": generation}
+
+        if steer_id is None:
+            return await steer(turn.generation)
+        delivery = asyncio.create_task(steer(turn.generation))
+        turn.steer_receipts[steer_id] = (text, delivery)
+        return await asyncio.shield(delivery)
 
     receipt = await _rpc(client, "prompt.submit", session_id=turn.canonical_sid,
                          text=text, submission_id=submission)
