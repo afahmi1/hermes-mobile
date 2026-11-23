@@ -1,21 +1,37 @@
 import SwiftUI
 
+private final class NotificationDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, willFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        ReplyNotifier.shared.install()
+        return true
+    }
+}
+
 @main
 struct HermesMobileApp: App {
+    @UIApplicationDelegateAdaptor(NotificationDelegate.self) private var delegate
+    @State private var selectedTab = 0
     @State private var app = AppModel()
     @Environment(\.scenePhase) private var phase
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(selectedTab: $selectedTab)
                 .environment(app)
                 .tint(Color.accentColor)
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
                     app.retryDraftStorage()
                 }
+                .onChange(of: ReplyNotifier.shared.destination, initial: true) { _, destination in
+                    guard let destination else { return }
+                    if destination.open(in: app) { selectedTab = 0 }
+                    ReplyNotifier.shared.destination = nil
+                }
         }
         .onChange(of: phase) { _, now in
+            if now == .background { ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns) }
             if now == .active {
+                ReplyNotifier.shared.returned()
                 app.retryDraftStorage()
                 app.resumeLiveRuns()
             }
@@ -24,11 +40,12 @@ struct HermesMobileApp: App {
 }
 
 struct RootView: View {
+    @Binding var selectedTab: Int
     @Environment(AppModel.self) private var app
 
     var body: some View {
         if app.signedIn {
-            MainTabs()
+            MainTabs(selectedTab: $selectedTab)
                 .id(app.gatewaySession)
                 .task(id: app.gatewaySession) { await app.refreshBots() }
         } else {
@@ -38,22 +55,28 @@ struct RootView: View {
 }
 
 struct MainTabs: View {
+    @Binding var selectedTab: Int
     @Environment(\.scenePhase) private var phase
     @Environment(AppModel.self) private var app
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             ChatListView()
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
+                .tag(0)
             BotsView()
                 .tabItem { Label("Bots", systemImage: "person.2") }
+                .tag(1)
             ProjectsView()
                 .tabItem { Label("Projects", systemImage: "folder") }
+                .tag(2)
             StatusView()
                 .tabItem { Label("Status", systemImage: "waveform.path.ecg") }
+                .tag(3)
                 .badge(app.status.badge)
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tag(4)
         }
         .task(id: phase) {
             guard phase == .active else { return }
@@ -151,7 +174,7 @@ struct ConnectionBadge: View {
                 if !app.checkedConnection {
                     Text("Checking the bridge and gateway.")
                 } else if app.needsLogin {
-                    Button("Sign in again") { app.signOut() }
+                    Button("Sign in again") { app.sessionExpired() }
                 } else if let failure = app.healthFailure {
                     Text(failure)
                     if let last = app.health?.phase { Text("Last known gateway state: " + last).font(.caption) }

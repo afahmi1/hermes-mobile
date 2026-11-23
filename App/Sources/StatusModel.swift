@@ -128,7 +128,10 @@ final class StatusModel {
             [b["id"].string, b["name"].string, b["served"].bool ? "s" : "", b["api_key"].bool ? "k" : ""]
                 .compactMap { $0 }.joined(separator: "|")
         }.sorted().joined(separator: ",")
-        if let last = lastBotKey, key != last { Task { await app.refreshBots() } }
+        // Also retry a bot list whose first load failed (the Mac was asleep at launch): the status
+        // payload arriving proves the gateway answers now.
+        let changed = lastBotKey.map { $0 != key } ?? false
+        if changed || !app.botsLoaded || app.loadError != nil { Task { await app.refreshBots() } }
         lastBotKey = key
         // Announce everything that happened since the last poll (one banner, summarized).
         let all = p["changes"]["events"].array

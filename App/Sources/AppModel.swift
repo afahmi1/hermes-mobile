@@ -22,7 +22,8 @@ struct ChatRef: Hashable, Identifiable {
 final class AppModel {
     var signedIn = API.shared.isSignedIn
     private(set) var gatewaySession = UUID()
-    private(set) var savedGateways = API.accounts.servers
+    private let accounts: SavedGateways
+    private(set) var savedGateways: [URL]
     var inboxPath: [ChatRef] = []
     var bots: [Bot] = []
     private(set) var botsLoaded = false
@@ -54,7 +55,9 @@ final class AppModel {
     private let visibleChats = NSMapTable<NSString, ChatModel>.strongToWeakObjects()
 
 
-    init() {
+    init(accounts: SavedGateways = API.accounts) {
+        self.accounts = accounts
+        savedGateways = accounts.servers
         #if DEBUG
         // Simulator / automation hook (debug builds only): `-HMServer <url> -HMToken <token>` signs in
         // without a password. Tokens come from `hermes_mobile_bridge.py --issue-token <name>` on the Mac.
@@ -69,12 +72,12 @@ final class AppModel {
                 API.activate(login)
                 signedIn = true
                 #else
-                if API.accounts.remember(login) { API.activate(login); signedIn = true }
+                if accounts.remember(login) { API.activate(login); signedIn = true }
                 #endif
             }
         }
         #endif
-        savedGateways = API.accounts.servers
+        savedGateways = accounts.servers
         DevicePreferences.migrate(account: inboxAccount)
     }
 
@@ -94,7 +97,7 @@ final class AppModel {
         } catch {
             guard request == botRequest, !Task.isCancelled else { return }
             loadError = error.localizedDescription
-            if case APIError.http(401, _) = error { signOut() }
+            if case APIError.http(401, _) = error { sessionExpired() }
         }
     }
 
@@ -168,51 +171,68 @@ final class AppModel {
         for chat in chats.values { chat.retryDraftStorage() }
     }
 
+    var hasLiveRuns: Bool { chats.values.contains { $0.isRunning } || newChats.values.contains { $0.isRunning } }
+
+    func hasLiveRuns(excluding chat: ChatModel) -> Bool {
+        chats.values.contains { $0 !== chat && $0.isRunning } || newChats.values.contains { $0 !== chat && $0.isRunning }
+    }
+
     func resumeLiveRuns() {
         for c in chats.values { c.resumeIfNeeded() }
     }
 
     func connect(_ login: GatewayLogin) throws {
-        let prior = inboxAccount
-        let oldURL = API.shared.baseURL
-        guard API.accounts.remember(login) else {
+        guard let origin = SavedGateways.origin(login.server) else { throw APIError.badResponse }
+        let canonical = GatewayLogin(server: origin, token: login.token)
+        guard accounts.remember(canonical) else {
             throw APIError.http(0, "Unable to save this device’s sign-in in Keychain.")
         }
-        if let prior, oldURL == login.server, API.shared.token != login.token {
-            Task { await InboxDisk.shared.forget(prior) }
-            ComposerDisk.shared.forget(prior)
-            DevicePreferences.forget(prior)
-        }
-        changeGateway(login)
+        // The bridge issues opaque device grants. Only the identical origin and grant may
+        // reopen saved drafts or unconfirmed sends, even when two grants use the same URL.
+        changeGateway(canonical)
+    }
+
+    func sessionExpired() {
+        guard let server = API.shared.baseURL else { return }
+        if accounts.credential(server)?.token == API.shared.token { _ = accounts.forget(server) }
+        accounts.defaults.set(server.absoluteString, forKey: "server")
+        // Keep device-protected writing in its original grant scope after involuntary sign-out.
+        changeGateway(nil)
+    }
+
+    func savedServer(forAccount id: String) -> URL? {
+        savedGateways.first { accounts.credential($0).map(API.accountID(for:)) == id }
     }
 
     func switchGateway(_ url: URL) throws {
-        guard let login = API.accounts.credential(url) else { throw APIError.notSignedIn }
-        UserDefaults.standard.set(login.server.absoluteString, forKey: "server")
+        guard let login = accounts.credential(url) else { throw APIError.notSignedIn }
+        accounts.defaults.set(login.server.absoluteString, forKey: "server")
         changeGateway(login)
     }
 
     func openDestinationChat(_ chat: SessionSummary, on login: GatewayLogin) throws {
-        guard API.accounts.credential(login.server) == login else { throw APIError.notSignedIn }
+        guard accounts.credential(login.server) == login else { throw APIError.notSignedIn }
         if API.shared.baseURL != login.server || API.shared.token != login.token { try switchGateway(login.server) }
         inboxPath = [ChatRef(profile: chat.profile, sessionId: chat.id)]
     }
 
-    /// Remove a saved gateway that is not the active one: revoke its grant when the host answers, then
-    /// delete its credential, cached inboxes, drafts and per-gateway preferences from this phone.
+    /// Remove the local entry before waiting for a best-effort revoke, so it cannot become
+    /// the active destination during that request. Send the captured grant to its own host.
     func forgetGateway(_ url: URL) async {
-        guard url != API.shared.baseURL, let login = API.accounts.credential(url) else { return }
-        try? await API.shared.revokeSavedDevice(login)
+        guard let login = accounts.credential(url), login.server != API.shared.baseURL else { return }
         let account = API.accountID(for: login)
-        _ = API.accounts.forget(login.server)
-        await InboxDisk.shared.forget(account)
+        _ = accounts.forget(login.server)
+        savedGateways = accounts.servers
         ComposerDisk.shared.forget(account)
         DevicePreferences.forget(account)
-        savedGateways = API.accounts.servers
+        let client = API.shared
+        async let revoke: Void? = try? client.revokeSavedDevice(login)
+        await InboxDisk.shared.forget(account)
+        _ = await revoke
     }
 
     func signOut() {
-        if let server = API.shared.baseURL { _ = API.accounts.forget(server) }
+        if let server = API.shared.baseURL { _ = accounts.forget(server) }
         if let account = inboxAccount {
             Task { await InboxDisk.shared.forget(account) }
             ComposerDisk.shared.forget(account)
@@ -226,7 +246,7 @@ final class AppModel {
         for chat in chats.values { chat.cancelLocalFollow() }
         inboxes.removeAll()
         API.activate(login)
-        savedGateways = API.accounts.servers
+        savedGateways = accounts.servers
         gatewaySession = UUID()
         loadError = nil
         status.reset()

@@ -152,7 +152,7 @@ struct ChatScreen: View {
         }
         .fullScreenCover(isPresented: Binding(get: { !showFullComposer && previewedImage != nil },
                                              set: { if !$0 { previewedImage = nil } })) { imagePreview }
-        .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: .any(of: [.images, .videos]))
+        .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: imagesAvailable ? .any(of: [.images, .videos]) : .videos)
         .task(id: pickerItem) { if let pickerItem { await importMedia(pickerItem) } }
         .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             importFiles(result)
@@ -167,7 +167,7 @@ struct ChatScreen: View {
                     defer { preparingMedia = false }
                     do {
                         guard let preview = await image.byPreparingThumbnail(ofSize: CGSize(width: 1600, height: 1600)) else { throw ChatMedia.Failure.unreadable }
-                        if account == app.inboxAccount { chat.draftAttachments.append(try ChatMedia.jpeg(preview, name: "Camera")) }
+                        try appendMedia([ChatMedia.jpeg(preview, name: "Camera")], account: account)
                     } catch { chat.error = error.localizedDescription }
                 }
             }.ignoresSafeArea()
@@ -176,7 +176,7 @@ struct ChatScreen: View {
             if mediaCapabilities?.video == true, chat.draftAttachments.isEmpty {
                 Button("Send clip for Hermes video analysis") { prepareClip() }
             }
-            Button("Choose from up to 3 frames") { prepareFrames() }
+            if imagesAvailable { Button("Choose from up to 3 frames") { prepareFrames() } }
             Button("Cancel", role: .cancel) { discardVideo() }
         } message: { Text(mediaCapabilities?.video == true ? "A clip includes audio and may be processed by the gateway’s video provider. Frames are still images you can review before sending." : "This gateway accepts still images. Review and remove frames before sending. Frames contain no audio.") }
         .onDisappear { discardVideo() }
@@ -184,7 +184,12 @@ struct ChatScreen: View {
         .sensoryFeedback(.success, trigger: chat.completedTick)
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
-        .task(id: chat.profile) { mediaCapabilities = try? await API.shared.mediaCapabilities(profile: chat.profile) }
+        // Re-ask when the gateway comes back: one failed probe must not hide attachments for the visit.
+        .task(id: [chat.profile, app.health?.ok == true ? "up" : "down"]) {
+            if let latest = try? await API.shared.mediaCapabilities(profile: chat.profile), !Task.isCancelled {
+                mediaCapabilities = latest
+            }
+        }
         .task(id: scenePhase) { if scenePhase == .active { await poll() } }
     }
 
@@ -227,7 +232,7 @@ struct ChatScreen: View {
     private var filesAvailable: Bool { mediaCapabilities?.files == true }
 
     private var canAttach: Bool {
-        !chat.isRunning && (imagesAvailable || filesAvailable)
+        !chat.isRunning && (imagesAvailable || filesAvailable || mediaCapabilities?.video == true)
     }
 
     private var attachmentLimitReached: Bool {
@@ -284,7 +289,15 @@ struct ChatScreen: View {
             if let e = chat.error {
                 HStack(alignment: .top) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text(e).font(.footnote)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(e).font(.footnote)
+                        if chat.hasUnconfirmedSend {
+                            Button("Move back to composer") { Task { await chat.cancelUnconfirmedSend() } }
+                                .font(.footnote.weight(.semibold))
+                                .frame(minHeight: 44, alignment: .leading)
+                                .accessibilityHint("Stops waiting for confirmation and returns the message for editing")
+                        }
+                    }
                     Spacer()
                     Button { chat.error = nil } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
                         .accessibilityLabel("Dismiss error")
@@ -305,8 +318,10 @@ struct ChatScreen: View {
             HStack(alignment: .bottom, spacing: 8) {
                 if canAttach {
                     Menu {
+                        if imagesAvailable || mediaCapabilities?.video == true {
+                            Button { showPicker = true } label: { Label(imagesAvailable ? "Photo or video" : "Video", systemImage: "photo.on.rectangle") }
+                        }
                         if imagesAvailable {
-                            Button { showPicker = true } label: { Label("Photo or video", systemImage: "photo.on.rectangle") }
                             if UIImagePickerController.isSourceTypeAvailable(.camera) {
                                 Button { openCamera() } label: { Label("Take photo", systemImage: "camera") }
                             }
@@ -336,13 +351,15 @@ struct ChatScreen: View {
                 if chat.isRunning {
                     Button { Task { await chat.stop() } } label: {
                         Image(systemName: "stop.circle.fill").font(.system(size: 32)).foregroundStyle(.red)
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
                     }
                     .accessibilityLabel("Stop")
                 } else {
                     Button { send() } label: {
                         Image(systemName: "arrow.up.circle.fill").font(.system(size: 32))
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
                     }
-                    .disabled(preparingMedia || chat.savingRuntime || (chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty && chat.pastedTexts.isEmpty))
+                    .disabled(preparingMedia || chat.savingRuntime || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     .accessibilityLabel("Send")
                 }
             }
@@ -369,19 +386,37 @@ struct ChatScreen: View {
         }
     }
 
+    private func issue(for assets: [SendAttachment]) -> String? {
+        AttachmentSelection.issue(assets, fileLimit: mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024,
+                                   videoLimit: mediaCapabilities?.maxVideoBytes ?? 4 * 1024 * 1024)
+    }
+
+    private func appendMedia(_ assets: [SendAttachment], account: String?) {
+        guard !Task.isCancelled, let account, account == app.inboxAccount else { return }
+        let proposed = chat.draftAttachments + assets
+        if let problem = issue(for: proposed) { chat.error = problem; return }
+        chat.draftAttachments = proposed
+    }
+
     private func importMedia(_ item: PhotosPickerItem) async {
+        let account = app.inboxAccount
         preparingMedia = true
         defer { preparingMedia = false; pickerItem = nil }
         do {
             if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
                 discardVideo()
-                pickedVideo = try await MediaImport.videoFile(from: item)
+                let file = try await MediaImport.videoFile(from: item)
+                guard !Task.isCancelled, let account, account == app.inboxAccount else {
+                    try? FileManager.default.removeItem(at: file)
+                    return
+                }
+                pickedVideo = file
                 chooseVideo = true
             } else {
                 let data = try await MediaImport.imageData(from: item)
                 if Task.isCancelled { return }
                 let asset = try await Task.detached(priority: .userInitiated) { try ChatMedia.image(from: data) }.value
-                if !Task.isCancelled { chat.draftAttachments.append(asset) }
+                appendMedia([asset], account: account)
             }
         } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
     }
@@ -402,7 +437,6 @@ struct ChatScreen: View {
             return
         }
         let account = app.inboxAccount
-        let cap = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
         preparingMedia = true
         Task {
             defer { preparingMedia = false }
@@ -412,13 +446,7 @@ struct ChatScreen: View {
                 }
                 try Task.checkCancellation()
                 let asset = try ChatMedia.pasted(preview)
-                guard account == app.inboxAccount else { return }
-                guard asset.byteCount <= cap,
-                      chat.draftAttachments.reduce(0, { $0 + $1.byteCount }) + asset.byteCount <= cap else {
-                    chat.error = "The attachments exceed this bot’s limit. Remove an attachment and try again."
-                    return
-                }
-                chat.draftAttachments.append(asset)
+                appendMedia([asset], account: account)
             } catch {
                 if !Task.isCancelled { chat.error = error.localizedDescription }
             }
@@ -442,9 +470,8 @@ struct ChatScreen: View {
             preparingMedia = true
             Task {
                 defer { preparingMedia = false }
-                let original = chat.draftAttachments
                 var added: [SendAttachment] = []
-                var left = cap - original.reduce(0) { $0 + $1.byteCount }
+                var left = cap - chat.draftAttachments.reduce(0) { $0 + $1.byteCount }
                 for url in urls {
                     if Task.isCancelled { return }
                     let accessed = url.startAccessingSecurityScopedResource()
@@ -454,7 +481,7 @@ struct ChatScreen: View {
                         if type?.conforms(to: .movie) == true {
                             guard urls.count == 1 else { chat.error = "Choose a video on its own to review the clip or frames."; return }
                             let snapshot = try await Task.detached { try MediaStaging.stage(url) }.value
-                            guard account == app.inboxAccount else { try? FileManager.default.removeItem(at: snapshot); return }
+                            guard !Task.isCancelled, account == app.inboxAccount else { try? FileManager.default.removeItem(at: snapshot); return }
                             discardVideo()
                             pickedVideo = snapshot
                             chooseVideo = true
@@ -475,8 +502,7 @@ struct ChatScreen: View {
                         return
                     }
                 }
-                guard chat.draftAttachments == original, account == app.inboxAccount else { return }
-                chat.draftAttachments.append(contentsOf: added)
+                appendMedia(added, account: account)
             }
         }
     }
@@ -495,7 +521,7 @@ struct ChatScreen: View {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
                 let clip = try await ChatMedia.clip(from: url, maxBytes: caps.maxVideoBytes)
-                if account == app.inboxAccount { chat.draftAttachments = [clip] }
+                appendMedia([clip], account: account)
             } catch { chat.error = error.localizedDescription }
         }
     }
@@ -509,7 +535,7 @@ struct ChatScreen: View {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
                 let frames = try await ChatMedia.frames(from: url, count: min(3, 4 - chat.draftAttachments.count))
-                if account == app.inboxAccount { chat.draftAttachments += frames }
+                appendMedia(frames, account: account)
             } catch { chat.error = error.localizedDescription }
         }
     }
@@ -528,9 +554,9 @@ struct ChatScreen: View {
 
     private func send() {
         let attachments = chat.draftAttachments
-        let budget = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
-        guard attachments.reduce(0, { $0 + $1.byteCount }) <= budget else {
-            chat.error = "The attachments exceed this bot’s limit. Remove an attachment and try again."
+        let text = chat.combinedDraft
+        if let problem = issue(for: attachments) {
+            chat.error = problem
             return
         }
         // The draft and pasted text are cleared by ChatModel.send only after the outbox is staged,
@@ -538,10 +564,13 @@ struct ChatScreen: View {
         followLatest = true
         sendTick += 1
         let context = ProjectContext.chosen(scope: projectScope?.projectID, optedIn: includeProjectContext && !chat.isRunning)
+        let opted = includeProjectContext
         includeProjectContext = false  // ask every send
         Task {
-            await chat.send(chat.combinedDraft, projectContext: context, attachments: chat.draftAttachments)
+            await chat.send(text, projectContext: context, attachments: attachments)
             app.adopt(chat, draftKey: draftKey)
+            // A send that never left keeps its draft, so it keeps the context choice made for it too.
+            if opted, !chat.isRunning, !chat.hasUnconfirmedSend, chat.combinedDraft == text, chat.draftAttachments == attachments { includeProjectContext = true }
         }
     }
 
@@ -724,7 +753,10 @@ final class PasteTextView: UITextView {
 
     /// Read the pasteboard only at the moment of an actual paste, never on load or appear.
     override func paste(_ sender: Any?) {
-        if let image = UIPasteboard.general.image {
+        // Spreadsheets, slides and Universal Clipboard often carry a picture of the copied text beside
+        // the text itself. Text wins when both are present; an image-only pasteboard attaches the image.
+        let board = UIPasteboard.general
+        if !board.hasStrings, board.hasImages, let image = board.image {
             onPasteImage?(image)
             return
         }

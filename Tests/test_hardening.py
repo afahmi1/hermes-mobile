@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Bridge"))
 import bridge_receipts
@@ -59,6 +59,54 @@ class PaginationTests(unittest.TestCase):
             self.assertEqual(sorted(set(seen)), ["s%03d" % i for i in range(100)], pinned)
             self.assertEqual(len(seen), len(set(seen)), pinned)
 
+    def test_all_pin_windows_do_not_hide_the_next_unpinned_chat(self):
+        for pins in (range(60), range(20, 80), range(40, 96)):
+            seen, rounds = page_all(self.rows(100, pinned=set(pins)), 8)
+            self.assertEqual(sorted(seen), ["s%03d" % i for i in range(100)])
+            self.assertLess(rounds, 50)
+
+    def test_pin_only_window_holds_older_chats_from_other_bots(self):
+        sources = {"a": self.rows(3, pinned={0, 1}),
+                   "b": [{"id": "older", "last_active": 2, "source": "gui"}]}
+        def read(method, pid, path):
+            return gateway(sources[pid])(method, pid, path)
+        with patch.object(bridge, "profile_ids", return_value=["a", "b"]), patch.object(bridge, "key_for", return_value="key"), \
+                patch.object(bridge, "gw", side_effect=read), patch.object(bridge, "with_mobile_origins", side_effect=lambda r: r):
+            chats, cursor = [], None
+            for _ in range(5):
+                page = bridge.all_sessions(2, cursor)
+                chats.extend(row["id"] for row in page["data"] if not row.get("pinned"))
+                cursor = page["next"]
+                if not cursor:
+                    break
+            self.assertEqual(chats, ["s002", "older"])
+            self.assertIsNone(cursor)
+
+    def test_temporarily_unavailable_profile_delivers_pins_once_after_recovery(self):
+        serve = gateway(self.rows(5, pinned={4}))
+        def read(method, pid, path):
+            if pid == "a":
+                return 200, {"data": []}
+            if read.first:
+                read.first = False
+                return 503, None
+            return serve(method, pid, path)
+        read.first = True
+        with patch.object(bridge, "profile_ids", return_value=["a", "b"]), patch.object(bridge, "key_for", return_value="key"), \
+                patch.object(bridge, "gw", side_effect=read), patch.object(bridge, "with_mobile_origins", side_effect=lambda r: r):
+            first = bridge.all_sessions(2, None)
+            self.assertIn("b", first["errors"])
+            ids = []
+            cursor = first["next"]
+            for _ in range(6):
+                if not cursor:
+                    break
+                page = bridge.all_sessions(2, cursor)
+                ids.extend(row["id"] for row in page["data"])
+                cursor = page["next"]
+            self.assertIsNone(cursor)
+            self.assertEqual(sorted(ids), ["s%03d" % i for i in range(5)])
+
     def test_paging_ends_when_only_pins_remain(self):
         seen, rounds = page_all(self.rows(45, pinned=set(range(45))), 40)
         self.assertLess(rounds, 5)
@@ -87,19 +135,28 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(journal.pending(), [])
             self.assertEqual(json.loads(journal.get("turn-a")["terminal"])["event"], "run.failed")
 
-    def test_finished_receipts_expire_and_pending_ones_stay(self):
+    def test_a_months_old_offline_send_recovers_its_original_receipt(self):
+        import uuid
+        submission = uuid.uuid4()
+        turn_id = "turn_" + submission.hex
         with tempfile.TemporaryDirectory() as tmp:
-            journal = bridge_receipts.Journal(Path(tmp))
-            old = time.time() - 40 * 86400
+            directory = Path(tmp)
+            journal = bridge_receipts.Journal(directory)
+            choice = bridge_turns.clean_choice({})
+            fingerprint = bridge_receipts.fingerprint("default", "sid", "hello", choice, None)
             with sqlite3.connect(journal.path) as db:
-                for name, started, terminal in (("old-done", old, "{}"), ("old-pending", old, None),
-                                                ("new-done", time.time(), "{}")):
-                    db.execute("INSERT INTO receipts(id, profile, sid, fingerprint, choice, started, terminal) "
-                               "VALUES (?,?,?,?,?,?,?)", (name, "default", name, "f", "{}", started, terminal))
-            self.assertEqual(journal.prune(30 * 86400), 1)
-            self.assertIsNone(journal.get("old-done"))
-            self.assertIsNotNone(journal.get("old-pending"))
-            self.assertIsNotNone(journal.get("new-done"))
+                db.execute("INSERT INTO receipts(id, profile, sid, fingerprint, choice, started, terminal) "
+                           "VALUES (?,?,?,?,?,?,?)", (turn_id, "default", "sid", fingerprint, "{}", time.time() - 90 * 86400,
+                                                      '{"event":"run.completed"}'))
+            bridge_turns.recover_primary(directory, lambda _: directory, None)
+            try:
+                recovered = bridge_turns.start_primary("default", directory, "sid", "hello", {}, submission, None,
+                                                       directory, lambda: self.fail("retried a completed send"), None)
+                self.assertTrue(recovered.done)
+                self.assertEqual(recovered.id, turn_id)
+            finally:
+                with bridge_turns.TURNS_LOCK:
+                    bridge_turns.TURNS.pop(turn_id, None)
 
 
 class Request(bridge.H):
@@ -142,6 +199,31 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(bridge._bounded_int(None, 40, 1, 100), 40)
         self.assertEqual(bridge._bounded_int("0", 40, 1, 100), 1)
         self.assertEqual(bridge._bounded_int("999", 40, 1, 100), 100)
+
+    def test_truncated_body_cannot_be_dispatched(self):
+        request = Request("/m/login")
+        request.connection = Mock()
+        request.rfile = io.BytesIO(b"{}")
+        request.headers["Content-Length"] = "15"
+        self.assertFalse(request._read_body())
+        self.assertTrue(request.close_connection)
+        self.assertEqual(request.status(), 400)
+
+    def test_stale_or_malformed_cursor_starts_again(self):
+        for invalid in ([], 123, {"default": -1}, {"_done": "default"}, {"_pin_runs": {"default": "two"}}):
+            with patch.object(bridge, "profile_ids", return_value=[]):
+                page = bridge.all_sessions(10, bridge._cursor_encode(invalid))
+            self.assertTrue(page["reset"])
+            self.assertIsNone(page["next"])
+
+    def test_disconnected_upstream_still_answers_the_phone(self):
+        for err in (ConnectionResetError(), bridge.http.client.IncompleteRead(b"")):
+            request = Request("/m/p/default/api/sessions/session/messages")
+            with patch.object(bridge, "key_for", return_value="fixture"), patch.object(bridge.http.client, "HTTPConnection") as conn:
+                conn.return_value.getresponse.return_value.read.side_effect = err
+                request.proxy(request.path, "")
+            self.assertEqual(request.status(), 502)
+            conn.return_value.close.assert_called_once()
 
     def test_login_without_a_readable_config_has_no_credentials(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(bridge, "HERMES", Path(tmp)):

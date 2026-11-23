@@ -31,6 +31,7 @@
 		A361553D096D10E613B2CFEE /* StatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2DA9159DDC16BE2AF3476DE /* StatusView.swift */; };
 		A4A842B468F6E4BFD7629888 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBF6F2AB0BD3858AAAAF4FFA /* AppModel.swift */; };
 		B16507F21903C2EEF6219FFB /* Projects.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD07289071E7483A587F926 /* Projects.swift */; };
+		B720454FD199801DFD0CDB87 /* ReplyNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */; };
 		C6254CDC81B9E435FBB3B981 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77BE1304B3824EAD4CAE8086 /* SignInView.swift */; };
 		CE8872AD244AC2FE04FB85DB /* API.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1476455C52D00777817E0CF2 /* API.swift */; };
 		DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2964B8E32E7A6E7CAE8E6CD /* Models.swift */; };
@@ -40,6 +41,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplyNotifier.swift; sourceTree = "<group>"; };
 		1476455C52D00777817E0CF2 /* API.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = API.swift; sourceTree = "<group>"; };
 		149305800C6FA857809273F1 /* DeletionPinView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionPinView.swift; sourceTree = "<group>"; };
 		14C8B1B8E8B3163B6AA3C3AC /* WorkspaceEditorViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceEditorViews.swift; sourceTree = "<group>"; };
@@ -89,6 +91,7 @@
 				C87199BB4AB4041206610E84 /* MediaStaging.swift */,
 				B2964B8E32E7A6E7CAE8E6CD /* Models.swift */,
 				AAD07289071E7483A587F926 /* Projects.swift */,
+				0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */,
 				785C4DB8C31E64EB728F4674 /* StatusModel.swift */,
 				84E690DA9F04A70286E6A83B /* StreamRecovery.swift */,
 				F13CB626AADCB78BCEFD62E2 /* Workspaces.swift */,
@@ -246,6 +249,7 @@
 				B16507F21903C2EEF6219FFB /* Projects.swift in Sources */,
 				13EC70EBF845B6FBB26EADC7 /* ProjectsView.swift in Sources */,
 				9871CAA201B1E5134B060C34 /* ProviderUsageView.swift in Sources */,
+				B720454FD199801DFD0CDB87 /* ReplyNotifier.swift in Sources */,
 				2D4D15E7A8B918383BC236CB /* RuntimeSheet.swift in Sources */,
 				2B813FA6CBE1A2730D43ED05 /* SettingsView.swift in Sources */,
 				C6254CDC81B9E435FBB3B981 /* SignInView.swift in Sources */,

@@ -43,7 +43,7 @@ struct ProjectsView: View {
         .task { await model.load() }
         .task { await workspaces.load() }  // separate from the catalog: its failure never hides it
         .onChange(of: model.state) { _, state in
-            if state == .failed(.signedOut), API.shared === originClient { app.signOut() }
+            if state == .failed(.signedOut), API.shared === originClient { app.sessionExpired() }
         }
     }
 

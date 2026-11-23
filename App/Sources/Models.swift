@@ -24,8 +24,8 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     let startedAt: Double?
     let lastActive: Double?
     let messageCount: Int?
-    let pinned: Bool?
-    let archived: Bool?
+    var pinned: Bool?
+    var archived: Bool?
     let endedAt: Double?
 
     enum CodingKeys: String, CodingKey {

@@ -64,6 +64,8 @@ final class ChatModel {
     private var app: AppModel? { API.shared === api ? owner : nil }
     private var recovery = StreamRecovery()
     private var confirmedPrimary = false
+    private var outboxRevision = UUID()
+    private var returningSend = false
     private var pendingSend: PendingSend?
     private var sendKey: String? {
         sessionId.flatMap { app?.inboxKey(profile: profile, filter: "outbox/" + $0) }
@@ -256,8 +258,14 @@ final class ChatModel {
         }
         if resumeLive, let key = sendKey {
             do {
+                let revision = outboxRevision
                 if let pending = try await InboxDisk.shared.pending(key) {
-                    guard !isRunning, !Task.isCancelled, key == sendKey else { return }
+                    guard revision == outboxRevision, !returningSend, !isRunning, !Task.isCancelled, key == sendKey else { return }
+                    if pending.returningToComposer == true || pendingSend?.returningToComposer == true {
+                        pendingSend = pending
+                        await returnSend(pending, key: key)
+                        return
+                    }
                     if pendingSend?.id != pending.id { clearStagedComposer(pending) }
                     pendingSend = pending
                     if Date() >= nextReceiptAttempt {
@@ -423,6 +431,7 @@ final class ChatModel {
             try await InboxDisk.shared.stage(send, key: key)
             guard key == sendKey else { throw APIError.notSignedIn }
             pendingSend = send
+            ReplyNotifier.shared.askOnce()
             clearStagedComposer(send)
             var local = ChatItem(id: send.id.uuidString, kind: .user, text: text)
             if projectContext != nil { local.contextNote = "Project instructions + reference files sent with this message" }
@@ -432,6 +441,50 @@ final class ChatModel {
             isRunning = false
             status = nil
             fail(error.localizedDescription)
+        }
+    }
+
+    /// True while a staged send is still waiting for the bridge to confirm it.
+    var hasUnconfirmedSend: Bool { pendingSend != nil && !isRunning && !returningSend }
+
+    /// Give up on a send the bridge never confirmed and return its text and files to the composer.
+    /// The bridge may still have accepted it, so the person is told to check the chat first.
+    func cancelUnconfirmedSend() async {
+        guard hasUnconfirmedSend, let send = pendingSend, let key = sendKey else { return }
+        await returnSend(send, key: key)
+    }
+
+    private func returnSend(_ send: PendingSend, key: String, reason: String? = nil) async {
+        guard !returningSend, key == sendKey, let account = composerAccount else { return }
+        returningSend = true
+        outboxRevision = UUID()
+        defer { returningSend = false; outboxRevision = UUID() }
+        var returning = send
+        returning.returningToComposer = true
+        pendingSend = returning
+        do {
+            // Persist the decision before any await that could let the process suspend. Subsequent
+            // launches must finish the return instead of attempting delivery again.
+            try await InboxDisk.shared.stage(returning, key: key)
+            guard key == sendKey else { return }
+            retryDraftStorage()
+            guard canEvictDraft else { throw CocoaError(.fileWriteUnknown) }
+            let snapshot = try ComposerDisk.shared.restoreSend(returning, account: account, scope: composerScope, id: draftID)
+            restoringComposer = true
+            draft = snapshot.text
+            pastedTexts = snapshot.pastes
+            draftAttachments = snapshot.media
+            restoringComposer = false
+            try await InboxDisk.shared.acknowledge(send.id, key: key)
+            guard key == sendKey else { return }
+            pendingSend = nil
+            items.removeAll { $0.id == send.id.uuidString }
+            receiptBackoff = 1
+            nextReceiptAttempt = .distantPast
+            if let reason { fail(reason) }
+            else { error = "Moved back to the composer. Refresh the chat to check whether Hermes already received it." }
+        } catch {
+            self.error = "Couldn’t finish returning this send. Reopen the chat to try again. " + error.localizedDescription
         }
     }
 
@@ -449,11 +502,13 @@ final class ChatModel {
                                                     choice: send.choice, projectContext: send.project, submission: send.id,
                                                     attachments: send.attachments ?? [], recovering: !allowLegacy)
             } catch APIError.http(404, _) where allowLegacy && send.attachments == nil {
-                // An old bridge does not implement send-once. Drop the retry record BEFORE the
-                // one legacy POST; a lost legacy acknowledgment cannot cause an automatic replay.
-                try await InboxDisk.shared.acknowledge(send.id, key: key)
+                // Legacy sends cannot be repeated safely. Keep the authored data recoverable
+                // across a crash, but turn off automatic delivery before the single legacy POST.
+                var legacy = send
+                legacy.returningToComposer = true
+                try await InboxDisk.shared.stage(legacy, key: key)
                 guard sendKey == key else { throw APIError.notSignedIn }
-                pendingSend = nil
+                pendingSend = legacy
                 run = try await api.startRun(profile: profile, session: session, text: send.text,
                                                     choice: send.choice, projectContext: send.project)
             }
@@ -474,21 +529,16 @@ final class ChatModel {
             // after delivery. Keep that original UUID until the bridge can confirm it.
             if case APIError.http(let code, _) = error,
                [400, 409, 413, 415, 422].contains(code) || (allowLegacy && [403, 404].contains(code)) {
-                try? await InboxDisk.shared.acknowledge(send.id, key: key)
-                pendingSend = nil
-                if draft.isEmpty && pastedTexts.isEmpty {
-                    draft = send.composerText ?? send.text
-                    pastedTexts = send.composerPastes ?? []
-                }
-                if draftAttachments.isEmpty, let attachments = send.attachments { draftAttachments = attachments }
-                items.removeAll { $0.id == send.id.uuidString }
-                fail(error.localizedDescription)
-            } else if pendingSend != nil {
+                await returnSend(send, key: key, reason: error.localizedDescription)
+            } else if pendingSend?.returningToComposer != true {
                 nextReceiptAttempt = Date().addingTimeInterval(receiptBackoff)
+                // The first failure is news. Later silent retries must not buzz the phone once a minute.
+                let first = receiptBackoff <= 1
                 receiptBackoff = min(60, receiptBackoff * 2)
-                fail("Waiting to confirm your send. Reopening this chat will check the same submission.")
+                let waiting = "Waiting to confirm your send. Reopening this chat will check the same submission."
+                if first { fail(waiting) } else { self.error = waiting }
             } else {
-                fail("The previous bridge could not confirm delivery. Check the saved chat before sending again.")
+                await returnSend(send, key: key, reason: "The bridge could not confirm delivery. Check the saved chat before sending again.")
             }
         }
     }
@@ -645,6 +695,7 @@ final class ChatModel {
                 do {
                     for try await ev in api.events(profile: profile, run: run, after: recovery.lastSequence,
                                                           epoch: recovery.epoch, routeRevision: network.revision) {
+                        guard !Task.isCancelled, runId == run, account == app?.inboxAccount else { break }
                         if ev.name == "stream.checkpoint" {
                             finished = try await restoreCheckpoint(ev, run: run)
                             if finished { break }
@@ -666,7 +717,7 @@ final class ChatModel {
                     // The turn is gone from the Mac (finished long ago, or the bridge restarted): Hermes's
                     // transcript has the outcome, so reload it instead of retrying.
                     finished = true
-                    if code == 401, let account, app?.inboxAccount == account { app?.signOut() }
+                    if code == 401, let account, app?.inboxAccount == account { app?.sessionExpired() }
                 } catch {
                     if Task.isCancelled { break }
                 }
@@ -730,12 +781,13 @@ final class ChatModel {
             items.append(ChatItem(id: "n-\(UUID().uuidString)", kind: .notice, text: ev.string("text") ?? ""))
         case "approval.request":
             let id = ev.string("request_id") ?? UUID().uuidString
-            guard !resolvedApprovals.contains(id) else { break }
+            guard !resolvedApprovals.contains(id), approval?.id != id, !waitingApprovals.contains(where: { $0.id == id }) else { break }
             enqueueApproval(ApprovalRequest(
                 id: id, runId: runId ?? "", generation: ev.raw["execution_generation"] as? Int,
                 command: ev.string("command") ?? "", description: ev.string("description") ?? "Hermes wants to run a command.",
                 choices: (ev.raw["choices"] as? [String]) ?? ["once", "deny"], requestId: ev.string("request_id")))
             status = "Waiting for your approval"
+            notify(.approval)
         case "run.completed":
             confirmedPrimary = true
             var answeredItem = streamingIndex
@@ -754,10 +806,12 @@ final class ChatModel {
             }
             runtimeNotice = nil
             completedTick += 1
+            notify(.reply)
             return true
         case "run.failed", "error":
             confirmedPrimary = true
             fail(ev.string("error") ?? ev.string("message") ?? "The run failed.")
+            notify(.failure)
             return true
         case "run.cancelled", "run.interrupted":
             confirmedPrimary = true
@@ -813,6 +867,17 @@ final class ChatModel {
     }
 
 
+
+    private func notify(_ event: ReplyNotifier.Event) {
+        guard let app else { return }
+        ReplyNotifier.shared.post(event, bot: app.botName(profile),
+                                  account: app.inboxAccount, profile: profile, session: sessionId)
+        if event != .approval {
+            // This run is over; if it was the last one, hand the background time back.
+            let others = app.hasLiveRuns(excluding: self)
+            ReplyNotifier.shared.settled(liveRuns: others)
+        }
+    }
 
     private func fail(_ message: String) {
         error = message

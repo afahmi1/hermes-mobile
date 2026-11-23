@@ -2,7 +2,7 @@ import Foundation
 
 @main
 struct ComposerDraftTests {
-    @MainActor static func main() throws {
+    @MainActor static func main() async throws {
         let account = GatewayLogin(server: URL(string: "https://draft-test.invalid")!, token: "temporary-fixture")
         API.activate(account)
         let app = AppModel()
@@ -72,6 +72,45 @@ struct ComposerDraftTests {
         let recovered = try disk.read(recoveryKey, scope: "main|session/chat-123")
         precondition(retry.canEvictDraft && retry.error == nil && recovered.text == "keep this edit")
         disk.forget(recoveryKey)
+        // Re-pairing the same URL can grant access to a different identity. Exercise the
+        // production sign-in/expiry paths against an isolated credential store.
+        let suite = "composer-isolation-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var credentials = [String: String]()
+        let vault = SavedGateways(defaults: defaults, read: { credentials[$0] },
+                                  write: { credentials[$0] = $1; return true },
+                                  remove: { credentials.removeValue(forKey: $0); return true })
+        let host = AppModel(accounts: vault)
+        let firstLogin = GatewayLogin(server: account.server, token: UUID().uuidString)
+        let nextLogin = GatewayLogin(server: account.server, token: UUID().uuidString)
+        let firstKey = API.accountID(for: firstLogin)
+        let nextKey = API.accountID(for: nextLogin)
+        defer { disk.forget(firstKey); disk.forget(nextKey) }
+        try host.connect(firstLogin)
+        let original = host.chat(for: existing)
+        original.draft = "private from first account"
+        original.draftAttachments = [image]
+        precondition(disk.scopes(firstKey) == ["main|session/chat-123"])
+        let alias = URL(string: "https://DRAFT-TEST.invalid:443/")!
+        await host.forgetGateway(alias)
+        precondition(host.signedIn && vault.credential(alias) == firstLogin && !disk.scopes(firstKey).isEmpty)
+        host.sessionExpired()
+        precondition(!host.signedIn && vault.credential(account.server) == nil)
+        try host.connect(nextLogin)
+        let replacement = host.chat(for: existing)
+        precondition(replacement.combinedDraft.isEmpty && replacement.draftAttachments.isEmpty && disk.scopes(nextKey).isEmpty)
+        replacement.draft = "private from second account"
+        try host.connect(firstLogin)
+        let restored = host.chat(for: existing)
+        precondition(restored.draft == "private from first account" && restored.draftAttachments == [image])
+        host.signOut()
+        precondition(disk.scopes(firstKey).isEmpty && disk.scopes(nextKey) == ["main|session/chat-123"])
+        try host.connect(nextLogin)
+        precondition(host.chat(for: existing).draft == "private from second account")
+        host.signOut()
+        precondition(disk.scopes(nextKey).isEmpty)
+        print("Verified same-origin grant isolation, protected drafts after expiry, and scoped sign-out.")
         print("Verified cold-process composer restoration, draft adoption, isolation, selective clearing and sign-out cleanup")
     }
 }

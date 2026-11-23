@@ -113,6 +113,20 @@ enum FileImport {
     }
 }
 
+/// Shared by all import sources and the final Send check, including drafts restored from disk.
+enum AttachmentSelection {
+    static func issue(_ assets: [SendAttachment], fileLimit: Int, videoLimit: Int) -> String? {
+        if assets.count > 4 { return "Choose up to four attachments for one message." }
+        let hasVideo = assets.contains { $0.mime == "video/mp4" }
+        if hasVideo && assets.count != 1 { return "Send a video on its own, or choose still frames." }
+        let limit = hasVideo ? videoLimit : fileLimit
+        if assets.reduce(0, { $0 + $1.byteCount }) > limit {
+            return "The attachments exceed this bot’s limit. Remove an attachment and try again."
+        }
+        return nil
+    }
+}
+
 enum ChatMedia {
     enum Failure: LocalizedError {
         case unreadable, tooLarge, noFrames, downloadFailed

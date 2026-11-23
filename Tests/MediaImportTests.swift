@@ -24,6 +24,15 @@ enum MediaImportTests {
         do { _ = try ChatMedia.image(from: Data()); fatalError("decoded empty data") }
         catch ChatMedia.Failure.unreadable {}
 
+        let fixture = SendAttachment(mime: "image/jpeg", filename: "a.jpg", base64: "YQ==")
+        let clip = SendAttachment(mime: "video/mp4", filename: "a.mp4", base64: "YWJj")
+        precondition(AttachmentSelection.issue([fixture, fixture], fileLimit: 2, videoLimit: 3) == nil)
+        precondition(AttachmentSelection.issue([fixture, fixture], fileLimit: 1, videoLimit: 3) != nil)
+        precondition(AttachmentSelection.issue([clip], fileLimit: 1, videoLimit: 3) == nil)
+        precondition(AttachmentSelection.issue([clip], fileLimit: 6, videoLimit: 2) != nil)
+        precondition(AttachmentSelection.issue([fixture, clip], fileLimit: 20, videoLimit: 20) != nil)
+        precondition(AttachmentSelection.issue(Array(repeating: fixture, count: 5), fileLimit: 20, videoLimit: 20) != nil)
+
         // A HEIC original decodes through the same path (ImageIO reads it on-device).
 
         // Pasted-text collapse: a huge paste is isolated exactly; small edits stay inline.

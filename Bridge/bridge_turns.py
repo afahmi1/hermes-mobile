@@ -822,15 +822,10 @@ def start_primary(profile, home, sid, text, choice, submission, project, directo
         return turn
 
 
-RECEIPT_RETENTION = 30 * 86400
-
-
 def recover_primary(directory, profile_home, restore_workspace):
     journal = primary_journal(directory)
-    try:
-        journal.prune(RECEIPT_RETENTION)
-    except sqlite3.Error as error:
-        print("Could not prune send receipts: %s" % type(error).__name__, file=sys.stderr, flush=True)
+    # A phone can restore a staged send after months offline. Its UUID must still resolve to
+    # the original outcome; terminal() already removes the prompt, workspace and media.
     for row in journal.pending():
         with _admission_lock(row["id"]), _admission_lock((row["profile"], row["sid"])):
             if get_turn(row["id"]) is not None:

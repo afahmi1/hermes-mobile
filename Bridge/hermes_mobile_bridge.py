@@ -583,8 +583,20 @@ def _ro(pid):
 
 def _cursor_decode(raw):
     try:
-        return json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))) if raw else {}
-    except Exception:
+        value = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))) if raw else {}
+        if not isinstance(value, dict):
+            return {}
+        done, pin_runs = value.get("_done", []), value.get("_pin_runs", {})
+        missing_pins = value.get("_awaiting_pins", [])
+        if (not isinstance(done, list) or not all(isinstance(pid, str) for pid in done)
+                or not isinstance(pin_runs, dict) or not isinstance(missing_pins, list)
+                or not all(isinstance(pid, str) for pid in missing_pins)):
+            return {}
+        counts = [v for k, v in value.items() if k not in ("_done", "_pin_runs", "_awaiting_pins")]
+        if any(type(n) is not int or not 0 <= n < 2**63 for n in [*counts, *pin_runs.values()]):
+            return {}
+        return value
+    except (ValueError, TypeError, RecursionError):
         return {}
 
 
@@ -639,6 +651,7 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
     """One fetch round across profiles. Returns (rows, pins, new_offsets, done, errors, more_left)."""
     exhausted = set(offsets.get("_done", []))
     live = [p for p in pids if p not in exhausted]
+    awaiting_pins = set(live if first_page else offsets.get("_awaiting_pins", []))
     batch = min(100, limit * (3 if exclude else 1))
     eligible_profiles = served_profiles() if native else set()
 
@@ -648,7 +661,7 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
             try:
                 if pid not in eligible_profiles:
                     return pid, None, "Profile unavailable"
-                return pid, native_inbox_window(pid, off, limit, exclude, first_page), None
+                return pid, native_inbox_window(pid, off, limit, exclude, pid in awaiting_pins), None
             except Exception as error:
                 return pid, None, type(error).__name__
         if sources or archived:
@@ -679,10 +692,9 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
         # missed are back-filled after it. The window therefore ends at the last unpinned row.
         last_unpinned = max((i for i, r in enumerate(data) if not r.get("pinned")), default=-1)
         window, backfill = data[:last_unpinned + 1], data[last_unpinned + 1:]
-        # A full reply means the window was full, even when its last rows are in-window pins that the
-        # line above set aside. Judging by the trimmed window alone ended the profile one pin early
-        # and every older chat became unreachable. An all-pin reply has nothing left to page.
-        more = len(data) >= batch and last_unpinned >= 0
+        # An all-pin window can sit between two ordinary chats. At end-of-list the gateway
+        # also returns every pin again, even for offsets beyond the last row.
+        more = len(data) >= batch
         return pid, (window, backfill, more), None
 
     fetched, errors = {}, {}
@@ -696,7 +708,10 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
     keep = lambda r: r.get("source") not in exclude
     # A profile that still has rows may hold unseen rows as new as its last fetched one: nothing
     # older than that may be emitted yet, or those rows would land on a later page out of order.
-    safe = max((_ts(w[-1]) for w, _, more in fetched.values() if more and w), default=None)
+    # For a gateway window made entirely of pins, the first batch entries still bound
+    # how recent its next unseen ordinary chat can be. Hold older rows from other bots.
+    safe = max((_ts(w[-1] if w else pins[batch - 1]) for w, pins, more in fetched.values()
+                if more and (w or len(pins) >= batch)), default=None)
     candidates = sorted((r for w, _, _ in fetched.values() for r in w if keep(r) and (sources or archived or not r.get("pinned"))),
                         key=_ts, reverse=True)
     eligible = [r for r in candidates if safe is None or _ts(r) >= safe]
@@ -706,17 +721,38 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
         cutoff = safe  # None: every profile is exhausted, so everything fetched is final
     page = [r for r in eligible if cutoff is None or _ts(r) >= cutoff]  # ties stay together
     new_off, done = {}, set(exhausted)
+    pin_runs = dict(offsets.get("_pin_runs", {}))
     for pid in pids:
         off = int(offsets.get(pid, 0))
         if pid not in fetched:
             new_off[pid] = off
             continue
-        window, _, more = fetched[pid]
+        window, backfill, more = fetched[pid]
+        if not native and not sources and not archived and not window and backfill and more:
+            # No unpinned row can be skipped here. At most len(backfill) distinct pins
+            # can occupy consecutive real window positions before the next ordinary row.
+            traversed = pin_runs.get(pid, 0)
+            if traversed >= len(backfill):
+                done.add(pid)
+                pin_runs.pop(pid, None)
+                new_off[pid] = off
+            else:
+                new_off[pid] = off + batch
+                pin_runs[pid] = traversed + batch
+            continue
+        pin_runs.pop(pid, None)
         used = len(window) if cutoff is None else sum(1 for r in window if _ts(r) >= cutoff)
         new_off[pid] = off + used
         if not more and used >= len(window):
             done.add(pid)
-    pins = [r for w, bf, _ in fetched.values() for r in w + bf if r.get("pinned") and keep(r)] if first_page and not sources and not archived else []
+    pins = [r for pid, (w, bf, _) in fetched.items() if pid in awaiting_pins
+            for r in w + bf if r.get("pinned") and keep(r)] if not sources and not archived else []
+    # A failed profile still owes its pins on its first successful fetch.
+    missing = awaiting_pins.intersection(errors)
+    if missing and not sources and not archived:
+        new_off["_awaiting_pins"] = sorted(missing)
+    if pin_runs:
+        new_off["_pin_runs"] = pin_runs
     new_off["_done"] = sorted(done)
     # A profile that errored keeps its offset and is retried by the next cursor.
     more_left = any(p not in done for p in pids)
@@ -740,7 +776,7 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
     consumed. Rows are only emitted down to the newest point every unfinished profile has reached, so
     paging stays exact while the lists interleave; a round that yields nothing fetches again."""
     offsets = _cursor_decode(cursor)
-    reset = bool(offsets.get("_native")) and not NATIVE_INBOX
+    reset = bool(cursor and not offsets) or (bool(offsets.get("_native")) and not NATIVE_INBOX)
     if reset:
         offsets = {}
     first_page = not offsets
@@ -1424,11 +1460,19 @@ class H(BaseHTTPRequestHandler):
         forwards bytes as they are, so without this a transcript page crosses cellular uncompressed."""
         if size < GZIP_MIN_BYTES or not ctype.startswith(GZIP_TYPES):
             return False
+        wildcard = False
         for part in (self.headers.get("Accept-Encoding") or "").lower().split(","):
             name, _, params = part.strip().partition(";")
-            if name.strip() in ("gzip", "*"):
-                return params.replace(" ", "") not in ("q=0", "q=0.0", "q=0.00", "q=0.000")
-        return False
+            name = name.strip()
+            if name not in ("gzip", "*"):
+                continue
+            quality = params.strip().replace(" ", "")
+            weight = re.fullmatch(r"q=(0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)", quality)
+            accepted = not quality or (weight is not None and float(weight[1]) > 0)
+            if name == "gzip":
+                return accepted
+            wildcard = accepted
+        return wildcard
 
     def body(self):
         return getattr(self, "_body", b"")
@@ -1460,6 +1504,10 @@ class H(BaseHTTPRequestHandler):
             self.connection.settimeout(WS_BODY_TIMEOUT if scoped else BODY_TIMEOUT)
         try:
             self._body = self.rfile.read(n) if n else b""
+            if len(self._body) != n:
+                self.close_connection = True
+                self.send(400, {"error": "Request body ended early."}, close=True)
+                return False
         except OSError:
             self.close_connection = True
             self.send(408, {"error": "Request timed out."}, close=True)
@@ -2256,8 +2304,8 @@ class H(BaseHTTPRequestHandler):
                 if self.headers.get("If-None-Match") == tag:
                     return self.send(304, validator=tag)
                 return self.send(200, compact, validator=tag)
+        c = http.client.HTTPConnection(*UPSTREAM, timeout=900 if stream else 120)
         try:
-            c = http.client.HTTPConnection(*UPSTREAM, timeout=900 if stream else 120)
             c.request(self.command, up, body=data, headers=headers)
             upstream_socket = c.sock
             r = c.getresponse()
@@ -2266,7 +2314,11 @@ class H(BaseHTTPRequestHandler):
             return self.send(502, {"error": "Hermes gateway is not answering (%s)." % type(e).__name__})
         try:
             if not stream:
-                raw = r.read()
+                try:
+                    raw = r.read()
+                except (OSError, http.client.HTTPException):
+                    # A reset here is upstream. The phone is still connected and needs a reply.
+                    return self.send(502, {"error": "Hermes gateway disconnected before finishing its response."})
                 if (r.status == 200 and self.command == "GET" and self.headers.get("X-Hermes-Transcript") == "timeline-v1"
                         and re.fullmatch(r"/api/sessions/[^/]+/messages", tail)):
                     try:

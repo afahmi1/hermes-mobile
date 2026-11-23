@@ -61,6 +61,12 @@ class CompressionTests(unittest.TestCase):
             # A cache between the phone and the bridge must still key on the request header.
             self.assertIn("Accept-Encoding", headers["vary"], accept)
 
+    def test_specific_encoding_wins_over_a_wildcard_in_either_order(self):
+        for header in ("*;q=1, gzip;q=0", "gzip;q=0, *;q=1", "gzip;q=garbage"):
+            self.assertNotIn("content-encoding", self.send(header)[0])
+        for header in ("*;q=0, gzip;q=0.25", "gzip;q=1, *;q=0", "*;q=0.001"):
+            self.assertEqual(self.send(header)[0]["content-encoding"], "gzip")
+
     def test_small_reply_is_left_alone(self):
         headers, body = self.send("gzip", body={"ok": True})
         self.assertNotIn("content-encoding", headers)

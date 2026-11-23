@@ -28,6 +28,7 @@ struct ChatListView: View {
     @State private var batchBusy = false
     @State private var showGateways = false
     @State private var showSourceGuide = false
+    @State private var draftScopes = Set<String>()
     private let fixedProfile: String?
     @State private var selectedBot: String?
     private var profile: String? { fixedProfile ?? selectedBot }
@@ -77,6 +78,10 @@ struct ChatListView: View {
                 .refreshable { await reload() }
                 .task(id: inboxScope) { await restoreInbox() }
                 .task(id: scenePhase) { if scenePhase == .active { await autoRefresh() } }
+                // Returning from a chat is when a draft may have appeared or been sent.
+                .task(id: [String(navigation.wrappedValue.count), app.inboxAccount ?? ""]) {
+                    draftScopes = app.inboxAccount.map(ComposerDisk.shared.scopes) ?? []
+                }
 
         }
     }
@@ -261,7 +266,7 @@ struct ChatListView: View {
                         .frame(width: 44, height: 44)
                         .font(.title3)
                         .foregroundStyle(selection.contains(s.key) ? Color.accentColor : Color.secondary)
-                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false)
+                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
                 .contentShape(Rectangle())
             }
@@ -276,7 +281,7 @@ struct ChatListView: View {
                 .buttonStyle(.borderless)
                 .accessibilityLabel("Select " + s.displayTitle)
                 NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
-                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false)
+                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
             }
             .swipeActions(edge: .trailing) {
@@ -417,7 +422,7 @@ struct ChatListView: View {
         } catch {
             guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.cacheKey) else { return }
             self.error = error.localizedDescription
-            if case APIError.http(401, _) = error { app.signOut() }
+            if case APIError.http(401, _) = error { app.sessionExpired() }
         }
     }
 
@@ -524,11 +529,27 @@ struct ChatListView: View {
             try await api.updateSession(profile: s.profile, session: s.id, fields: [flag: value])
             guard destination == app.gatewaySession else { return }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            await reload()
+            // Apply the change in place. Reloading would collapse a long list back to its first page
+            // and lose the reader's position; the periodic refresh reconciles with the gateway.
+            apply(flag, value, to: s.key)
             if !query.isEmpty { await runSearch() }
         } catch {
             guard destination == app.gatewaySession else { return }
             self.error = error.localizedDescription
+        }
+    }
+
+    private func apply(_ flag: String, _ value: Bool, to key: String) {
+        guard let index = sessions.firstIndex(where: { $0.key == key }) else { return }
+        if flag == "archived" {
+            // Archiving leaves every view but Archived; unarchiving leaves only that one.
+            if value != (filter == .archived) { sessions.remove(at: index) }
+        } else {
+            sessions[index].pinned = value
+            if filter != .archived { sessions.sort(by: Self.order) }
+        }
+        if let cacheKey = app.inboxKey(profile: profile, filter: filter.cacheKey), sessions.count <= 220 {
+            app.inboxes[cacheKey] = InboxSnapshot(sessions: sessions, cursor: cursor, savedAt: lastSync ?? Date())
         }
     }
 
@@ -541,6 +562,7 @@ struct SessionRow: View {
     let session: SessionSummary
     let botName: String
     var showAvatar = true
+    var hasDraft = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -551,7 +573,12 @@ struct SessionRow: View {
                     Spacer(minLength: 6)
                     Text(session.date, format: relative).font(.caption).foregroundStyle(.secondary)
                 }
-                if let p = session.preview, !p.isEmpty, p != session.displayTitle {
+                if hasDraft {
+                    // An unsent message is the most useful line a row can show: it is why you come back.
+                    Label("Draft", systemImage: "pencil.line")
+                        .font(.subheadline.weight(.medium)).foregroundStyle(.tint)
+                        .accessibilityLabel("Unsent draft")
+                } else if let p = session.preview, !p.isEmpty, p != session.displayTitle {
                     Text(p).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                 }
                 HStack(spacing: 6) {

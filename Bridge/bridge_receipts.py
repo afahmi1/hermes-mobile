@@ -68,14 +68,6 @@ class Journal:
         with closing(self.open()) as db, db:
             db.execute("INSERT OR IGNORE INTO mobile_origins VALUES (?,?)", (profile, sid))
 
-    def prune(self, older_than, now=None):
-        """Drop finished receipts past the retry horizon. A phone retries a send for minutes, not weeks;
-        without this the journal gains one row per message for the life of the install."""
-        import time
-        cutoff = (time.time() if now is None else now) - older_than
-        with closing(self.open()) as db, db:
-            return db.execute("DELETE FROM receipts WHERE terminal IS NOT NULL AND started < ?", (cutoff,)).rowcount
-
     def pending(self):
         with closing(self.open()) as db:
             return db.execute("SELECT * FROM receipts WHERE terminal IS NULL ORDER BY started").fetchall()
