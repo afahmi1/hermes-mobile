@@ -34,6 +34,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(receipt["requested_model"],"selected")
         self.assertEqual(receipt["runtime"],{"model":"served","fallback":True})
 
+    def test_native_receipt_reports_actual_provider_and_model(self):
+        engine._settle(self.turn,{"outcome":"completed", "model":"actual", "provider":"served-provider"})
+        self.assertEqual(self.turn.events[-1]["runtime"], {"model":"actual", "provider":"served-provider"})
+
     def test_receipt_still_running(self):
         self.assertFalse(self.recover({"status": "started"}))
         self.assertEqual(self.turn.events, [])

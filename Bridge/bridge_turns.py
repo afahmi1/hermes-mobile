@@ -395,6 +395,9 @@ def _settle(turn, pl):
         turn.push("run.failed", error=msg)
     else:
         _record_runtime(turn, pl.get("usage"))
+        # Native admission receipts report the actual route at the top level.
+        if pl.get("model"):
+            _record_runtime(turn, {"model": pl["model"], "provider": pl.get("provider")})
         turn.push("run.completed", output=pl.get("content") or pl.get("text") or "",
                   runtime=dict(turn.served), requested_model=turn.choice.get("model"), outcome=outcome or "completed")
     return kind
