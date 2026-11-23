@@ -409,6 +409,21 @@ final class API: @unchecked Sendable {
     }
 
     func search(_ text: String, archived: Bool = false, profile: String? = nil, source: String? = nil, scope: String? = nil) async throws -> [SessionSummary] {
+        let path = try Self.searchPath(text, archived: archived, profile: profile, source: source, scope: scope)
+        return try await get(path, as: SearchPage.self).data
+    }
+
+    /// An explicit read on a paired destination. Chat writes still require the active client.
+    func searchDestination(_ login: GatewayLogin, text: String) async throws -> [SessionSummary] {
+        let path = try Self.searchPath(text, archived: false, profile: nil, source: nil, scope: "all")
+        var r = try request(path, auth: false, server: login.server)
+        r.setValue("Bearer " + login.token, forHTTPHeaderField: "Authorization")
+        r.timeoutInterval = 8
+        r.cachePolicy = .reloadIgnoringLocalCacheData
+        return try JSONDecoder().decode(SearchPage.self, from: try await send(r)).data
+    }
+
+    private static func searchPath(_ text: String, archived: Bool, profile: String?, source: String?, scope: String?) throws -> String {
         var components = URLComponents()
         components.path = "/m/search"
         var query = [URLQueryItem(name: "q", value: text)]
@@ -420,7 +435,7 @@ final class API: @unchecked Sendable {
         // Form-style query decoders interpret literal plus signs as spaces.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         guard let path = components.string else { throw APIError.badResponse }
-        return try await get(path, as: SearchPage.self).data
+        return path
     }
     func messages(profile: String, session: String, limit: Int = 100, offset: Int = 0) async throws -> [StoredMessage] {
         let page = try await timeline(profile: profile, session: session, limit: limit, offset: offset)

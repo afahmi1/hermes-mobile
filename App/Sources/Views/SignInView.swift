@@ -9,6 +9,7 @@ struct SignInView: View {
         self.adding = adding
         _server = State(initialValue: adding ? "" : UserDefaults.standard.string(forKey: "server") ?? "")
     }
+    private var peerOrigin: URL? { adding ? SavedGateways.peerOrigin(server, relativeTo: API.shared.baseURL) : nil }
     @State private var username = ""
     @State private var password = ""
     @State private var pairing = false
@@ -46,7 +47,13 @@ struct SignInView: View {
                         .autocorrectionDisabled().focused($focus, equals: .server)
                         .submitLabel(.next).onSubmit { focus = .user }
                 } header: { Text("Server address") } footer: {
-                    Text("Enter the HTTPS address of your Hermes Mobile bridge. Connect your phone to the same Tailscale network.")
+                    if let peerOrigin {
+                        Text("Connect to " + peerOrigin.absoluteString)
+                    } else if adding, SavedGateways.peerOrigin("peer", relativeTo: API.shared.baseURL) != nil {
+                        Text("Enter a machine name on this tailnet, or the full HTTPS address of a bridge.")
+                    } else {
+                        Text("Enter the HTTPS address of your Hermes Mobile bridge. Keep Tailscale connected on your phone.")
+                    }
                 }
                 Section {
                     Picker("Sign-in method", selection: $pairing) {
@@ -90,7 +97,7 @@ struct SignInView: View {
         var s = server.trimmingCharacters(in: .whitespacesAndNewlines)
         if !s.contains("://") { s = "https://" + s }
         while s.hasSuffix("/") { s.removeLast() }
-        guard !busy, let parsed = URL(string: s), let url = SavedGateways.origin(parsed), let scheme = url.scheme else { error = "That address doesn't look right."; return }
+        guard !busy, let parsed = peerOrigin ?? URL(string: s), let url = SavedGateways.origin(parsed), let scheme = url.scheme else { error = "That address doesn't look right."; return }
         busy = true
         defer { busy = false }
         let client = API.shared

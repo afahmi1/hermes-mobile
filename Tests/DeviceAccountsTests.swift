@@ -12,6 +12,12 @@ import Foundation
         let originA = SavedGateways.origin(a)!
         precondition(originA.absoluteString == "https://first.example")
         precondition(SavedGateways.origin(URL(string: "https://u:p@first.example/")!) == nil)
+        let tailnet = URL(string: "https://alpha.example.ts.net:10001")!
+        precondition(SavedGateways.peerOrigin(" Beta-2 ", relativeTo: tailnet)?.absoluteString == "https://beta-2.example.ts.net:10001")
+        for invalid in ["https://new.example", "new.host", "not/a/host", "-bad", "bad-", "localhost", "127", "two words"] {
+            precondition(SavedGateways.peerOrigin(invalid, relativeTo: tailnet) == nil)
+        }
+        precondition(SavedGateways.peerOrigin("peer", relativeTo: a) == nil)
         var credentials = ["token": "old-install-fixture"]
         let vault = SavedGateways(defaults: defaults, read: { credentials[$0] },
                                   write: { credentials[$0] = $1; return true },
@@ -42,14 +48,25 @@ import Foundation
         let fixture = Process()
         fixture.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         fixture.arguments = ["python3", "-u", "-c", #"""
-import json,sys,threading
+import json,sys,threading,time
+from urllib.parse import urlsplit, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
-        if self.path != '/m/capabilities': self.send_error(404); return
+        path = urlsplit(self.path)
         if self.headers.get('Authorization') != 'Bearer ' + self.server.label: self.send_error(401); return
-        payload = json.dumps(dict(protocol=2, features=[], device_id=self.server.label, manage_devices=False)).encode()
+        if path.path == '/m/search':
+            text = parse_qs(path.query).get('q', [''])[0]
+            if text == 'redirect':
+                self.send_response(307); self.send_header('Location', first + self.path); self.end_headers(); return
+            if text != 'two + two & three': self.send_error(400); return
+            if self.server.label == 'first-fixture': time.sleep(0.40)
+            result = dict(data=[dict(id='shared-id', profile='default', title=self.server.label)])
+        elif path.path == '/m/capabilities':
+            result = dict(protocol=2, features=[], device_id=self.server.label, manage_devices=False)
+        else: self.send_error(404); return
+        payload = json.dumps(result).encode()
         self.send_response(200); self.send_header('Content-Length', str(len(payload))); self.end_headers(); self.wfile.write(payload)
     def do_POST(self):
         self.rfile.read(int(self.headers.get('Content-Length', 0)))
@@ -78,6 +95,29 @@ sys.stdin.read()
         let originalClient = API.shared
         let firstCaps = try await originalClient.capabilities()
         precondition(firstCaps.deviceID == first.token)
+        let started = ContinuousClock.now
+        try await withThrowingTaskGroup(of: (GatewayLogin, [SessionSummary]).self) { group in
+            for login in [first, second] {
+                group.addTask { (login, try await originalClient.searchDestination(login, text: "two + two & three")) }
+            }
+            var order: [GatewayLogin] = []
+            for try await (login, rows) in group {
+                precondition(rows.count == 1 && rows[0].key == "default/shared-id" && rows[0].title == login.token)
+                print("Search result from " + login.token + " at " + String(describing: started.duration(to: .now)))
+                order.append(login)
+            }
+            precondition(order == [second, first] && API.shared === originalClient)
+        }
+        do {
+            _ = try await originalClient.searchDestination(second, text: "redirect")
+            fatalError("Cross-origin search followed redirect")
+        } catch APIError.http(307, _) { }
+        do {
+            _ = try await originalClient.searchDestination(GatewayLogin(server: second.server, token: "expired"), text: "expired")
+            fatalError("Unpaired search succeeded")
+        } catch APIError.http(401, _) { }
+        let stillFirst = try await originalClient.capabilities()
+        precondition(stillFirst.deviceID == first.token)
         API.activate(second)
         let secondCaps = try await API.shared.capabilities()
         precondition(secondCaps.deviceID == second.token)

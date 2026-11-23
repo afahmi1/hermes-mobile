@@ -323,6 +323,25 @@ struct SavedGateways {
         return c.url
     }
 
+    /// Only expand a single DNS label on the active gateway's known Tailscale domain.
+    static func peerOrigin(_ input: String, relativeTo active: URL?) -> URL? {
+        let name = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let active, active.scheme == "https", let host = active.host?.lowercased(),
+              host.hasSuffix(".ts.net"), host.split(separator: ".").count == 4,
+              name.range(of: #"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"#, options: .regularExpression) != nil,
+              name != "localhost", !name.allSatisfy(\.isNumber),
+              var parts = URLComponents(url: active, resolvingAgainstBaseURL: false),
+              let dot = host.firstIndex(of: ".") else { return nil }
+        parts.host = name + String(host[dot...])
+        return parts.url.flatMap(origin)
+    }
+
+    static func displayName(_ url: URL) -> String {
+        guard let host = url.host else { return url.absoluteString }
+        if host.hasSuffix(".ts.net"), let first = host.split(separator: ".").first { return String(first) }
+        return host
+    }
+
     var servers: [URL] {
         (defaults.stringArray(forKey: "savedGatewayOrigins") ?? []).compactMap(URL.init(string:))
     }

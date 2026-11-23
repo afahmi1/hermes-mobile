@@ -24,6 +24,7 @@ final class AppModel {
     var signedIn = API.shared.isSignedIn
     private(set) var gatewaySession = UUID()
     private(set) var savedGateways = API.accounts.servers
+    var inboxPath: [ChatRef] = []
     var bots: [Bot] = []
     var health: HealthInfo?
     var checkedConnection = false
@@ -171,6 +172,12 @@ final class AppModel {
         changeGateway(login)
     }
 
+    func openDestinationChat(_ chat: SessionSummary, on login: GatewayLogin) throws {
+        guard API.accounts.credential(login.server) == login else { throw APIError.notSignedIn }
+        if API.shared.baseURL != login.server || API.shared.token != login.token { try switchGateway(login.server) }
+        inboxPath = [ChatRef(profile: chat.profile, sessionId: chat.id)]
+    }
+
     func signOut() {
         if let server = API.shared.baseURL { _ = API.accounts.forget(server) }
         if let account = inboxAccount {
@@ -181,6 +188,7 @@ final class AppModel {
     }
 
     private func changeGateway(_ login: GatewayLogin?) {
+        inboxPath.removeAll()
         for chat in chats.values { chat.cancelLocalFollow() }
         inboxes.removeAll()
         API.activate(login)

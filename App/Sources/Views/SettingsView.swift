@@ -185,3 +185,125 @@ private struct DeviceAccessView: View {
         catch { self.error = error.localizedDescription }
     }
 }
+
+/// Open a saved host directly, or explicitly search the unarchived history on every paired host.
+struct GatewayDestinationsView: View {
+    @Environment(AppModel.self) private var app
+    @Environment(\.dismiss) private var dismiss
+    @State private var adding = false
+    @State private var input = ""
+    @State private var search: Search?
+    @State private var states: [URL: Outcome] = [:]
+    @State private var error: String?
+
+    private struct Search: Equatable {
+        let id = UUID()
+        let text: String
+    }
+
+    private enum Outcome {
+        case matches(GatewayLogin, [SessionSummary])
+        case failed(String)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Switch gateway") {
+                    ForEach(app.savedGateways, id: \.self) { url in
+                        Button {
+                            do {
+                                if url != API.shared.baseURL { try app.switchGateway(url) }
+                                dismiss()
+                            } catch { self.error = error.localizedDescription }
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(SavedGateways.displayName(url)).font(.headline)
+                                    Text(url.absoluteString).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if url == API.shared.baseURL {
+                                    Image(systemName: "checkmark").accessibilityLabel("Current gateway")
+                                }
+                            }
+                        }
+                    }
+                    Button("Add gateway", systemImage: "plus") { adding = true }
+                }
+                if app.savedGateways.count > 1 {
+                    Section {
+                        HStack {
+                            TextField("Find a chat on any gateway", text: $input)
+                                .submitLabel(.search).onSubmit(submit)
+                                .onChange(of: input) { _, _ in search = nil; states.removeAll() }
+                            Button("Search", action: submit)
+                                .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    } footer: { Text("Search sends these words to each saved gateway.") }
+                    if search != nil {
+                        ForEach(app.savedGateways, id: \.self) { url in
+                            Section {
+                                switch states[url] {
+                                case .none:
+                                    HStack { ProgressView().controlSize(.small); Text("Searching…") }
+                                case .failed(let reason):
+                                    Label(reason, systemImage: "exclamationmark.circle").foregroundStyle(.secondary)
+                                case .matches(let login, let rows):
+                                    if rows.isEmpty { Text("No matching chats").foregroundStyle(.secondary) }
+                                    ForEach(rows, id: \.key) { row in
+                                        Button {
+                                            do { try app.openDestinationChat(row, on: login); dismiss() }
+                                            catch { self.error = error.localizedDescription }
+                                        } label: {
+                                            VStack(alignment: .leading) {
+                                                Text(row.displayTitle).lineLimit(2)
+                                                Text(row.profile + " · " + row.sourceLabel).font(.caption).foregroundStyle(.secondary)
+                                            }
+                                        }
+                                    }
+                                }
+                            } header: {
+                                Text(url.absoluteString.replacingOccurrences(of: "https://", with: ""))
+                                    .textCase(nil)
+                            }
+                        }
+                    }
+                }
+                if let error { Text(error).foregroundStyle(.red) }
+            }
+            .navigationTitle("Gateways")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+            .sheet(isPresented: $adding) { SignInView(adding: true) }
+            .task(id: search) { if let search { await find(search) } }
+        }
+    }
+
+    private func submit() {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        error = nil
+        states.removeAll()
+        search = Search(text: text)
+    }
+
+    @MainActor private func find(_ request: Search) async {
+        let client = API.shared
+        await withTaskGroup(of: (URL, Outcome).self) { group in
+            for url in app.savedGateways {
+                guard let login = API.accounts.credential(url) else {
+                    states[url] = .failed("Sign in again to search this gateway.")
+                    continue
+                }
+                group.addTask {
+                    do { return (url, .matches(login, try await client.searchDestination(login, text: request.text))) }
+                    catch { return (url, .failed(error.localizedDescription)) }
+                }
+            }
+            for await (url, state) in group {
+                guard !Task.isCancelled, request == search, client === API.shared else { group.cancelAll(); return }
+                states[url] = state
+            }
+        }
+    }
+}
