@@ -124,6 +124,26 @@ final class API: @unchecked Sendable {
         struct R: Decodable { let bots: [Bot] }
         return try await get("/m/bots", as: R.self).bots
     }
+    /// Read-only project list (bridge schema V1). Old bridges answer 404; that and other failures
+    /// become a ProjectsFailure with fixed wording, never the server's text.
+    func projects() async throws -> ProjectsSnapshot {
+        do {
+            var catalogRequest = try request("/m/projects")
+            catalogRequest.timeoutInterval = 15
+            catalogRequest.cachePolicy = .reloadIgnoringLocalCacheData
+            return try ProjectsSnapshot.decode(try await send(catalogRequest))
+        } catch let error as ProjectsFailure {
+            throw error
+        } catch APIError.notSignedIn {
+            throw ProjectsFailure.signedOut
+        } catch APIError.http(let code, _) {
+            throw ProjectsFailure.fromHTTP(code)
+        } catch APIError.badResponse {
+            throw ProjectsFailure.malformed
+        } catch {
+            throw ProjectsFailure.classify(error)
+        }
+    }
     func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], telegram: Bool = false) async throws -> SessionPage {
         let limit = cursor == nil ? 16 : 40
         var q = ["limit=\(limit)", "view=compact"]

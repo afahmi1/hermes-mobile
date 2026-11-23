@@ -40,6 +40,8 @@ struct MainTabs: View {
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
             BotsView()
                 .tabItem { Label("Bots", systemImage: "person.2") }
+            ProjectsView()
+                .tabItem { Label("Projects", systemImage: "folder") }
             StatusView()
                 .tabItem { Label("Status", systemImage: "waveform.path.ecg") }
                 .badge(app.status.badge)

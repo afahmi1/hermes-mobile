@@ -4,7 +4,9 @@ A native SwiftUI iPhone app for [Hermes Agent](https://github.com/NousResearch/h
 (profile) on your Mac, lets you continue any of them, and switches model, provider and reasoning effort per chat. The
 switch is saved on the chat inside Hermes, so the desktop app sees the same setting.
 
-It also has a **Status** tab, the same view as the Mac status dashboard (`Status/`, a web page on port 9230). It shows:
+The **Projects** tab shows an optional, read-only [project catalog](docs/project-catalog.md) with links to bots and named relative file references.
+
+The **Status** tab mirrors the Mac status dashboard (`Status/`, a web page on port 9230). It shows:
 - what's running right now: chats, subagents and cron runs;
 - every bot and every cron job;
 - incidents, recent runs, provider usage, and a "What's new" log.
