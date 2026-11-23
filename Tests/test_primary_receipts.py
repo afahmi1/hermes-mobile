@@ -65,6 +65,55 @@ class PrimaryReceipts(unittest.TestCase):
                     kwargs = rpc.await_args.kwargs
                     self.assertEqual(kwargs, {"source": "gui", **({"request_id": self.submission} if supported else {})})
 
+    def test_creation_receipt_is_bound_to_the_profile_owner_source_and_request(self):
+        import json
+        import sqlite3
+        from contextlib import closing
+        from types import SimpleNamespace
+        home = self.directory
+        key = self.submission
+        sid = "frozen-session"
+        modules = {
+            "gateway.owner_identity": SimpleNamespace(host_owner_subject=lambda: "owner"),
+            "hermes_state_keys": SimpleNamespace(local_identity=lambda *identity: sid),
+            "hermes_state_local": SimpleNamespace(POLICY_PREFIX="local:"),
+            "hermes_cli.gateway_runtime": SimpleNamespace(gateway_profile_home=lambda path: path),
+        }
+        with patch.dict(sys.modules, modules), closing(sqlite3.connect(home / "state.db")) as db:
+            db.executescript("CREATE TABLE sessions(id PRIMARY KEY, title);"
+                             "CREATE TABLE state_meta(key PRIMARY KEY, value);")
+            with db:
+                db.execute("INSERT INTO sessions VALUES (?,?)", (sid, "Test"))
+            receipt = dict(session_id=sid, request_id=key, profile_id=str(home), principal_id="owner", policy={"source": "gui"})
+            def save(fields):
+                with db:
+                    db.execute("INSERT OR REPLACE INTO state_meta VALUES (?,?)", ("local:" + sid, json.dumps(fields)))
+            for other in (dict(profile_id="elsewhere"), dict(principal_id="another"), dict(request_id="other"),
+                          dict(policy={"source": "cli"}), dict(session_id="foreign")):
+                save(dict(receipt, **other))
+                self.assertIsNone(engine._created_draft(home, key, None))
+            save(receipt)
+            self.assertIsNone(engine._created_draft(home, key, "Changed"))
+            with patch.object(engine, "_supports_create_id", return_value=True), patch.object(engine, "connect", side_effect=AssertionError):
+                recovered = asyncio.run(engine._create(home, "default", "Test", key))
+            self.assertEqual(recovered, {"session_id": sid, "stored_session_id": sid})
+
+    def test_lost_create_reply_rechecks_commit_but_keeps_explicit_refusals(self):
+        from unittest.mock import AsyncMock
+        receipt = {"session_id": "one", "stored_session_id": "one"}
+        for error in (TimeoutError(), engine.TurnError("permission denied", 403)):
+            with patch.object(engine, "_supports_create_id", return_value=True), patch.object(engine, "connect", self.connect), \
+                    patch.object(engine, "_created_draft", side_effect=[None, receipt]) as lookup, \
+                    patch.object(engine, "_rpc", AsyncMock(side_effect=error)):
+                op = engine._create(self.directory, "default", None, self.submission)
+                if isinstance(error, TimeoutError):
+                    self.assertEqual(asyncio.run(op), receipt)
+                    self.assertEqual(lookup.call_count, 2)
+                else:
+                    with self.assertRaises(engine.TurnError):
+                        asyncio.run(op)
+                    self.assertEqual(lookup.call_count, 1)
+
     def test_concurrent_requests_and_conflicting_intents(self):
         with ThreadPoolExecutor(max_workers=8) as workers:
             turns = list(workers.map(lambda _: self.start(), range(20)))

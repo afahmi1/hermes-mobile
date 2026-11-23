@@ -27,7 +27,8 @@ import threading
 import time
 import uuid
 import weakref
-from contextlib import asynccontextmanager
+import sqlite3
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 LOOP = asyncio.new_event_loop()
@@ -155,25 +156,64 @@ def _supports_create_id():
         return False
 
 
+def _created_draft(home, request_id, title):
+    """Read the native creation receipt left behind when the WebSocket reply is lost."""
+    try:
+        from gateway.owner_identity import host_owner_subject
+        from hermes_state_keys import local_identity
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_cli.gateway_runtime import gateway_profile_home
+        profile_id = str(gateway_profile_home(home))
+        subject = host_owner_subject()
+        sid = local_identity(profile_id, subject, request_id)
+        uri = (Path(home) / "state.db").resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as db:
+            row = db.execute("""
+                SELECT 1 FROM state_meta r JOIN sessions s ON s.id = ?
+                WHERE r.key = ? AND json_extract(r.value, '$.policy.source') = 'gui'
+                AND (? IS NULL OR s.title = ?)
+                AND json_extract(r.value, '$.session_id') = s.id
+                AND json_extract(r.value, '$.request_id') = ?
+                AND json_extract(r.value, '$.profile_id') = ?
+                AND json_extract(r.value, '$.principal_id') = ?
+                """, (sid, POLICY_PREFIX + sid, title, title, request_id, profile_id, subject)).fetchone()
+        return {"session_id": sid, "stored_session_id": sid} if row else None
+    except (ImportError, OSError, ValueError, sqlite3.Error):
+        # Remote-only and older installs keep using the canonical gateway RPC.
+        return None
+
+
 async def _create(home, profile, title, request_id=None):
-    async with connect(home) as c:
-        # The ticketed connection binds the owner profile; it isn't a create field.
-        params = {"source": "gui"}
-        if request_id is not None and _supports_create_id():
-            try:
-                params["request_id"] = uuid.UUID(str(request_id)).hex
-            except ValueError:
-                raise TurnError("Invalid draft ID.") from None
-        if title:
-            params["title"] = title[:120]
-        created = await _rpc(c, "session.create", **params)
-        sid = created.get("session_id") or created.get("stored_session_id")
-        if not sid:
-            raise TurnError("session.create returned no session id", 502)
-        out = {"session_id": sid}
-        if created.get("stored_session_id"):
-            out["stored_session_id"] = created["stored_session_id"]
-        return out
+    params = {"source": "gui"}
+    if title:
+        params["title"] = title[:120]
+    key = None
+    if request_id is not None and _supports_create_id():
+        try:
+            key = uuid.UUID(str(request_id)).hex
+        except ValueError:
+            raise TurnError("Invalid draft ID.") from None
+        params["request_id"] = key
+        previous = await asyncio.to_thread(_created_draft, home, key, params.get("title"))
+        if previous:
+            return previous
+    try:
+        async with connect(home) as c:
+            created = await _rpc(c, "session.create", **params)
+    except Exception as exc:
+        # Only transport failures can hide an acknowledged creation. Preserve RPC refusals.
+        if key and (isinstance(exc, OSError) or isinstance(exc.__cause__, OSError)):
+            previous = await asyncio.to_thread(_created_draft, home, key, params.get("title"))
+            if previous:
+                return previous
+        raise
+    sid = created.get("session_id") or created.get("stored_session_id")
+    if not sid:
+        raise TurnError("session.create returned no session id", 502)
+    out = {"session_id": sid}
+    if created.get("stored_session_id"):
+        out["stored_session_id"] = created["stored_session_id"]
+    return out
 
 
 def create_session(home, profile, title=None, request_id=None):
