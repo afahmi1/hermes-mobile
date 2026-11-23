@@ -1744,7 +1744,7 @@ class H(BaseHTTPRequestHandler):
             if m:
                 turn = turns.get_turn(m.group(1))
                 if turn is None and self.command == "GET":
-                    turn = turns.completed_primary(m.group(1), STATE_DIR / "admissions", profile_home)
+                    turn = turns.completed_primary(m.group(1), admissions_dir(), profile_home)
                 if turn is None:
                     return self.send(404, {"error": "That reply is no longer running."})
                 action = m.group(2) or ""
