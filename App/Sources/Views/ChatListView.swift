@@ -508,7 +508,7 @@ struct SessionRow: View {
                     Text(p).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                 }
                 HStack(spacing: 6) {
-                    Text(botName).foregroundStyle(Bot.color(for: session.profile))
+                    Text(botName)
                     if !session.sourceLabel.isEmpty { Text("·"); Text(session.sourceLabel) }
                     if let m = session.model, !m.isEmpty { Text("·"); Text(m).lineLimit(1) }
                     if session.pinned == true { Image(systemName: "pin.fill").font(.caption2) }

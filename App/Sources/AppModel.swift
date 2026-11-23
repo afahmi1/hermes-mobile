@@ -233,7 +233,7 @@ extension Bot {
     static func color(for id: String) -> Color {
         var h: UInt32 = 2166136261
         for b in id.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
-        return Color(hue: Double(h % 360) / 360, saturation: 0.55, brightness: 0.85)
+        return Color(hue: Double(h % 360) / 360, saturation: 0.65, brightness: 0.46)
     }
 }
 
@@ -244,7 +244,7 @@ struct BotAvatar: View {
 
     var body: some View {
         ZStack {
-            Circle().fill(Bot.color(for: id).gradient)
+            Circle().fill(Bot.color(for: id))
             Text(initials).font(.system(size: size * 0.4, weight: .semibold, design: .rounded)).foregroundStyle(.white)
         }
         .frame(width: size, height: size)
