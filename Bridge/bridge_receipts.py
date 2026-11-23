@@ -16,6 +16,27 @@ def fingerprint(profile, session, text, choice, project, frames=()):
     return hashlib.sha256(request.encode()).hexdigest()
 
 
+def annotate_origins(path, rows):
+    if not rows or not path.is_file():
+        return
+    # One indexed lookup per displayed identity within one SQLite connection.
+    # Presentation metadata must not compete with admission for a writer lock.
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.025)) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mobile_origins'").fetchone():
+            return
+        for offset in range(0, len(rows), 200):
+            page = rows[offset:offset + 200]
+            ids = [(r["profile"], r["id"]) for r in page]
+            values = ",".join(["(?,?)"] * len(ids))
+            matches = set(map(tuple, db.execute(
+                "WITH page(profile,sid) AS (VALUES " + values + ") "
+                "SELECT p.profile,p.sid FROM page p JOIN mobile_origins m ON m.profile=p.profile AND m.sid=p.sid",
+                [value for pair in ids for value in pair])))
+            for row, key in zip(page, ids):
+                if key in matches:
+                    row["created_via"] = "mobile_bridge"
+
+
 class Journal:
     def __init__(self, directory):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -30,6 +51,7 @@ class Journal:
                 canonical TEXT, admission TEXT, generation INTEGER, terminal TEXT, steered INTEGER DEFAULT 0, media TEXT)""")
             if "media_types" not in {row[1] for row in db.execute("PRAGMA table_info(receipts)")}:
                 db.execute("ALTER TABLE receipts ADD COLUMN media_types TEXT")
+            db.execute("CREATE TABLE IF NOT EXISTS mobile_origins(profile TEXT, sid TEXT, PRIMARY KEY(profile, sid)) WITHOUT ROWID")
             db.execute("CREATE INDEX IF NOT EXISTS pending_sends ON receipts(started) WHERE terminal IS NULL")
 
     def open(self):
@@ -41,6 +63,10 @@ class Journal:
     def get(self, id):
         with closing(self.open()) as db:
             return db.execute("SELECT * FROM receipts WHERE id=?", (id,)).fetchone()
+
+    def record_mobile_origin(self, profile, sid):
+        with closing(self.open()) as db, db:
+            db.execute("INSERT OR IGNORE INTO mobile_origins VALUES (?,?)", (profile, sid))
 
     def pending(self):
         with closing(self.open()) as db:

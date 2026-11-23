@@ -7,6 +7,16 @@ from hermes_status_server import parse_auth_list
 
 
 class ProviderTests(unittest.TestCase):
+    def test_platform_report_from_previous_process_is_not_a_live_incident(self):
+        from hermes_status_server import prior_platform_observation
+        lifecycle = {"pid": 3, "phase": "running", "started_at": "2026-11-23T12:00:00+00:00"}
+        stale = {"updated_at": "2026-04-28T12:00:00+00:00", "state": "retrying"}
+        fresh = dict(stale, updated_at="2026-11-23T12:01:00+00:00")
+        self.assertTrue(prior_platform_observation(stale, lifecycle, 3))
+        self.assertFalse(prior_platform_observation(fresh, lifecycle, 3))
+        self.assertFalse(prior_platform_observation(stale, lifecycle, 4))
+        self.assertFalse(prior_platform_observation({}, lifecycle, 3))
+
     def test_labels_with_spaces_count_towards_the_pool(self):
         rows = ["openrouter (12 credentials):"]
         for i in range(12):
