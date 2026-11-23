@@ -359,6 +359,7 @@ final class ChatModel {
                                                     choice: send.choice, projectContext: send.project)
             }
             guard key == sendKey else { throw APIError.notSignedIn }
+            error = nil
             receiptBackoff = 1
             nextReceiptAttempt = .distantPast
             recovery = StreamRecovery()
