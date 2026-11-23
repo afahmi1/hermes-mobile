@@ -6,10 +6,18 @@ struct ProjectsView: View {
     private struct Selection: Hashable { let id: Project.ID }
 
     @Environment(AppModel.self) private var app
-    private let originClient = API.shared
-    @State private var model = ProjectsModel(fetch: { [api = API.shared] in try await api.projects() })
+    private let originClient: API
+    @State private var model: ProjectsModel
     @State private var path = NavigationPath()
-    @State private var workspaces = WorkspaceIndexModel(fetch: { [api = API.shared] in try await api.workspaceIndex() })
+    @State private var workspaces: WorkspaceIndexModel
+
+    init() {
+        // Bind both loaders to the client that is current when this view is created.
+        let api = API.shared
+        originClient = api
+        _model = State(initialValue: ProjectsModel(fetch: { try await api.projects() }))
+        _workspaces = State(initialValue: WorkspaceIndexModel(fetch: { try await api.workspaceIndex() }))
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
