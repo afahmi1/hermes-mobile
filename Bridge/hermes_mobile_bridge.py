@@ -1359,7 +1359,9 @@ class H(BaseHTTPRequestHandler):
         log(fmt % args)
 
     def send(self, code, body=b"", ctype="application/json", close=False, validator=None):
-        if self.command in ("POST", "PATCH", "DELETE") and 200 <= code < 300 and not self.path.endswith("/send-receipt"):
+        if (self.command in ("POST", "PATCH", "DELETE") and 200 <= code < 300
+                and urlsplit(self.path).path != "/m/sessions/flags"
+                and not urlsplit(self.path).path.endswith("/send-receipt")):
             invalidate_pages()
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
@@ -1486,6 +1488,8 @@ class H(BaseHTTPRequestHandler):
             return self.manage_route(path, q)
         if path == "/m/workspaces" or path.startswith(("/m/workspaces/", "/m/workspace-artifacts", "/m/workspace-file/")):
             return self.workspace_route(path, q)
+        if path == "/m/sessions/flags" and self.command == "POST":
+            return self.session_flags()
         if self.command == "GET":
             if path == "/m/health":
                 return self.send(200, health())
@@ -1501,8 +1505,6 @@ class H(BaseHTTPRequestHandler):
                     return self.send(503, {"error": "The Hermes status dashboard on your Mac (%s) isn't answering: %s."
                                                     % (STATUS_URL, why)})
                 return self.send(200, d)
-            if path == "/m/sessions/flags" and self.command == "POST":
-                return self.session_flags()
             if path in ("/m/sessions", "/m/telegram", "/m/desktop", "/m/archived"):
                 limit = max(1, min(int(q.get("limit", "40") or 40), 100))
                 only = set(q["profile"].split(",")) if q.get("profile") else None
@@ -1982,7 +1984,7 @@ class H(BaseHTTPRequestHandler):
             home = profile_home(pid)
             d = self.json_body()
             if m.group(2) == "new":
-                return self.send(201, turns.create_session(home, pid, d.get("title")))
+                return self.send(201, turns.create_session(home, pid, d.get("title"), d.get("request_id")))
             sid, action = m.group(2).rsplit("/", 1)
             if action == "runtime":
                 applied = turns.set_runtime(home, sid, d)

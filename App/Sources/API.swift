@@ -471,8 +471,8 @@ final class API: @unchecked Sendable {
 
     /// Create a chat the way the desktop app does (canonical `session.create`, source `gui`),
     /// so it lands in the desktop's Recents and model/effort switches persist on it.
-    func createSession(profile: String) async throws -> String {
-        let obj = try await json("/m/chat/\(Self.esc(profile))/new", method: "POST", body: [:])
+    func createSession(profile: String, draftID: UUID) async throws -> String {
+        let obj = try await json("/m/chat/\(Self.esc(profile))/new", method: "POST", body: ["request_id": draftID.uuidString])
         guard let id = obj["session_id"] as? String else { throw APIError.badResponse }
         return id
     }

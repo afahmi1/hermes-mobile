@@ -146,10 +146,24 @@ async def _apply(c, sid, choice: dict) -> dict:
 
 # ---------- one-shot operations ----------
 
-async def _create(home, profile, title):
+@functools.lru_cache(maxsize=1)
+def _supports_create_id():
+    try:
+        from tui_gateway.contracts.canonical_sessions import CanonicalCreateParams
+        return "request_id" in CanonicalCreateParams.__annotations__
+    except ImportError:
+        return False
+
+
+async def _create(home, profile, title, request_id=None):
     async with connect(home) as c:
         # The ticketed connection binds the owner profile; it isn't a create field.
         params = {"source": "gui"}
+        if request_id is not None and _supports_create_id():
+            try:
+                params["request_id"] = uuid.UUID(str(request_id)).hex
+            except ValueError:
+                raise TurnError("Invalid draft ID.") from None
         if title:
             params["title"] = title[:120]
         created = await _rpc(c, "session.create", **params)
@@ -162,8 +176,8 @@ async def _create(home, profile, title):
         return out
 
 
-def create_session(home, profile, title=None):
-    return run(_create(home, profile, title))
+def create_session(home, profile, title=None, request_id=None):
+    return run(_create(home, profile, title, request_id))
 
 
 async def _set_runtime(home, sid, choice):
@@ -485,7 +499,7 @@ async def _drive_connection(turn: Turn):
         params = {"session_id": turn.sid, "submission_id": turn.submission or uuid.uuid4().hex, "text": _turn_text(turn)}
         images = [m for m in turn.media if m["mime"] == bridge_media.JPEG]
         if images:
-            params["attachments"] = images
+            params["attachments"] = [{"path": m["path"], "mime": m["mime"]} for m in images]
         params.update(_admission_runtime(turn.choice))
         if following_queue:
             if await _recover_gap(c, turn, snapshot):

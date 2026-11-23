@@ -69,6 +69,14 @@ class DeviceGrantTests(unittest.TestCase):
         self.assertEqual(code, 201)
         return self.request("POST", "/m/pair", data={"code": reply["code"], "device": "Phone"})[1]["token"]
 
+    def test_paired_phone_can_reach_bulk_session_flags_over_http(self):
+        with patch.object(self.b, "profile_ids", return_value=["default"]), patch.object(self.b, "key_for", return_value="key"), \
+                patch.object(self.b, "set_session_flags", return_value=(["one", "two"], {})) as apply_flags:
+            code, data = self.request("POST", "/m/sessions/flags", self.pair(),
+                                      {"profile": "default", "ids": ["one", "two"], "fields": {"archived": True}})
+        self.assertEqual((code, data), (200, {"updated": ["one", "two"], "errors": {}}))
+        apply_flags.assert_called_once_with("default", ["one", "two"], {"archived": True})
+
     def test_one_time_pairing_concurrent_exchange_and_privileges(self):
         offer = self.request("POST", "/m/devices/pair-code", self.owner)[1]
         with ThreadPoolExecutor(2) as pool:

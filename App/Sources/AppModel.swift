@@ -127,7 +127,7 @@ final class AppModel {
     func chat(for ref: ChatRef) -> ChatModel {
         let key = ref.id
         let chat = chats[key] ?? visibleChats.object(forKey: key as NSString)
-            ?? ChatModel(profile: ref.profile, sessionId: ref.sessionId, app: self)
+            ?? ChatModel(profile: ref.profile, sessionId: ref.sessionId, app: self, draftID: ref.draft)
         if recentChatKeys.last != key {
             recentChatKeys.removeAll { $0 == key }
             recentChatKeys.append(key)

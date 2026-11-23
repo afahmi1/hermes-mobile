@@ -53,6 +53,18 @@ class PrimaryReceipts(unittest.TestCase):
         return {"admission_id": "admission", "status": "terminal", "outcome": "completed",
                 "result": {"final_response": "done"}}
 
+    def test_create_reuses_draft_id_only_on_capable_gateways(self):
+        from unittest.mock import AsyncMock
+        rpc = AsyncMock(return_value={"session_id": "sid"})
+        for supported in (True, False):
+            with patch.object(engine, "connect", self.connect), patch.object(engine, "_rpc", rpc), \
+                    patch.object(engine, "_supports_create_id", return_value=supported):
+                for _ in range(2):
+                    self.assertEqual(asyncio.run(engine._create(self.directory, "default", None, self.submission)),
+                                     {"session_id": "sid"})
+                    kwargs = rpc.await_args.kwargs
+                    self.assertEqual(kwargs, {"source": "gui", **({"request_id": self.submission} if supported else {})})
+
     def test_concurrent_requests_and_conflicting_intents(self):
         with ThreadPoolExecutor(max_workers=8) as workers:
             turns = list(workers.map(lambda _: self.start(), range(20)))
@@ -196,6 +208,7 @@ class PrimaryReceipts(unittest.TestCase):
                 engine.TURNS.clear()
                 restored = self.start(attachments=[row])
                 asyncio.run(engine._drive(restored))
+                self.assertEqual(self.attempts[0]["attachments"], [{"path": str(path), "mime": "image/jpeg"}])
                 self.assertEqual(self.attempts[0]["attachments"], self.attempts[1]["attachments"])
                 self.assertFalse(path.exists())
                 self.assertEqual(len(self.native), 1)

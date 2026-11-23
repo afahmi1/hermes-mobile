@@ -57,6 +57,7 @@ final class ChatModel {
     var completedTick = 0
     var failedTick = 0
 
+    private let draftID: UUID
     private let api = API.shared
     private weak var owner: AppModel?
     // Late work must never borrow the new gateway's account, including after A → B → A.
@@ -110,7 +111,8 @@ final class ChatModel {
     /// Approvals already answered (here or anywhere): a replayed request for one is not shown again.
     private var resolvedApprovals = Set<String>()
 
-    init(profile: String, sessionId: String?, app: AppModel) {
+    init(profile: String, sessionId: String?, app: AppModel, draftID: UUID = UUID()) {
+        self.draftID = draftID
         self.profile = profile
         self.sessionId = sessionId
         self.owner = app
@@ -336,7 +338,7 @@ final class ChatModel {
             if picked && sessionId != nil { await refreshServed() }
             guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
             if sessionId == nil {
-                let sid = try await api.createSession(profile: profile)
+                let sid = try await api.createSession(profile: profile, draftID: draftID)
                 guard account == app?.inboxAccount else { throw APIError.notSignedIn }
                 sessionId = sid
                 if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
