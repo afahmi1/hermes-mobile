@@ -1,6 +1,43 @@
 @main
 enum StreamRecoveryTests {
+    // Enumerate short histories including stalled links and an epoch change whose
+    // new sequence numbers overlap the old reader's. Each branch starts with a
+    // copy of the exact client state. A rejected event cannot acknowledge progress.
+    static func explore(_ reader: StreamRecovery, cursor: Int, epoch: String?, depth: Int) -> Int {
+        guard depth > 0 else { return 1 }
+        var count = 0
+        for action in 0..<6 {
+            var next = reader
+            var expected = cursor
+            var nextEpoch = epoch
+            switch action {
+            case 0, 1, 2:
+                let sequence = [cursor + 1, cursor, cursor + 2][action]
+                let accepted = next.accept(sequence, epoch: epoch)
+                precondition(accepted == (sequence == cursor + 1))
+                if accepted { expected = sequence }
+            case 3:
+                _ = next.retryDelay()
+            case 4:
+                nextEpoch = epoch == "a" ? "b" : "a"
+                expected = 0
+                next.restore(checkpoint: expected, epoch: nextEpoch)
+            default:
+                let other = epoch == "a" ? "b" : "a"
+                let accepted = next.accept(cursor + 1, epoch: other)
+                precondition(accepted == (epoch == nil))
+                if accepted { expected += 1; nextEpoch = other }
+            }
+            precondition((next.lastSequence ?? -1) == expected && next.epoch == nextEpoch)
+            count += explore(next, cursor: expected, epoch: nextEpoch, depth: depth - 1)
+        }
+        return count
+    }
+
     static func main() async {
+        let paths = explore(StreamRecovery(), cursor: -1, epoch: nil, depth: 6)
+        precondition(paths == 46_656)
+        print("Verified \(paths) six-step replay histories")
         var state = StreamRecovery()
         precondition(state.accept(0))
         precondition(state.retryDelay() != nil)
