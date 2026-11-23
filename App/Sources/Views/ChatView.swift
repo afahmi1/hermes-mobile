@@ -121,6 +121,13 @@ struct ChatScreen: View {
         .sheet(item: $chat.approval) { req in
             ApprovalSheet(req: req, busy: chat.answeringApproval, error: chat.approvalError) { answer in Task { await chat.answer(req, choice: answer) } }
         }
+        .onChange(of: chat.draft) { old, new in
+            // A huge paste leaves the composer and rides as a removable chip (T3-style).
+            if let paste = PasteSplit.insertion(old: old, new: new) {
+                chat.absorbPaste(paste)
+                chat.draft = old
+            }
+        }
         .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: .any(of: [.images, .videos]))
         .task(id: pickerItem) { if let pickerItem { await importMedia(pickerItem) } }
         .sheet(isPresented: $showCamera) {
@@ -209,6 +216,15 @@ struct ChatScreen: View {
                 }
                 .padding(.horizontal, 16)
             }
+            if !chat.pastedTexts.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack {
+                        ForEach(chat.pastedTexts) { chunk in
+                            PasteChip(text: chunk.text) { chat.removePastedText(chunk.id) }
+                        }
+                    }.padding(.horizontal, 12)
+                }.scrollIndicators(.hidden)
+            }
             if !chat.draftAttachments.isEmpty {
                 ScrollView(.horizontal) {
                     HStack {
@@ -249,7 +265,7 @@ struct ChatScreen: View {
                     Button { send() } label: {
                         Image(systemName: "arrow.up.circle.fill").font(.system(size: 32))
                     }
-                    .disabled(preparingMedia || chat.savingRuntime || (chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
+                    .disabled(preparingMedia || chat.savingRuntime || (chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty && chat.pastedTexts.isEmpty))
                     .accessibilityLabel("Send")
                 }
             }
@@ -260,7 +276,7 @@ struct ChatScreen: View {
                     Button { followUp("steer") } label: { Label("Guide this reply", systemImage: "arrow.turn.up.right") }
                     Spacer()
                 }
-                .font(.subheadline.weight(.medium)).disabled(!chat.acceptsFollowUp || chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .font(.subheadline.weight(.medium)).disabled(!chat.acceptsFollowUp || chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .padding(.horizontal, 16).padding(.bottom, 5)
             }
         }
@@ -327,16 +343,22 @@ struct ChatScreen: View {
     }
 
     private func followUp(_ mode: String) {
-        let text = chat.draft
+        let draftAtSend = chat.draft
+        let pastedAtSend = chat.pastedTexts
+        let text = chat.combinedDraft
         Task {
-            if await chat.followUp(text, mode: mode), chat.draft == text { chat.draft = "" }
+            if await chat.followUp(text, mode: mode), chat.draft == draftAtSend, chat.pastedTexts == pastedAtSend {
+                chat.draft = ""
+                chat.pastedTexts = []
+            }
         }
     }
 
     private func send() {
-        let text = chat.draft
+        let text = chat.combinedDraft
         let attachments = chat.draftAttachments
         chat.draft = ""
+        chat.pastedTexts = []
         followLatest = true
         sendTick += 1
         let context = ProjectContext.chosen(scope: projectScope?.projectID, optedIn: includeProjectContext && !chat.isRunning)
@@ -353,6 +375,25 @@ struct ChatScreen: View {
             try? await Task.sleep(for: .seconds(8))
             if !Task.isCancelled && !chat.isRunning && chat.sessionId != nil { await chat.load(quiet: true) }
         }
+    }
+}
+
+/// A collapsed long paste, removable before send.
+struct PasteChip: View {
+    let text: String
+    let remove: () -> Void
+    var body: some View {
+        Button(action: remove) {
+            HStack(spacing: 5) {
+                Image(systemName: "doc.on.clipboard").font(.caption)
+                Text("Pasted text · \(text.count.formatted()) characters").font(.caption2).lineLimit(1)
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Remove pasted text, \(text.count) characters")
     }
 }
 

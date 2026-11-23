@@ -122,6 +122,7 @@ From the repository root, run the following on macOS with Python 3.11+ and Xcode
 ```sh
 python3 -m unittest discover -s Tests -v
 swiftc App/Sources/StreamRecovery.swift Tests/StreamRecoveryTests.swift -o /tmp/hermes-recovery-tests
+python3 Benchmarks/request_path.py
 xcrun -sdk iphonesimulator swiftc -parse-as-library -target arm64-apple-ios17.0-simulator App/Sources/API.swift App/Sources/AppModel.swift App/Sources/ChatModel.swift App/Sources/InboxCache.swift App/Sources/Management.swift App/Sources/ManagementAPI.swift App/Sources/MediaStaging.swift App/Sources/Models.swift App/Sources/Projects.swift App/Sources/StatusModel.swift App/Sources/StreamRecovery.swift App/Sources/Workspaces.swift App/Sources/Views/ChatMedia.swift Tests/MediaImportTests.swift -o /tmp/media-import-tests
 xcrun simctl spawn <SIMULATOR-UDID> /tmp/media-import-tests
 swiftc App/Sources/Projects.swift App/Sources/Models.swift Tests/ProjectsTests.swift -parse-as-library -o /tmp/hermes-projects-tests
@@ -176,3 +177,13 @@ Run the media regression on macOS with `swiftc App/Sources/MediaStaging.swift Te
 Photos import through the picker's data transferable instead of one generic `.item` file representation shared by photos and videos. The single generic file import intermittently matched nothing on large or not-yet-local assets and surfaced CoreTransferable's raw error text in the chat. Photos now decode straight from bytes through ImageIO (PNG screenshots, HEIC originals, GIF first frames), download by the system when only an iCloud original exists, render at 2048 px with one extra compression step before the 1 MiB budget, and report a human failure message. Videos stage through a movie-typed file representation into the existing snapshot pipeline. Two 23 MB noise photos and a video were imported end-to-end in the simulator: photo chips, the receive-choice dialog and two review frames all appeared with no error banner.
 
 The import regression compiles the top-level App/Sources files plus App/Sources/Views/ChatMedia.swift and Tests/MediaImportTests.swift for the iOS simulator and runs with simctl spawn. It covers a screenshot-sized noise PNG staying inside the send budget, a readable JPEG result, refused junk bytes, and a HEIC original.
+
+## Build 16
+
+The bridge cached its repeated config parsing by file (mtime, size): every bot-list request had re-run `yaml.safe_load` on each profile's config.yaml (~20 ms per profile; five profiles made `/m/bots` a 92 ms median request). The cache invalidates on any write, verified by rewrite-and-recheck. `Benchmarks/request_path.py` now measures the bridge's hot request paths against the real Hermes home: bots() fell from 92 ms median / 97 ms p95 to 0.16 ms / 0.22 ms; the inbox first page (6 s shared cache), cursor pages, auth token verification and search were already sub-millisecond or ~10 ms and are unchanged. The 234-test bridge suite passes unchanged.
+
+Long pastes (≥2,000 characters in one insertion) leave the composer and ride as removable "Pasted text · N characters" chips, sent with the next message — the T3 pattern. A 7,200-character per-key typing session was exercised in the simulator without producing a chip (no false positives); the isolation logic is unit-verified exactly (mid-string paste extraction, short insertions stay inline).
+
+Attachment chips now badge the source format in the corner of the preview — GIF (first frame), PNG, WebP or HEIC — because the sent bytes are always converted JPEG. The attachment budget per send is configurable on the bridge with `HERMES_MOBILE_MEDIA_MAX_BYTES` (clamped to 256 KiB–8 MiB so an encoded attachment can never exceed the 12 MiB request body cap; the default stays 4 MiB), which the phone picks up automatically from media capabilities.
+
+Sign-in already rejects plain `http://` origins except loopback, so no cleartext bearer can be saved from the sign-in screen; this was verified rather than changed.

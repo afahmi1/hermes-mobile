@@ -70,7 +70,18 @@ enum ChatMedia {
     static func image(from data: Data) throws -> SendAttachment {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let thumbnail = thumbnail(source, pixels: 2048) else { throw Failure.unreadable }
-        return try jpeg(UIImage(cgImage: thumbnail), name: "Photo")
+        return try jpeg(UIImage(cgImage: thumbnail), name: "Photo", sourceType: originalTypeName(data))
+    }
+
+    /// The original format behind picked bytes, for an honest badge on the chip. nil = plain JPEG.
+    /// The bytes sent are always JPEG (first frame); the badge says where they came from.
+    static func originalTypeName(_ data: Data) -> String? {
+        if data.starts(with: [0x47, 0x49, 0x46, 0x38]) { return "GIF" }          // GIF87a / GIF89a
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "PNG" }
+        if data.count >= 12, data[8] == 0x57, data[9] == 0x45, data[10] == 0x42, data[11] == 0x50 { return "WebP" }
+        if data.count >= 12, let head = String(bytes: data[4..<12], encoding: .ascii), head.hasPrefix("ftyp"),
+           head.dropFirst(4).hasPrefix("he") || head.dropFirst(4).hasPrefix("mi") || head.dropFirst(4).hasPrefix("ms") { return "HEIC" }
+        return nil
     }
 
     static func thumbnail(_ source: CGImageSource, pixels: Int) -> CGImage? {
@@ -80,10 +91,12 @@ enum ChatMedia {
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
-    static func jpeg(_ image: UIImage, name: String) throws -> SendAttachment {
+    /// JPEG bytes within the 1 MiB send budget; the filename keeps the source type's extension.
+    static func jpeg(_ image: UIImage, name: String, sourceType: String? = nil) throws -> SendAttachment {
+        let ext = sourceType.map { $0.lowercased() } ?? "jpg"
         for quality in [0.82, 0.62, 0.45, 0.3, 0.18] {
             if let bytes = image.jpegData(compressionQuality: quality), bytes.count <= 1024 * 1024 {
-                return SendAttachment(mime: "image/jpeg", filename: name + "-" + UUID().uuidString.prefix(6) + ".jpg",
+                return SendAttachment(mime: "image/jpeg", filename: name + "-" + UUID().uuidString.prefix(6) + "." + ext,
                                       base64: bytes.base64EncodedString())
             }
         }
@@ -150,6 +163,27 @@ enum ChatMedia {
     }
 }
 
+
+/// T3-style long pastes: a paste this big leaves the composer and rides as a removable chip,
+/// sent with the next message instead of flooding the text field.
+enum PasteSplit {
+    static let threshold = 2_000
+
+    /// The single inserted run that turned `old` into `new`, when at least `threshold` characters.
+    static func insertion(old: String, new: String) -> String? {
+        guard new.count - old.count >= threshold else { return nil }
+        let a = Array(old), b = Array(new)
+        let m = min(a.count, b.count)
+        var p = 0
+        while p < m, a[p] == b[p] { p += 1 }
+        var s = 0
+        while s < m - p, a[a.count - 1 - s] == b[b.count - 1 - s] { s += 1 }
+        let run = b[p ..< b.count - s]
+        guard run.count >= threshold else { return nil }
+        return String(run)
+    }
+}
+
 struct CameraPhoto: UIViewControllerRepresentable {
     let picked: (UIImage?) -> Void
     final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
@@ -180,11 +214,32 @@ struct AttachmentChip: View {
         let pieces = attachment.filename.split(separator: "-")
         return pieces.count >= 3 && pieces[0] == "Frame" ? "Frame at " + pieces[1] : "Photo"
     }
+
+    /// The source format when the sent bytes are a converted JPEG (a GIF's first frame, a HEIC
+    /// original): named in the corner of the preview so the type is never a surprise.
+    private var typeBadge: String? {
+        guard attachment.mime == "image/jpeg" else { return nil }
+        switch (attachment.filename as NSString).pathExtension.lowercased() {
+        case "gif": return "GIF · 1st frame"
+        case "png": return "PNG"
+        case "webp": return "WebP"
+        case "heic": return "HEIC"
+        default: return nil
+        }
+    }
+
     var body: some View {
         Button(action: remove) {
             HStack(spacing: 5) {
                 if let thumbnail {
                     Image(uiImage: thumbnail).resizable().scaledToFill().frame(width: 46, height: 38).clipped()
+                        .overlay(alignment: .bottomLeading) {
+                            if let typeBadge {
+                                Text(typeBadge).font(.system(size: 8, weight: .semibold))
+                                    .padding(.horizontal, 3).padding(.vertical, 1)
+                                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 4))
+                            }
+                        }
                 } else { Image(systemName: "film") }
                 if label != "Photo" { Text(label).font(.caption2) }
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)

@@ -13,7 +13,20 @@ import tempfile
 import threading
 import time
 
-MAX_BYTES = 4 * 1024 * 1024
+# Total attachment budget per send. HERMES_MOBILE_MEDIA_MAX_BYTES can raise it (longer clips
+# on gateways that accept them); it is clamped so a raised budget can never exceed the
+# bridge's JSON body cap once base64-encoded: 8 MiB raw -> ~10.7 MiB encoded < 12 MiB body.
+def _max_bytes():
+    try:
+        configured = int(os.environ.get("HERMES_MOBILE_MEDIA_MAX_BYTES", ""))
+    except ValueError:
+        configured = 0
+    if configured <= 0:
+        return 4 * 1024 * 1024
+    return max(256 * 1024, min(8 * 1024 * 1024, configured))
+
+
+MAX_BYTES = _max_bytes()
 JPEG = "image/jpeg"
 MP4 = "video/mp4"
 

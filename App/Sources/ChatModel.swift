@@ -25,6 +25,12 @@ struct ApprovalRequest: Identifiable, Hashable {
     let requestId: String?
 }
 
+
+/// One collapsed long paste, shown as a chip in the composer and sent with the next message.
+struct PastedText: Identifiable, Equatable {
+    let id = UUID()
+    let text: String
+}
 /// One chat: its transcript (from Hermes), its live run, and its model/provider/effort choice.
 @MainActor @Observable
 final class ChatModel {
@@ -79,6 +85,15 @@ final class ChatModel {
     private(set) var cachedAt: Date?
     var draft = ""
     var draftAttachments: [SendAttachment] = []
+    /// Large pastes (T3-style): kept out of the composer, sent with the next message.
+    var pastedTexts: [PastedText] = []
+
+    /// What the next send actually delivers: the draft plus every pasted chunk.
+    var combinedDraft: String {
+        let extra = pastedTexts.map(\.text).joined(separator: "\n\n")
+        guard !extra.isEmpty else { return draft }
+        return draft.isEmpty ? extra : draft + "\n\n" + extra
+    }
     private var transcriptKey: String? {
         sessionId.flatMap { app?.inboxKey(profile: profile, filter: "transcript/" + $0) }
     }
@@ -699,6 +714,16 @@ final class ChatModel {
         await load(quiet: true, resumeLive: !gaveUp)
         if gaveUp { error = "The live connection was lost. Pull down to reconnect." }
     }
+
+    func absorbPaste(_ text: String) {
+        pastedTexts.append(PastedText(text: text))
+    }
+
+    func removePastedText(_ id: UUID) {
+        pastedTexts.removeAll { $0.id == id }
+    }
+
+
 
     private func fail(_ message: String) {
         error = message

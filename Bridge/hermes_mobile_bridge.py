@@ -69,16 +69,50 @@ def log(msg):
     sys.stderr.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     sys.stderr.flush()
 
+# ---------- mtime-keyed caches ----------
+# Repeated config reads (every bot-list and workspace request re-reads each profile's
+# .env and config.yaml) are cached until the file's (mtime, size) changes: any write
+# bumps mtime, so a cached value can never outlive the file it came from.
+_MTIME_CACHE = {}
+_MTIME_LOCK = threading.Lock()
+
+
+def _read_text(path):
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
+
+
+def _by_mtime(section, path, load):
+    try:
+        st = path.stat()
+        key = (section, str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return load()
+    with _MTIME_LOCK:
+        cached = _MTIME_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value = load()
+    with _MTIME_LOCK:
+        if len(_MTIME_CACHE) >= 512:
+            _MTIME_CACHE.clear()
+        _MTIME_CACHE[key] = value
+    return value
+
+
+def env_text(path):
+    """A file's text, cached by mtime ("" when unreadable)."""
+    return _by_mtime("text", path, lambda: _read_text(path))
+
 
 # ---------- config ----------
 def env_value(path, key):
     val = ""
-    try:
-        for line in path.read_text().splitlines():
-            if line.startswith(key + "="):
-                val = line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
+    for line in env_text(path).splitlines():
+        if line.startswith(key + "="):
+            val = line.split("=", 1)[1].strip().strip('"').strip("'")
     return val  # last one wins, like dotenv
 
 
@@ -94,6 +128,12 @@ def basic_auth():
 
 
 def model_default(cfg):
+    """The profile's default model/provider, cached until config.yaml's (mtime, size) changes.
+    Parsing all five configs took ~20 ms each on every bot-list request; this is the hot path."""
+    return _by_mtime("model_default", cfg, lambda: _model_default_read(cfg))
+
+
+def _model_default_read(cfg):
     try:
         text = cfg.read_text()
     except OSError:
@@ -122,6 +162,11 @@ def model_default(cfg):
 
 
 def fleet_meta():
+    """Display names from the fleet list in the main SOUL.md, cached by mtime."""
+    return _by_mtime("fleet_meta", HERMES / "SOUL.md", lambda: _fleet_meta_read())
+
+
+def _fleet_meta_read():
     """Display names and one-line roles from the fleet list in the main SOUL.md."""
     meta = {}
     try:
@@ -186,8 +231,9 @@ def bots():
 
 def served_profiles():
     """Profiles the running gateway serves (it hot-serves new ones on its own; see gateway_state.json)."""
+    text = env_text(HERMES / "gateway_state.json")
     try:
-        return set(json.loads((HERMES / "gateway_state.json").read_text()).get("served_profiles") or [])
+        return set(json.loads(text).get("served_profiles") or [])
     except Exception:
         return set()
 
@@ -967,10 +1013,7 @@ def profile_protected(pid):
                 "portfolio", "stocks", "trader", "doctor", "medical", "bacta", "finance", "bank", "banking",
                    "therapy", "secrets", "vault"} or not key_for(pid):
         return True
-    try:
-        return OPT_OUT in (profile_home(pid) / ".env").read_text()
-    except OSError:
-        return False
+    return OPT_OUT in env_text(profile_home(pid) / ".env")
 
 
 def workspace_catalog():

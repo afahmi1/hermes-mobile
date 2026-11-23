@@ -25,12 +25,38 @@ enum MediaImportTests {
         catch ChatMedia.Failure.unreadable {}
 
         // A HEIC original decodes through the same path (ImageIO reads it on-device).
+
+        // Pasted-text collapse: a huge paste is isolated exactly; small edits stay inline.
+        let big = String(repeating: "paste ", count: 600)  // 3,600 characters
+        guard let run = PasteSplit.insertion(old: "keep tail", new: "keep " + big + "tail") else {
+            fatalError("a 3,600-char paste was not isolated")
+        }
+        precondition(run == big, "isolated run differs from the pasted text")
+        precondition(PasteSplit.insertion(old: big, new: big + "tail") == nil, "short insertion collapsed")
+        precondition(PasteSplit.insertion(old: "a", new: "ab") == nil, "tiny insertion collapsed")
+
+        // Source-type sniffing names the original format; JPEGs stay unbadged.
+        precondition(ChatMedia.originalTypeName(Data("GIF89a".utf8)) == "GIF")
+        precondition(ChatMedia.originalTypeName(Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A])) == "PNG")
+        precondition(ChatMedia.originalTypeName(Data([0, 0, 0, 0]) + Data("ftypheic".utf8)) == "HEIC")
+        precondition(ChatMedia.originalTypeName(Data("RIFF____WEBP".utf8)) == "WebP")
+        precondition(ChatMedia.originalTypeName(Data([0xFF, 0xD8, 0xFF, 0xE0]) + Data(repeating: 0, count: 20)) == nil)
+        precondition(ChatMedia.originalTypeName(Data()) == nil)
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8))
+        let dot = renderer.image { context in
+            UIColor.systemRed.setFill(); context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        }
+        let gifAsset = try ChatMedia.jpeg(dot, name: "Photo", sourceType: "GIF")
+        precondition((gifAsset.filename as NSString).pathExtension == "gif", gifAsset.filename)
+        precondition(gifAsset.mime == "image/jpeg", "a GIF's first frame still rides as JPEG bytes")
+
+        // A HEIC original decodes through the same path (ImageIO reads it on-device).
         if let heic = try? heicFixture(1200) {
             let h = try ChatMedia.image(from: heic)
             precondition(h.mime == "image/jpeg")
         }
 
-        print("Media import decode, large screenshot, HEIC and budget boundaries passed")
+        print("Media import decode, paste split, source types and budget boundaries passed")
     }
     /// A large, per-pixel-noise PNG: uncompressible, like a real photo or dense screenshot.
     static func render(_ size: CGSize) throws -> Data {
