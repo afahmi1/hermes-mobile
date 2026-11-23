@@ -122,6 +122,8 @@ From the repository root, run the following on macOS with Python 3.11+ and Xcode
 ```sh
 python3 -m unittest discover -s Tests -v
 swiftc App/Sources/StreamRecovery.swift Tests/StreamRecoveryTests.swift -o /tmp/hermes-recovery-tests
+xcrun -sdk iphonesimulator swiftc -parse-as-library -target arm64-apple-ios17.0-simulator App/Sources/API.swift App/Sources/AppModel.swift App/Sources/ChatModel.swift App/Sources/InboxCache.swift App/Sources/Management.swift App/Sources/ManagementAPI.swift App/Sources/MediaStaging.swift App/Sources/Models.swift App/Sources/Projects.swift App/Sources/StatusModel.swift App/Sources/StreamRecovery.swift App/Sources/Workspaces.swift App/Sources/Views/ChatMedia.swift Tests/MediaImportTests.swift -o /tmp/media-import-tests
+xcrun simctl spawn <SIMULATOR-UDID> /tmp/media-import-tests
 swiftc App/Sources/Projects.swift App/Sources/Models.swift Tests/ProjectsTests.swift -parse-as-library -o /tmp/hermes-projects-tests
 swiftc App/Sources/Workspaces.swift App/Sources/Models.swift Tests/WorkspaceModelTests.swift -parse-as-library -o /tmp/hermes-workspace-tests
 swiftc App/Sources/Management.swift App/Sources/Projects.swift App/Sources/Workspaces.swift App/Sources/Models.swift Tests/ManagementTests.swift -parse-as-library -o /tmp/hermes-management-tests
@@ -168,3 +170,9 @@ Photos picker imports first try a copy-on-write file snapshot. The picker may st
 Chat presentation follows the underlying chat model. A send finishing after the user changes gateways can attach a session to the inbox only if the original draft still belongs to that inbox. An explicit profile-level rejection of image input takes precedence over a gateway-wide image capability.
 
 Run the media regression on macOS with `swiftc App/Sources/MediaStaging.swift Tests/MediaStagingTests.swift -o /tmp/media-staging && /tmp/media-staging`. It exercises a source edit after staging, empty input, symlinks and the free-space and full-copy thresholds. For the chat regression, compile the top-level App/Sources Swift files except HermesMobileApp.swift together with Tests/ChatOwnershipTests.swift for the iOS simulator and run with simctl spawn. It constructs two app models that use the same session ID and delivers a late completion from the first to the second.
+
+## Build 15
+
+Photos import through the picker's data transferable instead of one generic `.item` file representation shared by photos and videos. The single generic file import intermittently matched nothing on large or not-yet-local assets and surfaced CoreTransferable's raw error text in the chat. Photos now decode straight from bytes through ImageIO (PNG screenshots, HEIC originals, GIF first frames), download by the system when only an iCloud original exists, render at 2048 px with one extra compression step before the 1 MiB budget, and report a human failure message. Videos stage through a movie-typed file representation into the existing snapshot pipeline. Two 23 MB noise photos and a video were imported end-to-end in the simulator: photo chips, the receive-choice dialog and two review frames all appeared with no error banner.
+
+The import regression compiles the top-level App/Sources files plus App/Sources/Views/ChatMedia.swift and Tests/MediaImportTests.swift for the iOS simulator and runs with simctl spawn. It covers a screenshot-sized noise PNG staying inside the send budget, a readable JPEG result, refused junk bytes, and a HEIC original.

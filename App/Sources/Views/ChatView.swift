@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 import AVFoundation
 
 struct ChatView: View {
@@ -279,15 +280,14 @@ struct ChatScreen: View {
         preparingMedia = true
         defer { preparingMedia = false; pickerItem = nil }
         do {
-            guard let media = try await item.loadTransferable(type: PickedMedia.self) else { throw ChatMedia.Failure.unreadable }
-            if Task.isCancelled { try? FileManager.default.removeItem(at: media.url); return }
             if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
                 discardVideo()
-                pickedVideo = media.url
+                pickedVideo = try await MediaImport.videoFile(from: item)
                 chooseVideo = true
             } else {
-                defer { try? FileManager.default.removeItem(at: media.url) }
-                let asset = try await Task.detached(priority: .userInitiated) { try ChatMedia.image(at: media.url) }.value
+                let data = try await MediaImport.imageData(from: item)
+                if Task.isCancelled { return }
+                let asset = try await Task.detached(priority: .userInitiated) { try ChatMedia.image(from: data) }.value
                 if !Task.isCancelled { chat.draftAttachments.append(asset) }
             }
         } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }

@@ -5,31 +5,71 @@ import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Photos may supply an iCloud-backed file. Copy it inside the transfer callback before its URL expires.
-struct PickedMedia: Transferable {
+/// The picked video as a private file snapshot. Declaring the movie content type matches the
+/// picker's actual representations; the old single generic `.item` file import, used for photos
+/// and videos alike, intermittently matched nothing and failed with "no compatible representations".
+struct PickedVideoFile: Transferable {
     let url: URL
     static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(importedContentType: .item) { file in
+        FileRepresentation(importedContentType: .movie) { file in
             try Self(url: MediaStaging.stage(file.file))
+        }
+    }
+}
+
+enum MediaImport {
+    /// The photo's bytes. `Data` is the native transferable for library assets: the system picks
+    /// the asset's real representation and downloads the iCloud original when needed, instead of
+    /// negotiating a generic file representation that large or not-yet-local items fail to provide.
+    static func imageData(from item: PhotosPickerItem) async throws -> Data {
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                throw ChatMedia.Failure.downloadFailed
+            }
+            return data
+        } catch let failure as ChatMedia.Failure {
+            throw failure
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ChatMedia.Failure.downloadFailed
+        }
+    }
+
+    static func videoFile(from item: PhotosPickerItem) async throws -> URL {
+        do {
+            guard let picked = try await item.loadTransferable(type: PickedVideoFile.self) else {
+                throw ChatMedia.Failure.downloadFailed
+            }
+            return picked.url
+        } catch let failure as ChatMedia.Failure {
+            throw failure
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ChatMedia.Failure.downloadFailed
         }
     }
 }
 
 enum ChatMedia {
     enum Failure: LocalizedError {
-        case unreadable, tooLarge, noFrames
+        case unreadable, tooLarge, noFrames, downloadFailed
         var errorDescription: String? {
             switch self {
             case .unreadable: "This media could not be opened. Try another file."
             case .tooLarge: "This file is too large to send. Choose a smaller photo or a shorter clip."
             case .noFrames: "No frames could be read from this video."
+            case .downloadFailed: "This photo or video couldn't be downloaded from iCloud. Check your connection and try again."
             }
         }
     }
 
-    static func image(at url: URL) throws -> SendAttachment {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let thumbnail = thumbnail(source, pixels: 1600) else { throw Failure.unreadable }
+    /// Decode the picked photo's bytes: PNG screenshots, HEIC camera originals and animated GIFs
+    /// (first frame) all pass through ImageIO, whatever the library hands over.
+    static func image(from data: Data) throws -> SendAttachment {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let thumbnail = thumbnail(source, pixels: 2048) else { throw Failure.unreadable }
         return try jpeg(UIImage(cgImage: thumbnail), name: "Photo")
     }
 
@@ -41,7 +81,7 @@ enum ChatMedia {
     }
 
     static func jpeg(_ image: UIImage, name: String) throws -> SendAttachment {
-        for quality in [0.82, 0.65, 0.48, 0.32] {
+        for quality in [0.82, 0.62, 0.45, 0.3, 0.18] {
             if let bytes = image.jpegData(compressionQuality: quality), bytes.count <= 1024 * 1024 {
                 return SendAttachment(mime: "image/jpeg", filename: name + "-" + UUID().uuidString.prefix(6) + ".jpg",
                                       base64: bytes.base64EncodedString())
