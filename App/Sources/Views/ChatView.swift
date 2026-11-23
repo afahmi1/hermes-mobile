@@ -1,4 +1,6 @@
 import SwiftUI
+import PhotosUI
+import AVFoundation
 
 struct ChatView: View {
     @Environment(AppModel.self) private var app
@@ -18,10 +20,18 @@ struct ChatScreen: View {
     var projectScope: WorkspaceScope?
     /// Off for every send; switched back off after each one.
     @State private var includeProjectContext = false
-    @State private var draft = ""
+    @State private var followLatest = true
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showRuntime = false
     @State private var sendTick = 0
     @FocusState private var composerFocused: Bool
+    @State private var pickerItem: PhotosPickerItem?
+    @State private var showPicker = false
+    @State private var showCamera = false
+    @State private var preparingMedia = false
+    @State private var pickedVideo: URL?
+    @State private var chooseVideo = false
+    @State private var mediaCapabilities: MediaCapabilities?
 
     private var bot: Bot? { app.bot(chat.profile) }
 
@@ -29,8 +39,13 @@ struct ChatScreen: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 10) {
+                    if let saved = chat.cachedAt {
+                        Text("Saved on this iPhone \(saved, style: .relative) ago")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     if chat.hasOlder && !chat.isRunning {
                         Button(chat.loadingOlder ? "Loading earlier messages…" : "Load earlier messages") {
+                            followLatest = false
                             let anchor = chat.items.first?.id
                             Task {
                                 await chat.loadOlder()
@@ -59,8 +74,25 @@ struct ChatScreen: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
-            .onChange(of: chat.items.last?.text) { _, _ in withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) } }
-            .onChange(of: chat.items.last?.id) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { drag in
+                if drag.translation.height > 12 { followLatest = false }
+            })
+            .onChange(of: chat.textRevision) { _, _ in
+                if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: chat.items.last?.id) { _, _ in
+                if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !followLatest {
+                    Button {
+                        followLatest = true
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    } label: { Label("Latest", systemImage: "arrow.down") }
+                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                    .padding(.trailing, 12).padding(.bottom, 6)
+                }
+            }
             .overlay { if chat.isLoading { ProgressView() } }
         }
         .safeAreaInset(edge: .bottom) { composer }
@@ -71,6 +103,7 @@ struct ChatScreen: View {
                 Button { showRuntime = true } label: { titleBlock }
                     .buttonStyle(.plain)
                     .accessibilityHint("Change model, provider and effort")
+                    .disabled(chat.savingRuntime)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 ConnectionBadge()
@@ -78,18 +111,43 @@ struct ChatScreen: View {
         }
         .sheet(isPresented: $showRuntime) {
             RuntimeSheet(profile: chat.profile, bot: bot, current: chat.choice, served: chat.served,
-                         sessionId: chat.sessionId) { choice in
+                         sessionId: chat.sessionId, running: chat.isRunning) { choice in
                 Task { await chat.apply(choice) }
             }
         }
         .sheet(item: $chat.approval) { req in
-            ApprovalSheet(req: req) { answer in Task { await chat.answer(req, choice: answer) } }
+            ApprovalSheet(req: req, busy: chat.answeringApproval, error: chat.approvalError) { answer in Task { await chat.answer(req, choice: answer) } }
         }
+        .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: .any(of: [.images, .videos]))
+        .task(id: pickerItem) { if let pickerItem { await importMedia(pickerItem) } }
+        .sheet(isPresented: $showCamera) {
+            CameraPhoto { image in
+                showCamera = false
+                guard let image else { return }
+                let account = app.inboxAccount
+                preparingMedia = true
+                Task {
+                    defer { preparingMedia = false }
+                    do {
+                        guard let preview = await image.byPreparingThumbnail(ofSize: CGSize(width: 1600, height: 1600)) else { throw ChatMedia.Failure.unreadable }
+                        if account == app.inboxAccount { chat.draftAttachments.append(try ChatMedia.jpeg(preview, name: "Camera")) }
+                    } catch { chat.error = error.localizedDescription }
+                }
+            }.ignoresSafeArea()
+        }
+        .confirmationDialog("How should Hermes receive this video?", isPresented: $chooseVideo) {
+            if mediaCapabilities?.video == true, chat.draftAttachments.isEmpty {
+                Button("Send clip for Hermes video analysis") { prepareClip() }
+            }
+            Button("Choose from up to 3 frames") { prepareFrames() }
+            Button("Cancel", role: .cancel) { discardVideo() }
+        } message: { Text(mediaCapabilities?.video == true ? "A clip includes audio and may be processed by the gateway’s video provider. Frames are still images you can review before sending." : "This gateway accepts still images. Review and remove frames before sending. Frames contain no audio.") }
         .sensoryFeedback(.impact(weight: .light), trigger: sendTick)
         .sensoryFeedback(.success, trigger: chat.completedTick)
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
-        .task { await poll() }
+        .task(id: chat.profile) { mediaCapabilities = try? await API.shared.mediaCapabilities(profile: chat.profile) }
+        .task(id: scenePhase) { if scenePhase == .active { await poll() } }
         .refreshable { await chat.load() }
     }
 
@@ -105,7 +163,9 @@ struct ChatScreen: View {
     }
 
     private var runtimeLabel: String {
+        if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
+        if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + (c.model ?? bot?.model ?? "Bot default") }
         let model = c.model ?? bot?.model ?? "default"
         let effort = c.effort.flatMap { Effort(rawValue: $0)?.label } ?? "default effort"
         return c.isDefault ? "\(model) · bot default" : "\(model) · \(effort)"
@@ -144,8 +204,33 @@ struct ChatScreen: View {
                 }
                 .padding(.horizontal, 16)
             }
+            if !chat.draftAttachments.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack {
+                        ForEach(chat.draftAttachments, id: \.filename) { asset in
+                            AttachmentChip(attachment: asset) {
+                                chat.draftAttachments.removeAll { $0.filename == asset.filename }
+                            }
+                        }
+                    }.padding(.horizontal, 12)
+                }.scrollIndicators(.hidden)
+            }
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Message \(bot?.name ?? "Hermes")", text: $draft, axis: .vertical)
+                if (mediaCapabilities?.images == true || app.health?.imageAttachments == true) && !chat.isRunning {
+                    Menu {
+                        Button { showPicker = true } label: { Label("Photo or video", systemImage: "photo.on.rectangle") }
+                        if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                            Button { openCamera() } label: { Label("Take photo", systemImage: "camera") }
+                        }
+                    } label: {
+                        if preparingMedia { ProgressView() }
+                        else { Image(systemName: "plus.circle").font(.title2) }
+                    }
+                    .frame(minWidth: 44, minHeight: 44)
+                    .disabled(chat.draftAttachments.count >= 4 || chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) || preparingMedia)
+                    .accessibilityLabel("Add photo or video")
+                }
+                TextField("Message \(bot?.name ?? "Hermes")", text: $chat.draft, axis: .vertical)
                     .lineLimit(1...8)
                     .focused($composerFocused)
                     .padding(.horizontal, 14).padding(.vertical, 9)
@@ -159,18 +244,18 @@ struct ChatScreen: View {
                     Button { send() } label: {
                         Image(systemName: "arrow.up.circle.fill").font(.system(size: 32))
                     }
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(preparingMedia || chat.savingRuntime || (chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     .accessibilityLabel("Send")
                 }
             }
             .padding(.horizontal, 12).padding(.bottom, 6)
-            if chat.isRunning && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if chat.isRunning {
                 HStack(spacing: 20) {
                     Button { followUp("queue") } label: { Label("Send next", systemImage: "text.line.last.and.arrowtriangle.forward") }
                     Button { followUp("steer") } label: { Label("Guide this reply", systemImage: "arrow.turn.up.right") }
                     Spacer()
                 }
-                .font(.subheadline.weight(.medium)).disabled(!chat.acceptsFollowUp)
+                .font(.subheadline.weight(.medium)).disabled(!chat.acceptsFollowUp || chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .padding(.horizontal, 16).padding(.bottom, 5)
             }
         }
@@ -178,21 +263,82 @@ struct ChatScreen: View {
         .background(.bar)
     }
 
-    private func followUp(_ mode: String) {
-        let text = draft
+    private func openCamera() {
         Task {
-            if await chat.followUp(text, mode: mode), draft == text { draft = "" }
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            if granted { showCamera = true }
+            else { chat.error = "Allow camera access in iPhone Settings to take a photo." }
+        }
+    }
+
+    private func importMedia(_ item: PhotosPickerItem) async {
+        preparingMedia = true
+        defer { preparingMedia = false; pickerItem = nil }
+        do {
+            guard let media = try await item.loadTransferable(type: PickedMedia.self) else { throw ChatMedia.Failure.unreadable }
+            if Task.isCancelled { try? FileManager.default.removeItem(at: media.url); return }
+            if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
+                discardVideo()
+                pickedVideo = media.url
+                chooseVideo = true
+            } else {
+                defer { try? FileManager.default.removeItem(at: media.url) }
+                let asset = try await Task.detached(priority: .userInitiated) { try ChatMedia.image(at: media.url) }.value
+                if !Task.isCancelled { chat.draftAttachments.append(asset) }
+            }
+        } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
+    }
+
+    private func discardVideo() {
+        if let url = pickedVideo { try? FileManager.default.removeItem(at: url) }
+        pickedVideo = nil
+    }
+
+    private func prepareClip() {
+        guard let url = pickedVideo, let caps = mediaCapabilities, caps.video, chat.draftAttachments.isEmpty else { return }
+        pickedVideo = nil
+        preparingMedia = true
+        let account = app.inboxAccount
+        Task {
+            defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
+            do {
+                let clip = try await ChatMedia.clip(from: url, maxBytes: caps.maxVideoBytes)
+                if account == app.inboxAccount { chat.draftAttachments = [clip] }
+            } catch { chat.error = error.localizedDescription }
+        }
+    }
+
+    private func prepareFrames() {
+        guard let url = pickedVideo else { return }
+        pickedVideo = nil
+        preparingMedia = true
+        let account = app.inboxAccount
+        Task {
+            defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
+            do {
+                let frames = try await ChatMedia.frames(from: url, count: min(3, 4 - chat.draftAttachments.count))
+                if account == app.inboxAccount { chat.draftAttachments += frames }
+            } catch { chat.error = error.localizedDescription }
+        }
+    }
+
+    private func followUp(_ mode: String) {
+        let text = chat.draft
+        Task {
+            if await chat.followUp(text, mode: mode), chat.draft == text { chat.draft = "" }
         }
     }
 
     private func send() {
-        let text = draft
-        draft = ""
+        let text = chat.draft
+        let attachments = chat.draftAttachments
+        chat.draft = ""
+        followLatest = true
         sendTick += 1
         let context = ProjectContext.chosen(scope: projectScope?.projectID, optedIn: includeProjectContext && !chat.isRunning)
         includeProjectContext = false  // ask every send
         Task {
-            await chat.send(text, projectContext: context)
+            await chat.send(text, projectContext: context, attachments: attachments)
             app.adopt(chat, draftKey: draftKey)
         }
     }
@@ -280,8 +426,9 @@ struct MessageRow: View {
 
 struct ApprovalSheet: View {
     let req: ApprovalRequest
+    let busy: Bool
+    let error: String?
     let answer: (String) -> Void
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
@@ -290,12 +437,14 @@ struct ApprovalSheet: View {
                 if !req.command.isEmpty {
                     Section("Command") { Text(req.command).font(.system(.footnote, design: .monospaced)).textSelection(.enabled) }
                 }
+                if let error { Label(error, systemImage: "exclamationmark.triangle") }
                 Section {
                     ForEach(req.choices, id: \.self) { c in
-                        Button(role: c == "deny" ? .destructive : nil) { answer(c); dismiss() } label: { Text(label(c)) }
+                        Button(role: c == "deny" ? .destructive : nil) { answer(c) } label: { Text(label(c)) }
                     }
                 }
             }
+            .disabled(busy)
             .navigationTitle("Approve?")
             .navigationBarTitleDisplayMode(.inline)
         }

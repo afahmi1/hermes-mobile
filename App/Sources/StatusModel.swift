@@ -54,8 +54,11 @@ final class StatusModel {
     var refreshingProviders = false
     /// The newest "added"/"removed" event the user has seen on the Status tab.
     /// nil until the first payload: that one becomes the baseline, so old events never show as unseen.
-    var seenEventsUntil: Date? = UserDefaults.standard.object(forKey: "status.seenEvents") as? Date {
-        didSet { UserDefaults.standard.set(seenEventsUntil, forKey: "status.seenEvents") }
+    private var seenAccount: String?
+    var seenEventsUntil: Date? {
+        didSet {
+            if let seenAccount { UserDefaults.standard.set(seenEventsUntil, forKey: "device." + seenAccount + ".status.seenEvents") }
+        }
     }
     /// Shown briefly when something new appears while the app is open.
     var announcement: String?
@@ -77,6 +80,10 @@ final class StatusModel {
     private var forcingRefresh = false
 
     func refresh(force: Bool = false, app: AppModel) async {
+        if let account = app.inboxAccount, seenAccount != account {
+            seenAccount = account
+            seenEventsUntil = UserDefaults.standard.object(forKey: "device." + account + ".status.seenEvents") as? Date
+        }
         if refreshID != nil && (!force || forcingRefresh) { return }
         let id = UUID()
         refreshID = id
@@ -109,6 +116,7 @@ final class StatusModel {
         announcement = nil
         lastBotKey = nil
         lastEventAt = nil
+        seenAccount = nil
         seenEventsUntil = nil
     }
 

@@ -6,9 +6,10 @@ struct ProjectsView: View {
     private struct Selection: Hashable { let id: Project.ID }
 
     @Environment(AppModel.self) private var app
-    @State private var model = ProjectsModel(fetch: { try await API.shared.projects() })
+    private let originClient = API.shared
+    @State private var model = ProjectsModel(fetch: { [api = API.shared] in try await api.projects() })
     @State private var path = NavigationPath()
-    @State private var workspaces = WorkspaceIndexModel(fetch: { try await API.shared.workspaceIndex() })
+    @State private var workspaces = WorkspaceIndexModel(fetch: { [api = API.shared] in try await api.workspaceIndex() })
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -34,7 +35,7 @@ struct ProjectsView: View {
         .task { await model.load() }
         .task { await workspaces.load() }  // separate from the catalog: its failure never hides it
         .onChange(of: model.state) { _, state in
-            if state == .failed(.signedOut) { app.signOut() }
+            if state == .failed(.signedOut), API.shared === originClient { app.signOut() }
         }
     }
 

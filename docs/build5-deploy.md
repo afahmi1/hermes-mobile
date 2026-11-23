@@ -50,7 +50,7 @@ The eligible, host and manageable lists are narrowed further on every request. A
 ## Migration (opt-in)
 
 1. **Stop the bridge and back up** `<HERMES_HOME>/mobile/` (it holds `workspaces.db`, which contains the pilot's instructions, chats and artifacts).
-2. **Deploy the new bridge files:** `hermes_mobile_bridge.py`, `bridge_workspaces.py`, `bridge_owner.py` and `bridge_manage.py`.
+2. **Deploy the full Bridge and Status directories together.** The services import sibling modules for per-device grants, host process checks and turn recovery.
    - Start it with no new settings first. Check that the existing project and normal login behave exactly as before. The test suite proves operator mode returns the build-4 shapes.
 3. **Add the owner settings** from the tables above and restart.
    - On first owner-mode use, the pilot `{project: [bots]}` map is copied into assignments, once.

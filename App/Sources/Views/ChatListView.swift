@@ -7,16 +7,29 @@ struct ChatListView: View {
     @State private var sessions: [SessionSummary] = []
     @State private var cursor: String?
     @State private var generation = UUID()
+    @State private var lastSync: Date?
+    @Environment(\.scenePhase) private var scenePhase
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
     @State private var results: [SessionSummary]?
     @State private var path = NavigationPath()
     @State private var showNew = false
-    var profile: String? = nil
+    private let fixedProfile: String?
+    @State private var selectedBot: String?
+    private var profile: String? { fixedProfile ?? selectedBot }
+    init(profile: String? = nil) { fixedProfile = profile }
+
 
     enum Filter: String, CaseIterable, Identifiable {
-        case chats = "Chats", all = "Everything", telegram = "Telegram", archived = "Archived"
+        case chats = "Chats", desktop = "Desktop & mobile", telegram = "Telegram", all = "Everything", archived = "Archived"
+        var source: String? {
+            switch self {
+            case .desktop: "desktop"
+            case .telegram: "telegram"
+            default: nil
+            }
+        }
         var id: String { rawValue }
     }
 
@@ -26,7 +39,7 @@ struct ChatListView: View {
                 .navigationTitle(profile.map { app.botName($0) } ?? "Chats")
                 .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
                 .searchable(text: $query, prompt: "Search titles and messages")
-                .task(id: [query, filter.rawValue]) { await runSearch() }
+                .task(id: [query] + inboxScope) { await runSearch() }
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) { ConnectionBadge() }
                     ToolbarItem(placement: .topBarTrailing) {
@@ -41,44 +54,68 @@ struct ChatListView: View {
                     }
                 }
                 .refreshable { await reload() }
-                .task(id: filter) {
-                    let request = UUID()
-                    generation = request
-                    loading = false
-                    let scope = filter
-                    error = nil
-                    let key = app.inboxKey(profile: profile, filter: scope.rawValue)
-                    var saved = key.flatMap { app.inboxes[$0] }
-                    sessions = saved?.sessions ?? []
-                    cursor = saved?.cursor
-                    if saved == nil, let key {
-                        saved = await InboxDisk.shared.read(key)
-                        guard !Task.isCancelled, generation == request, filter == scope, key == app.inboxKey(profile: profile, filter: scope.rawValue) else { return }
-                        if let saved {
-                            app.inboxes[key] = saved
-                            sessions = saved.sessions
-                            cursor = saved.cursor
-                        }
-                    }
-                    if saved.map({ Date().timeIntervalSince($0.savedAt) < 12 }) != true { await reload() }
-                }
-                .task { await autoRefresh() }
+                .task(id: inboxScope) { await restoreInbox() }
+                .task(id: scenePhase) { if scenePhase == .active { await autoRefresh() } }
 
         }
     }
 
+    private var inboxScope: [String] { [filter.rawValue, profile ?? "", app.inboxAccount ?? ""] }
+
+    private func restoreInbox() async {
+        let request = UUID()
+        generation = request
+        loading = false
+        let scope = filter
+        error = nil
+        let key = app.inboxKey(profile: profile, filter: scope.rawValue)
+        var saved = key.flatMap { app.inboxes[$0] }
+        sessions = saved?.sessions ?? []
+        cursor = saved?.cursor
+        lastSync = saved?.savedAt
+        if saved == nil, let key {
+            saved = await InboxDisk.shared.read(key)
+            guard !Task.isCancelled, generation == request, filter == scope, key == app.inboxKey(profile: profile, filter: scope.rawValue) else { return }
+            if let saved {
+                app.inboxes[key] = saved
+                sessions = saved.sessions
+                cursor = saved.cursor
+                lastSync = saved.savedAt
+            }
+        }
+        if saved.map({ Date().timeIntervalSince($0.savedAt) < 12 }) != true { await reload() }
+    }
+
     @ViewBuilder private var content: some View {
         List {
-            if profile == nil && results == nil {
-                Picker("Show", selection: $filter) {
-                    ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
+            Section {
+                HStack {
+                    Picker("Source", selection: $filter) {
+                        ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    if fixedProfile == nil {
+                        Divider()
+                        Picker("Bot", selection: $selectedBot) {
+                            Text("All bots").tag(String?.none)
+                            ForEach(app.bots) { bot in
+                                Text(bot.name == bot.id ? bot.name : "\(bot.name) · \(bot.id)").tag(Optional(bot.id))
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
                 }
-                .pickerStyle(.segmented)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                .labelsHidden()
+            } footer: {
+                if let host = API.shared.baseURL?.host {
+                    Label(host, systemImage: "server.rack").lineLimit(1)
+                }
             }
             if let error {
-                Label(error, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(error, systemImage: "wifi.exclamationmark")
+                    if let lastSync { Text("Last synced \(lastSync, style: .relative) ago").font(.footnote) }
+                }.foregroundStyle(.secondary)
             }
             if let results {
                 if results.isEmpty { Text("No matches").foregroundStyle(.secondary) }
@@ -92,7 +129,7 @@ struct ChatListView: View {
                         .task(id: cursor) { await loadMore() }  // re-runs for every new page, even an empty one
                 } else if sessions.isEmpty && !loading && error == nil {
                     ContentUnavailableView("No chats yet", systemImage: "bubble.left",
-                                           description: Text("Start one with the compose button."))
+                                           description: Text(filter == .telegram ? "Telegram chats appear here after this bot saves them in Hermes." : "Choose another source or start a chat with the compose button."))
                 }
             }
         }
@@ -148,13 +185,13 @@ struct ChatListView: View {
         loading = true
         defer { if generation == request { loading = false } }
         do {
-            if filter == .archived && profile == nil {
-                let archived = try await API.shared.search("", archived: true)
+            if filter == .archived {
+                let archived = try await API.shared.search("", archived: true, profile: profile)
                 guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
                 sessions = archived
                 cursor = nil
             } else {
-                let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, telegram: filter == .telegram)
+                let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, source: filter.source)
                 guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
                 if let warning = page.partialWarning {
                     sessions = dedupe(page.data + sessions)
@@ -177,6 +214,7 @@ struct ChatListView: View {
     private func rememberPage(_ key: String?) {
         guard let key else { return }
         let snapshot = InboxSnapshot(sessions: sessions, cursor: cursor, savedAt: Date())
+        lastSync = snapshot.savedAt
         app.inboxes[key] = snapshot
         Task { await InboxDisk.shared.save(snapshot, key: key) }
     }
@@ -192,7 +230,7 @@ struct ChatListView: View {
         defer { if generation == request { loading = false } }
         // Keep going while pages come back empty but more remain (all-cron stretches on the Chats filter).
         for _ in 0..<5 {
-            guard let page = try? await API.shared.sessions(cursor: c, profile: profile, exclude: exclude, telegram: filter == .telegram) else {
+            guard let page = try? await API.shared.sessions(cursor: c, profile: profile, exclude: exclude, source: filter.source) else {
                 guard !Task.isCancelled, generation == request, filter == requestedFilter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
                 error = "Couldn't load older chats. Pull down to retry."
                 return
@@ -221,7 +259,7 @@ struct ChatListView: View {
             let requestedFilter = filter
             let key = app.inboxKey(profile: profile, filter: requestedFilter.rawValue)
             guard !Task.isCancelled, results == nil, filter != .archived, !loading,
-                  let page = try? await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, telegram: filter == .telegram) else { continue }
+                  let page = try? await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, source: filter.source) else { continue }
             guard !Task.isCancelled, request == generation, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { continue }
             if let warning = page.partialWarning { error = warning; continue }
             error = nil
@@ -232,6 +270,7 @@ struct ChatListView: View {
             let combined = (fresh + rest).sorted(by: Self.order)
             if combined != sessions { sessions = combined }
             if let key {
+                lastSync = Date()
                 let firstPage = InboxSnapshot(sessions: fresh, cursor: page.next, savedAt: Date())
                 if sessions.count <= 220 {
                     app.inboxes[key] = InboxSnapshot(sessions: sessions, cursor: cursor, savedAt: firstPage.savedAt)
@@ -257,7 +296,7 @@ struct ChatListView: View {
         try? await Task.sleep(for: .milliseconds(300))
         guard !Task.isCancelled else { return }
         do {
-            let found = try await API.shared.search(q, archived: filter == .archived, profile: profile, telegram: filter == .telegram)
+            let found = try await API.shared.search(q, archived: filter == .archived, profile: profile, source: filter.source)
             guard !Task.isCancelled else { return }
             results = profile.map { p in found.filter { $0.profile == p } } ?? found
             error = nil

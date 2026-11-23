@@ -11,14 +11,14 @@ chat state. It does three things the gateway API server cannot do for a phone on
 3. A whitelisted pass-through to /p/<profile>/... (sessions, runs, model catalog) that adds the
    right key and streams SSE untouched.
 
-5. Optional Projects workspaces (HERMES_MOBILE_WORKSPACES, off by default): per-project instructions, files and
-   chats, plus files a project turn produces. This is a SINGLE-OWNER feature. Every hm1 bearer is minted only
-   after the one shared dashboard Basic credential verifies, so any valid bearer is the owner; the token's
-   device label and nonce are not a principal. Do not enable it on a shared or multi-user bridge.
+5. Optional single-owner project workspaces (HERMES_MOBILE_WORKSPACES). Device tokens share the
+   bridge's chats and tools. One-time pairing grants do not authorize owner management.
 
 Binds to loopback only; reach it through `tailscale serve`. Stdlib only (system python3).
 """
 import base64, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
+from tempfile import NamedTemporaryFile
+from functools import lru_cache
 from collections import deque
 from datetime import datetime, timezone
 from contextlib import closing
@@ -45,6 +45,8 @@ WS_BOTS_SETTING = "HERMES_MOBILE_WORKSPACE_BOTS"
 POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
+import bridge_devices
+from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
@@ -318,9 +320,20 @@ def _secret():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     f = STATE_DIR / "secret"
     if not f.exists():
-        f.write_text(secrets.token_hex(32))
-        os.chmod(f, 0o600)
-    return f.read_text().strip().encode()
+        # The service and a local pairing command may both start against a new home.
+        with NamedTemporaryFile("wb", dir=STATE_DIR, delete=False) as tmp:
+            tmp.write(secrets.token_hex(32).encode())
+            stage = Path(tmp.name)
+        try:
+            os.link(stage, f)
+        except FileExistsError:
+            pass
+        finally:
+            stage.unlink(missing_ok=True)
+    secret = f.read_bytes().strip()
+    if not secret:
+        raise RuntimeError("The bridge signing secret is empty.")
+    return secret
 
 
 SECRET = _secret()
@@ -332,35 +345,49 @@ FAILS_LOCK = threading.Lock()
 LOGIN_GATE = threading.Semaphore(1)
 
 
-def make_token(device, owner=False):
-    claims = {"exp": int(time.time()) + TOKEN_TTL, "dev": device[:60], "n": secrets.token_hex(4)}
+@lru_cache(maxsize=8)
+def _devices(directory):
+    return bridge_devices.Devices(directory / "devices")
+
+
+def devices():
+    return _devices(STATE_DIR)
+
+
+STREAMS = bridge_devices.Streams()
+
+
+def make_token(device, owner=False, method="local", pair_code=None):
+    now = int(time.time())
+    claims = {"exp": now + TOKEN_TTL, "issued": now, "dev": device[:60], "did": secrets.token_hex(16), "method": method}
     if owner:  # owner scope: own/iat, honoured only while the owner epoch is not newer than iat
         bridge_owner.epoch(owner_dir())  # created on first owner-mode use, never after the token's iat
         claims.update(own=1, iat=int(time.time()))
     payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-    sig = hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()
-    return "hm1." + payload + "." + sig
+    message = "hm2." + payload
+    sig = hmac.new(SECRET, message.encode(), hashlib.sha256).hexdigest()
+    if not devices().issue(claims, pair_code):
+        return None
+    return message + "." + sig
 
 
 def token_ok(tok):
-    try:
-        ver, payload, sig = tok.split(".")
-        if ver != "hm1" or not hmac.compare_digest(sig, hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()):
-            return False
-        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        return int(data["exp"]) > time.time()
-    except Exception:
-        return False
+    return token_claims(tok) is not None
 
 
 def token_claims(tok):
     """Verified payload of a bearer token, or None."""
     try:
         ver, payload, sig = tok.split(".")
-        if ver != "hm1" or not hmac.compare_digest(sig, hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()):
+        if ver not in ("hm1", "hm2"):
+            return None
+        message = "hm2." + payload if ver == "hm2" else payload
+        if not hmac.compare_digest(sig, hmac.new(SECRET, message.encode(), hashlib.sha256).hexdigest()):
             return None
         data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        return data if isinstance(data, dict) and int(data["exp"]) > time.time() else None
+        if isinstance(data, dict) and int(data["exp"]) > time.time() and devices().accepts(data, tok):
+            return data
+        return None
     except Exception:
         return None
 
@@ -546,7 +573,14 @@ def native_inbox_window(pid, offset, limit, exclude, first_page):
     return [summary(r) for r in rows[:limit]], [summary(r) for r in pins], len(rows) > limit
 
 
-def _page_round(offsets, pids, limit, exclude, first_page, telegram=False, native=False):
+def _source_ids(source):
+    if source == "desktop":
+        # Desktop and mobile-created GUI sessions use the same canonical source in Hermes.
+        return ("local", "gui", "desktop")
+    return (source,) if source else ()
+
+
+def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=False):
     """One fetch round across profiles. Returns (rows, pins, new_offsets, done, errors, more_left)."""
     exhausted = set(offsets.get("_done", []))
     live = [p for p in pids if p not in exhausted]
@@ -562,15 +596,16 @@ def _page_round(offsets, pids, limit, exclude, first_page, telegram=False, nativ
                 return pid, native_inbox_window(pid, off, limit, exclude, first_page), None
             except Exception as error:
                 return pid, None, type(error).__name__
-        if telegram:
+        if sources:
             try:
                 con = _ro(pid)
                 if con is None:
                     return pid, ([], [], False), None
                 try:
-                    rows = con.execute("SELECT " + SESSION_COLS + " FROM sessions WHERE source='telegram' "
+                    placeholders = ",".join("?" for _ in sources)
+                    rows = con.execute("SELECT " + SESSION_COLS + f" FROM sessions WHERE source IN ({placeholders}) "
                                        "AND coalesce(hidden,0)=0 AND coalesce(archived,0)=0 "
-                                       "ORDER BY last_active DESC, id LIMIT ? OFFSET ?", (batch + 1, off)).fetchall()
+                                       "ORDER BY last_active DESC, id LIMIT ? OFFSET ?", (*sources, batch + 1, off)).fetchall()
                     return pid, ([dict(row, archived=False) for row in rows[:batch]], [], len(rows) > batch), None
                 finally:
                     con.close()
@@ -628,7 +663,7 @@ def _page_round(offsets, pids, limit, exclude, first_page, telegram=False, nativ
     return page, pins, new_off, done, errors, more_left
 
 
-def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=False):
+def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=False, source=None):
     """Merge every profile's /api/sessions (each sorted by last activity) into one page.
 
     The cursor holds a per-profile offset. Excluded sources (cron, one-shot...) are skipped but still
@@ -640,7 +675,8 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
         offsets = {}
     first_page = not offsets
     pids = [p for p in profile_ids() if (not only or p in only) and key_for(p)]
-    native = compact and not telegram and NATIVE_INBOX and (first_page or offsets.get("_native") == 1)
+    sources = _source_ids("telegram" if telegram else source)
+    native = compact and not sources and NATIVE_INBOX and (first_page or offsets.get("_native") == 1)
     if native:
         served = served_profiles()
         if first_page:
@@ -648,7 +684,7 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
 
     page, pins, errors, more_left = [], [], {}, True
     for _ in range(6):
-        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page, telegram, native)
+        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page, sources, native)
         page += rows
         pins += round_pins
         errors.update(errs)
@@ -688,8 +724,9 @@ def search_sessions(q, archived=False, limit=40, profile=None, source=None):
                      "source NOT IN ('subagent','tool')"]
             args = []
             if source:
-                where.append("source=?")
-                args.append(source)
+                sources = _source_ids(source)
+                where.append("source IN (" + ",".join("?" for _ in sources) + ")")
+                args.extend(sources)
             if like:
                 where.append("(title LIKE ? OR id IN (SELECT session_id FROM messages WHERE role='user' AND content LIKE ? "
                              "ORDER BY id DESC LIMIT 400))")
@@ -799,8 +836,13 @@ def gateway_phase(ok, api_state, state, life, now):
     if life.get("phase") == "exited" and _recent(life.get("exited_at"), now):
         return "restarting" if "restart" in str(life.get("exit_reason", "")).lower() else "stopped"
     if life.get("phase") == "running" and _recent(life.get("started_at"), now):
-        return "starting"
+        pid = life.get("pid") or state.get("pid")
+        return "stopped" if pid and not pid_alive(pid) else "starting"
     return "unavailable"
+
+
+def image_attachments_supported():
+    return bool(turns and turns.bridge_media.supported())
 
 
 def health():
@@ -832,6 +874,7 @@ def health():
                 _health_history.append({"phase": phase, "at": now})
         history = list(reversed(_health_history))
     return {"ok": ok, "gateway_state": api_state, "phase": phase, "reason": reason,
+            "image_attachments": image_attachments_supported(),
             "recent": history, "version": info.get("version"), "platforms": list((info.get("platforms") or {}).keys()),
             "inbox_reader": "native" if NATIVE_INBOX else "gateway", "inbox_fallback": INBOX_FALLBACK}
 
@@ -851,10 +894,10 @@ def invalidate_pages():
         _pages.clear()
 
 
-def session_page(limit, cursor, only, exclude, telegram, compact=False):
+def session_page(limit, cursor, only, exclude, telegram, compact=False, source=None):
     if cursor:
-        return all_sessions(limit, cursor, only, exclude, telegram, compact)
-    key = (limit, tuple(sorted(only or ())), tuple(sorted(exclude)), telegram, compact)
+        return all_sessions(limit, cursor, only, exclude, telegram, compact, source)
+    key = (limit, tuple(sorted(only or ())), tuple(sorted(exclude)), telegram, compact, source)
     with _page_lock:
         epoch = _page_epoch
         cached = _pages.get(key)
@@ -868,7 +911,7 @@ def session_page(limit, cursor, only, exclude, telegram, compact=False):
     if not owner:
         return future.result()
     try:
-        page = all_sessions(limit, None, only, exclude, telegram, compact)
+        page = all_sessions(limit, None, only, exclude, telegram, compact, source)
         with _page_lock:
             if not page["errors"] and epoch == _page_epoch:
                 if len(_pages) >= 24 and key not in _pages:
@@ -1064,6 +1107,19 @@ ARTIFACT_NOTE = ("Project output: save any file you want to hand back only insid
                  "For each saved file, add a line `MEDIA:<full path>` to your final reply.")
 
 
+def restore_send_workspace(metadata, profile, sid):
+    project = metadata.get("project")
+    if not project:
+        # Persona-only prompts had no artifact capture. Verify the link still exists before retry.
+        if not owner_managed() or not manage_overlay().persona_for(profile, sid):
+            raise turns.TurnError("The original persona is no longer linked to this chat.", 403)
+        return dict(metadata, store=_NoStore())
+    store = workspace_store()
+    if profile not in workspace_grants().get(project, ()) or store.project_for(profile, sid) != project:
+        raise turns.TurnError("The original project is no longer linked to this chat.", 403)
+    return dict(metadata, store=store)
+
+
 def prepare_workspace_turn(pid, sid, payload):
     """Scope for one turn, or None when the chat is not a project chat on a currently allowed pair.
     Raises WorkspaceError for an explicit project_context that does not match."""
@@ -1096,6 +1152,32 @@ def prepare_workspace_turn(pid, sid, payload):
     return {"store": store, "project": project, "output_dir": out_dir, "suffix": suffix, "summary": summary}
 
 
+def admissions_dir():
+    # Deployments with a small system volume can place new receipts on a private data volume.
+    override = os.environ.get("HERMES_MOBILE_ADMISSIONS_DIR")
+    return Path(override) if override else STATE_DIR / "admissions"
+
+
+def timeline_page(raw):
+    """Return exactly the rows consumed by the mobile timeline, retaining pagination positions."""
+    page = json.loads(raw)
+    rows = []
+    for message in page["data"]:
+        row = {k: message[k] for k in ("id", "role", "timestamp") if k in message}
+        if message.get("role") in ("user", "assistant"):
+            body = message.get("content")
+            if isinstance(body, list):
+                body = "\n".join(p["text"] for p in body if isinstance(p, dict) and isinstance(p.get("text"), str))
+            if isinstance(body, str):
+                row["content"] = body
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                row["tool_calls"] = [{"function": {"name": f["name"]}} for c in calls if isinstance(c, dict)
+                                     and isinstance(f := c.get("function"), dict) and isinstance(f.get("name"), str)]
+        rows.append(row)
+    return json.dumps({"data": rows}, ensure_ascii=False, separators=(",", ":")).encode()
+
+
 # ---------- HTTP ----------
 class H(BaseHTTPRequestHandler):
     server_version = "HermesMobile/1"
@@ -1104,14 +1186,18 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log(fmt % args)
 
-    def send(self, code, body=b"", ctype="application/json", close=False):
+    def send(self, code, body=b"", ctype="application/json", close=False, validator=None):
         if self.command in ("POST", "PATCH", "DELETE") and 200 <= code < 300:
             invalidate_pages()
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+        if code != 304:
+            self.send_header("Content-Length", str(len(body)))
+        if validator:
+            self.send_header("ETag", validator)
+            self.send_header("Vary", "X-Hermes-Transcript, Authorization")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         if close:
@@ -1137,8 +1223,10 @@ class H(BaseHTTPRequestHandler):
             n = int(raw)
         except ValueError:
             n = -1
-        scoped = urlsplit(self.path).path.startswith(("/m/workspace", "/m/manage"))
-        cap = WS_MAX_BODY if scoped else MAX_BODY
+        path = urlsplit(self.path).path
+        auth = path in ("/m/pair", "/m/login") or path.startswith("/m/devices")
+        scoped = auth or path.startswith(("/m/workspace", "/m/manage"))
+        cap = 4096 if auth else WS_MAX_BODY if scoped else MAX_BODY
         if n < 0 or n > cap:
             self.close_connection = True
             self.send(413 if n > cap else 400, {"error": "Bad request body."}, close=True)
@@ -1158,7 +1246,8 @@ class H(BaseHTTPRequestHandler):
 
     def authed(self):
         h = self.headers.get("Authorization") or ""
-        return h.startswith("Bearer ") and token_ok(h[7:].strip())
+        self.device_claims = token_claims(h[7:].strip()) if h.startswith("Bearer ") else None
+        return self.device_claims is not None
 
     def login_elevates_to_owner(self):
         """A password login mints owner scope ONLY over the verified Tailscale Serve path for the one configured
@@ -1199,8 +1288,24 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True, "app": "hermes-mobile-bridge", "version": 1})
         if path == "/m/login" and self.command == "POST":
             return self.login()
+        if path == "/m/pair" and self.command == "POST":
+            data = self.json_body()
+            token = make_token(str(data.get("device") or "Paired phone")[:60], method="pair", pair_code=data.get("code"))
+            if token is None:
+                return self.send(401, {"error": "Pairing code expired or already used. Request another code."})
+            return self.send(200, {"token": token, "ttl": TOKEN_TTL})
         if not self.authed():
             return self.send(401, {"error": "Sign in again."})
+        if path == "/m/capabilities" and self.command == "GET":
+            features = ["device_grants", "pair_code"]
+            if turns:
+                features.append("replay_checkpoint")
+            if image_attachments_supported():
+                features.append("image_attachments_v1")
+            return self.send(200, {"protocol": 2, "features": features,
+                                   "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
+        if path == "/m/devices" or path.startswith("/m/devices/"):
+            return self.device_route(path)
         if path == "/m/projects":
             return self.projects_route(u)
         if path == "/m/manage" or path.startswith("/m/manage/"):
@@ -1222,11 +1327,11 @@ class H(BaseHTTPRequestHandler):
                     return self.send(503, {"error": "The Hermes status dashboard on your Mac (%s) isn't answering: %s."
                                                     % (STATUS_URL, why)})
                 return self.send(200, d)
-            if path in ("/m/sessions", "/m/telegram"):
+            if path in ("/m/sessions", "/m/telegram", "/m/desktop"):
                 limit = max(1, min(int(q.get("limit", "40") or 40), 100))
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
-                return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact"))
+                return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact", "desktop" if path == "/m/desktop" else None))
             if path == "/m/search":
                 return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"))})
             m = re.match(r"^/m/runtime/([^/]+)/([^/]+)$", path)
@@ -1238,6 +1343,25 @@ class H(BaseHTTPRequestHandler):
         if path.startswith("/m/chat/") or path.startswith("/m/turns"):
             return self.chat_route(path, q)
         self.send(404, {"error": "not found"})
+
+    def device_route(self, path):
+        current = self.device_claims["did"]
+        if path == "/m/devices/current" and self.command == "DELETE":
+            target = current
+        else:
+            if not self.owner_ok():
+                return self._err(403, "Owner sign-in required.", "owner_required")
+            if path == "/m/devices" and self.command == "GET":
+                return self.send(200, {"devices": devices().active()})
+            if path == "/m/devices/pair-code" and self.command == "POST":
+                return self.send(201, devices().offer())
+            match = re.fullmatch(r"/m/devices/([0-9a-f]{32})", path)
+            if self.command != "DELETE" or not match:
+                return self.send(404, {"error": "Unknown device action."})
+            target = match.group(1)
+        devices().revoke(target)
+        STREAMS.revoked(target)
+        return self.send(200, {"ok": True})
 
     def projects_route(self, u):
         if self.command != "GET":
@@ -1479,8 +1603,9 @@ class H(BaseHTTPRequestHandler):
             if part == "assignment" and not owner and self.command == "PUT":
                 return self.send(403, {"error": "Assignments are managed by the operator.", "code": "operator_managed"})
             # Owner-managed workspaces: every mutation needs the owner scope. Operator mode keeps build-4
-            # semantics (any valid bearer is the single owner), including the new file edit.
-            if owner and self.command in ("PUT", "POST", "DELETE", "PATCH") and part != "chats" and not self.owner_ok():
+            # compatibility for existing password/local tokens. A paired phone never gains owner scope.
+            paired = self.device_claims.get("method") == "pair"
+            if (owner or paired) and self.command in ("PUT", "POST", "DELETE", "PATCH") and part != "chats" and not self.owner_ok():
                 return self.send(403, {"error": "Owner sign-in required.", "code": "owner_required"})
             if owner:  # every valid catalog project has a workspace, with or without active bots
                 if project not in catalog:
@@ -1569,7 +1694,7 @@ class H(BaseHTTPRequestHandler):
                     "eligible": now}
         revision, stored = store.assignment(project)
         eligible = workspace_eligible(project, catalog)
-        return {"editable": True, "revision": revision, "assigned": [b for b in stored if b in eligible],
+        return {"editable": self.owner_ok(), "revision": revision, "assigned": [b for b in stored if b in eligible],
                 "inactive": [b for b in stored if b not in eligible], "eligible": eligible}
 
     def workspace_detail(self, store, project, allowed, owner, catalog):
@@ -1582,7 +1707,9 @@ class H(BaseHTTPRequestHandler):
         d["mode"] = "owner" if owner else "operator"
         d["instructions_revision"] = hashlib.sha256((d.get("instructions") or "").encode("utf-8")).hexdigest()
         files = store.files_with_sha(project) if hasattr(store, "files_with_sha") else d.get("files") or []
-        d["files"] = [dict(f, editable=True) for f in files]
+        editable = self.owner_ok() if owner else self.device_claims.get("method") != "pair"
+        d["editable"] = editable
+        d["files"] = [dict(f, editable=editable) for f in files]
         d["assignment"] = self.workspace_assignment(store, project, owner, catalog)
         return d
 
@@ -1613,18 +1740,21 @@ class H(BaseHTTPRequestHandler):
         try:
             if path == "/m/turns" and self.command == "GET":
                 return self.send(200, {"turns": turns.live_turns()})
-            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval|/queue|/steer)?$", path)
+            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval|/queue|/queue-with-runtime|/steer)?$", path)
             if m:
                 turn = turns.get_turn(m.group(1))
+                if turn is None and self.command == "GET":
+                    turn = turns.completed_primary(m.group(1), STATE_DIR / "admissions", profile_home)
                 if turn is None:
                     return self.send(404, {"error": "That reply is no longer running."})
                 action = m.group(2) or ""
                 if action == "/events" and self.command == "GET":
                     last = self.headers.get("Last-Event-ID") or q.get("after")
                     return self.tail(turn, int(last) + 1 if last not in (None, "") and str(last).lstrip("-").isdigit() else 0)
-                if action in ("/queue", "/steer") and self.command == "POST":
+                if action in ("/queue", "/queue-with-runtime", "/steer") and self.command == "POST":
                     body = self.json_body()
-                    return self.send(200, turns.follow_up(turn, action[1:], body.get("text"), body.get("submission_id")))
+                    mode = "steer" if action == "/steer" else "queue"
+                    return self.send(200, turns.follow_up(turn, mode, body.get("text"), body.get("submission_id"), body))
                 if action == "/stop" and self.command == "POST":
                     turns.stop(turn)
                     return self.send(200, {"ok": True})
@@ -1635,7 +1765,15 @@ class H(BaseHTTPRequestHandler):
                 if not action and self.command == "GET":
                     return self.send(200, turn.summary())
                 return self.send(405, {"error": "method not allowed"})
-            m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|runtime))$", path)
+            media = re.fullmatch(r"/m/chat/([^/]+)/media-capabilities", path)
+            if media and self.command == "GET":
+                pid = media.group(1)
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                return self.send(200, {"images": image_attachments_supported(),
+                                       "video": turns.bridge_media.video_supported(profile_home(pid)),
+                                       "max_video_bytes": turns.bridge_media.MAX_BYTES})
+            m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|runtime))$", path)
             if not m or self.command != "POST":
                 return self.send(404, {"error": "not found"})
             pid = m.group(1)
@@ -1647,20 +1785,24 @@ class H(BaseHTTPRequestHandler):
                 return self.send(201, turns.create_session(home, pid, d.get("title")))
             sid, action = m.group(2).rsplit("/", 1)
             if action == "runtime":
-                before = (session_runtime(pid, sid) or {}).get("policy")
                 applied = turns.set_runtime(home, sid, d)
-                # Hermes writes the session's policy row a moment after session.mutate answers: wait for
-                # it, so the phone's next read shows the new setting instead of the old one.
-                after = before
-                for _ in range(20):
-                    after = (session_runtime(pid, sid) or {}).get("policy")
-                    if after != before:
-                        break
-                    time.sleep(0.1)
-                return self.send(200, {"applied": applied, "policy": after})
+                # A deferred pick lands at the next claim; polling here delays the picker and
+                # still reads the old policy throughout a long-running turn.
+                deferred = any(row.get("status") == "deferred" for row in applied.values())
+                return self.send(200, {"applied": applied, "timing": "next_turn" if deferred else "saved",
+                                       "policy": (session_runtime(pid, sid) or {}).get("policy")})
             text = str(d.get("text") or "").strip()
-            if not text:
+            if d.get("attachments") and action != "send-once":
+                return self.send(400, {"error": "Media requires a durable send."})
+            if not text and not d.get("attachments"):
                 return self.send(400, {"error": "Empty message."})
+            if not text:
+                text = "Describe the attached media."
+            if action == "send-once" or "submission_id" in d:
+                turn = turns.start_primary(pid, home, sid, text, d, d.get("submission_id"), d.get("project_context"),
+                                           admissions_dir(), lambda: persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d)),
+                                           restore_send_workspace, d.get("attachments"), d.get("video_analysis_consent") is True)
+                return self.send(202, turn.summary())
             workspace = persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d))
             try:
                 turn = turns.start_turn(pid, home, sid, text, {k: d.get(k) for k in ("provider", "model", "effort", "reset_model", "reset_effort")},
@@ -1691,30 +1833,43 @@ class H(BaseHTTPRequestHandler):
     def tail(self, turn, offset):
         """SSE of a turn's buffered events from `offset`; resumable with Last-Event-ID."""
         try:
+            with STREAMS.watch(self.device_claims["did"], self.authed, self.connection) as valid:
+                if not valid:
+                    return self.send(401, {"error": "Sign in again."})
+                self._authorized_tail(turn, offset)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _authorized_tail(self, turn, offset):
+        try:
+            supported = self.headers.get("X-Hermes-Replay") == "checkpoint-v1"
+            # Check before sending headers so older clients receive an actionable HTTP error.
+            # A durable turn can be attached by a new bridge process with the same ID.
+            # Its new sequence space may already overlap the old cursor numerically.
+            claimed_epoch = self.headers.get("X-Hermes-Replay-Epoch")
+            reset = supported and ((offset > 0 and claimed_epoch != turn.replay_epoch)
+                                   or (offset == 0 and getattr(turn, "restored", False)))
+            batch, offset, done, gap = turn.replay(offset, timeout=0, reset=reset)
+            if gap and not supported:
+                return self.send(410, {"error": "Live history expired. Update Hermes Mobile to reconnect."})
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("X-Hermes-Replay-Epoch", turn.replay_epoch)
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            idle = 0
             while True:
-                with turn.cond:
-                    if len(turn.events) <= offset and not turn.done:
-                        turn.cond.wait(15)
-                    batch = turn.events[offset:]
-                    done = turn.done
-                for ev in batch:
-                    self.wfile.write(("id: %d\ndata: %s\n\n" % (ev["seq"], json.dumps(ev))).encode())
-                offset += len(batch)
+                if gap and not supported:
+                    break  # The next HTTP request receives 410.
                 if batch:
+                    self.wfile.write(b"".join(batch))
                     self.wfile.flush()
-                    idle = 0
-                elif done:
+                if done:
                     break
-                else:
-                    idle += 1
+                batch, offset, done, gap = turn.replay(offset)
+                if not batch and not done:
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -1728,10 +1883,7 @@ class H(BaseHTTPRequestHandler):
             f = FAILS.setdefault(who, {"n": 0, "until": 0.0})
             if time.time() < f["until"]:
                 return self.send(429, {"error": "Too many attempts. Wait a minute."})
-        try:
-            d = json.loads(self.body() or b"{}")
-        except Exception:
-            d = {}
+        d = self.json_body()
         user, pw = basic_auth()
         with LOGIN_GATE:  # one check at a time: parallel requests can't multiply the guess rate
             with FAILS_LOCK:
@@ -1752,9 +1904,9 @@ class H(BaseHTTPRequestHandler):
         log("login ok for %r device %r" % (who, str(d.get("device", ""))[:60]))
         owner = self.login_elevates_to_owner()
         try:
-            token = make_token(str(d.get("device", "iphone")), owner=owner)
+            token = make_token(str(d.get("device", "iphone")), owner=owner, method="password")
         except (bridge_owner.OwnerError, OSError):
-            token = make_token(str(d.get("device", "iphone")))
+            token = make_token(str(d.get("device", "iphone")), method="password")
         return self.send(200, {"token": token, "ttl": TOKEN_TTL})
 
     def proxy(self, path, query):
@@ -1781,12 +1933,24 @@ class H(BaseHTTPRequestHandler):
         try:
             c = http.client.HTTPConnection(*UPSTREAM, timeout=900 if stream else 120)
             c.request(self.command, up, body=data, headers=headers)
+            upstream_socket = c.sock
             r = c.getresponse()
         except Exception as e:
             return self.send(502, {"error": "Hermes gateway is not answering (%s)." % type(e).__name__})
         try:
             if not stream:
                 raw = r.read()
+                if (r.status == 200 and self.command == "GET" and self.headers.get("X-Hermes-Transcript") == "timeline-v1"
+                        and re.fullmatch(r"/api/sessions/[^/]+/messages", tail)):
+                    try:
+                        compact = timeline_page(raw)
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        pass  # Preserve the gateway response for older or unrecognized schemas.
+                    else:
+                        tag = '"' + hashlib.sha256(compact).hexdigest() + '"'
+                        if self.headers.get("If-None-Match") == tag:
+                            return self.send(304, validator=tag)
+                        return self.send(200, compact, validator=tag)
                 self.send(r.status, raw, r.getheader("Content-Type") or "application/json")
                 return
             self.send_response(r.status)
@@ -1796,19 +1960,31 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            while True:
-                chunk = r.read1(8192)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+            with STREAMS.watch(self.device_claims["did"], self.authed, self.connection, upstream_socket) as valid:
+                if valid:
+                    while True:
+                        chunk = r.read1(8192)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
             pass  # the phone went away; /v1/runs keeps running on the gateway and can be re-attached
         finally:
             c.close()
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--pair-code"]:
+        print(devices().offer()["code"])
+        sys.exit(0)
+    if sys.argv[1:] == ["--list-devices"]:
+        print(json.dumps(devices().active(), indent=2))
+        sys.exit(0)
+    if sys.argv[1:2] == ["--revoke-device"]:
+        if len(sys.argv) != 3 or not re.fullmatch(r"[a-f0-9]{32}", sys.argv[2]):
+            sys.exit("Use --revoke-device ID from --list-devices.")
+        sys.exit(0 if devices().revoke(sys.argv[2]) else "Device not found or already revoked.")
     if "--set-owner-pin" in sys.argv:  # local seam only: the PIN is typed here, never sent over HTTP
         import getpass
         pin, again = getpass.getpass("New 4-digit deletion PIN: "), getpass.getpass("Repeat it: ")
@@ -1832,6 +2008,10 @@ if __name__ == "__main__":
         sys.exit(0)
     threading.Thread(target=_key_watcher, name="key-watcher", daemon=True).start()
     srv = ThreadingHTTPServer((os.environ.get("HERMES_MOBILE_BIND", "127.0.0.1"), PORT), H)
+    if turns is not None:
+        turns.recover_primary(admissions_dir(), profile_home, restore_send_workspace)
+        for pid in profile_ids():
+            turns.bridge_media.prune_clips(profile_home(pid))
     srv.daemon_threads = True
     log("Hermes Mobile bridge on http://%s:%d -> gateway %s:%d" % (srv.server_address[0], PORT, *UPSTREAM))
     srv.serve_forever()

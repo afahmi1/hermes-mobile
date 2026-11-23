@@ -1,6 +1,6 @@
 @main
 enum StreamRecoveryTests {
-    static func main() {
+    static func main() async {
         var state = StreamRecovery()
         precondition(state.accept(0))
         precondition(state.retryDelay() != nil)
@@ -14,6 +14,32 @@ enum StreamRecoveryTests {
         }
         precondition(state.retryDelay() == nil)
         precondition(state.accept(nil) && state.lastSequence == 1 && state.failures == 0)
+        state.restore(checkpoint: 20, epoch: "previous")
+        precondition(!state.accept(21, epoch: "restored"))
+        state.restore(checkpoint: 4, epoch: "restored")
+        precondition(state.accept(5, epoch: "restored") && state.lastSequence == 5)
+        let wifi = StreamRoute(reachable: true, interfaces: ["wifi"])
+        let cell = StreamRoute(reachable: true, interfaces: ["cellular"])
+        let offline = StreamRoute(reachable: false, interfaces: [])
+        precondition(!wifi.wakesReader(after: nil) && !wifi.wakesReader(after: wifi))
+        precondition(cell.wakesReader(after: wifi) && wifi.wakesReader(after: offline))
+        precondition(!offline.wakesReader(after: cell))
+        let routes = StreamRoutes(monitor: nil)
+        routes.update(wifi)
+        let gen = routes.state.revision
+        routes.update(offline)
+        precondition(routes.state.offline)
+        let observer = routes.changes(after: gen)
+        routes.update(cell)
+        var iterator = observer.makeAsyncIterator()
+        let woke = await iterator.next() != nil
+        precondition(woke && !routes.state.offline && routes.state.revision != gen)
+        // A route restored between a failed request and installing its retry wait must wake it too.
+        await routes.waitForRetry(after: gen, seconds: nil)
+        let cancelled = Task { await routes.waitForRetry(after: routes.state.revision, seconds: nil) }
+        cancelled.cancel()
+        await cancelled.value
+        await routes.waitForRetry(after: routes.state.revision, seconds: 0.001)
         print("Stream replay, progress, jitter bounds and retry exhaustion passed")
     }
 }

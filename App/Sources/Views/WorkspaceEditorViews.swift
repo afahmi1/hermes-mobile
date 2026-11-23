@@ -160,7 +160,7 @@ struct InstructionsView: View {
                 ScrollView {
                     Group {
                         if model.detail.instructions.isEmpty {
-                            Text("No instructions yet. Tap Edit to add some.").foregroundStyle(.secondary)
+                            Text(model.detail.editable ? "No instructions yet. Tap Edit to add some." : "No instructions yet.").foregroundStyle(.secondary)
                         } else {
                             Text(verbatim: model.detail.instructions).textSelection(.enabled)
                         }
@@ -185,7 +185,7 @@ struct InstructionsView: View {
                     Button("Save") { Task { await model.saveInstructions() } }
                         .disabled(!model.canSaveInstructions).accessibilityIdentifier("instr.save")
                 }
-            } else {
+            } else if model.detail.editable {
                 ToolbarItem(placement: .primaryAction) {
                     Button("Edit") { model.beginEditInstructions() }.accessibilityIdentifier("instr.edit")
                 }
@@ -248,8 +248,10 @@ struct WorkspaceFileView: View {
                                 .accessibilityIdentifier("file.text")
                         }
                         .accessibilityLabel("Contents of \(editor.name)")
-                        Button("Delete file", role: .destructive) { confirmDelete = true }
-                            .accessibilityIdentifier("file.delete")
+                        if editor.editable {
+                            Button("Delete file", role: .destructive) { confirmDelete = true }
+                                .accessibilityIdentifier("file.delete")
+                        }
                     }
                 }
                 .padding()
@@ -268,7 +270,7 @@ struct WorkspaceFileView: View {
                     Button("Save") { Task { if await editor.save() { onChanged() } } }
                         .disabled(!editor.canSave).accessibilityIdentifier("file.save")
                 }
-            } else if editor.phase == .loaded {
+            } else if editor.phase == .loaded && editor.editable {
                 ToolbarItem(placement: .primaryAction) {
                     Button("Edit") { editor.beginEdit() }.accessibilityIdentifier("file.edit")
                 }

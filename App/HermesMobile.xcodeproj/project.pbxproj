@@ -8,7 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		040EECE81F4B000CAF3EFD44 /* Workspaces.swift in Sources */ = {isa = PBXBuildFile; fileRef = F13CB626AADCB78BCEFD62E2 /* Workspaces.swift */; };
+		06F259BFBCA480D178465DCE /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E7B82EEB179DC61751CFE04C /* PrivacyInfo.xcprivacy */; };
 		0CEE5C7B2A1CF628C67B9D67 /* ChatListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 398143EB1C4D7C38BC6B945F /* ChatListView.swift */; };
+		0DAE41E337B7E65618F89707 /* ChatMedia.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88150F0A49310BFAA320BF50 /* ChatMedia.swift */; };
 		0FBF1FA94B0C0D38F486FBDA /* WorkspaceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7AC94C0A7E3ECC0AA98E648 /* WorkspaceViews.swift */; };
 		11047681052764C050F89289 /* Management.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEDE9C050CDF0DF9C49E0B64 /* Management.swift */; };
 		13EC70EBF845B6FBB26EADC7 /* ProjectsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 587EB11B4B0982F2A981F8F5 /* ProjectsView.swift */; };
@@ -51,6 +53,7 @@
 		785C4DB8C31E64EB728F4674 /* StatusModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusModel.swift; sourceTree = "<group>"; };
 		81D8AF5D872DE5BB11D76FA3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		84E690DA9F04A70286E6A83B /* StreamRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamRecovery.swift; sourceTree = "<group>"; };
+		88150F0A49310BFAA320BF50 /* ChatMedia.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMedia.swift; sourceTree = "<group>"; };
 		8E0CEC74256653C26970ED7B /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		A7064B9C91B578271B8CD8CC /* ManagementAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagementAPI.swift; sourceTree = "<group>"; };
 		AA8AF41DA7F59809B8B46AA5 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
@@ -64,6 +67,7 @@
 		D7223536BDFD6A8A524C9B2B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		D7AC94C0A7E3ECC0AA98E648 /* WorkspaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViews.swift; sourceTree = "<group>"; };
 		E11909D98B0F5781E0DA91D1 /* HermesMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = HermesMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E7B82EEB179DC61751CFE04C /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		F13CB626AADCB78BCEFD62E2 /* Workspaces.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Workspaces.swift; sourceTree = "<group>"; };
 		F1ED146FEC9A4A8EC318137C /* BotsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BotsView.swift; sourceTree = "<group>"; };
 		FEDF83C8338A7C71FD8C2FB4 /* ManageViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManageViews.swift; sourceTree = "<group>"; };
@@ -111,6 +115,7 @@
 			children = (
 				D7223536BDFD6A8A524C9B2B /* Assets.xcassets */,
 				81D8AF5D872DE5BB11D76FA3 /* Info.plist */,
+				E7B82EEB179DC61751CFE04C /* PrivacyInfo.xcprivacy */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -130,6 +135,7 @@
 			children = (
 				F1ED146FEC9A4A8EC318137C /* BotsView.swift */,
 				398143EB1C4D7C38BC6B945F /* ChatListView.swift */,
+				88150F0A49310BFAA320BF50 /* ChatMedia.swift */,
 				CBA5B61C8421B891EEEAE3A8 /* ChatView.swift */,
 				149305800C6FA857809273F1 /* DeletionPinView.swift */,
 				FEDF83C8338A7C71FD8C2FB4 /* ManageViews.swift */,
@@ -207,6 +213,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A3443EAB48D059B4AEEAD94A /* Assets.xcassets in Resources */,
+				06F259BFBCA480D178465DCE /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -221,6 +228,7 @@
 				A4A842B468F6E4BFD7629888 /* AppModel.swift in Sources */,
 				9DA17B9EB323216AE4CB9A1C /* BotsView.swift in Sources */,
 				0CEE5C7B2A1CF628C67B9D67 /* ChatListView.swift in Sources */,
+				0DAE41E337B7E65618F89707 /* ChatMedia.swift in Sources */,
 				2D6EC1097BA97174EF7469E1 /* ChatModel.swift in Sources */,
 				8A4FEE22C59ED755F87C1232 /* ChatView.swift in Sources */,
 				76D6BA0E07AD7BC36AE172AA /* DeletionPinView.swift in Sources */,

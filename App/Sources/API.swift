@@ -1,6 +1,16 @@
 import Foundation
 import Security
 
+struct MediaCapabilities: Decodable {
+    let images: Bool
+    let video: Bool
+    let maxVideoBytes: Int
+    enum CodingKeys: String, CodingKey {
+        case images, video
+        case maxVideoBytes = "max_video_bytes"
+    }
+}
+
 enum APIError: LocalizedError {
     case notSignedIn
     case http(Int, String)
@@ -18,36 +28,76 @@ enum APIError: LocalizedError {
 
 /// Talks to the Hermes Mobile bridge on the Mac. Every chat and setting lives in Hermes's own
 /// state.db there; this client keeps nothing but the server address and a sign-in token.
+private final class BridgeTransport: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var detached = false
+    func detach() { lock.withLock { detached = true } }
+
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+        if lock.withLock({ detached }) { task.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        // The bridge serves fixed API routes. Login bodies and bearer tokens must stay at this origin.
+        completionHandler(nil)
+    }
+}
+
 final class API: @unchecked Sendable {
-    static let shared = API()
+    private static let lock = NSLock()
+    static let accounts = SavedGateways(defaults: .standard, read: Keychain.read, write: Keychain.write, remove: Keychain.delete)
+    private static var client = API(accounts.restore())
 
-    var baseURL: URL? {
-        get { UserDefaults.standard.string(forKey: "server").flatMap(URL.init(string:)) }
-        set { UserDefaults.standard.set(newValue?.absoluteString, forKey: "server") }
+    static var shared: API { lock.withLock { client } }
+    private let login: GatewayLogin?
+    var baseURL: URL? { login?.server }
+    var token: String? { login?.token }
+    var isSignedIn: Bool { login != nil }
+    private let transport = BridgeTransport()
+    private init(_ login: GatewayLogin?) {
+        self.login = login
+        self.session = Self.makeSession(stream: false, transport: transport)
+        self.streamSession = Self.makeSession(stream: true, transport: transport)
     }
-    var token: String? {
-        get { Keychain.read("token") }
-        set { if let newValue { Keychain.write("token", newValue) } else { Keychain.delete("token") } }
-    }
-    var isSignedIn: Bool { baseURL != nil && token != nil }
 
-    private let session: URLSession = {
-        let c = URLSessionConfiguration.default
-        c.timeoutIntervalForRequest = 60
-        c.waitsForConnectivity = false
-        return URLSession(configuration: c)
-    }()
-    private let streamSession: URLSession = {
-        let c = URLSessionConfiguration.default
-        c.timeoutIntervalForRequest = 900
-        c.timeoutIntervalForResource = 3600
-        return URLSession(configuration: c)
-    }()
+    deinit {
+        session.invalidateAndCancel()
+        streamSession.invalidateAndCancel()
+    }
+
+    /// All outstanding work keeps its original destination. Closing the old sessions detaches local streams.
+    static func activate(_ login: GatewayLogin?) {
+        let old = lock.withLock {
+            let previous = client
+            client = API(login)
+            return previous
+        }
+        old.transport.detach()
+        for session in [old.session, old.streamSession] {
+            session.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+        }
+    }
+
+    private let session: URLSession
+    private let streamSession: URLSession
+
+    private static func makeSession(stream: Bool, transport: BridgeTransport) -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = stream ? 45 : 60
+        if stream { configuration.timeoutIntervalForResource = 3600 }
+        configuration.waitsForConnectivity = false
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        return URLSession(configuration: configuration, delegate: transport, delegateQueue: nil)
+    }
 
     // MARK: plumbing
 
-    private func request(_ path: String, method: String = "GET", body: Any? = nil, auth: Bool = true) throws -> URLRequest {
-        guard let base = baseURL, let url = URL(string: path, relativeTo: base) else { throw APIError.notSignedIn }
+    private func request(_ path: String, method: String = "GET", body: Any? = nil, auth: Bool = true, server: URL? = nil) throws -> URLRequest {
+        guard API.shared === self, let base = server ?? baseURL, path.hasPrefix("/"), !path.hasPrefix("//"),
+              let url = URL(string: path, relativeTo: base) else { throw APIError.notSignedIn }
         var r = URLRequest(url: url)
         r.httpMethod = method
         r.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -93,19 +143,46 @@ final class API: @unchecked Sendable {
 
     // MARK: sign-in
 
-    func signIn(server: URL, username: String, password: String, device: String) async throws {
-        baseURL = server
-        let r = try request("/m/login", method: "POST", body: ["username": username, "password": password, "device": device], auth: false)
-        let data = try await send(r)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any], let t = obj["token"] as? String else {
-            throw APIError.badResponse
-        }
-        token = t
+    func signIn(server: URL, username: String, password: String, device: String) async throws -> GatewayLogin {
+        try await authenticate(server, path: "/m/login", body: ["username": username, "password": password, "device": device])
     }
 
-    func signOut() { token = nil }
+    func pair(server: URL, code: String, device: String) async throws -> GatewayLogin {
+        try await authenticate(server, path: "/m/pair", body: ["code": code, "device": device])
+    }
+
+    private func authenticate(_ server: URL, path: String, body: [String: String]) async throws -> GatewayLogin {
+        let r = try request(path, method: "POST", body: body, auth: false, server: server)
+        let data = try await send(r)
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let t = obj["token"] as? String, !t.isEmpty else { throw APIError.badResponse }
+        guard let origin = SavedGateways.origin(server) else { throw APIError.badResponse }
+        return GatewayLogin(server: origin, token: t)
+    }
+
+    func capabilities() async throws -> BridgeCapabilities {
+        try await get("/m/capabilities", as: BridgeCapabilities.self)
+    }
+
+    func devices() async throws -> [DeviceGrant] {
+        struct Response: Decodable { let devices: [DeviceGrant] }
+        return try await get("/m/devices", as: Response.self).devices
+    }
+
+    func pairingCode() async throws -> DevicePairCode {
+        let result = try await send(request("/m/devices/pair-code", method: "POST"))
+        return try JSONDecoder().decode(DevicePairCode.self, from: result)
+    }
+
+    func revokeDevice(_ id: String) async throws {
+        _ = try await send(request("/m/devices/\(Self.esc(id))", method: "DELETE"))
+    }
 
     // MARK: reads
+
+    func mediaCapabilities(profile: String) async throws -> MediaCapabilities {
+        try await get("/m/chat/\(Self.esc(profile))/media-capabilities", as: MediaCapabilities.self)
+    }
 
     func health() async throws -> HealthInfo {
         var probe = try request("/m/health")
@@ -294,22 +371,22 @@ final class API: @unchecked Sendable {
         }
     }
 
-    func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], telegram: Bool = false) async throws -> SessionPage {
+    func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], source: String? = nil) async throws -> SessionPage {
         let limit = cursor == nil ? 16 : 40
         var q = ["limit=\(limit)", "view=compact"]
         if let cursor { q.append("cursor=\(cursor)") }
         if let profile { q.append("profile=\(Self.esc(profile))") }
         if !exclude.isEmpty { q.append("exclude=\(exclude.joined(separator: ","))") }
-        let path = telegram ? "/m/telegram?" : "/m/sessions?"
+        let path = source == "telegram" ? "/m/telegram?" : source == "desktop" ? "/m/desktop?" : "/m/sessions?"
         return try await get(path + q.joined(separator: "&"), as: SessionPage.self)
     }
-    func search(_ text: String, archived: Bool = false, profile: String? = nil, telegram: Bool = false) async throws -> [SessionSummary] {
+    func search(_ text: String, archived: Bool = false, profile: String? = nil, source: String? = nil) async throws -> [SessionSummary] {
         var components = URLComponents()
         components.path = "/m/search"
         var query = [URLQueryItem(name: "q", value: text)]
         if archived { query.append(URLQueryItem(name: "archived", value: "1")) }
         if let profile { query.append(URLQueryItem(name: "profile", value: profile)) }
-        if telegram { query.append(URLQueryItem(name: "source", value: "telegram")) }
+        if let source { query.append(URLQueryItem(name: "source", value: source)) }
         components.queryItems = query
         // Form-style query decoders interpret literal plus signs as spaces.
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
@@ -317,7 +394,22 @@ final class API: @unchecked Sendable {
         return try await get(path, as: SearchPage.self).data
     }
     func messages(profile: String, session: String, limit: Int = 100, offset: Int = 0) async throws -> [StoredMessage] {
-        try await get(p(profile, "/api/sessions/\(Self.esc(session))/messages?limit=\(limit)&offset=\(offset)&order=latest"), as: MessagesPage.self).data
+        let page = try await timeline(profile: profile, session: session, limit: limit, offset: offset)
+        guard let rows = page.rows else { throw APIError.badResponse }
+        return rows
+    }
+
+    func timeline(profile: String, session id: String, limit: Int = 100, offset: Int = 0,
+                  validator: String? = nil) async throws -> (rows: [StoredMessage]?, validator: String?) {
+        var r = try request(p(profile, "/api/sessions/\(Self.esc(id))/messages?limit=\(limit)&offset=\(offset)&order=latest"))
+        r.cachePolicy = .reloadIgnoringLocalCacheData
+        r.setValue("timeline-v1", forHTTPHeaderField: "X-Hermes-Transcript")
+        r.setValue(validator, forHTTPHeaderField: "If-None-Match")
+        let (data, response) = try await session.data(for: r)
+        guard let http = response as? HTTPURLResponse else { throw APIError.badResponse }
+        if http.statusCode == 304, let validator { return (nil, validator) }
+        guard http.statusCode == 200 else { throw APIError.http(http.statusCode, Self.errorText(data)) }
+        return (try JSONDecoder().decode(MessagesPage.self, from: data).data, http.value(forHTTPHeaderField: "ETag"))
     }
     func catalog(profile: String) async throws -> ModelCatalog {
         try await get(p(profile, "/api/model/options"), as: ModelCatalog.self)
@@ -356,26 +448,39 @@ final class API: @unchecked Sendable {
     /// Persist the chat's model/provider/effort on the session in Hermes (`session.mutate`), exactly
     /// what the desktop's picker does, so every device sees it and the next turn runs on it.
     /// `previous` is what the chat had; fields cleared since then are reset to the bot's own setting.
-    func lockRuntime(profile: String, session: String, choice: RuntimeChoice, previous: RuntimeChoice? = nil) async throws {
+    func lockRuntime(profile: String, session: String, choice: RuntimeChoice, previous: RuntimeChoice? = nil) async throws -> Bool {
         let body = Self.choiceBody(choice, previous: previous)
-        guard !body.isEmpty else { return }
-        _ = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/runtime", method: "POST", body: body)
+        guard !body.isEmpty else { return false }
+        let result = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/runtime", method: "POST", body: body)
+        return result["timing"] as? String == "next_turn"
     }
 
     /// Start a turn. The Mac holds it; it keeps running if the phone locks or loses signal.
     func startRun(profile: String, session: String, text: String, choice: RuntimeChoice,
-                  projectContext: String? = nil) async throws -> String {
+                  projectContext: String? = nil, submission: UUID? = nil, attachments: [SendAttachment] = []) async throws -> String {
         var body = Self.choiceBody(choice)
+        if let submission { body["submission_id"] = submission.uuidString }
+        if !attachments.isEmpty {
+            guard submission != nil else { throw APIError.badResponse }
+            if attachments.contains(where: { $0.mime == "video/mp4" }) { body["video_analysis_consent"] = true }
+            body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
+        }
         body["text"] = text
         ProjectContext.apply(to: &body, projectID: projectContext)
-        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/send", method: "POST", body: body)
+        let action = submission == nil ? "send" : "send-once"
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/\(action)", method: "POST", body: body)
         guard let id = obj["turn_id"] as? String else { throw APIError.badResponse }
         return id
     }
 
-    func followUp(run: String, mode: String, text: String, submission: UUID) async throws {
-        let result = try await json("/m/turns/\(Self.esc(run))/\(mode)", method: "POST",
-                                    body: ["text": text, "submission_id": submission.uuidString])
+    func followUp(run: String, mode: String, text: String, submission: UUID, choice: RuntimeChoice) async throws {
+        var body = mode == "queue" ? Self.choiceBody(choice) : [:]
+        // Older bridges ignore unknown JSON fields. A distinct route refuses an unsupported
+        // override before it can submit the message with the wrong model.
+        let action = body.isEmpty ? mode : "queue-with-runtime"
+        body["text"] = text
+        body["submission_id"] = submission.uuidString
+        let result = try await json("/m/turns/\(Self.esc(run))/\(action)", method: "POST", body: body)
         let expected = mode == "queue" ? "queued" : "steer_accepted"
         guard result["status"] as? String == expected else { throw APIError.badResponse }
     }
@@ -398,27 +503,62 @@ final class API: @unchecked Sendable {
     }
 
     /// Server-sent events for a run, resuming after `lastSeq` (the gateway replays its backlog).
-    func events(profile: String, run: String, after lastSeq: Int?) -> AsyncThrowingStream<RunEvent, Error> {
-        AsyncThrowingStream { continuation in
+    func events(profile: String, run: String, after lastSeq: Int?, epoch: String? = nil,
+                routeRevision: UInt64) -> AsyncThrowingStream<RunEvent, Error> {
+        // A slow UI catches up from its last applied ID instead of buffering unlimited tokens.
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(256)) { continuation in
+            // Freeze the account's URL and bearer together before starting transport work.
+            let r: URLRequest
+            do {
+                var request = try self.request("/m/turns/\(Self.esc(run))/events")
+                request.timeoutInterval = 45
+                request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                request.setValue("checkpoint-v1", forHTTPHeaderField: "X-Hermes-Replay")
+                if let epoch { request.setValue(epoch, forHTTPHeaderField: "X-Hermes-Replay-Epoch") }
+                if let lastSeq { request.setValue(String(lastSeq), forHTTPHeaderField: "Last-Event-ID") }
+                r = request
+            } catch {
+                continuation.finish(throwing: error)
+                return
+            }
             let task = Task {
-                do {
-                    var r = try request("/m/turns/\(Self.esc(run))/events")
-                    r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                    if let lastSeq { r.setValue(String(lastSeq), forHTTPHeaderField: "Last-Event-ID") }
-                    let (bytes, resp) = try await streamSession.bytes(for: r)
-                    guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
-                    guard http.statusCode == 200 else { throw APIError.http(http.statusCode, "") }  // 404 = turn gone
-                    for try await line in bytes.lines {
-                        guard line.hasPrefix("data:") else { continue }
-                        let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                        guard let d = payload.data(using: .utf8),
-                              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
-                        let name = (obj["event"] as? String) ?? (obj["type"] as? String) ?? ""
-                        continuation.yield(RunEvent(seq: obj["seq"] as? Int, name: name, raw: obj))
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { [self] in
+                        do {
+                            let (bytes, resp) = try await streamSession.bytes(for: r)
+                            guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+                            guard http.statusCode == 200 else { throw APIError.http(http.statusCode, "") }  // 404 = turn gone
+                            let wireEpoch = http.value(forHTTPHeaderField: "X-Hermes-Replay-Epoch")
+                            for try await line in bytes.lines {
+                                guard line.hasPrefix("data:") else { continue }
+                                let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                                guard let d = payload.data(using: .utf8),
+                                      let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+                                let name = (obj["event"] as? String) ?? (obj["type"] as? String) ?? ""
+                                let event = RunEvent(seq: obj["seq"] as? Int, name: name, raw: obj, replayEpoch: wireEpoch)
+                                switch continuation.yield(event) {
+                                case .enqueued: break
+                                case .dropped:
+                                    continuation.finish(throwing: URLError(.networkConnectionLost))
+                                    return
+                                case .terminated: return
+                                @unknown default: return
+                                }
+                            }
+                            continuation.finish()
+                        } catch {
+                            continuation.finish(throwing: error)
+                        }
                     }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+                    group.addTask {
+                        for await _ in StreamRoutes.shared.changes(after: routeRevision) {
+                            guard !Task.isCancelled else { return }
+                            continuation.finish(throwing: StreamRouteChanged())
+                            return
+                        }
+                    }
+                    await group.next()
+                    group.cancelAll()
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -429,12 +569,15 @@ final class API: @unchecked Sendable {
 enum Keychain {
     private static let service = Bundle.main.bundleIdentifier ?? "HermesMobile"
 
-    static func write(_ key: String, _ value: String) {
-        delete(key)
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                kSecAttrAccount as String: key, kSecValueData as String: Data(value.utf8),
-                                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock]
-        SecItemAdd(q as CFDictionary, nil)
+    static func write(_ key: String, _ value: String) -> Bool {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: service, kSecAttrAccount as String: key]
+        let data: [String: Any] = [kSecValueData as String: Data(value.utf8),
+                                   kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        let status = SecItemUpdate(query as CFDictionary, data as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        return SecItemAdd(query.merging(data) { _, new in new } as CFDictionary, nil) == errSecSuccess
     }
 
     static func read(_ key: String) -> String? {
@@ -446,24 +589,26 @@ enum Keychain {
         return String(data: d, encoding: .utf8)
     }
 
-    static func delete(_ key: String) {
+    static func delete(_ key: String) -> Bool {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
                                 kSecAttrAccount as String: key]
-        SecItemDelete(q as CFDictionary)
+        let status = SecItemDelete(q as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
 
 extension WorkspaceClient {
     static func live(project: String) -> WorkspaceClient {
-        WorkspaceClient(
-            detail: { try await API.shared.workspaceDetail(project: project) },
-            saveInstructions: { try await API.shared.saveWorkspaceInstructions(project: project, text: $0, revision: $1) },
-            addFile: { try await API.shared.addWorkspaceFile(project: project, name: $0, data: $1) },
-            deleteFile: { try await API.shared.deleteWorkspaceFile(project: project, id: $0) },
-            createChat: { try await API.shared.createWorkspaceChat(project: project, profile: $0, title: $1) },
-            saveAssignment: { try await API.shared.saveWorkspaceAssignment(project: project, profiles: $0, revision: $1) },
-            fileContent: { try await API.shared.workspaceFileContent(project: project, id: $0) },
-            saveFile: { try await API.shared.saveWorkspaceFile(project: project, id: $0, content: $1, sha: $2) })
+        let api = API.shared
+        return WorkspaceClient(
+            detail: { try await api.workspaceDetail(project: project) },
+            saveInstructions: { try await api.saveWorkspaceInstructions(project: project, text: $0, revision: $1) },
+            addFile: { try await api.addWorkspaceFile(project: project, name: $0, data: $1) },
+            deleteFile: { try await api.deleteWorkspaceFile(project: project, id: $0) },
+            createChat: { try await api.createWorkspaceChat(project: project, profile: $0, title: $1) },
+            saveAssignment: { try await api.saveWorkspaceAssignment(project: project, profiles: $0, revision: $1) },
+            fileContent: { try await api.workspaceFileContent(project: project, id: $0) },
+            saveFile: { try await api.saveWorkspaceFile(project: project, id: $0, content: $1, sha: $2) })
     }
 }
 extension API {

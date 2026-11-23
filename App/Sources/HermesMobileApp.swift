@@ -23,7 +23,8 @@ struct RootView: View {
     var body: some View {
         if app.signedIn {
             MainTabs()
-                .task { await app.refreshBots() }
+                .id(app.gatewaySession)
+                .task(id: app.gatewaySession) { await app.refreshBots() }
         } else {
             SignInView()
         }
@@ -116,10 +117,10 @@ struct ConnectionBadge: View {
         default: break
         }
         let gateway = health.gatewayState?.lowercased() ?? ""
-        if !health.ok || ["stopped", "down", "failed", "offline"].contains(gateway) || diagnostic?["health"].string == "down" {
+        if !health.ok || ["stopped", "down", "failed", "offline"].contains(gateway) {
             return ("Gateway down", "xmark.circle.fill", .red)
         }
-        if diagnostic?["health"].string == "degraded" || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
+        if ["degraded", "down"].contains(diagnostic?["health"].string ?? "") || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
             return ("Degraded", "exclamationmark.triangle.fill", .yellow)
         }
         return ("Online", "checkmark.circle.fill", .green)
@@ -155,6 +156,9 @@ struct ConnectionBadge: View {
                 } else if app.health?.ok == false {
                     Text("The bridge answered. The gateway health check failed.")
                 } else {
+                    if diagnostic?["health"].string == "down" {
+                        Text("The gateway answered the live probe. The host process record disagrees.")
+                    }
                     ForEach(Array((diagnostic?["reasons"].array ?? []).enumerated()), id: \.offset) { _, reason in
                         if let text = reason.string { Text(text) }
                     }

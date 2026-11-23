@@ -26,6 +26,14 @@ class RecoveryTests(unittest.TestCase):
                 self.assertTrue(self.recover({"status": "terminal", "outcome": outcome}))
                 self.assertEqual(self.turn.events[-1]["event"], event)
 
+    def test_fallback_keeps_policy_and_usage_separate(self):
+        self.turn.choice = {"model":"selected", "provider":"policy-provider"}
+        engine._record_runtime(self.turn,{"model":"selected","provider":"old"})
+        engine._settle(self.turn,{"status":"complete","usage":{"model":"selected","fallback_model":"served"}})
+        receipt = self.turn.events[-1]
+        self.assertEqual(receipt["requested_model"],"selected")
+        self.assertEqual(receipt["runtime"],{"model":"served","fallback":True})
+
     def test_receipt_still_running(self):
         self.assertFalse(self.recover({"status": "started"}))
         self.assertEqual(self.turn.events, [])
@@ -81,6 +89,30 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
             rpc.assert_not_awaited()
             with self.assertRaises(engine.TurnError):
                 await engine._follow_up(turn, "queue", "different", queued.submission)
+
+    async def test_queued_runtime_is_frozen_at_admission_and_exact_retry_does_not_submit(self):
+        from uuid import uuid4
+        turn = engine.Turn("default", Path("."), "chat", "first", {"model":"current"})
+        turn.client, turn.generation = object(), 5
+        request = uuid4().hex
+        pick = dict(model="next-model", provider="relay", effort="low")
+        with patch.dict(engine.TURNS, {turn.id:turn}, clear=True), patch.object(engine, "_drive", AsyncMock()), \
+                patch.object(engine, "_rpc", AsyncMock(return_value={"status":"queued","admission_id":"new"})) as rpc:
+            receipt = await engine._follow_up(turn,"queue","next",request,pick)
+            rpc.assert_awaited_once_with(turn.client,"prompt.submit",session_id="chat",text="next",
+                                         submission_id=request,model_override={"model":"next-model","provider":"relay","reasoning":"low"})
+            self.assertEqual(engine.TURNS[receipt["turn_id"]].choice, pick)
+            self.assertEqual(turn.choice, {"model":"current"})
+            self.assertEqual(await engine._follow_up(turn,"queue","next",request,pick),receipt)
+            with self.assertRaises(engine.TurnError):
+                await engine._follow_up(turn,"queue","next",request,{"model":"another"})
+            self.assertEqual(rpc.await_count,1)
+
+    async def test_busy_model_and_effort_share_one_native_mutation_receipt(self):
+        with patch.object(engine, "_mutate", AsyncMock(return_value={"status":"deferred"})) as mutate:
+            result = await engine._apply(None,"chat",{"model":"new","provider":"p","effort":"high"})
+            mutate.assert_awaited_once_with(None,"chat","model",{"model":"new","provider":"p","reasoning":"high"})
+            self.assertEqual(result["model"]["status"],"deferred")
 
     async def test_simultaneous_steers_share_the_gateway_ack(self):
         import asyncio

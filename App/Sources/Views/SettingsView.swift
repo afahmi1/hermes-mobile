@@ -3,12 +3,34 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
     @State private var confirmSignOut = false
+    @State private var localSignOut = false
+    @State private var addingGateway = false
+    @State private var gatewayError: String?
+    @State private var capabilities: BridgeCapabilities?
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("Gateways") {
+                    ForEach(app.savedGateways, id: \.self) { url in
+                        if url == API.shared.baseURL {
+                            Label(url.absoluteString, systemImage: "checkmark")
+                                .accessibilityLabel("Active gateway, " + url.absoluteString)
+                        } else {
+                            Button(url.absoluteString) {
+                                do { try app.switchGateway(url) } catch { gatewayError = error.localizedDescription }
+                            }
+                        }
+                    }
+                    Button("Add Gateway", systemImage: "plus") { addingGateway = true }
+                    if let gatewayError { Text(gatewayError).foregroundStyle(.red) }
+                }
                 Section("Hermes server") {
-                    LabeledContent("Address", value: API.shared.baseURL?.absoluteString ?? "—")
+                    if let caps = capabilities, caps.features.contains("device_grants") {
+                        NavigationLink { DeviceAccessView(capabilities: caps) } label: {
+                            Label("Device access", systemImage: "iphone")
+                        }
+                    }
                     LabeledContent("Gateway") { ConnectionBadge() }
                     if let v = app.health?.version { LabeledContent("Hermes", value: v) }
                     NavigationLink { SettingsBotsList() } label: {
@@ -32,6 +54,12 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .sheet(isPresented: $addingGateway) { SignInView(adding: true) }
+            .task(id: app.inboxAccount) {
+                capabilities = nil
+                let caps = try? await API.shared.capabilities()
+                if !Task.isCancelled { capabilities = caps }
+            }
             .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
             .refreshable {
                 async let health: Void = app.refreshHealth()
@@ -40,7 +68,26 @@ struct SettingsView: View {
                 _ = await (health, bots)
             }
             .confirmationDialog("Sign out of this server?", isPresented: $confirmSignOut, titleVisibility: .visible) {
-                Button("Sign Out", role: .destructive) { app.signOut() }
+                Button("Sign Out", role: .destructive) {
+                    Task {
+                        let account = app.inboxAccount
+                        do {
+                            try await API.shared.revokeDevice("current")
+                        } catch APIError.http(let code, _) where code == 401 || code == 404 {
+                            // Already revoked, or this older bridge predates device grants.
+                        } catch {
+                            if account == app.inboxAccount { localSignOut = true }
+                            return
+                        }
+                        if account == app.inboxAccount { app.signOut() }
+                    }
+                }
+            }
+            .confirmationDialog("The bridge couldn’t confirm revocation.", isPresented: $localSignOut, titleVisibility: .visible) {
+                Button("Sign Out on This Phone", role: .destructive) { app.signOut() }
+                Button("Keep Signed In", role: .cancel) {}
+            } message: {
+                Text("Signing out here clears this phone. You can revoke its grant later on the host.")
             }
         }
     }
@@ -61,5 +108,80 @@ private struct SettingsBotsList: View {
         .navigationTitle("Bots")
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await app.refreshBots() }
+    }
+}
+
+private struct DeviceAccessView: View {
+    let capabilities: BridgeCapabilities
+    @State private var devices: [DeviceGrant] = []
+    @State private var offer: DevicePairCode?
+    @State private var error: String?
+    @State private var selected: DeviceGrant?
+    @State private var busy = false
+
+    var body: some View {
+        Form {
+            if let error { Text(error).foregroundStyle(.red) }
+            if capabilities.manageDevices {
+                Section("Signed-in devices") {
+                    ForEach(devices) { device in
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(device.name)
+                                Text("Expires " + Date(timeIntervalSince1970: device.expires).formatted(date: .abbreviated, time: .omitted))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if device.id == capabilities.deviceID {
+                                Text("This phone").font(.caption)
+                            } else {
+                                Button("Revoke", role: .destructive) { selected = device }
+                                    .buttonStyle(.borderless).disabled(busy)
+                            }
+                        }
+                    }
+                }
+                Section {
+                    Button("Create One-Time Pairing Code") {
+                        Task {
+                            busy = true
+                            defer { busy = false }
+                            do { offer = try await API.shared.pairingCode(); error = nil }
+                            catch { self.error = error.localizedDescription }
+                        }
+                    }.disabled(busy)
+                    if let offer {
+                        Text(offer.code).font(.body.monospaced()).textSelection(.enabled)
+                        Text("Expires at " + Date(timeIntervalSince1970: offer.expires).formatted(date: .omitted, time: .shortened))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } footer: { Text("A paired phone can access chats, tools and approvals on this bridge.") }
+            } else {
+                Section {
+                    Text("This phone has its own revocable sign-in. The bridge owner can manage devices on the host.")
+                }
+            }
+        }
+        .navigationTitle("Device access")
+        .task { await reload() }
+        .refreshable { await reload() }
+        .confirmationDialog("Revoke this device’s access?", isPresented: Binding(
+            get: { selected != nil }, set: { if !$0 { selected = nil } }
+        ), titleVisibility: .visible, presenting: selected) { device in
+            Button("Revoke " + device.name, role: .destructive) {
+                Task {
+                    busy = true
+                    defer { busy = false }
+                    do { try await API.shared.revokeDevice(device.id); await reload() }
+                    catch { self.error = error.localizedDescription }
+                }
+            }
+        }
+    }
+
+    private func reload() async {
+        guard capabilities.manageDevices else { return }
+        do { devices = try await API.shared.devices(); error = nil }
+        catch { self.error = error.localizedDescription }
     }
 }
