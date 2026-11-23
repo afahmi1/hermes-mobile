@@ -18,6 +18,29 @@ class RecoveryTests(unittest.TestCase):
         with patch.object(engine, "_rpc", rpc):
             return asyncio.run(engine._recover_gap(None, self.turn))
 
+    def test_stop_cannot_interrupt_another_execution_before_admission(self):
+        self.turn.admission = None
+        rpc = AsyncMock()
+        with patch.object(engine, "_rpc", rpc), self.assertRaises(engine.TurnError):
+            asyncio.run(engine._interrupt(self.turn))
+        rpc.assert_not_called()
+
+    def test_stop_never_borrows_the_session_execution_generation(self):
+        self.turn.client = object()
+        self.turn.generation = None
+        rpc = AsyncMock()
+        with patch.object(engine, "_resume", AsyncMock(return_value={"execution_generation": 99, "pending": []})), patch.object(engine, "_rpc", rpc), self.assertRaises(engine.TurnError):
+            asyncio.run(engine._interrupt(self.turn))
+        rpc.assert_not_called()
+
+    def test_stop_cancels_its_own_queued_admission(self):
+        self.turn.client = object()
+        rpc = AsyncMock()
+        with patch.object(engine, "_resume", AsyncMock(return_value={"execution_generation": 99, "pending": [{"admission_id": "admission", "status": "queued"}]})), patch.object(engine, "_rpc", rpc):
+            asyncio.run(engine._interrupt(self.turn))
+        self.assertEqual(rpc.call_args.args[1], "prompt.cancel")
+        self.assertEqual(rpc.call_args.kwargs["admission_id"], "admission")
+
     def test_receipt_outcomes(self):
         cases = [("completed", "run.completed"), ("interrupted", "run.cancelled"),
                  ("failed", "run.failed"), ("unknown", "run.failed"), (None, "run.failed")]

@@ -179,12 +179,19 @@ def set_runtime(home, sid, choice):
 
 async def _interrupt(turn):
     """Stop a turn. session.interrupt is generation-fenced; a turn still queued is cancelled instead."""
+    if not turn.admission:
+        raise TurnError("Hermes is still confirming this send. Try Stop again once it starts.", 409)
+
     async def go(c):
         snap = await _resume(c, turn.canonical_sid)
-        gen = turn.generation if turn.generation is not None else snap.get("execution_generation")
         row = next((r for r in snap.get("pending") or [] if r.get("admission_id") == turn.admission), {})
-        if turn.admission and row.get("status") == "queued":
+        if row.get("status") == "queued":
             return await _rpc(c, "prompt.cancel", session_id=turn.canonical_sid, admission_id=turn.admission)
+        gen = turn.generation
+        if gen is None and row.get("status") == "started":
+            gen = row.get("execution_generation")
+        if gen is None:
+            raise TurnError("This reply has no confirmed execution to stop. Refresh the conversation.", 409)
         return await _rpc(c, "session.interrupt", session_id=turn.canonical_sid, execution_generation=gen)
     if turn.client is not None:
         return await go(turn.client)
