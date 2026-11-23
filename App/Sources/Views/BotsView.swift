@@ -12,8 +12,10 @@ struct BotsView: View {
                     NavigationLink(value: bot) { BotRow(bot: bot) }
                         .disabled(!bot.reachable)
                 }
+                ManagePersonasSection()  // build5 manage hook
             }
             .navigationTitle("Bots")
+            .modifier(ManageBotsToolbar())  // build5 manage hook
             .navigationDestination(for: Bot.self) { BotDetailView(bot: $0) }
             .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
             .refreshable { await app.refreshBots() }
@@ -59,6 +61,7 @@ struct BotDetailView: View {
             Section {
                 Toggle("Show scheduled & one-shot runs", isOn: $showAutomations)
             }
+            ManageBotSection(bot: bot)  // build5 manage hook
             Section("Sessions") {
                 ForEach(sessions) { s in
                     NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {

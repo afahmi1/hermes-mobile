@@ -144,6 +144,156 @@ final class API: @unchecked Sendable {
             throw ProjectsFailure.classify(error)
         }
     }
+    // MARK: workspaces (signed-in, app only)
+
+    private func workspaceCall<T>(_ work: () async throws -> T) async throws -> T {
+        do { return try await work() }
+        catch let e as WorkspacesFailure { throw e }
+        catch APIError.notSignedIn { throw WorkspacesFailure.signedOut }
+        catch APIError.http(let code, _) { throw WorkspacesFailure.fromHTTP(code) }
+        catch APIError.badResponse { throw WorkspacesFailure.malformed }
+        catch is CancellationError { throw CancellationError() }
+        catch let e as URLError where e.code == .cancelled { throw e }
+        catch { throw WorkspacesFailure.network }
+    }
+
+    /// Like `send`, but keeps the bridge's machine `code` so 409/403 become distinct, fixed-text failures.
+    private func wsSend(_ r: URLRequest) async throws -> Data {
+        let (data, resp) = try await session.data(for: r)
+        guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+            throw WorkspacesFailure.fromResponse(status: http.statusCode, code: code)
+        }
+        return data
+    }
+
+    private func workspaceGET(_ path: String) async throws -> Data {
+        var r = try request(path)
+        r.timeoutInterval = 15
+        r.cachePolicy = .reloadIgnoringLocalCacheData
+        return try await wsSend(r)
+    }
+
+    private func workspaceWrite(_ path: String, method: String, body: [String: Any]?) async throws -> Data {
+        var r = try request(path, method: method, body: body)
+        r.timeoutInterval = 20
+        return try await wsSend(r)
+    }
+
+    private func workspaceJSON(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any] {
+        let data = try await workspaceWrite(path, method: method, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    func workspaceIndex() async throws -> WorkspaceIndex {
+        try await workspaceCall { try WorkspaceIndex.decode(try await workspaceGET("/m/workspaces")) }
+    }
+
+    func workspaceDetail(project: String) async throws -> WorkspaceDetail {
+        try await workspaceCall { try WorkspaceDetail.decode(try await workspaceGET("/m/workspaces/\(Self.esc(project))")) }
+    }
+
+    /// Returns the new revision (nil from a build-4 bridge). `revision` makes a concurrent edit a 409.
+    func saveWorkspaceInstructions(project: String, text: String, revision: String?) async throws -> String? {
+        try WorkspaceValidation.checkInstructions(text)
+        return try await workspaceCall {
+            var b: [String: Any] = ["instructions": text]
+            if let revision { b["revision"] = revision }
+            let o = try await workspaceJSON("/m/workspaces/\(Self.esc(project))/instructions", method: "PUT", body: b)
+            guard o["ok"] as? Bool == true else { throw APIError.badResponse }
+            return o["revision"] as? String
+        }
+    }
+
+    func saveWorkspaceAssignment(project: String, profiles: [String], revision: Int) async throws -> WorkspaceAssignment {
+        try await workspaceCall {
+            let data = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/assignment", method: "PUT",
+                                                body: ["profiles": profiles, "revision": revision])
+            return try WorkspaceAssignment.decodeEnvelope(data)
+        }
+    }
+
+    func workspaceFileContent(project: String, id: String) async throws -> WorkspaceFileContent {
+        try await workspaceCall {
+            let data = try await workspaceGET("/m/workspaces/\(Self.esc(project))/files/\(Self.esc(id))")
+            guard data.count <= 64 * 1024, let c = try? JSONDecoder().decode(WorkspaceFileContent.self, from: data) else {
+                throw APIError.badResponse
+            }
+            return c
+        }
+    }
+
+    func saveWorkspaceFile(project: String, id: String, content: String, sha: String) async throws -> WorkspaceFileMeta {
+        try await workspaceCall {
+            let data = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/files/\(Self.esc(id))", method: "PUT",
+                                                body: ["content": content, "sha": sha])
+            guard let m = try? JSONDecoder().decode(WorkspaceFileMeta.self, from: data) else { throw APIError.badResponse }
+            return m
+        }
+    }
+
+    func addWorkspaceFile(project: String, name: String, data: Data) async throws -> WorkspaceFile {
+        try await workspaceCall {
+            let body = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/files", method: "POST",
+                                                body: WorkspaceValidation.fileBody(name: name, data: data))
+            guard let f = try? JSONDecoder().decode(WorkspaceFile.self, from: body) else { throw APIError.badResponse }
+            return f
+        }
+    }
+
+    func deleteWorkspaceFile(project: String, id: String) async throws {
+        try await workspaceCall {
+            let o = try await workspaceJSON("/m/workspaces/\(Self.esc(project))/files/\(Self.esc(id))", method: "DELETE", body: nil)
+            guard o["ok"] as? Bool == true else { throw APIError.badResponse }
+        }
+    }
+
+    func createWorkspaceChat(project: String, profile: String, title: String?) async throws -> WorkspaceChat {
+        try await workspaceCall {
+            var b: [String: Any] = ["profile": profile]
+            if let title { b["title"] = title }
+            let body = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/chats", method: "POST", body: b)
+            guard let c = try? JSONDecoder().decode(WorkspaceChat.self, from: body) else { throw APIError.badResponse }
+            return c
+        }
+    }
+
+    /// One chat's artifacts, or (`session == nil`) one bot's library within ONE project. The bridge refuses a
+    /// library request with no project, so a bot's files never mix across projects.
+    func workspaceArtifacts(profile: String, session: String? = nil, project: String? = nil) async throws -> [WorkspaceArtifact] {
+        try await workspaceCall {
+            var path = "/m/workspace-artifacts/\(Self.esc(profile))" + (session.map { "/\(Self.esc($0))" } ?? "")
+            if session == nil, let project { path += "?project=\(Self.esc(project))" }
+            return try WorkspaceArtifact.decodeList(try await workspaceGET(path))
+        }
+    }
+
+    /// Downloads one artifact, never more than 8 MiB, with the server's Content-Disposition name.
+    func workspaceFile(id: String, fallbackName: String) async throws -> WorkspaceDownload {
+        guard WorkspaceArtifact.isValidID(id) else { throw WorkspacesFailure.malformed }
+        return try await workspaceCall {
+            var r = try request("/m/workspace-file/\(id)")
+            r.setValue("*/*", forHTTPHeaderField: "Accept")
+            r.timeoutInterval = 60
+            r.cachePolicy = .reloadIgnoringLocalCacheData
+            let (bytes, resp) = try await session.bytes(for: r)
+            guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+            guard (200..<300).contains(http.statusCode) else { throw APIError.http(http.statusCode, "") }
+            let cap = WorkspaceLimits.artifactDownloadBytes
+            if resp.expectedContentLength > Int64(cap) { throw WorkspacesFailure.tooLarge }
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count > cap { throw WorkspacesFailure.tooLarge }
+            }
+            return WorkspaceDownload(
+                data: data,
+                filename: ArtifactPreview.filename(disposition: http.value(forHTTPHeaderField: "Content-Disposition"), fallback: fallbackName),
+                mime: http.value(forHTTPHeaderField: "Content-Type"))
+        }
+    }
+
     func sessions(cursor: String?, profile: String? = nil, exclude: [String] = [], telegram: Bool = false) async throws -> SessionPage {
         let limit = cursor == nil ? 16 : 40
         var q = ["limit=\(limit)", "view=compact"]
@@ -213,9 +363,11 @@ final class API: @unchecked Sendable {
     }
 
     /// Start a turn. The Mac holds it; it keeps running if the phone locks or loses signal.
-    func startRun(profile: String, session: String, text: String, choice: RuntimeChoice) async throws -> String {
+    func startRun(profile: String, session: String, text: String, choice: RuntimeChoice,
+                  projectContext: String? = nil) async throws -> String {
         var body = Self.choiceBody(choice)
         body["text"] = text
+        ProjectContext.apply(to: &body, projectID: projectContext)
         let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/send", method: "POST", body: body)
         guard let id = obj["turn_id"] as? String else { throw APIError.badResponse }
         return id
@@ -298,5 +450,29 @@ enum Keychain {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
                                 kSecAttrAccount as String: key]
         SecItemDelete(q as CFDictionary)
+    }
+}
+
+extension WorkspaceClient {
+    static func live(project: String) -> WorkspaceClient {
+        WorkspaceClient(
+            detail: { try await API.shared.workspaceDetail(project: project) },
+            saveInstructions: { try await API.shared.saveWorkspaceInstructions(project: project, text: $0, revision: $1) },
+            addFile: { try await API.shared.addWorkspaceFile(project: project, name: $0, data: $1) },
+            deleteFile: { try await API.shared.deleteWorkspaceFile(project: project, id: $0) },
+            createChat: { try await API.shared.createWorkspaceChat(project: project, profile: $0, title: $1) },
+            saveAssignment: { try await API.shared.saveWorkspaceAssignment(project: project, profiles: $0, revision: $1) },
+            fileContent: { try await API.shared.workspaceFileContent(project: project, id: $0) },
+            saveFile: { try await API.shared.saveWorkspaceFile(project: project, id: $0, content: $1, sha: $2) })
+    }
+}
+extension API {
+    /// Raw status + body for the owner-management routes (they map `code` themselves). Never logs bodies.
+    func manageRaw(_ path: String, method: String, body: Any?) async throws -> (Int, Data) {
+        var r = try request(path, method: method, body: body)
+        r.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, resp) = try await session.data(for: r)
+        guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+        return (http.statusCode, data)
     }
 }

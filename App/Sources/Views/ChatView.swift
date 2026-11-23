@@ -3,9 +3,11 @@ import SwiftUI
 struct ChatView: View {
     @Environment(AppModel.self) private var app
     let ref: ChatRef
+    /// Set only when opened from a project's workspace; the only place project context can be offered.
+    var projectScope: WorkspaceScope?
 
     var body: some View {
-        ChatScreen(chat: app.chat(for: ref), draftKey: ref.id)
+        ChatScreen(chat: app.chat(for: ref), draftKey: ref.id, projectScope: projectScope)
     }
 }
 
@@ -13,6 +15,9 @@ struct ChatScreen: View {
     @Environment(AppModel.self) private var app
     @Bindable var chat: ChatModel
     let draftKey: String
+    var projectScope: WorkspaceScope?
+    /// Off for every send; switched back off after each one.
+    @State private var includeProjectContext = false
     @State private var draft = ""
     @State private var showRuntime = false
     @State private var sendTick = 0
@@ -130,6 +135,15 @@ struct ChatScreen: View {
                 .padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
                 .padding(.horizontal, 12)
             }
+            if let scope = projectScope {
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle("Include \(scope.title) context with next message", isOn: $includeProjectContext)
+                        .font(.subheadline)
+                        .disabled(chat.isRunning)
+                    Text(ProjectContext.disclosure).font(.caption2).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 16)
+            }
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Message \(bot?.name ?? "Hermes")", text: $draft, axis: .vertical)
                     .lineLimit(1...8)
@@ -175,8 +189,10 @@ struct ChatScreen: View {
         let text = draft
         draft = ""
         sendTick += 1
+        let context = ProjectContext.chosen(scope: projectScope?.projectID, optedIn: includeProjectContext && !chat.isRunning)
+        includeProjectContext = false  // ask every send
         Task {
-            await chat.send(text)
+            await chat.send(text, projectContext: context)
             app.adopt(chat, draftKey: draftKey)
         }
     }
@@ -199,11 +215,16 @@ struct MessageRow: View {
         case .user:
             HStack {
                 Spacer(minLength: 48)
-                Text(item.text)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .foregroundStyle(.white)
-                    .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                VStack(alignment: .trailing, spacing: 6) {
+                    if let note = item.contextNote {
+                        Label(note, systemImage: "folder.badge.gearshape").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Text(item.text)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .foregroundStyle(.white)
+                        .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                }
             }
             .padding(.horizontal, 12)
         case .assistant:
