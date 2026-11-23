@@ -157,11 +157,33 @@ final class API: @unchecked Sendable {
         catch { throw WorkspacesFailure.network }
     }
 
+    /// Like `send`, but keeps the bridge's machine `code` so 409/403 become distinct, fixed-text failures.
+    private func wsSend(_ r: URLRequest) async throws -> Data {
+        let (data, resp) = try await session.data(for: r)
+        guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+            throw WorkspacesFailure.fromResponse(status: http.statusCode, code: code)
+        }
+        return data
+    }
+
     private func workspaceGET(_ path: String) async throws -> Data {
         var r = try request(path)
         r.timeoutInterval = 15
         r.cachePolicy = .reloadIgnoringLocalCacheData
-        return try await send(r)
+        return try await wsSend(r)
+    }
+
+    private func workspaceWrite(_ path: String, method: String, body: [String: Any]?) async throws -> Data {
+        var r = try request(path, method: method, body: body)
+        r.timeoutInterval = 20
+        return try await wsSend(r)
+    }
+
+    private func workspaceJSON(_ path: String, method: String, body: [String: Any]?) async throws -> [String: Any] {
+        let data = try await workspaceWrite(path, method: method, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
     func workspaceIndex() async throws -> WorkspaceIndex {
@@ -172,18 +194,49 @@ final class API: @unchecked Sendable {
         try await workspaceCall { try WorkspaceDetail.decode(try await workspaceGET("/m/workspaces/\(Self.esc(project))")) }
     }
 
-    func saveWorkspaceInstructions(project: String, text: String) async throws {
+    /// Returns the new revision (nil from a build-4 bridge). `revision` makes a concurrent edit a 409.
+    func saveWorkspaceInstructions(project: String, text: String, revision: String?) async throws -> String? {
         try WorkspaceValidation.checkInstructions(text)
-        try await workspaceCall {
-            let o = try await json("/m/workspaces/\(Self.esc(project))/instructions", method: "PUT", body: ["instructions": text])
+        return try await workspaceCall {
+            var b: [String: Any] = ["instructions": text]
+            if let revision { b["revision"] = revision }
+            let o = try await workspaceJSON("/m/workspaces/\(Self.esc(project))/instructions", method: "PUT", body: b)
             guard o["ok"] as? Bool == true else { throw APIError.badResponse }
+            return o["revision"] as? String
+        }
+    }
+
+    func saveWorkspaceAssignment(project: String, profiles: [String], revision: Int) async throws -> WorkspaceAssignment {
+        try await workspaceCall {
+            let data = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/assignment", method: "PUT",
+                                                body: ["profiles": profiles, "revision": revision])
+            return try WorkspaceAssignment.decodeEnvelope(data)
+        }
+    }
+
+    func workspaceFileContent(project: String, id: String) async throws -> WorkspaceFileContent {
+        try await workspaceCall {
+            let data = try await workspaceGET("/m/workspaces/\(Self.esc(project))/files/\(Self.esc(id))")
+            guard data.count <= 64 * 1024, let c = try? JSONDecoder().decode(WorkspaceFileContent.self, from: data) else {
+                throw APIError.badResponse
+            }
+            return c
+        }
+    }
+
+    func saveWorkspaceFile(project: String, id: String, content: String, sha: String) async throws -> WorkspaceFileMeta {
+        try await workspaceCall {
+            let data = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/files/\(Self.esc(id))", method: "PUT",
+                                                body: ["content": content, "sha": sha])
+            guard let m = try? JSONDecoder().decode(WorkspaceFileMeta.self, from: data) else { throw APIError.badResponse }
+            return m
         }
     }
 
     func addWorkspaceFile(project: String, name: String, data: Data) async throws -> WorkspaceFile {
         try await workspaceCall {
-            let body = try await send(try request("/m/workspaces/\(Self.esc(project))/files", method: "POST",
-                                                  body: WorkspaceValidation.fileBody(name: name, data: data)))
+            let body = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/files", method: "POST",
+                                                body: WorkspaceValidation.fileBody(name: name, data: data))
             guard let f = try? JSONDecoder().decode(WorkspaceFile.self, from: body) else { throw APIError.badResponse }
             return f
         }
@@ -191,7 +244,7 @@ final class API: @unchecked Sendable {
 
     func deleteWorkspaceFile(project: String, id: String) async throws {
         try await workspaceCall {
-            let o = try await json("/m/workspaces/\(Self.esc(project))/files/\(Self.esc(id))", method: "DELETE", body: nil)
+            let o = try await workspaceJSON("/m/workspaces/\(Self.esc(project))/files/\(Self.esc(id))", method: "DELETE", body: nil)
             guard o["ok"] as? Bool == true else { throw APIError.badResponse }
         }
     }
@@ -200,7 +253,7 @@ final class API: @unchecked Sendable {
         try await workspaceCall {
             var b: [String: Any] = ["profile": profile]
             if let title { b["title"] = title }
-            let body = try await send(try request("/m/workspaces/\(Self.esc(project))/chats", method: "POST", body: b))
+            let body = try await workspaceWrite("/m/workspaces/\(Self.esc(project))/chats", method: "POST", body: b)
             guard let c = try? JSONDecoder().decode(WorkspaceChat.self, from: body) else { throw APIError.badResponse }
             return c
         }
@@ -404,9 +457,22 @@ extension WorkspaceClient {
     static func live(project: String) -> WorkspaceClient {
         WorkspaceClient(
             detail: { try await API.shared.workspaceDetail(project: project) },
-            saveInstructions: { try await API.shared.saveWorkspaceInstructions(project: project, text: $0) },
+            saveInstructions: { try await API.shared.saveWorkspaceInstructions(project: project, text: $0, revision: $1) },
             addFile: { try await API.shared.addWorkspaceFile(project: project, name: $0, data: $1) },
             deleteFile: { try await API.shared.deleteWorkspaceFile(project: project, id: $0) },
-            createChat: { try await API.shared.createWorkspaceChat(project: project, profile: $0, title: $1) })
+            createChat: { try await API.shared.createWorkspaceChat(project: project, profile: $0, title: $1) },
+            saveAssignment: { try await API.shared.saveWorkspaceAssignment(project: project, profiles: $0, revision: $1) },
+            fileContent: { try await API.shared.workspaceFileContent(project: project, id: $0) },
+            saveFile: { try await API.shared.saveWorkspaceFile(project: project, id: $0, content: $1, sha: $2) })
+    }
+}
+extension API {
+    /// Raw status + body for the owner-management routes (they map `code` themselves). Never logs bodies.
+    func manageRaw(_ path: String, method: String, body: Any?) async throws -> (Int, Data) {
+        var r = try request(path, method: method, body: body)
+        r.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, resp) = try await session.data(for: r)
+        guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+        return (http.statusCode, data)
     }
 }

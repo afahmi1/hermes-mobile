@@ -17,6 +17,7 @@ struct WorkspaceView: View {
     @State private var model: WorkspaceProjectModel
     @State private var tab = WorkspaceTab.context
     @State private var importing = false
+    @State private var newFile = false
     @State private var chatTitle = ""
     @State private var pendingDelete: WorkspaceFile?
 
@@ -35,6 +36,22 @@ struct WorkspaceView: View {
         }
         .navigationTitle(scope.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button { newFile = true } label: { Label("New text file", systemImage: "square.and.pencil") }
+                        .accessibilityIdentifier("ws.add.new")
+                    Button { importing = true } label: { Label("Import from Files", systemImage: "square.and.arrow.down") }
+                        .accessibilityIdentifier("ws.add.import")
+                } label: { Label("Add", systemImage: "plus") }
+                    .disabled(model.phase != .loaded || !model.canAddFile)
+                    .accessibilityIdentifier("ws.add")
+                    .accessibilityLabel("Add file")
+            }
+        }
+        .sheet(isPresented: $newFile) {
+            NewFileSheet(project: scope.projectID, existingCount: model.detail.files.count) { Task { await model.load() } }
+        }
         .task { await model.load() }
         .onChange(of: model.phase) { _, p in if p == .failed(.signedOut) { app.signOut() } }
         .alert("Workspace", isPresented: Binding(get: { model.notice != nil }, set: { if !$0 { model.notice = nil } })) {
@@ -84,36 +101,41 @@ struct WorkspaceView: View {
     private var contextTab: some View {
         List {
             Section {
-                TextEditor(text: $model.instructionsDraft)
-                    .frame(minHeight: 140)
-                    .accessibilityLabel("Project instructions")
-                HStack {
-                    Text("\(model.instructionBytes) / \(WorkspaceLimits.instructionBytes) bytes")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(model.instructionsOverLimit ? .red : .secondary)
-                    Spacer()
-                    Button("Save") { Task { await model.saveInstructions() } }
-                        .disabled(!model.canSaveInstructions)
+                NavigationLink { InstructionsView(model: model) } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Instructions")
+                        Text(model.detail.instructions.isEmpty ? "None yet" : model.detail.instructions)
+                            .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                    .accessibilityElement(children: .combine)
                 }
-            } header: { Text("Instructions") } footer: {
+                .accessibilityIdentifier("ws.instructions")
+                .accessibilityHint("Opens the project instructions")
+            } footer: {
                 Text("Saved on your Mac. Sent to a bot only when you switch project context on for a message.")
             }
             Section {
+                if model.detail.files.isEmpty { Text("No files yet. Use Add to create or import one.").foregroundStyle(.secondary) }
                 ForEach(model.detail.files) { file in
-                    HStack {
-                        Label(file.name, systemImage: "doc.text")
-                        Spacer()
-                        Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)).font(.caption).foregroundStyle(.secondary)
+                    NavigationLink {
+                        WorkspaceFileView(file: file, project: scope.projectID) { Task { await model.load() } }
+                    } label: {
+                        HStack {
+                            Label(file.name, systemImage: "doc.text")
+                            Spacer()
+                            Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)).font(.caption).foregroundStyle(.secondary)
+                        }
+                        .accessibilityElement(children: .combine)
                     }
+                    .accessibilityIdentifier("ws.file.\(file.name)")
+                    .accessibilityHint("Opens this file")
                     .swipeActions { Button("Remove", role: .destructive) { pendingDelete = file } }
-                    .accessibilityElement(children: .combine)
                 }
-                Button { importing = true } label: { Label("Add file", systemImage: "plus") }
-                    .disabled(!model.canAddFile)
-            } header: { Text("Reference files (\(model.detail.files.count)/\(WorkspaceLimits.maxFiles))") } footer: {
+            } header: { Text("Files (\(model.detail.files.count)/\(WorkspaceLimits.maxFiles))") } footer: {
                 Text(".txt, .md, .csv or .json; UTF-8, up to 8192 bytes each.")
             }
         }
+        .refreshable { await model.load() }
     }
 
     // MARK: chats

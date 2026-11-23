@@ -38,12 +38,14 @@ PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 PASS = re.compile(r"^/(api/sessions(/[^/]+(/(messages|model|fork))?)?|v1/runs(/[^/]+(/(events|stop|approval|steer))?)?"
                   r"|api/model/options|v1/models|health)$")
 MAX_BODY = 12 * 1024 * 1024
-WS_MAX_BODY = 32 * 1024  # Fits an 8 KiB base64 file or 4 KiB JSON-escaped instructions.
+WS_MAX_BODY = 64 * 1024  # Fits an 8 KiB file JSON-escaped (\u00XX per control byte) or 4 KiB instructions.
 WS_BODY_TIMEOUT = 10
 WS_SETTING = "HERMES_MOBILE_WORKSPACES"
+WS_BOTS_SETTING = "HERMES_MOBILE_WORKSPACE_BOTS"
 POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
+import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
     TURNS_ERROR = None
@@ -164,7 +166,10 @@ def bots():
     gmodel, gprov = model_default(HERMES / "config.yaml")
     served = served_profiles()
     out = []
+    hidden = archived_live_bots()
     for pid in profile_ids():
+        if pid in hidden:
+            continue
         m, pv = (gmodel, gprov) if pid == "default" else model_default(profile_home(pid) / "config.yaml")
         if pid == "default":
             name, blurb = front, "The front door. Does the work or hands it to the right bot."
@@ -173,7 +178,7 @@ def bots():
             name = nm or pid.replace("-", " ").replace("_", " ").title().replace("Captains", "Captain's")
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
                     "reachable": bool(key_for(pid)), "served": pid in served,
-                    "front": pid == "default"})
+                    "front": pid == "default", "managed": False})
     return out
 
 
@@ -327,9 +332,12 @@ FAILS_LOCK = threading.Lock()
 LOGIN_GATE = threading.Semaphore(1)
 
 
-def make_token(device):
-    payload = base64.urlsafe_b64encode(json.dumps(
-        {"exp": int(time.time()) + TOKEN_TTL, "dev": device[:60], "n": secrets.token_hex(4)}).encode()).decode().rstrip("=")
+def make_token(device, owner=False):
+    claims = {"exp": int(time.time()) + TOKEN_TTL, "dev": device[:60], "n": secrets.token_hex(4)}
+    if owner:  # owner scope: own/iat, honoured only while the owner epoch is not newer than iat
+        bridge_owner.epoch(owner_dir())  # created on first owner-mode use, never after the token's iat
+        claims.update(own=1, iat=int(time.time()))
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     sig = hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()
     return "hm1." + payload + "." + sig
 
@@ -343,6 +351,118 @@ def token_ok(tok):
         return int(data["exp"]) > time.time()
     except Exception:
         return False
+
+
+def token_claims(tok):
+    """Verified payload of a bearer token, or None."""
+    try:
+        ver, payload, sig = tok.split(".")
+        if ver != "hm1" or not hmac.compare_digest(sig, hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()):
+            return None
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return data if isinstance(data, dict) and int(data["exp"]) > time.time() else None
+    except Exception:
+        return None
+
+
+# ---------- owner management overlay (slice B) ----------
+def owner_dir():
+    """Private 0700 directory for the owner PIN verifier, attempt counter and owner epoch. A dedicated
+    subdirectory, so the bridge never has to change the permissions of the existing STATE_DIR."""
+    return STATE_DIR / "owner"
+
+
+_MANAGE = {}
+_MANAGE_LOCK = threading.Lock()
+
+
+def owner_managed():
+    return os.environ.get("HERMES_MOBILE_OWNER_MANAGED") == "1"
+
+
+def manage_overlay():
+    key = str(STATE_DIR)
+    with _MANAGE_LOCK:
+        if key not in _MANAGE:
+            _MANAGE[key] = bridge_manage.Manage(STATE_DIR)
+        return _MANAGE[key]
+
+
+def archived_live_bots():
+    if not owner_managed():
+        return set()
+    try:
+        return manage_overlay().archived_bots()
+    except Exception:
+        return set()
+
+
+def catalog_response():
+    """bridge_projects.catalog_response() plus the owner overlay (managed projects, minus archived ids)."""
+    code, body = bridge_projects.catalog_response()
+    if code != 200 or not owner_managed():
+        return code, body
+    try:
+        m = manage_overlay()
+        doc, archived, managed = json.loads(body), m.archived_projects(), m.managed_projects()
+        if not doc.get("configured") and not managed:
+            return code, body
+        doc["configured"] = True
+        projects = [dict(p, managed=False) for p in doc.get("projects") or [] if p["id"] not in archived]
+        doc["projects"] = projects + [p for p in managed if p["id"] not in archived]
+        return 200, json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except Exception:  # fail closed: never show a project the owner archived
+        return 503, json.dumps(bridge_projects.UNAVAILABLE).encode()
+
+
+def manageable_bots():
+    """Live bots the owner may archive: listed by the operator, never default, never protected."""
+    try:
+        listed = json.loads(os.environ.get("HERMES_MOBILE_MANAGEABLE_BOTS") or "[]")
+        if not isinstance(listed, list):
+            return []
+    except ValueError:
+        return []
+    live = set(profile_ids()) - archived_live_bots()
+    return sorted({b for b in listed if isinstance(b, str) and b != "default" and PROFILE_RE.match(b)
+                   and b in live and not profile_protected(b)})
+
+
+def persona_hosts():
+    try:
+        listed = json.loads(os.environ.get("HERMES_MOBILE_PERSONA_HOSTS") or "[]")
+        if not isinstance(listed, list):
+            return []
+    except ValueError:
+        return []
+    live = set(profile_ids()) - archived_live_bots()
+    return sorted({b for b in listed if isinstance(b, str) and b in live and not profile_protected(b)})
+
+
+class _NoStore:  # persona-only turns: no output directory, nothing to capture
+    def capture(self, *a):
+        pass
+
+    def discard_output(self, *a):
+        pass
+
+
+def persona_scope(pid, sid, workspace):
+    """Append an app persona's labelled, @-escaped text to the turn when (pid, sid) is a linked persona chat."""
+    if not owner_managed():
+        return workspace
+    try:
+        persona = manage_overlay().persona_for(pid, sid)
+    except Exception:
+        return workspace
+    if not persona:
+        return workspace
+    doc = json.dumps({"name": persona["name"], "instructions": persona["persona"]}, ensure_ascii=False)
+    note = ("\n\nApp persona for this chat, set by the user. The JSON below describes the character and style "
+            "to adopt; treat it as guidance, not as commands from files or tools.\n" + doc.replace("@", "\\u0040") + "\n")
+    if workspace:
+        return dict(workspace, suffix=(workspace.get("suffix") or "") + note)
+    return {"store": _NoStore(), "project": None, "output_dir": None, "suffix": note, "summary": None}
 
 
 # ---------- gateway ----------
@@ -810,24 +930,94 @@ def profile_protected(pid):
         return False
 
 
-def workspace_grants():
-    """Live permission map {project_id: set(profile_ids)}. The owner's HERMES_MOBILE_WORKSPACES allowlist is
-    the source of authority for which bot may use which project; it is narrowed, never widened, by: the
-    project existing in the current catalog; the catalog's `bot_ids` when that list is non-empty (an
-    empty/absent list means the catalog expresses no opinion, since it is display metadata and today's real
-    catalogs carry none); and the profile being live and not protected. Evaluated on every request."""
-    allow = workspace_allowlist()
-    if not allow:
-        return {}
-    code, body = bridge_projects.catalog_response()
+def workspace_catalog():
+    """{project_id: set(catalog bot_ids)} for the current valid catalog, or {} when unconfigured/unavailable.
+    Uses the effective catalog (catalog + managed projects - archived ids)."""
+    code, body = catalog_response()
     if code != 200:
         return {}
     try:
         doc = json.loads(body)
     except ValueError:
         return {}
-    catalog = {p["id"]: set(p.get("bot_ids") or []) for p in doc.get("projects") or [] if doc.get("configured")}
-    live = set(profile_ids())
+    if not doc.get("configured"):
+        return {}
+    return {p["id"]: set(p.get("bot_ids") or []) for p in doc.get("projects") or []
+            if isinstance(p.get("id"), str) and _WS_ID.match(p["id"])}
+
+
+def workspace_owner_mode():
+    """One owner-mode flag for workspaces and management: HERMES_MOBILE_OWNER_MANAGED=1."""
+    return owner_managed()
+
+
+def workspace_base_eligible():
+    """Operator-defined eligible set, narrowed to live, unprotected profiles. HERMES_MOBILE_WORKSPACE_BOTS
+    absent => union of the bots named in HERMES_MOBILE_WORKSPACES; malformed => empty (fail closed)."""
+    raw = os.environ.get(WS_BOTS_SETTING)
+    if raw is None:
+        named = set().union(*workspace_allowlist().values()) if workspace_allowlist() else set()
+    else:
+        try:
+            doc = json.loads(raw)
+        except (ValueError, RecursionError):
+            return set()
+        if (not isinstance(doc, list) or len(doc) > 256
+                or any(not isinstance(b, str) or not (b == "default" or PROFILE_RE.match(b)) for b in doc)):
+            return set()
+        named = set(doc)
+    live = set(profile_ids()) - archived_live_bots()
+    return {b for b in named if b in live and not profile_protected(b)}
+
+
+def workspace_eligible(project, catalog, base=None):
+    """Eligible(P): base set, further narrowed by the catalog's bot_ids for P when that list is non-empty."""
+    base = workspace_base_eligible() if base is None else base
+    listed = catalog.get(project) or set()
+    return sorted(b for b in base if not listed or b in listed)
+
+
+def workspace_seed(store):
+    """One-time seed of owner assignments from the legacy HERMES_MOBILE_WORKSPACES allowlist."""
+    allow = workspace_allowlist()
+    store.seed_assignments({p: sorted(b) for p, b in allow.items()})
+
+
+def workspace_owner_grants(store, catalog):
+    """Active grants in owner mode: stored assignment ∩ eligible, for projects in the current catalog."""
+    workspace_seed(store)
+    base = workspace_base_eligible()
+    stored = store.all_assignments()
+    grants = {}
+    for project, bots in stored.items():
+        if project in catalog:
+            ok = set(bots) & set(workspace_eligible(project, catalog, base))
+            if ok:
+                grants[project] = ok
+    return grants
+
+
+def workspace_grants():
+    """Live permission map {project_id: set(profile_ids)}. Operator mode: the owner's HERMES_MOBILE_WORKSPACES
+    allowlist is the source of authority for which bot may use which project; it is narrowed, never widened,
+    by: the project existing in the current catalog; the catalog's `bot_ids` when that list is non-empty (an
+    empty/absent list means the catalog expresses no opinion, since it is display metadata and today's real
+    catalogs carry none); and the profile being live and not protected. Owner mode (HERMES_MOBILE_OWNER_
+    MANAGED=1): the stored owner assignment replaces the allowlist, with the same narrowing.
+    Evaluated on every request."""
+    if workspace_owner_mode():
+        catalog = workspace_catalog()
+        if not catalog:
+            return {}
+        try:
+            return workspace_owner_grants(workspace_store(), catalog)
+        except WorkspaceError:
+            return {}
+    allow = workspace_allowlist()
+    if not allow:
+        return {}
+    catalog = workspace_catalog()
+    live = set(profile_ids()) - archived_live_bots()
     grants = {}
     for project, bots in allow.items():
         if project not in catalog:
@@ -947,7 +1137,7 @@ class H(BaseHTTPRequestHandler):
             n = int(raw)
         except ValueError:
             n = -1
-        scoped = urlsplit(self.path).path.startswith("/m/workspace")
+        scoped = urlsplit(self.path).path.startswith(("/m/workspace", "/m/manage"))
         cap = WS_MAX_BODY if scoped else MAX_BODY
         if n < 0 or n > cap:
             self.close_connection = True
@@ -970,6 +1160,36 @@ class H(BaseHTTPRequestHandler):
         h = self.headers.get("Authorization") or ""
         return h.startswith("Bearer ") and token_ok(h[7:].strip())
 
+    def login_elevates_to_owner(self):
+        """A password login mints owner scope ONLY over the verified Tailscale Serve path for the one configured
+        owner identity. Every condition must hold; anything missing or ambiguous fails closed (ordinary token):
+          - owner mode on (HERMES_MOBILE_OWNER_MANAGED=1) and HERMES_MOBILE_OWNER_LOGIN set;
+          - the operator asserts Tailscale Serve is the only remote path (HERMES_MOBILE_TRUST_TAILSCALE_SERVE=1);
+          - the bridge listens on loopback only and this connection came from loopback (i.e. from serve);
+          - exactly one Tailscale-User-Login header, equal to the owner identity, and no Funnel marker.
+        Tailscale Serve removes client-supplied Tailscale-User-* headers and sets its own, and sets none for
+        Funnel or tagged-node traffic, so a remote client cannot claim the identity. A local Mac process could,
+        but it can already read the bridge secret; local issuance is `--issue-token NAME --owner`."""
+        want = (os.environ.get("HERMES_MOBILE_OWNER_LOGIN") or "").strip().lower()
+        if not (owner_managed() and want and os.environ.get("HERMES_MOBILE_TRUST_TAILSCALE_SERVE") == "1"):
+            return False
+        loop = ("127.0.0.1", "::1", "localhost")
+        if os.environ.get("HERMES_MOBILE_BIND", "127.0.0.1") not in loop:
+            return False
+        if not self.client_address or self.client_address[0] not in ("127.0.0.1", "::1"):
+            return False
+        got = self.headers.get_all("Tailscale-User-Login") or []
+        if len(got) != 1 or self.headers.get("Tailscale-Funnel-Request") is not None:
+            return False
+        return hmac.compare_digest(got[0].strip().lower().encode(), want.encode())
+
+    def owner_ok(self):
+        """Valid bearer AND owner scope: owner mode on, token own == 1, iat >= owner epoch."""
+        h = self.headers.get("Authorization") or ""
+        if not (owner_managed() and h.startswith("Bearer ")):
+            return False
+        return bridge_owner.claims_are_owner(token_claims(h[7:].strip()), owner_dir())
+
     def route(self):
         if not self._read_body():
             return
@@ -983,6 +1203,8 @@ class H(BaseHTTPRequestHandler):
             return self.send(401, {"error": "Sign in again."})
         if path == "/m/projects":
             return self.projects_route(u)
+        if path == "/m/manage" or path.startswith("/m/manage/"):
+            return self.manage_route(path, q)
         if path == "/m/workspaces" or path.startswith(("/m/workspaces/", "/m/workspace-artifacts", "/m/workspace-file/")):
             return self.workspace_route(path, q)
         if self.command == "GET":
@@ -1022,18 +1244,190 @@ class H(BaseHTTPRequestHandler):
             return self.send(405, {"error": "Method not allowed."})
         if "?" in self.path or u.query or self.body():
             return self.send(400, {"error": "Bad request."})
-        code, body = bridge_projects.catalog_response()
+        code, body = catalog_response()
         self.send(code, body)
+
+    # ---- owner management (slice B): every route needs owner_ok; PIN routes share one limiter ----
+    def _err(self, status, message, code, **extra):
+        return self.send(status, dict({"error": message, "code": code}, **extra))
+
+    def _pin_gate(self):
+        """True when the PIN in the JSON body is right. Otherwise answers and returns False; only the
+        attempt counter can change. The PIN is read from the body field `pin` and nowhere else."""
+        try:
+            bridge_owner.check_pin(owner_dir(), self.json_body().get("pin"))
+            return True
+        except bridge_owner.OwnerError as e:
+            msg = {"pin_locked": "Too many wrong PINs. Try again later.", "pin_unset": "No deletion PIN is set.",
+                   "pin_required": "Enter your PIN.", "pin_wrong": "Wrong PIN."}[e.code]
+            self._err(e.status, msg, e.code, **({"retry_after": e.retry_after} if e.retry_after else {}))
+            return False
+
+    def manage_pin(self):
+        """Owner-only deletion PIN: GET -> {configured}; POST {pin, confirm, current?} sets it the first time
+        (no verifier on disk) or changes it (current PIN checked by the shared limiter). Nothing secret is
+        ever returned; the reply is only {ok, configured}."""
+        if self.command == "GET":
+            return self.send(200, {"configured": bridge_owner.verifier_state(owner_dir()) == "ok"})
+        if self.command != "POST":
+            return self.send(405, {"error": "Method not allowed."})
+        d = self.json_body()
+        new, again = d.get("pin"), d.get("confirm")
+        if not (isinstance(new, str) and isinstance(again, str) and hmac.compare_digest(new.encode(), again.encode())):
+            return self._err(400, "The two PINs don't match.", "pin_mismatch")
+        try:
+            bridge_owner.change_pin(owner_dir(), new, d.get("current"))
+        except bridge_owner.OwnerError as e:
+            msg = {"pin_locked": "Too many wrong PINs. Try again later.", "pin_unset": "The PIN file on the Mac is damaged.",
+                   "pin_required": "Enter your current PIN.", "pin_wrong": "Wrong PIN.",
+                   "pin_invalid": "The PIN must be exactly 4 digits."}[e.code]
+            return self._err(e.status, msg, e.code, **({"retry_after": e.retry_after} if e.retry_after else {}))
+        log("owner deletion PIN %s" % ("changed" if d.get("current") is not None else "set"))
+        return self.send(200, {"ok": True, "configured": True})
+
+    def manage_route(self, path, q=None):
+        if not self.owner_ok():
+            return self._err(403, "Sign in as the owner to manage this.", "owner_required")
+        try:
+            m = manage_overlay()
+            parts = path.split("/")[3:]  # after /m/manage
+            method = self.command
+            if parts == ["pin"]:
+                return self.manage_pin()
+            if parts == ["archived"]:
+                if method != "GET":
+                    return self.send(405, {"error": "Method not allowed."})
+                return self.send(200, self.manage_archived(m))
+            if parts == ["bots"]:
+                if method == "GET":
+                    return self.send(200, {"personas": m.personas(), "hosts": persona_hosts(),
+                                           "manageable": manageable_bots()})
+                if method != "POST":
+                    return self.send(405, {"error": "Method not allowed."})
+                d = self.json_body()
+                hosts = persona_hosts()
+                if not hosts:
+                    return self._err(403, "No bot can host app bots.", "no_host")
+                if d.get("host") not in hosts:
+                    return self._err(403, "That bot can't host app bots.", "bad_host")
+                return self.send(201, m.create_persona(d.get("name"), d.get("persona"), d["host"]))
+            if parts == ["projects"]:
+                if method != "POST":
+                    return self.send(405, {"error": "Method not allowed."})
+                d = self.json_body()
+                code, body = bridge_projects.catalog_response()
+                if code != 200:
+                    return self._err(503, "Project catalog unavailable.", "unavailable")
+                ids = {p["id"] for p in json.loads(body).get("projects") or []}
+                return self.send(201, m.create_project(d.get("title"), d.get("summary"), d.get("id"), ids))
+            if len(parts) >= 2 and parts[0] == "projects" and bridge_projects.ID_RE.fullmatch(parts[1]):
+                return self.manage_project(m, parts[1], parts[2:])
+            if len(parts) >= 2 and parts[0] == "bots" and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", parts[1]):
+                return self.manage_bot(m, parts[1], parts[2:])
+            return self.send(404, {"error": "not found"})
+        except bridge_manage.ManageError as e:
+            return self._err(e.status, str(e), e.code)
+        except Exception as e:  # type only: never a PIN, body or path
+            log("manage route failed: %s" % type(e).__name__)
+            return self._err(502, "Management request failed.", "failed")
+
+    def manage_archived(self, m):
+        code, body = bridge_projects.catalog_response()
+        titles = {p["id"]: p.get("title") for p in (json.loads(body).get("projects") or [])} if code == 200 else {}
+        managed = {p["id"]: p["title"] for p in m.managed_projects()}
+        projects = [{"id": i, "title": managed.get(i) or titles.get(i) or i, "managed": i in managed}
+                    for i in sorted(m.archived_projects()) if i in managed or i in titles]
+        names = {b["id"]: b["name"] for b in bots()}
+        live = [{"id": i, "name": i.replace("-", " ").replace("_", " ").title(), "managed": False}
+                for i in sorted(m.archived_bots()) if i in profile_ids()]
+        return {"projects": projects, "bots": live + m.personas(archived=True)}
+
+    def manage_project(self, m, pid, rest):
+        method = self.command
+        if rest == [] and method == "PATCH":
+            d = self.json_body()
+            if pid not in m.managed_ids():
+                code, body = bridge_projects.catalog_response()
+                known = code == 200 and any(p["id"] == pid for p in json.loads(body).get("projects") or [])
+                return self._err(403, "This project is read-only.", "read_only") if known \
+                    else self._err(404, "Not found.", "not_found")
+            return self.send(200, m.update_project(pid, d))
+        if rest == ["archive"] and method == "POST":
+            if not self._pin_gate():
+                return
+            if pid not in {p["id"] for p in json.loads(catalog_response()[1]).get("projects") or []}:
+                return self._err(404, "Not found.", "not_found")
+            m.archive_project(pid)
+            return self.send(200, {"ok": True, "id": pid, "archived": True})
+        if rest == ["restore"] and method == "POST":
+            if not m.restore_project(pid):
+                return self._err(404, "Not found.", "not_found")
+            return self.send(200, {"ok": True, "id": pid, "archived": False})
+        return self.send(405 if rest in ([], ["archive"], ["restore"]) else 404, {"error": "not found"})
+
+    def manage_bot(self, m, bid, rest):
+        method = self.command
+        if rest == ["chats"] and method == "POST":
+            persona = m.persona(bid)
+            if not persona or persona["archived"]:
+                return self._err(404, "Not found.", "not_found")
+            host = persona["host"]
+            if host not in persona_hosts():
+                return self._err(403, "No bot can host this app bot.", "no_host")
+            if turns is None:
+                return self._err(503, "Turn engine unavailable.", "unavailable")
+            title = self.json_body().get("title")
+            if title is not None and not isinstance(title, str):
+                return self._err(400, "Bad title.", "bad_request")
+            try:
+                created = turns.create_session(profile_home(host), host)
+            except turns.TurnError:
+                return self._err(502, "Hermes couldn't create this chat.", "failed")
+            stored = created.get("stored_session_id")
+            if not isinstance(stored, str) or not _WS_SID.match(stored):
+                return self._err(502, "Hermes didn't return a canonical chat id.", "failed")
+            title = (title or "").strip()[:120] or "New chat"
+            m.link_chat(host, stored, bid, title)
+            return self.send(201, {"profile": host, "session_id": stored, "title": title, "persona_id": bid})
+        if rest == ["archive"] and method == "POST":
+            if not self._pin_gate():
+                return
+            if bridge_manage.PERSONA_ID_RE.fullmatch(bid):
+                if not m.set_persona_archived(bid, True):
+                    return self._err(404, "Not found.", "not_found")
+            elif bid in manageable_bots() and bid not in m.archived_bots():
+                m.archive_bot(bid)
+            else:
+                return self._err(403, "This bot can't be archived here.", "not_manageable")
+            return self.send(200, {"ok": True, "id": bid, "archived": True})
+        if rest == ["restore"] and method == "POST":
+            if bridge_manage.PERSONA_ID_RE.fullmatch(bid):
+                ok = m.set_persona_archived(bid, False)
+            else:
+                ok = m.restore_bot(bid)
+            if not ok:
+                return self._err(404, "Not found.", "not_found")
+            return self.send(200, {"ok": True, "id": bid, "archived": False})
+        return self.send(405 if rest in (["chats"], ["archive"], ["restore"]) else 404, {"error": "not found"})
 
     # ---- Projects workspaces (single owner; every route sits behind the bearer check in route()) ----
     def workspace_route(self, path, q=None):
         q = q or {}
         try:
             grants = workspace_grants()
+            owner = workspace_owner_mode()
+            catalog = workspace_catalog() if owner else {}
             if path == "/m/workspaces":
                 if self.command != "GET":
                     return self.send(405, {"error": "Method not allowed."})
-                return self.send(200, {"projects": sorted(grants), "profiles": sorted(set().union(*grants.values()))})
+                active = sorted(set().union(*grants.values()))
+                if not owner:  # build-4 shape exactly
+                    return self.send(200, {"projects": sorted(grants), "profiles": active})
+                base = workspace_base_eligible()
+                return self.send(200, {"projects": sorted(catalog), "profiles": active, "mode": "owner",
+                                       "workspaces": [{"id": p, "assigned": sorted(grants.get(p, ())),
+                                                       "eligible": workspace_eligible(p, catalog, base)}
+                                                      for p in sorted(catalog)]})
             m = re.match(r"^/m/workspace-artifacts/([^/]+)(?:/([^/]+))?$", path)
             if m:
                 if self.command != "GET":
@@ -1078,36 +1472,77 @@ class H(BaseHTTPRequestHandler):
                 if self.command != "HEAD":
                     self.wfile.write(data)
                 return
-            m = re.match(r"^/m/workspaces/([^/]+)(?:/(instructions|files|chats)(?:/([^/]+))?)?$", path)
+            m = re.match(r"^/m/workspaces/([^/]+)(?:/(instructions|files|chats|assignment)(?:/([^/]+))?)?$", path)
             if not m or not _WS_ID.match(m.group(1)):
                 return self.send(404, {"error": "Not found."})
             project, part, item = m.groups()
-            allowed = grants.get(project)
-            if not allowed:
-                return self.send(404, {"error": "Not found."})
+            if part == "assignment" and not owner and self.command == "PUT":
+                return self.send(403, {"error": "Assignments are managed by the operator.", "code": "operator_managed"})
+            # Owner-managed workspaces: every mutation needs the owner scope. Operator mode keeps build-4
+            # semantics (any valid bearer is the single owner), including the new file edit.
+            if owner and self.command in ("PUT", "POST", "DELETE", "PATCH") and part != "chats" and not self.owner_ok():
+                return self.send(403, {"error": "Owner sign-in required.", "code": "owner_required"})
+            if owner:  # every valid catalog project has a workspace, with or without active bots
+                if project not in catalog:
+                    return self.send(404, {"error": "Not found."})
+                allowed = grants.get(project, set())
+            else:
+                allowed = grants.get(project)
+                if not allowed:
+                    return self.send(404, {"error": "Not found."})
             store = workspace_store()
             if part is None and not item:
                 if self.command != "GET":
                     return self.send(405, {"error": "Method not allowed."})
-                d = dict(store.detail(project))
-                d["chats"] = [c for c in d.get("chats") or [] if c.get("profile") in allowed]
-                d["artifacts"] = [a for a in d.get("artifacts") or [] if a.get("profile") in allowed]
-                d["profiles"] = sorted(allowed)
-                return self.send(200, d)
+                return self.send(200, self.workspace_detail(store, project, allowed, owner, catalog))
+            if part == "assignment" and not item:
+                if self.command != "PUT":
+                    return self.send(405, {"error": "Method not allowed."})
+                d = self.json_body()
+                profiles, revision = d.get("profiles"), d.get("revision")
+                if (not isinstance(profiles, list) or len(profiles) > 32 or any(not isinstance(b, str) for b in profiles)
+                        or isinstance(revision, bool) or not isinstance(revision, int) or revision < 0):
+                    return self.send(400, {"error": "Bad assignment."})
+                workspace_seed(store)
+                try:
+                    store.set_assignment(project, profiles, revision, workspace_eligible(project, catalog))
+                except WorkspaceError as e:
+                    if e.kind == "stale":
+                        view = self.workspace_assignment(store, project, owner, catalog, allowed=None)
+                        return self.send(409, {"error": str(e), "code": "stale", "assignment": view})
+                    raise
+                return self.send(200, {"assignment": self.workspace_assignment(store, project, owner, catalog)})
             if part == "instructions" and not item:
                 if self.command != "PUT":
                     return self.send(405, {"error": "Method not allowed."})
-                value = self.json_body().get("instructions")
+                body = self.json_body()
+                value = body.get("instructions")
                 if not isinstance(value, str):
                     return self.send(400, {"error": "Instructions must be text."})
-                store.save_instructions(project, value)
-                return self.send(200, {"ok": True})
+                if body.get("revision") is None:
+                    store.save_instructions(project, value)
+                else:
+                    if not isinstance(body["revision"], str):
+                        return self.send(400, {"error": "Bad revision."})
+                    store.save_instructions(project, value, body["revision"])
+                out = {"ok": True}
+                if owner or body.get("revision") is not None:  # operator mode without a revision: build-4 reply
+                    out["revision"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                return self.send(200, out)
             if part == "files" and not item and self.command == "POST":
                 d = self.json_body()
                 name = safe_name(d.get("name"))
                 if not name or not isinstance(d.get("data"), str):
                     return self.send(400, {"error": "A file name and data are required."})
-                return self.send(201, store.add_file(project, name, d["data"]))
+                row = store.add_file(project, name, d["data"])
+                if "sha" not in row and hasattr(store, "get_file"):
+                    row = dict(row, sha=store.get_file(project, row["id"])["sha"])
+                return self.send(201, row)
+            if part == "files" and item and self.command == "GET":
+                return self.send(200, store.get_file(project, item))
+            if part == "files" and item and self.command == "PUT":
+                d = self.json_body()
+                return self.send(200, store.put_file(project, item, d.get("content"), d.get("sha")))
             if part == "files" and item and self.command == "DELETE":
                 if not _WS_FILE_ID.match(item):
                     return self.send(404, {"error": "Not found."})
@@ -1117,10 +1552,39 @@ class H(BaseHTTPRequestHandler):
                 return self.workspace_new_chat(store, project, allowed)
             return self.send(405 if part else 404, {"error": "Method not allowed."})
         except WorkspaceError as e:
-            return self.send(e.code, {"error": str(e)})
+            body = {"error": str(e)}
+            if getattr(e, "kind", None):
+                body.update(e.extra, code=e.kind)
+            return self.send(e.code, body)
         except Exception as e:  # type only: never a path, token, prompt or body
             log("workspace route failed: %s" % type(e).__name__)
             return self.send(502, {"error": "Projects request failed."})
+
+    def workspace_assignment(self, store, project, owner, catalog, allowed=None):
+        """The `assignment` object of the wire contract for one project."""
+        if not owner:
+            allow = workspace_allowlist().get(project, frozenset())
+            now = sorted((workspace_grants().get(project) or set()))
+            return {"editable": False, "revision": 0, "assigned": now, "inactive": sorted(set(allow) - set(now)),
+                    "eligible": now}
+        revision, stored = store.assignment(project)
+        eligible = workspace_eligible(project, catalog)
+        return {"editable": True, "revision": revision, "assigned": [b for b in stored if b in eligible],
+                "inactive": [b for b in stored if b not in eligible], "eligible": eligible}
+
+    def workspace_detail(self, store, project, allowed, owner, catalog):
+        d = dict(store.detail(project))
+        chats = d.get("chats") or []
+        d["chats"] = [c for c in chats if c.get("profile") in allowed]
+        d["hidden_chats"] = len(chats) - len(d["chats"])
+        d["artifacts"] = [a for a in d.get("artifacts") or [] if a.get("profile") in allowed]
+        d["profiles"] = sorted(allowed)
+        d["mode"] = "owner" if owner else "operator"
+        d["instructions_revision"] = hashlib.sha256((d.get("instructions") or "").encode("utf-8")).hexdigest()
+        files = store.files_with_sha(project) if hasattr(store, "files_with_sha") else d.get("files") or []
+        d["files"] = [dict(f, editable=True) for f in files]
+        d["assignment"] = self.workspace_assignment(store, project, owner, catalog)
+        return d
 
     def workspace_new_chat(self, store, project, allowed):
         if turns is None:
@@ -1197,7 +1661,7 @@ class H(BaseHTTPRequestHandler):
             text = str(d.get("text") or "").strip()
             if not text:
                 return self.send(400, {"error": "Empty message."})
-            workspace = prepare_workspace_turn(pid, sid, d)
+            workspace = persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d))
             try:
                 turn = turns.start_turn(pid, home, sid, text, {k: d.get(k) for k in ("provider", "model", "effort", "reset_model", "reset_effort")},
                                         workspace=workspace)
@@ -1286,7 +1750,12 @@ class H(BaseHTTPRequestHandler):
             with FAILS_LOCK:
                 f["n"] = 0
         log("login ok for %r device %r" % (who, str(d.get("device", ""))[:60]))
-        return self.send(200, {"token": make_token(str(d.get("device", "iphone"))), "ttl": TOKEN_TTL})
+        owner = self.login_elevates_to_owner()
+        try:
+            token = make_token(str(d.get("device", "iphone")), owner=owner)
+        except (bridge_owner.OwnerError, OSError):
+            token = make_token(str(d.get("device", "iphone")))
+        return self.send(200, {"token": token, "ttl": TOKEN_TTL})
 
     def proxy(self, path, query):
         m = re.match(r"^/m/p/([^/]+)(/.*)$", path)
@@ -1340,9 +1809,26 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if "--set-owner-pin" in sys.argv:  # local seam only: the PIN is typed here, never sent over HTTP
+        import getpass
+        pin, again = getpass.getpass("New 4-digit deletion PIN: "), getpass.getpass("Repeat it: ")
+        if pin != again or not bridge_owner.valid_pin(pin):
+            sys.exit("The PINs must match and be exactly 4 digits. Nothing changed.")
+        bridge_owner.set_pin(owner_dir(), pin)
+        print("Deletion PIN set.")
+        sys.exit(0)
+    if "--clear-owner-pin" in sys.argv:
+        bridge_owner.clear_pin(owner_dir())
+        print("Deletion PIN cleared.")
+        sys.exit(0)
+    if "--rotate-owner-sessions" in sys.argv:
+        bridge_owner.rotate_epoch(owner_dir())
+        print("Owner sessions rotated: owners must sign in again.")
+        sys.exit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--issue-token":
         # Pair a device without typing the password: prints a token to paste into the app.
-        print(make_token(sys.argv[2] if len(sys.argv) > 2 else "paired-device"))
+        name = [a for a in sys.argv[2:] if not a.startswith("--")]
+        print(make_token(name[0] if name else "paired-device", owner="--owner" in sys.argv))
         sys.exit(0)
     threading.Thread(target=_key_watcher, name="key-watcher", daemon=True).start()
     srv = ThreadingHTTPServer((os.environ.get("HERMES_MOBILE_BIND", "127.0.0.1"), PORT), H)

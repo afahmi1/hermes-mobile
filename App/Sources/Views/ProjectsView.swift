@@ -14,6 +14,7 @@ struct ProjectsView: View {
         NavigationStack(path: $path) {
             content
                 .navigationTitle("Projects")
+                .modifier(ManageProjectsToolbar(reload: { await model.load() }))  // build5 manage hook
                 .navigationDestination(for: Selection.self) { selection in
                     if case .loaded(let snapshot) = model.state,
                        let project = snapshot.projects.first(where: { $0.id == selection.id }) {
@@ -112,25 +113,45 @@ struct ProjectDetailView: View {
     let project: Project
     let snapshot: ProjectsSnapshot
     var workspaces: WorkspaceIndexModel
-    @State private var copied: String?
+    @State private var assignment: WorkspaceAssignmentModel
+
+    init(project: Project, snapshot: ProjectsSnapshot, workspaces: WorkspaceIndexModel) {
+        self.project = project; self.snapshot = snapshot; self.workspaces = workspaces
+        _assignment = State(initialValue: WorkspaceAssignmentModel(client: .live(project: project.id)))
+    }
 
     var body: some View {
         let refs = snapshot.references(for: project)
+        let hasWorkspace = workspaces.isEnabled(project.id)
         List {
             if let summary = project.summary, !summary.isEmpty {
                 Section { Text(summary) }
             }
-            if workspaces.isEnabled(project.id) {
+            if hasWorkspace {
                 Section {
                     NavigationLink(value: WorkspaceRoute(scope: WorkspaceScope(projectID: project.id, title: project.title))) {
                         Label("Workspace", systemImage: "square.stack.3d.up")
                     }
-                } footer: { Text("Instructions, reference files, chats and artifacts.") }
+                    .accessibilityIdentifier("ws.open")
+                    .accessibilityHint("Opens instructions, files, chats and artifacts")
+                    NavigationLink { BotAssignmentView(model: assignment) } label: {
+                        HStack {
+                            Label("Assigned bots", systemImage: "person.2")
+                            Spacer()
+                            Text(assignment.summary(name: { app.botName($0) }))
+                                .font(.subheadline).foregroundStyle(.secondary).lineLimit(2).multilineTextAlignment(.trailing)
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
+                    .accessibilityIdentifier("ws.assign")
+                    .accessibilityHint("Choose which bots can work in this project")
+                } footer: { Text("Instructions, files, chats and artifacts.") }
             }
-            Section("Bots") {
+            ManageProjectSection(project: project)  // build5 manage hook
+            Section("Catalog bots") {
                 let links = snapshot.botLinks(for: project, bots: app.bots)
                 if links.isEmpty {
-                    Text("No bot is assigned to this project.").foregroundStyle(.secondary)
+                    Text("No bot is listed for this project in the catalog.").foregroundStyle(.secondary)
                 }
                 ForEach(links) { link in
                     if let bot = link.bot {
@@ -155,10 +176,8 @@ struct ProjectDetailView: View {
             Section {
                 if refs.shown.isEmpty { Text("No related files.").foregroundStyle(.secondary) }
                 ForEach(refs.shown) { ref in
-                    Button {
-                        UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: ref.copyText]],
-                                                     options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(300)])
-                        copied = ref.id
+                    NavigationLink {
+                        ReferenceDetailView(reference: ref, workspaceProject: hasWorkspace ? project.id : nil)
                     } label: {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(ref.path).font(.body.monospaced()).foregroundStyle(.primary)
@@ -167,16 +186,16 @@ struct ProjectDetailView: View {
                         }
                     }
                     .accessibilityLabel("\(ref.path) in \(ref.rootName)")
-                    .accessibilityHint("Copies the root name and path")
+                    .accessibilityHint("Shows what this reference is and lets you copy its path")
                 }
             } header: {
                 Text("Related files")
             } footer: {
                 if refs.hidden > 0 { Text("\(refs.hidden) reference(s) hidden because they weren't a safe relative path in a known root.") }
-                else if copied != nil { Text("Copied.") }
             }
         }
         .navigationTitle(project.title)
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: hasWorkspace) { if hasWorkspace { await assignment.load() } }
     }
 }

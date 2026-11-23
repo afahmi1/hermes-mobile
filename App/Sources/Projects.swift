@@ -39,9 +39,11 @@ struct Project: Decodable, Hashable, Identifiable {
     let botIds: [String]
     let sources: [ProjectSource]
     let relatedFiles: [ProjectFileRef]
+    /// True for projects made in the app (editable/archivable); catalog projects are read-only.
+    let managed: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, summary, sources
+        case id, title, summary, sources, managed
         case botIds = "bot_ids", relatedFiles = "related_files"
     }
     init(from decoder: Decoder) throws {
@@ -52,6 +54,7 @@ struct Project: Decodable, Hashable, Identifiable {
         botIds = try c.decodeIfPresent([String].self, forKey: .botIds) ?? []
         sources = try c.decodeIfPresent([ProjectSource].self, forKey: .sources) ?? []
         relatedFiles = try c.decodeIfPresent([ProjectFileRef].self, forKey: .relatedFiles) ?? []
+        managed = (try? c.decodeIfPresent(Bool.self, forKey: .managed)) ?? false
     }
 }
 

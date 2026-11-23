@@ -561,5 +561,104 @@ class Storage(Base):
         self.assertIsInstance(e, Exception)
 
 
+class Build5Edit(Base):
+    def test_old_db_migration_keeps_rows_and_adds_only_new_tables(self):
+        import sqlite3
+        root = Path(self.tmp.name) / "old"
+        old = bw.WorkspaceStore(root)
+        old.save_instructions(P, "keep me")
+        old.link_chat(P, PROF, SID, "Chat")
+        old.close()
+        db = sqlite3.connect(str(root / "workspaces.db"))
+        for t in ("meta", "assignments", "assignment_state"):
+            db.execute(f"DROP TABLE IF EXISTS {t}")
+        db.commit()
+        db.close()
+        new = bw.WorkspaceStore(root)
+        self.assertEqual(new.detail(P)["instructions"], "keep me")
+        self.assertEqual(new.detail(P)["chats"][0]["session_id"], SID)
+        self.assertEqual(new.assignment(P), (0, []))
+
+    def test_seed_once_and_removal_not_reseeded(self):
+        self.assertTrue(self.s.seed_assignments({"alpha": ["default", "b"], "beta": []}))
+        self.assertEqual(self.s.assignment("alpha")[1], ["b", "default"])
+        self.assertFalse(self.s.seed_assignments({"alpha": ["default"], "gamma": ["x"]}))
+        self.assertEqual(self.s.assignment("gamma"), (0, []))
+        self.s.set_assignment("alpha", [], 0, {"default", "b"})
+        self.s.close()
+        s2 = bw.WorkspaceStore(self.root)
+        self.assertFalse(s2.seed_assignments({"alpha": ["default"]}))
+        self.assertEqual(s2.assignment("alpha"), (1, []))
+
+    def test_assignment_cas_eligibility_and_reload(self):
+        e = self.err(self.s.set_assignment, P, ["zz"], 0, {"a"})
+        self.assertEqual((e.code, e.kind), (403, "not_eligible"))
+        self.assertEqual(self.s.assignment(P), (0, []))
+        self.assertEqual(self.s.set_assignment(P, ["a", "a"], 0, {"a"}), (1, ["a"]))
+        e = self.err(self.s.set_assignment, P, ["a"], 0, {"a"})
+        self.assertEqual((e.code, e.kind), (409, "stale"))
+        # keeping an already stored but now ineligible id is allowed; adding one is not
+        self.assertEqual(self.s.set_assignment(P, ["a"], 1, set())[1], ["a"])
+        self.err(self.s.set_assignment, P, ["a", "b"], 1, set(), code=403)
+        self.assertEqual(bw.WorkspaceStore(self.root).assignment(P), (1, ["a"]))
+        self.err(self.s.set_assignment, P, ["x%d" % i for i in range(33)], 1, {"x%d" % i for i in range(33)}, code=400)
+
+    def test_removal_keeps_chats_and_artifacts(self):
+        self.s.set_assignment(P, [PROF], 0, {PROF})
+        self.turn({"a.txt": b"hi"})
+        self.s.set_assignment(P, [], 1, {PROF})
+        self.assertEqual(len(self.s.detail(P)["chats"]), 1)
+        self.assertEqual(len(self.s.detail(P)["artifacts"]), 1)
+        self.s.set_assignment(P, [PROF], 2, {PROF})
+        self.assertEqual(len(self.s.detail(P)["chats"]), 1)
+        self.assertEqual(len(self.s.list_artifacts(PROF, SID, P)), 1)
+
+    def test_file_put_get_and_cas(self):
+        row = self.s.add_file(P, "n.txt", b64("one"))
+        self.assertEqual(self.s.files_with_sha(P)[0]["sha"], bw.hashlib.sha256(b"one").hexdigest())
+        row = self.s.files_with_sha(P)[0]
+        got = self.s.get_file(P, row["id"])
+        self.assertEqual(got["content"], "one")
+        new = self.s.put_file(P, row["id"], "two é", row["sha"])
+        self.assertEqual(new["size"], len("two é".encode()))
+        self.assertEqual(self.s.get_file(P, row["id"])["content"], "two é")
+        e = self.err(self.s.put_file, P, row["id"], "three", row["sha"], code=409)
+        self.assertEqual(e.kind, "stale")
+        self.assertEqual(e.extra["current"]["sha"], new["sha"])
+        self.assertEqual(self.s.get_file(P, row["id"])["content"], "two é")
+        self.assertEqual(self.s.files_with_sha(P), [new])
+        self.assertEqual(bw.WorkspaceStore(self.root).get_file(P, row["id"])["content"], "two é")
+
+    def test_file_put_validation_scope_duplicate(self):
+        self.s.add_file(P, "a.txt", b64("aaa"))
+        self.s.add_file(P, "j.json", b64('{"a":1}'))
+        self.s.add_file("beta", "o.txt", b64("zzz"))
+        a, j = self.s.files_with_sha(P)
+        o = self.s.files_with_sha("beta")[0]
+        self.err(self.s.put_file, P, o["id"], "x", o["sha"], code=404)
+        self.err(self.s.get_file, P, o["id"], code=404)
+        self.err(self.s.get_file, P, "nope", code=404)
+        self.err(self.s.put_file, P, a["id"], "", a["sha"], code=400)
+        self.err(self.s.put_file, P, a["id"], "a\x00b", a["sha"], code=400)
+        self.err(self.s.put_file, P, a["id"], "a" * 8193, a["sha"], code=413)
+        self.err(self.s.put_file, P, a["id"], "\ud800", a["sha"], code=400)
+        self.err(self.s.put_file, P, a["id"], "x", None, code=400)
+        self.err(self.s.put_file, P, j["id"], "{bad", j["sha"], code=400)
+        self.s.put_file(P, j["id"], '{"b":2}', j["sha"])
+        e = self.err(self.s.put_file, P, a["id"], '{"b":2}', a["sha"], code=409)
+        self.assertEqual(e.kind, "duplicate")
+        self.assertEqual(self.s.get_file(P, a["id"])["content"], "aaa")
+
+    def test_instruction_revision_cas(self):
+        r0 = self.s.save_instructions(P, "v1")
+        self.assertEqual(r0, bw.hashlib.sha256(b"v1").hexdigest())
+        e = self.err(self.s.save_instructions, P, "v2", "stale", code=409)
+        self.assertEqual((e.kind, e.extra["revision"]), ("stale", r0))
+        self.assertEqual(self.s._instructions(P), "v1")
+        self.assertEqual(self.s.save_instructions(P, "v2", r0), bw.hashlib.sha256(b"v2").hexdigest())
+        empty = bw.hashlib.sha256(b"").hexdigest()
+        self.assertEqual(self.s.save_instructions("beta", "x", empty), bw.hashlib.sha256(b"x").hexdigest())
+
+
 if __name__ == "__main__":
     unittest.main()

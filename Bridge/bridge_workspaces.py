@@ -65,9 +65,13 @@ MIME = {
 
 
 class WorkspaceError(Exception):
-    def __init__(self, message, code=400):
+    """`kind` is the machine code sent as `code` on the wire (stale, duplicate, not_eligible); `extra` is
+    merged into the error body. Build-4 errors carry neither."""
+    def __init__(self, message, code=400, kind=None, extra=None):
         super().__init__(message)
         self.code = code
+        self.kind = kind
+        self.extra = extra or {}
 
 
 def _check(rx, value, what):
@@ -143,7 +147,16 @@ CREATE TABLE IF NOT EXISTS artifacts(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL,
   project TEXT NOT NULL, profile TEXT NOT NULL, session_id TEXT NOT NULL, mime TEXT NOT NULL,
   sha TEXT NOT NULL, data BLOB NOT NULL, UNIQUE(profile, session_id, sha));
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS assignments(
+  project TEXT NOT NULL, profile TEXT NOT NULL, PRIMARY KEY(project, profile));
+CREATE TABLE IF NOT EXISTS assignment_state(project TEXT PRIMARY KEY, revision INTEGER NOT NULL);
 """
+MAX_ASSIGNED = 32
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class WorkspaceStore:
@@ -197,7 +210,9 @@ class WorkspaceStore:
     _ART_COLS = "id,name,size,project,profile,session_id,mime"
 
     # -- instructions ----------------------------------------------------
-    def save_instructions(self, project, value):
+    def save_instructions(self, project, value, revision=None):
+        """Store instructions; returns the new revision (sha256 hex of the UTF-8 text). When `revision` is
+        given it must equal the current one (compare-and-swap in the same transaction), else 409 stale."""
         _check(PROJECT_RE, project, "project")
         if not isinstance(value, str) or "\x00" in value:
             raise WorkspaceError("Instructions must be text.", 400)
@@ -207,16 +222,22 @@ class WorkspaceStore:
             raise WorkspaceError("Instructions must be valid UTF-8.", 400)
         if n > MAX_INSTRUCTIONS_BYTES:
             raise WorkspaceError(f"Instructions exceed {MAX_INSTRUCTIONS_BYTES} bytes.", 413)
+        if revision is not None and not isinstance(revision, str):
+            raise WorkspaceError("Invalid revision.", 400)
 
         def run(db):
+            row = db.execute("SELECT value FROM instructions WHERE project=?", (project,)).fetchone()
+            current = _sha(row[0] if row else "")
+            if revision is not None and revision != current:
+                raise WorkspaceError("These instructions changed elsewhere.", 409, "stale", {"revision": current})
             if value == "":
                 db.execute("DELETE FROM instructions WHERE project=?", (project,))
             else:
-                if (not db.execute("SELECT 1 FROM instructions WHERE project=?", (project,)).fetchone()
-                        and self._projects_stored(db, project) >= MAX_PROJECTS_STORED):
+                if (not row and self._projects_stored(db, project) >= MAX_PROJECTS_STORED):
                     raise WorkspaceError("Too many projects hold stored data.", STORAGE_FULL)
                 db.execute("INSERT OR REPLACE INTO instructions(project,value) VALUES(?,?)", (project, value))
         self._tx(run)
+        return _sha(value)
 
     @staticmethod
     def _projects_stored(db, besides):
@@ -285,6 +306,135 @@ class WorkspaceStore:
 
     def _files(self, project):
         return self._q("SELECT id,name,size,data FROM files WHERE project=? ORDER BY seq", (project,))
+
+    def files_with_sha(self, project):
+        """Same rows as detail()['files'] plus each file's content sha (for compare-and-swap edits)."""
+        _check(PROJECT_RE, project, "project")
+        return [{"id": i, "name": n, "size": s, "sha": hashlib.sha256(bytes(d)).hexdigest()}
+                for i, n, s, d in self._files(project)]
+
+    def get_file(self, project, file_id):
+        _check(PROJECT_RE, project, "project")
+        r = self._file_row(project, file_id)
+        return {"id": r[0], "name": r[1], "size": r[2], "sha": r[3], "content": bytes(r[4]).decode("utf-8")}
+
+    def _file_row(self, project, file_id, db=None):
+        if not isinstance(file_id, str) or not FILE_ID_RE.fullmatch(file_id):
+            raise WorkspaceError("File not found.", 404)
+        sql, args = "SELECT id,name,size,sha,data FROM files WHERE project=? AND id=?", (project, file_id)
+        r = db.execute(sql, args).fetchall() if db else self._q(sql, args)
+        if not r:
+            raise WorkspaceError("File not found.", 404)
+        return r[0]
+
+    def put_file(self, project, file_id, content, sha):
+        """Replace a file's text. Compare-and-swap on the expected sha inside one BEGIN IMMEDIATE."""
+        _check(PROJECT_RE, project, "project")
+        if not isinstance(sha, str) or not sha:
+            raise WorkspaceError("The current file version is required.", 400)
+        if not isinstance(content, str):
+            raise WorkspaceError("File content must be text.", 400)
+        try:
+            data = content.encode("utf-8")
+        except UnicodeEncodeError:
+            raise WorkspaceError("File content must be valid UTF-8.", 400)
+        if not data or b"\x00" in data:
+            raise WorkspaceError("File content must be non-empty text.", 400)
+        if len(data) > MAX_FILE_BYTES:
+            raise WorkspaceError(f"File exceeds {MAX_FILE_BYTES} bytes.", 413)
+        new_sha = hashlib.sha256(data).hexdigest()
+
+        def run(db):
+            r = self._file_row(project, file_id, db)
+            try:
+                _validate_content(_ext(r[1]), data)
+            except ValueError as e:
+                raise WorkspaceError(f"File rejected: {e}.", 400)
+            if r[3] != sha:
+                raise WorkspaceError("This file changed elsewhere.", 409, "stale",
+                                     {"current": {"id": r[0], "name": r[1], "size": r[2], "sha": r[3]}})
+            if new_sha != r[3]:
+                if db.execute("SELECT 1 FROM files WHERE project=? AND sha=? AND id<>?",
+                              (project, new_sha, file_id)).fetchone():
+                    raise WorkspaceError("A file with identical content already exists.", 409, "duplicate")
+                db.execute("UPDATE files SET size=?, sha=?, data=? WHERE project=? AND id=?",
+                           (len(data), new_sha, data, project, file_id))
+            return {"id": r[0], "name": r[1], "size": len(data), "sha": new_sha}
+        return self._tx(run)
+
+    # -- assignments (owner-managed workspaces) --------------------------
+    def meta_get(self, key):
+        r = self._q("SELECT value FROM meta WHERE key=?", (key,))
+        return r[0][0] if r else None
+
+    def assignment(self, project):
+        """(revision, sorted stored profiles) for a project; (0, []) when never assigned."""
+        _check(PROJECT_RE, project, "project")
+        with self._lock:
+            r = self._db.execute("SELECT revision FROM assignment_state WHERE project=?", (project,)).fetchone()
+            rows = self._db.execute("SELECT profile FROM assignments WHERE project=? ORDER BY profile",
+                                    (project,)).fetchall()
+        return (r[0] if r else 0), [x[0] for x in rows]
+
+    def all_assignments(self):
+        out = {}
+        for project, profile in self._q("SELECT project,profile FROM assignments ORDER BY project,profile"):
+            out.setdefault(project, []).append(profile)
+        return out
+
+    def seed_assignments(self, mapping):
+        """One-time seed (guarded by meta key `assign_seeded`). Returns True when it seeded something."""
+        clean = {}
+        for project, bots in (mapping or {}).items():
+            if (isinstance(project, str) and PROJECT_RE.fullmatch(project) and bots):
+                ok = sorted({b for b in bots if isinstance(b, str) and PROFILE_RE.fullmatch(b)})[:MAX_ASSIGNED]
+                if ok:
+                    clean[project] = ok
+        # The guard is set on the FIRST owner-mode use even when there is nothing to seed, so a later change
+        # to the legacy allowlist never re-adds bots the owner removed (or never chose).
+        if self.meta_get("assign_seeded"):
+            return False
+
+        def run(db):
+            if db.execute("SELECT 1 FROM meta WHERE key='assign_seeded'").fetchone():
+                return False
+            for project, bots in clean.items():
+                if db.execute("SELECT 1 FROM assignment_state WHERE project=?", (project,)).fetchone():
+                    continue  # the owner already decided this project
+                for b in bots:
+                    db.execute("INSERT OR IGNORE INTO assignments(project,profile) VALUES(?,?)", (project, b))
+            db.execute("INSERT INTO meta(key,value) VALUES('assign_seeded','1')")
+            return True
+        return self._tx(run)
+
+    def set_assignment(self, project, profiles, revision, eligible):
+        """Replace the stored assignment atomically. Every id must be in `eligible` or already stored for the
+        project (keeping is not granting). Returns (revision, profiles). Chats/artifacts are never touched."""
+        _check(PROJECT_RE, project, "project")
+        if (not isinstance(profiles, list) or len(profiles) > MAX_ASSIGNED
+                or any(not isinstance(p, str) for p in profiles)):
+            raise WorkspaceError("Invalid assignment.", 400)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise WorkspaceError("Invalid revision.", 400)
+        want = sorted(set(profiles))
+        elig = set(eligible)
+
+        def run(db):
+            rev = (db.execute("SELECT revision FROM assignment_state WHERE project=?", (project,)).fetchone() or (0,))[0]
+            stored = [x[0] for x in db.execute("SELECT profile FROM assignments WHERE project=? ORDER BY profile",
+                                               (project,)).fetchall()]
+            if any(p not in elig and p not in stored for p in want):
+                raise WorkspaceError("That bot can't be assigned to this project.", 403, "not_eligible")
+            if revision != rev:
+                raise WorkspaceError("The assignment changed elsewhere.", 409, "stale")
+            if want == stored:
+                return rev, stored
+            db.execute("DELETE FROM assignments WHERE project=?", (project,))
+            for p in want:
+                db.execute("INSERT INTO assignments(project,profile) VALUES(?,?)", (project, p))
+            db.execute("INSERT OR REPLACE INTO assignment_state(project,revision) VALUES(?,?)", (project, rev + 1))
+            return rev + 1, want
+        return self._tx(run)
 
     # -- chats -----------------------------------------------------------
     def link_chat(self, project, profile, session_id, title):
