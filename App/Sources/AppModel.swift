@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import Observation
 import SwiftUI
@@ -37,10 +36,7 @@ final class AppModel {
     var loadError: String?
     @ObservationIgnored var inboxes: [String: InboxSnapshot] = [:]
     var inboxAccount: String? { Self.currentAccount }
-    static var currentAccount: String? {
-        guard let url = API.shared.baseURL, let token = API.shared.token else { return nil }
-        return SHA256.hash(data: Data((url.absoluteString + "|" + token).utf8)).map { String(format: "%02x", $0) }.joined()
-    }
+    static var currentAccount: String? { API.shared.accountID }
 
     func inboxKey(profile: String?, filter: String) -> String? {
         inboxAccount.map { [$0, profile ?? "*", filter].joined(separator: "|") }
@@ -106,7 +102,15 @@ final class AppModel {
             guard !Task.isCancelled, signedIn, request == healthRequest else { return }
             needsLogin = false
             if case APIError.http(401, _) = error { needsLogin = true }
-            healthFailure = error.localizedDescription
+            if let reason = error as? URLError, API.shared.baseURL?.host?.hasSuffix(".ts.net") == true {
+                switch reason.code {
+                case .cannotFindHost, .dnsLookupFailed:
+                    healthFailure = "The phone couldn’t resolve this gateway’s Tailscale name. Check the saved address and tailnet connection."
+                case .timedOut, .cannotConnectToHost:
+                    healthFailure = "The private HTTPS endpoint didn’t answer. Check that the host is awake and its bridge is published on the saved port. An exit node is optional."
+                default: healthFailure = error.localizedDescription
+                }
+            } else { healthFailure = error.localizedDescription }
         }
         checkedConnection = true
     }

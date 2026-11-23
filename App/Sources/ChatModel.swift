@@ -58,7 +58,9 @@ final class ChatModel {
     var failedTick = 0
 
     private let api = API.shared
-    private weak var app: AppModel?
+    private weak var owner: AppModel?
+    // Late work must never borrow the new gateway's account, including after A → B → A.
+    private var app: AppModel? { API.shared === api ? owner : nil }
     private var recovery = StreamRecovery()
     private var confirmedPrimary = false
     private var pendingSend: PendingSend?
@@ -111,7 +113,7 @@ final class ChatModel {
     init(profile: String, sessionId: String?, app: AppModel) {
         self.profile = profile
         self.sessionId = sessionId
-        self.app = app
+        self.owner = app
         if let sid = sessionId, let saved = app.savedChoice(profile: profile, session: sid) {
             choice = saved
             picked = !saved.isDefault
@@ -363,7 +365,7 @@ final class ChatModel {
             do {
                 run = try await api.startRun(profile: profile, session: session, text: send.text,
                                                     choice: send.choice, projectContext: send.project, submission: send.id,
-                                                    attachments: send.attachments ?? [])
+                                                    attachments: send.attachments ?? [], recovering: !allowLegacy)
             } catch APIError.http(404, _) where allowLegacy && send.attachments == nil {
                 // An old bridge does not implement send-once. Drop the retry record BEFORE the
                 // one legacy POST; a lost legacy acknowledgment cannot cause an automatic replay.
@@ -534,7 +536,7 @@ final class ChatModel {
     }
 
     func cancelLocalFollow() {
-        app = nil
+        owner = nil
         streamTask?.cancel()
         textTimer?.cancel()
         runId = nil

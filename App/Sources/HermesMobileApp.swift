@@ -138,7 +138,7 @@ struct ConnectionBadge: View {
         .popover(isPresented: $detail) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(state.label).font(.headline)
-                Text(API.shared.baseURL?.host ?? "Hermes gateway").font(.footnote).foregroundStyle(.secondary)
+                Text(API.shared.baseURL?.absoluteString ?? "Hermes gateway").textSelection(.enabled).font(.footnote).foregroundStyle(.secondary)
                 if let at = app.lastHealthCheck {
                     Text("Last response \(at, style: .relative) ago").font(.caption).foregroundStyle(.secondary)
                 }

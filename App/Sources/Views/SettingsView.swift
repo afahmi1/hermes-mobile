@@ -209,7 +209,7 @@ struct GatewayDestinationsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Switch gateway") {
+                Section {
                     ForEach(app.savedGateways, id: \.self) { url in
                         Button {
                             do {
@@ -230,7 +230,7 @@ struct GatewayDestinationsView: View {
                         }
                     }
                     Button("Add gateway", systemImage: "plus") { adding = true }
-                }
+                } header: { Text("Switch gateway") } footer: { Text("Chats, files and approvals stay on the gateway you choose.") }
                 if app.savedGateways.count > 1 {
                     Section {
                         HStack {

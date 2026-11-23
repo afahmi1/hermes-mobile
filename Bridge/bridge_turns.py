@@ -26,6 +26,7 @@ from collections import OrderedDict
 import threading
 import time
 import uuid
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -636,9 +637,23 @@ async def _drive(turn: Turn):
             turn.finish()
 
 
+# Contenders keep their lock alive while waiting. Idle chat/submission keys disappear.
+_admission_locks = weakref.WeakValueDictionary()
+_admission_registry_lock = threading.Lock()
+
+
+def _admission_lock(key):
+    with _admission_registry_lock:
+        lock = _admission_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _admission_locks[key] = lock
+        return lock
+
+
 def start_turn(profile, home, sid, text, choice, workspace=None) -> Turn:
     purge()
-    with TURNS_LOCK:
+    with _admission_lock((profile, sid)), TURNS_LOCK:
         busy = [t for t in TURNS.values() if t.sid == sid and t.profile == profile and not t.done]
         if busy:
             raise TurnError("This chat is still working on the last message.", 409)
@@ -671,10 +686,36 @@ def restored_turn(row, home, journal, restore_workspace):
         turn.finish()
     else:
         turn.push("turn.restored")
-    TURNS[turn.id] = turn
+    with TURNS_LOCK:
+        TURNS[turn.id] = turn
     if not turn.done:
         asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
     return turn
+
+
+def match_receipt(profile, sid, text, request, directory):
+    """Read-only confirmation of the exact durable send, even after media cleanup."""
+    try:
+        turn_id = "turn_" + uuid.UUID(str(request.get("submission_id"))).hex
+    except ValueError:
+        raise TurnError("Invalid submission ID.") from None
+    manifest = request.get("manifest")
+    if not isinstance(manifest, list) or not 1 <= len(manifest) <= bridge_media.MAX_ITEMS:
+        raise TurnError("Invalid attachment manifest.")
+    frames = []
+    for item in manifest:
+        if not isinstance(item, dict) or any(not isinstance(item.get(k), str) for k in ("filename", "mime", "sha256")):
+            raise TurnError("Invalid attachment manifest.")
+        frames.append((item["filename"], item["sha256"], None, item["mime"]))
+    row = primary_journal(directory).get(turn_id)
+    if row is None or row["media_types"] is None:
+        # Older receipts omitted image/video types from their fingerprint. Use
+        # the original validated upload path when those types cannot be proved.
+        raise TurnError("No media receipt available.", 404)
+    digest = bridge_receipts.fingerprint(profile, sid, text, clean_choice(request), request.get("project_context"), frames)
+    if row["fingerprint"] != digest or json.loads(row["media_types"]) != [frame[3] for frame in frames]:
+        raise TurnError("This submission ID belongs to a different send.", 409)
+    return {"turn_id": turn_id}
 
 
 def start_primary(profile, home, sid, text, choice, submission, project, directory, prepare, restore_workspace, attachments=None, video_consent=False):
@@ -697,14 +738,18 @@ def start_primary(profile, home, sid, text, choice, submission, project, directo
     if clip and journal.get(id) is None and not bridge_media.video_supported(home):
         raise TurnError("This bot cannot analyze video clips. Send reviewed frames instead.")
     purge()
-    with TURNS_LOCK:
+    # Always take submission then chat. Disk staging and SQLite commits must not
+    # block unrelated sends, stop/steer lookups, or a different phone's live list.
+    with _admission_lock(id), _admission_lock((profile, sid)):
         existing = journal.get(id)
         if existing:
-            if existing["fingerprint"] != digest:
+            if (existing["fingerprint"] != digest or
+                    existing["media_types"] is not None and json.loads(existing["media_types"]) != [frame[3] for frame in frames]):
                 raise TurnError("This submission ID belongs to a different send.", 409)
-            return TURNS.get(id) or restored_turn(existing, home, journal, restore_workspace)
-        if any(t.profile == profile and t.sid == sid and not t.done for t in TURNS.values()):
-            raise TurnError("This chat is still working on the last message.", 409)
+            return get_turn(id) or restored_turn(existing, home, journal, restore_workspace)
+        with TURNS_LOCK:
+            if any(t.profile == profile and t.sid == sid and not t.done for t in TURNS.values()):
+                raise TurnError("This chat is still working on the last message.", 409)
         ws = prepare()
         turn = Turn(profile, home, sid, text, choice, ws)
         turn.id, turn.submission, turn.journal = id, id[5:], journal
@@ -716,31 +761,34 @@ def start_primary(profile, home, sid, text, choice, submission, project, directo
             if ws:
                 ws["store"].discard_output(ws["output_dir"])
             raise
-        TURNS[id] = turn
+        with TURNS_LOCK:
+            TURNS[id] = turn
         asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
         return turn
 
 
 def recover_primary(directory, profile_home, restore_workspace):
     journal = primary_journal(directory)
-    with TURNS_LOCK:
-        for row in journal.pending():
-            if row["id"] not in TURNS:
-                try:
-                    restored_turn(row, profile_home(row["profile"]), journal, restore_workspace)
-                except TurnError:
-                    # A project grant or identity was withdrawn. Never revive its context.
-                    turn = Turn(row["profile"], profile_home(row["profile"]), row["sid"], "", {})
-                    turn.id = row["id"]
-                    bridge_media.discard(json.loads(row["media"] or "[]"))
-                    journal.terminal(turn, {"event": "run.failed"})
+    for row in journal.pending():
+        with _admission_lock(row["id"]), _admission_lock((row["profile"], row["sid"])):
+            if get_turn(row["id"]) is not None:
+                continue
+            try:
+                restored_turn(row, profile_home(row["profile"]), journal, restore_workspace)
+            except TurnError:
+                # A project grant or identity was withdrawn. Never revive its context.
+                turn = Turn(row["profile"], profile_home(row["profile"]), row["sid"], "", {})
+                turn.id = row["id"]
+                bridge_media.discard(json.loads(row["media"] or "[]"))
+                journal.terminal(turn, {"event": "run.failed"})
 
 
 def completed_primary(turn_id, directory, profile_home):
-    journal = primary_journal(directory)
-    with TURNS_LOCK:
-        if turn_id in TURNS:
-            return TURNS[turn_id]
+    with _admission_lock(turn_id):
+        live = get_turn(turn_id)
+        if live is not None:
+            return live
+        journal = primary_journal(directory)
         row = journal.get(turn_id)
         if row is not None and row["terminal"]:
             return restored_turn(row, profile_home(row["profile"]), journal, None)

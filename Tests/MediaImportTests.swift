@@ -60,6 +60,12 @@ enum MediaImportTests {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let originalPNG = directory.appendingPathComponent("large.png")
+        try screenshot.write(to: originalPNG)
+        let fromFiles = try FileImport.attachment(from: originalPNG, maxBytes: 1024 * 1024)
+        precondition(fromFiles.byteCount <= 1024 * 1024 && fromFiles.mime == "image/jpeg")
+        do { _ = try FileImport.attachment(from: originalPNG, maxBytes: 10); fatalError("ignored compressed image budget") }
+        catch FileImport.Failure.tooLarge {}
         let audio = Data([0x49, 0x44, 0x33, 0x04, 0x00, 0x00]) + Data(repeating: 0x55, count: 1024)
         let mp3 = directory.appendingPathComponent("A song — take 2.mp3")
         try audio.write(to: mp3)

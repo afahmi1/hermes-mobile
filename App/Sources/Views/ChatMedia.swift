@@ -76,14 +76,24 @@ enum FileImport {
         guard values.isRegularFile == true else { throw Failure.unreadable }
         let size = values.fileSize ?? 0
         guard size > 0 else { throw Failure.empty }
+        let type = values.contentType ?? UTType(filenameExtension: url.pathExtension)
+        if let type, type.conforms(to: .image) {
+            // Downsample the file at its URL. A large original can produce a small valid upload.
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+                  let preview = ChatMedia.thumbnail(source, pixels: 2048) else { throw ChatMedia.Failure.unreadable }
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let header = try handle.read(upToCount: 12) ?? Data()
+            let attachment = try ChatMedia.jpeg(UIImage(cgImage: preview), name: "Photo", sourceType: ChatMedia.originalTypeName(header))
+            guard attachment.byteCount <= maxBytes else { throw Failure.tooLarge(maxBytes) }
+            return attachment
+        }
         guard size <= maxBytes else { throw Failure.tooLarge(maxBytes) }
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let data = try handle.read(upToCount: maxBytes + 1) ?? Data()
         guard !data.isEmpty else { throw Failure.empty }
         guard data.count <= maxBytes else { throw Failure.tooLarge(maxBytes) }
-        let type = values.contentType ?? UTType(filenameExtension: url.pathExtension)
-        if let type, type.conforms(to: .image) { return try ChatMedia.image(from: data) }
         if let type, type.conforms(to: .movie) {
             throw Failure.unreadable  // the app routes clips through Photos, where consent is explained
         }

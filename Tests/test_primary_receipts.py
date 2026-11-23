@@ -1,4 +1,7 @@
 import asyncio
+import threading
+import hashlib
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -60,6 +63,67 @@ class PrimaryReceipts(unittest.TestCase):
             with self.assertRaises(engine.TurnError) as error:
                 self.start(**params)
             self.assertEqual(error.exception.code, 409)
+
+    def test_slow_stage_keeps_other_chat_and_control_available(self):
+        waiting, release = threading.Event(), threading.Event()
+        def hold(frames, home):
+            waiting.set()
+            if not release.wait(4):
+                raise AssertionError("unrelated chat was blocked by staging")
+            return []
+        with ThreadPoolExecutor(max_workers=4) as pool, patch.object(engine.bridge_media, "stage", side_effect=hold):
+            first = pool.submit(self.start)
+            try:
+                self.assertTrue(waiting.wait(1))
+                other = pool.submit(engine.start_turn, "default", self.directory, "other", "hi", {})
+                live = other.result(timeout=2)
+                self.assertIs(pool.submit(engine.get_turn, live.id).result(timeout=1), live)
+                duplicate = pool.submit(self.start)
+                legacy = pool.submit(engine.start_turn, "default", self.directory, "sid", "hi", {})
+            finally:
+                release.set()
+            self.assertIs(first.result(), duplicate.result())
+            with self.assertRaises(engine.TurnError):
+                legacy.result()
+
+    def test_receipt_proves_exact_send_without_restaging(self):
+        data = b"private bytes"
+        attachment = dict(filename="a.mp3", mime="audio/mpeg", base64=base64.b64encode(data).decode())
+        request = dict(submission_id=self.submission, project_context="alpha", manifest=[
+            dict(filename="a.mp3", mime="audio/mpeg", sha256=hashlib.sha256(data).hexdigest())])
+        def lookup(sid="sid", text="hello"):
+            return engine.match_receipt("default", sid, text, request, self.directory)
+        with self.assertRaises(engine.TurnError) as missing:
+            lookup()
+        self.assertEqual(missing.exception.code, 404)
+        accepted = self.start(attachments=[attachment])
+        with patch.object(engine.bridge_media, "stage", side_effect=AssertionError):
+            self.assertEqual(lookup(), {"turn_id": accepted.id})
+            for args in [("other", "hello"), ("sid", "different")]:
+                with self.assertRaises(engine.TurnError) as mismatch:
+                    lookup(*args)
+                self.assertEqual(mismatch.exception.code, 409)
+            request["manifest"][0]["mime"] = "application/pdf"
+            with self.assertRaises(engine.TurnError) as changed:
+                lookup()
+            self.assertEqual(changed.exception.code, 409)
+
+    def test_older_media_journal_migrates_and_reuses_original_upload(self):
+        from contextlib import closing
+        data = b"old send"
+        attachment = dict(filename="test.txt", mime="text/plain", base64=base64.b64encode(data).decode())
+        turn = self.start(attachments=[attachment])
+        with closing(self.journal.open()) as db, db:
+            db.execute("ALTER TABLE receipts DROP COLUMN media_types")
+        engine.primary_journal.cache_clear()
+        request = dict(submission_id=self.submission, project_context="alpha", manifest=[
+            dict(filename="test.txt", mime="text/plain", sha256=hashlib.sha256(data).hexdigest())])
+        with self.assertRaises(engine.TurnError) as legacy:
+            engine.match_receipt("default", "sid", "hello", request, self.directory)
+        self.assertEqual(legacy.exception.code, 404)
+        with patch.object(engine.bridge_media, "stage", side_effect=AssertionError):
+            self.assertIs(turn, self.start(attachments=[attachment]))
+        self.assertEqual(self.schedule.call_count, 1)
 
     def test_lost_ack_restart_reuses_native_admission_and_workspace(self):
         first = self.start()

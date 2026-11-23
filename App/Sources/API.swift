@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 
 struct MediaCapabilities: Decodable {
     let images: Bool
@@ -64,12 +65,16 @@ final class API: @unchecked Sendable {
 
     static var shared: API { lock.withLock { client } }
     private let login: GatewayLogin?
+    let accountID: String?
     var baseURL: URL? { login?.server }
     var token: String? { login?.token }
     var isSignedIn: Bool { login != nil }
     private let transport = BridgeTransport()
     private init(_ login: GatewayLogin?) {
         self.login = login
+        self.accountID = login.map {
+            SHA256.hash(data: Data(($0.server.absoluteString + "|" + $0.token).utf8)).map { String(format: "%02x", $0) }.joined()
+        }
         self.session = Self.makeSession(stream: false, transport: transport)
         self.streamSession = Self.makeSession(stream: true, transport: transport)
     }
@@ -501,18 +506,35 @@ final class API: @unchecked Sendable {
 
     /// Start a turn. The Mac holds it; it keeps running if the phone locks or loses signal.
     func startRun(profile: String, session: String, text: String, choice: RuntimeChoice,
-                  projectContext: String? = nil, submission: UUID? = nil, attachments: [SendAttachment] = []) async throws -> String {
+                  projectContext: String? = nil, submission: UUID? = nil, attachments: [SendAttachment] = [], recovering: Bool = false) async throws -> String {
         var body = Self.choiceBody(choice)
+        body["text"] = text
+        ProjectContext.apply(to: &body, projectID: projectContext)
         if let submission { body["submission_id"] = submission.uuidString }
+        let endpoint = "/m/chat/\(Self.esc(profile))/\(Self.esc(session))/"
+        if recovering, let submission, !attachments.isEmpty {
+            var probe = body
+            probe["manifest"] = try attachments.map { item -> [String: String] in
+                guard let data = Data(base64Encoded: item.base64) else { throw APIError.badResponse }
+                let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                return ["filename": item.filename, "mime": item.mime, "sha256": hash]
+            }
+            do {
+                let receipt = try await json(endpoint + "send-receipt", method: "POST", body: probe)
+                let expected = "turn_" + submission.uuidString.lowercased().replacingOccurrences(of: "-", with: "")
+                guard receipt["turn_id"] as? String == expected else { throw APIError.badResponse }
+                return expected
+            } catch APIError.http(404, _) {
+                // A missing receipt or older bridge needs the original send with its original UUID.
+            }
+        }
         if !attachments.isEmpty {
             guard submission != nil else { throw APIError.badResponse }
             if attachments.contains(where: { $0.mime == "video/mp4" }) { body["video_analysis_consent"] = true }
             body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
         }
-        body["text"] = text
-        ProjectContext.apply(to: &body, projectID: projectContext)
         let action = submission == nil ? "send" : "send-once"
-        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/\(action)", method: "POST", body: body)
+        let obj = try await json(endpoint + action, method: "POST", body: body)
         guard let id = obj["turn_id"] as? String else { throw APIError.badResponse }
         return id
     }

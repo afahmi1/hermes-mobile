@@ -23,10 +23,13 @@ class Journal:
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
         with closing(self.open()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
             db.execute("""CREATE TABLE IF NOT EXISTS receipts(
                 id TEXT PRIMARY KEY, profile TEXT NOT NULL, sid TEXT NOT NULL, fingerprint TEXT NOT NULL,
                 prompt TEXT, choice TEXT NOT NULL, workspace TEXT, started REAL NOT NULL,
                 canonical TEXT, admission TEXT, generation INTEGER, terminal TEXT, steered INTEGER DEFAULT 0, media TEXT)""")
+            if "media_types" not in {row[1] for row in db.execute("PRAGMA table_info(receipts)")}:
+                db.execute("ALTER TABLE receipts ADD COLUMN media_types TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS pending_sends ON receipts(started) WHERE terminal IS NULL")
 
     def open(self):
@@ -47,9 +50,10 @@ class Journal:
         ws = turn.workspace
         metadata = ({k: ws.get(k) for k in ("project", "output_dir", "summary")} if ws else None)
         with closing(self.open()) as db, db:
-            db.execute("""INSERT INTO receipts(id, profile, sid, fingerprint, prompt, choice, workspace, started, media)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (turn.id, turn.profile, turn.sid, digest, prompt,
-                       json.dumps(turn.choice), json.dumps(metadata, default=str), time.time(), json.dumps(turn.media)))
+            db.execute("""INSERT INTO receipts(id, profile, sid, fingerprint, prompt, choice, workspace, started, media, media_types)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (turn.id, turn.profile, turn.sid, digest, prompt,
+                       json.dumps(turn.choice), json.dumps(metadata, default=str), time.time(), json.dumps(turn.media),
+                       json.dumps([item["mime"] for item in turn.media]) if turn.media else None))
 
     def prepared(self, turn):
         with closing(self.open()) as db, db:

@@ -48,7 +48,7 @@ import Foundation
         let fixture = Process()
         fixture.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         fixture.arguments = ["python3", "-u", "-c", #"""
-import json,sys,threading,time
+import hashlib,json,sys,threading,time
 from urllib.parse import urlsplit, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 class Handler(BaseHTTPRequestHandler):
@@ -69,7 +69,21 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.dumps(result).encode()
         self.send_response(200); self.send_header('Content-Length', str(len(payload))); self.end_headers(); self.wfile.write(payload)
     def do_POST(self):
-        self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        if self.path.endswith(('/send-receipt','/send-once')):
+            assert self.headers.get('Authorization') == 'Bearer ' + self.server.label
+            body = json.loads(raw)
+            receipt = self.path.endswith('/send-receipt')
+            if receipt and '/old/' in self.path: self.send_error(404); return
+            if receipt and '/busy/' in self.path: self.send_error(503); return
+            if receipt:
+                assert 'attachments' not in body and len(raw) < 1024
+                assert body['manifest'][0]['sha256'] == hashlib.sha256(b'x' * 4194304).hexdigest()
+            else:
+                assert '/old/' in self.path and len(raw) > 5592400 and 'attachments' in body
+            print('Recovery request bytes',len(raw),'receipt' if receipt else 'upload',file=sys.stderr)
+            payload = json.dumps(dict(turn_id='turn_'+body['submission_id'].replace('-','').lower())).encode()
+            self.send_response(200); self.send_header('Content-Length',str(len(payload))); self.end_headers(); self.wfile.write(payload); return
         self.send_response(307); self.send_header('Location', first + '/m/pair'); self.end_headers()
 servers = [ThreadingHTTPServer(('127.0.0.1',0), Handler) for _ in range(2)]
 for label, s in zip(['first-fixture','second-fixture'], servers):
@@ -95,6 +109,19 @@ sys.stdin.read()
         let originalClient = API.shared
         let firstCaps = try await originalClient.capabilities()
         precondition(firstCaps.deviceID == first.token)
+        let file = SendAttachment(mime: "audio/mpeg", filename: "audio.mp3",
+                                  base64: Data(repeating: 120, count: 4 * 1024 * 1024).base64EncodedString())
+        let submission = UUID()
+        for sid in ["received", "old"] {
+            let receipt = try await originalClient.startRun(profile: "default", session: sid, text: "hello", choice: .botDefault,
+                                                             submission: submission, attachments: [file], recovering: true)
+            precondition(receipt == "turn_" + submission.uuidString.lowercased().replacingOccurrences(of: "-", with: ""))
+        }
+        do {
+            _ = try await originalClient.startRun(profile: "default", session: "busy", text: "hello", choice: .botDefault,
+                                                  submission: submission, attachments: [file], recovering: true)
+            fatalError("Temporary receipt failure triggered a full upload")
+        } catch APIError.http(503, _) { }
         let started = ContinuousClock.now
         try await withThrowingTaskGroup(of: (GatewayLogin, [SessionSummary]).self) { group in
             for login in [first, second] {

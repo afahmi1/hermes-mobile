@@ -1359,7 +1359,7 @@ class H(BaseHTTPRequestHandler):
         log(fmt % args)
 
     def send(self, code, body=b"", ctype="application/json", close=False, validator=None):
-        if self.command in ("POST", "PATCH", "DELETE") and 200 <= code < 300:
+        if self.command in ("POST", "PATCH", "DELETE") and 200 <= code < 300 and not self.path.endswith("/send-receipt"):
             invalidate_pages()
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
@@ -1973,7 +1973,7 @@ class H(BaseHTTPRequestHandler):
                                        "video": turns.bridge_media.video_supported(profile_home(pid)),
                                        "max_video_bytes": turns.bridge_media.MAX_BYTES,
                                        "max_file_bytes": turns.bridge_media.MAX_BYTES})
-            m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|runtime))$", path)
+            m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|send-receipt|runtime))$", path)
             if not m or self.command != "POST":
                 return self.send(404, {"error": "not found"})
             pid = m.group(1)
@@ -1992,6 +1992,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, {"applied": applied, "timing": "next_turn" if deferred else "saved",
                                        "policy": (session_runtime(pid, sid) or {}).get("policy")})
             text = str(d.get("text") or "").strip()
+            if action == "send-receipt":
+                return self.send(200, turns.match_receipt(pid, sid, text or "Describe the attached media.", d, admissions_dir()))
             if d.get("attachments") and action != "send-once":
                 return self.send(400, {"error": "Media requires a durable send."})
             if not text and not d.get("attachments"):
