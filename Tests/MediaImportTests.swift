@@ -56,6 +56,32 @@ enum MediaImportTests {
             precondition(h.mime == "image/jpeg")
         }
 
+        // Files passes original bytes and type through: an MP3 stays audio/mpeg, not JPEG/octet-stream.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audio = Data([0x49, 0x44, 0x33, 0x04, 0x00, 0x00]) + Data(repeating: 0x55, count: 1024)
+        let mp3 = directory.appendingPathComponent("A song — take 2.mp3")
+        try audio.write(to: mp3)
+        let picked = try FileImport.attachment(from: mp3, maxBytes: 4 * 1024 * 1024)
+        precondition(picked.mime == "audio/mpeg", picked.mime)
+        precondition(picked.filename == "A song — take 2.mp3", picked.filename)
+        precondition(Data(base64Encoded: picked.base64) == audio, "file bytes changed")
+        do { _ = try FileImport.attachment(from: mp3, maxBytes: 128); fatalError("accepted oversized file") }
+        catch FileImport.Failure.tooLarge {}
+        let imageFile = directory.appendingPathComponent("shot.png")
+        try dot.pngData()!.write(to: imageFile)
+        let check0 = try FileImport.attachment(from: imageFile, maxBytes: 1024 * 1024).mime
+        precondition(check0 == "image/jpeg")
+        let movie = directory.appendingPathComponent("clip.mov")
+        try Data([0, 0, 0, 0]).write(to: movie)
+        do { _ = try FileImport.attachment(from: movie, maxBytes: 1024); fatalError("accepted a movie from Files") }
+        catch FileImport.Failure.unreadable {}
+        let check1 = try FileImport.safeName(URL(fileURLWithPath: "/tmp/../song.mp3"))
+        precondition(check1 == "song.mp3")
+        let check2 = try FileImport.safeName(URL(fileURLWithPath: "/tmp/a:b.txt"))
+        precondition(check2 == "ab.txt")
+
         print("Media import decode, paste split, source types and budget boundaries passed")
     }
     /// A large, per-pixel-noise PNG: uncompressible, like a real photo or dense screenshot.

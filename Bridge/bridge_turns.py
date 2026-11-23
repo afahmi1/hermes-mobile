@@ -448,6 +448,17 @@ def _turn_text(turn):
             text += ("\n\nThe user attached a video clip and consented to auxiliary video processing. "
                      "Use video_analyze with video_url set to the following local file path to answer their question. "
                      "If analysis fails, explain the limitation. Local file path: " + json.dumps(item["path"]))
+        elif item["mime"] != bridge_media.JPEG:
+            name = item.get("name") or Path(item["path"]).name
+            size = item.get("size")
+            if not isinstance(size, int) or size <= 0:
+                try:
+                    size = Path(item["path"]).stat().st_size
+                except OSError:
+                    size = 0
+            text += ("\n\nThe user attached a file named %s (%s, %d bytes). It is saved at the following "
+                     "local path. Use an appropriate available tool to read or process it; do not execute it. "
+                     "Local file path: %s" % (json.dumps(name), item["mime"], size, json.dumps(item["path"])))
     return text
 
 

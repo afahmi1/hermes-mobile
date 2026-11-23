@@ -6,6 +6,7 @@ import importlib.util
 from io import BytesIO
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -29,6 +30,9 @@ def _max_bytes():
 MAX_BYTES = _max_bytes()
 JPEG = "image/jpeg"
 MP4 = "video/mp4"
+MAX_ITEMS = 4
+MIME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$")
+EXT = re.compile(r"^[A-Za-z0-9]{1,10}$")
 
 
 class MediaError(ValueError):
@@ -173,21 +177,23 @@ def _validate_clip(raw):
 def decode(items):
     if items is None or items == []:
         return []
-    if not isinstance(items, list) or not 1 <= len(items) <= 4:
-        raise MediaError("Attach one MP4 or up to four JPEG images.")
+    if not isinstance(items, list) or not 1 <= len(items) <= MAX_ITEMS:
+        raise MediaError("Attach up to four files, or one MP4 clip.")
     frames = []
     remaining = MAX_BYTES
     for item in items:
         if not isinstance(item, dict) or set(item) != {"filename", "mime", "base64"}:
             raise MediaError("Invalid attachment fields.")
         name, encoded, mime = item["filename"], item["base64"], item["mime"]
-        if mime not in (JPEG, MP4) or (mime == MP4 and len(items) != 1):
-            raise MediaError("Attach one MP4 or up to four JPEG images.")
+        if not isinstance(mime, str) or not MIME.match(mime) or mime.startswith("image/") and mime != JPEG:
+            raise MediaError("Attach images as JPEG and other files with a valid media type.")
+        if mime == MP4 and len(items) != 1:
+            raise MediaError("Attach one MP4 clip, or up to four other files.")
         if (not isinstance(name, str) or not 0 < len(name) <= 140 or not name.isprintable()
                 or any(c in name for c in "/\\:") or name in (".", "..")):
             raise MediaError("Invalid attachment name.")
         if not isinstance(encoded, str) or len(encoded) > (remaining + 2) // 3 * 4:
-            raise MediaError("Attachments must total 4 MiB or less.")
+            raise MediaError("Attachments must total %d MiB or less." % (MAX_BYTES // (1024 * 1024)))
         try:
             raw = base64.b64decode(encoded, validate=True)
             if not raw or len(raw) > remaining:
@@ -199,7 +205,7 @@ def decode(items):
                 _validate_clip(raw)
             except ValueError:
                 raise MediaError("The video must be a self-contained MP4 with a video track.") from None
-        else:
+        elif mime == JPEG:
             if not supported():
                 raise MediaError("This Hermes installation does not support native image attachments.")
             from PIL import Image
@@ -209,18 +215,18 @@ def decode(items):
                         raise ValueError
                     image.load()
             except (ValueError, OSError, Image.DecompressionBombError):
-                raise MediaError("An attachment is damaged, is too large, or is not a JPEG.") from None
+                raise MediaError("An image is damaged, is too large, or is not a JPEG.") from None
         remaining -= len(raw)
         frames.append((name, hashlib.sha256(raw).hexdigest(), raw, mime))
     return frames
 
 
-def _clip_dir(home):
-    directory = Path(home).resolve() / "mobile-video-inputs"
+def _private_dir(home, name, label):
+    directory = Path(home).resolve() / name
     directory.mkdir(mode=0o700, exist_ok=True)
     st = directory.lstat()
     if not stat.S_ISDIR(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:
-        raise MediaError("The profile cannot privately store video.")
+        raise MediaError("The profile cannot privately store %s." % label)
     if os.name == "nt":
         import win32api, win32con, win32security as ws, ntsecuritycon
         token = ws.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
@@ -232,34 +238,55 @@ def _clip_dir(home):
                                 ws.PROTECTED_DACL_SECURITY_INFORMATION, None, None, acl, None)
     else:
         directory.chmod(0o700)
-    prune_clips(home)
+    prune(home)
     return directory
 
 
-def prune_clips(home):
-    directory = Path(home).resolve() / "mobile-video-inputs"
-    if directory.resolve() != directory or not directory.is_dir():
-        return
+def _clip_dir(home):
+    return _private_dir(home, "mobile-video-inputs", "video")
+
+
+def _file_dir(home):
+    return _private_dir(home, "mobile-file-inputs", "files")
+
+
+def _extension(name):
+    ext = Path(name).suffix.lstrip(".")
+    return "." + ext.lower() if EXT.match(ext) else ".bin"
+
+
+def prune(home):
     cutoff = time.time() - 4 * 3600
-    for clip in directory.glob("hm_send_*.mp4"):
-        try:
-            if clip.lstat().st_mtime < cutoff:
-                clip.unlink(missing_ok=True)
-        except OSError:
-            pass
+    for name in ("mobile-video-inputs", "mobile-file-inputs"):
+        directory = Path(home).resolve() / name
+        if directory.resolve() != directory or not directory.is_dir():
+            continue
+        for staged in directory.glob("hm_send_*"):
+            try:
+                if staged.is_file() and staged.lstat().st_mtime < cutoff:
+                    staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def prune_clips(home):
+    """Kept as the startup hook's name; files and clips share the same age-based sweep."""
+    prune(home)
 
 
 def stage(frames, home):
     paths = []
     try:
-        for _, _, raw, mime in frames:
+        for name, _, raw, mime in frames:
             if mime == MP4:
                 directory, ext = _clip_dir(home), ".mp4"
-            else:
+            elif mime == JPEG:
                 from gateway.platforms.base import get_image_cache_dir
                 directory, ext = get_image_cache_dir().resolve(), ".jpg"
+            else:
+                directory, ext = _file_dir(home), _extension(name)
             with tempfile.NamedTemporaryFile(prefix="hm_send_", suffix=ext, dir=directory, delete=False) as f:
-                paths.append({"path": f.name, "mime": mime})
+                paths.append({"path": f.name, "mime": mime, "name": name, "size": len(raw)})
                 f.write(raw)
                 f.flush()
                 os.fsync(f.fileno())

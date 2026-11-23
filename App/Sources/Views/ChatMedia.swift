@@ -52,6 +52,57 @@ enum MediaImport {
     }
 }
 
+/// A file chosen from Files. Unlike a photo or video, this keeps the original bytes and media
+/// type: Hermes's agent gets a private local path and decides which tool reads it. The bridge
+/// stages the bytes; nothing is transcoded, so an MP3 stays an MP3.
+enum FileImport {
+    enum Failure: LocalizedError {
+        case unreadable, empty, tooLarge(Int)
+        var errorDescription: String? {
+            switch self {
+            case .unreadable: "This file could not be opened. Try choosing it again."
+            case .empty: "This file is empty."
+            case .tooLarge(let max):
+                "This file is larger than \(ByteCountFormatter.string(fromByteCount: Int64(max), countStyle: .file)). Choose a smaller file."
+            }
+        }
+    }
+
+    /// Read a security-scoped file and turn it into the one attachment the bridge accepts.
+    /// Images keep the existing camera/library pipeline (decoded and bounded as JPEG); every
+    /// other regular file rides as its original bytes and MIME type.
+    static func attachment(from url: URL, maxBytes: Int) throws -> SendAttachment {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentTypeKey])
+        guard values.isRegularFile == true else { throw Failure.unreadable }
+        let size = values.fileSize ?? 0
+        guard size > 0 else { throw Failure.empty }
+        guard size <= maxBytes else { throw Failure.tooLarge(maxBytes) }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: maxBytes + 1) ?? Data()
+        guard !data.isEmpty else { throw Failure.empty }
+        guard data.count <= maxBytes else { throw Failure.tooLarge(maxBytes) }
+        let type = values.contentType ?? UTType(filenameExtension: url.pathExtension)
+        if let type, type.conforms(to: .image) { return try ChatMedia.image(from: data) }
+        if let type, type.conforms(to: .movie) {
+            throw Failure.unreadable  // the app routes clips through Photos, where consent is explained
+        }
+        return SendAttachment(mime: type?.preferredMIMEType ?? "application/octet-stream",
+                              filename: try safeName(url), base64: data.base64EncodedString())
+    }
+
+    /// A bridge- and filesystem-safe display/staging name: last path component, printable,
+    /// no separators or quotes, at most 120 characters.
+    static func safeName(_ url: URL) throws -> String {
+        let banned = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/\\:\""))
+        let cleaned = String(url.lastPathComponent.unicodeScalars.filter { !banned.contains($0) })
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = String(cleaned.prefix(120))
+        guard !name.isEmpty, name != ".", name != ".." else { throw Failure.unreadable }
+        return name
+    }
+}
+
 enum ChatMedia {
     enum Failure: LocalizedError {
         case unreadable, tooLarge, noFrames, downloadFailed
@@ -209,10 +260,33 @@ struct AttachmentChip: View {
     let attachment: SendAttachment
     let remove: () -> Void
     @State private var thumbnail: UIImage?
+
+    private var isImage: Bool { attachment.mime.hasPrefix("image/") }
+    private var isVideo: Bool { attachment.mime.hasPrefix("video/") }
+    private var isAudio: Bool { attachment.mime.hasPrefix("audio/") }
+
     private var label: String {
-        if attachment.mime.hasPrefix("video/") { return "Video" }
+        if isVideo { return "Video" }
+        if isAudio { return "Audio" }
+        if !isImage { return "File" }
         let pieces = attachment.filename.split(separator: "-")
         return pieces.count >= 3 && pieces[0] == "Frame" ? "Frame at " + pieces[1] : "Photo"
+    }
+
+    /// Non-image chips show what was picked and roughly how big it is, so an MP3 is not
+    /// presented as an anonymous "file".
+    private var detail: String? {
+        guard !isImage else { return nil }
+        let name = attachment.filename
+        let shown = name.count > 26 ? String(name.prefix(24)) + "…" : name
+        let bytes = attachment.base64.count / 4 * 3
+        return shown + " · " + ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    private var icon: String {
+        if isVideo { return "film" }
+        if isAudio { return "waveform" }
+        return "doc"
     }
 
     /// The source format when the sent bytes are a converted JPEG (a GIF's first frame, a HEIC
@@ -240,14 +314,24 @@ struct AttachmentChip: View {
                                     .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 4))
                             }
                         }
-                } else { Image(systemName: "film") }
-                if label != "Photo" { Text(label).font(.caption2) }
+                } else {
+                    Image(systemName: icon).frame(width: 46, height: 38)
+                }
+                if let detail {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(label).font(.caption2.weight(.semibold))
+                        Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                } else if label != "Photo" {
+                    Text(label).font(.caption2)
+                }
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
             }.padding(4).background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
         }
-        .buttonStyle(.plain).accessibilityLabel("Remove " + label)
-        .task(id: attachment.filename) {
-            guard attachment.mime.hasPrefix("image/"), let data = Data(base64Encoded: attachment.base64),
+        .buttonStyle(.plain).accessibilityLabel("Remove " + label + (detail.map { ", " + $0 } ?? ""))
+        .task(id: attachment) {
+            thumbnail = nil
+            guard isImage, let data = Data(base64Encoded: attachment.base64),
                   let source = CGImageSourceCreateWithData(data as CFData, nil),
                   let pixel = ChatMedia.thumbnail(source, pixels: 96) else { return }
             thumbnail = UIImage(cgImage: pixel)

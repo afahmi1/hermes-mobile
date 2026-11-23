@@ -10,7 +10,8 @@ from contextlib import closing
 def fingerprint(profile, session, text, choice, project, frames=()):
     fields = [profile, session, text, choice, project]
     if frames:
-        fields.append([[name, digest] for name, digest, _, _ in frames])
+        fields.append([[name, digest] if mime in ("image/jpeg", "video/mp4") else [name, digest, mime]
+                       for name, digest, _, mime in frames])
     request = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(request.encode()).hexdigest()
 

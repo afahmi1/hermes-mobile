@@ -55,6 +55,19 @@ class Devices:
         claims["did"] = key
         return True
 
+    def permitted(self, keys):
+        """Fresh registry snapshot, including revocations made by other processes."""
+        ids = tuple(set(keys))
+        permitted = set()
+        with closing(self.connect()) as db, db:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                slots = ",".join("?" for _ in chunk)
+                permitted.update(row[0] for row in db.execute(
+                    f"SELECT id FROM devices WHERE revoked=0 AND expires>? AND id IN ({slots})",
+                    (time.time(), *chunk)))
+        return permitted
+
     def active(self):
         with closing(self.connect()) as db:
             db.row_factory = sqlite3.Row
@@ -81,16 +94,17 @@ class Devices:
 
 class Streams:
     """Close live streams, including idle upstream reads, on token revocation or expiry."""
-    def __init__(self):
+    def __init__(self, permitted):
+        self.permitted = permitted
         self.lock = threading.Lock()
         self.live = {}
         self.running = False
 
     @contextmanager
-    def watch(self, key, valid, *sockets):
+    def watch(self, claims, valid, *sockets):
         handle = object()
         with self.lock:
-            self.live[handle] = key, valid, sockets
+            self.live[handle] = claims["did"], claims["exp"], sockets
             if not self.running:
                 self.running = True
                 threading.Thread(target=self._monitor, daemon=True, name="device-stream-auth").start()
@@ -108,9 +122,18 @@ class Streams:
                 if not entries:
                     self.running = False
                     return
-            for handle, (_, valid, _) in entries:
-                if valid():
-                    continue
+            self._check(entries)
+
+    def _check(self, entries):
+        # Signatures were checked at entry. Continue enforcing the individual token
+        # deadline and read current grants every tick, even for a completely idle socket.
+        try:
+            allowed = self.permitted(key for _, (key, _, _) in entries)
+        except (sqlite3.Error, OSError):
+            allowed = set()
+        now = time.time()
+        for handle, (key, expiry, _) in entries:
+            if key not in allowed or expiry <= now:
                 self._disconnect(handle)
 
     def revoked(self, key):

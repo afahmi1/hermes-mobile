@@ -42,14 +42,15 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     /// Where the chat came from, in plain words.
     var sourceLabel: String {
         switch source ?? "" {
-        case "local", "desktop": return "Desktop"
-        case "gui": return "Desktop / mobile"
-        case "hermes_browser", "api_server": return "Phone/API"
+        case "local", "desktop": return "Local"
+        case "gui": return "Desktop or phone"
+        case "hermes_browser", "api_server": return "Phone / API"
         case "bluebubbles": return "iMessage"
         case "tui", "cli": return "Terminal"
         case "cron": return "Scheduled"
         case "oneshot": return "One-shot"
         case "subagent": return "Subagent"
+        case "tool": return "Tool run"
         case let s where s.isEmpty: return ""
         case let s: return s.capitalized
         }
@@ -66,6 +67,11 @@ struct SessionPage: Codable {
     }
     let data: [SessionSummary]
     let next: String?
+}
+
+struct SessionFlagResult {
+    let updated: [String]
+    let errors: [String: String]
 }
 
 struct SearchPage: Codable { let data: [SessionSummary] }
@@ -220,11 +226,15 @@ struct HealthInfo: Codable {
     let recent: [Transition]?
     let reason: String?
     let imageAttachments: Bool?
+    let fileAttachments: Bool?
+    let maxFileBytes: Int?
     let inboxFallback: String?
     let ok: Bool
     let gatewayState: String?
     let version: String?
-    enum CodingKeys: String, CodingKey { case ok, version, phase, recent, reason, imageAttachments = "image_attachments", inboxFallback = "inbox_fallback", gatewayState = "gateway_state" }
+    enum CodingKeys: String, CodingKey { case ok, version, phase, recent, reason, imageAttachments = "image_attachments",
+                                              fileAttachments = "file_attachments", maxFileBytes = "max_file_bytes",
+                                              inboxFallback = "inbox_fallback", gatewayState = "gateway_state" }
 }
 
 // MARK: - Live run events

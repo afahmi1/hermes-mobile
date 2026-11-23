@@ -32,6 +32,7 @@ struct SendAttachment: Codable, Hashable {
     let mime: String
     let filename: String
     let base64: String
+    var byteCount: Int { base64.utf8.count / 4 * 3 - (base64.hasSuffix("==") ? 2 : base64.hasSuffix("=") ? 1 : 0) }
 }
 
 struct PendingSend: Codable {

@@ -45,7 +45,7 @@ class DeviceGrantTests(unittest.TestCase):
         self.enterContext(patch.object(self.b, "STATE_DIR", self.home / "mobile"))
         self.enterContext(patch.object(self.b, "HERMES", self.home))
         self.enterContext(patch.object(self.b, "SECRET", os.urandom(32)))
-        self.enterContext(patch.object(self.b, "STREAMS", self.b.bridge_devices.Streams()))
+        self.enterContext(patch.object(self.b, "STREAMS", self.b.bridge_devices.Streams(lambda ids: self.b.devices().permitted(ids))))
         self.server = self.serve(self.b.H)
         self.owner = self.b.make_token("Host", owner=True)
 
@@ -215,6 +215,24 @@ class DeviceGrantTests(unittest.TestCase):
         self.assertEqual(response.read(), b"")
         self.assertLess(time.monotonic() - started, 2)
         end.set()
+
+    def test_shared_tick_honors_individual_expiry_and_registry_failure(self):
+        from unittest.mock import Mock
+        import sqlite3
+        allowed = Mock(return_value={"one"})
+        streams = self.b.bridge_devices.Streams(allowed)
+        sockets = [Mock() for _ in range(3)]
+        streams.live = {i: (device, expiry, (sock,)) for i, (device, expiry, sock) in
+                        enumerate(zip(("one", "one", "two"), (0, time.time()+60, time.time()+60), sockets))}
+        streams._check(list(streams.live.items()))
+        allowed.assert_called_once()
+        self.assertEqual(set(streams.live), {1})
+        sockets[1].shutdown.assert_not_called()
+        allowed.side_effect = sqlite3.OperationalError("locked")
+        streams._check(list(streams.live.items()))
+        self.assertFalse(streams.live)
+        for sock in sockets:
+            sock.shutdown.assert_called_once()
 
     def test_expiry_disconnects_active_stream(self):
         end = threading.Event()

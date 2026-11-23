@@ -145,6 +145,27 @@ class PrimaryReceipts(unittest.TestCase):
         with patch.object(bridge_media, "supported", return_value=False), self.assertRaises(bridge_media.MediaError):
             bridge_media.decode([row])
 
+    def test_file_retry_recovers_original_bytes_and_one_admission(self):
+        import base64
+        raw = b"ID3" + bytes(range(127))
+        attachment = {"filename": "sample.mp3", "mime": "audio/mpeg",
+                      "base64": base64.b64encode(raw).decode()}
+        first = self.start(attachments=[attachment])
+        path = Path(first.media[0]["path"])
+        with patch.object(engine, "connect", self.connect), patch.object(engine, "_rpc", self.rpc):
+            with self.assertRaises(ConnectionError):
+                asyncio.run(engine._drive_connection(first))
+            with self.assertRaises(engine.TurnError):
+                self.start(attachments=[dict(attachment, mime="application/octet-stream")])
+            engine.TURNS.clear()
+            restored = self.start(attachments=[attachment])
+            self.assertEqual(Path(restored.media[0]["path"]).read_bytes(), raw)
+            asyncio.run(engine._drive(restored))
+            self.assertEqual(self.attempts[0], self.attempts[1])
+            self.assertEqual(len(self.native), 1)
+            self.assertFalse(path.exists())
+            self.assertEqual(restored._terminal["event"], "run.completed")
+
     def test_video_consent_capability_private_file_and_recovery(self):
         import base64
         import json

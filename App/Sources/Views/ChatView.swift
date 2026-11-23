@@ -30,6 +30,7 @@ struct ChatScreen: View {
     @FocusState private var composerFocused: Bool
     @State private var pickerItem: PhotosPickerItem?
     @State private var showPicker = false
+    @State private var showFilePicker = false
     @State private var showCamera = false
     @State private var preparingMedia = false
     @State private var pickedVideo: URL?
@@ -130,6 +131,9 @@ struct ChatScreen: View {
         }
         .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: .any(of: [.images, .videos]))
         .task(id: pickerItem) { if let pickerItem { await importMedia(pickerItem) } }
+        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
+            importFiles(result)
+        }
         .sheet(isPresented: $showCamera) {
             CameraPhoto { image in
                 showCamera = false
@@ -194,6 +198,20 @@ struct ChatScreen: View {
         }
     }
 
+    private var imagesAvailable: Bool {
+        mediaCapabilities?.images == true || (mediaCapabilities == nil && app.health?.imageAttachments == true)
+    }
+
+    private var filesAvailable: Bool { mediaCapabilities?.files == true }
+
+    private var canAttach: Bool {
+        !chat.isRunning && (imagesAvailable || filesAvailable)
+    }
+
+    private var attachmentLimitReached: Bool {
+        chat.draftAttachments.count >= 4 || chat.draftAttachments.contains { $0.mime == "video/mp4" }
+    }
+
     private var composer: some View {
         VStack(spacing: 6) {
             if let e = chat.error {
@@ -228,28 +246,33 @@ struct ChatScreen: View {
             if !chat.draftAttachments.isEmpty {
                 ScrollView(.horizontal) {
                     HStack {
-                        ForEach(chat.draftAttachments, id: \.filename) { asset in
+                        ForEach(Array(chat.draftAttachments.enumerated()), id: \.offset) { index, asset in
                             AttachmentChip(attachment: asset) {
-                                chat.draftAttachments.removeAll { $0.filename == asset.filename }
+                                if chat.draftAttachments.indices.contains(index) { chat.draftAttachments.remove(at: index) }
                             }
                         }
                     }.padding(.horizontal, 12)
                 }.scrollIndicators(.hidden)
             }
             HStack(alignment: .bottom, spacing: 8) {
-                if (mediaCapabilities?.images == true || (mediaCapabilities == nil && app.health?.imageAttachments == true)) && !chat.isRunning {
+                if canAttach {
                     Menu {
-                        Button { showPicker = true } label: { Label("Photo or video", systemImage: "photo.on.rectangle") }
-                        if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                            Button { openCamera() } label: { Label("Take photo", systemImage: "camera") }
+                        if imagesAvailable {
+                            Button { showPicker = true } label: { Label("Photo or video", systemImage: "photo.on.rectangle") }
+                            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                                Button { openCamera() } label: { Label("Take photo", systemImage: "camera") }
+                            }
+                        }
+                        if filesAvailable {
+                            Button { showFilePicker = true } label: { Label("Choose file", systemImage: "doc") }
                         }
                     } label: {
                         if preparingMedia { ProgressView() }
                         else { Image(systemName: "plus.circle").font(.title2) }
                     }
                     .frame(minWidth: 44, minHeight: 44)
-                    .disabled(chat.draftAttachments.count >= 4 || chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) || preparingMedia)
-                    .accessibilityLabel("Add photo or video")
+                    .disabled(attachmentLimitReached || preparingMedia)
+                    .accessibilityLabel("Add photo, video or file")
                 }
                 TextField("Message \(bot?.name ?? "Hermes")", text: $chat.draft, axis: .vertical)
                     .lineLimit(1...8)
@@ -309,6 +332,62 @@ struct ChatScreen: View {
         } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
     }
 
+    /// Files keeps the original bytes and type; only images reuse the photo pipeline. The
+    /// security-scoped URL is read inside the scope, and base64 happens off the main actor.
+    private func importFiles(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure(let error):
+            if (error as NSError).domain == NSCocoaErrorDomain && (error as NSError).code == NSUserCancelledError { return }
+            chat.error = error.localizedDescription
+            return
+        case .success(let urls):
+            guard !urls.isEmpty else { return }
+            let slots = max(0, 4 - chat.draftAttachments.count)
+            guard urls.count <= slots else { chat.error = "Choose up to \(slots) more attachments for this message."; return }
+            let account = app.inboxAccount
+            let cap = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
+            preparingMedia = true
+            Task {
+                defer { preparingMedia = false }
+                let original = chat.draftAttachments
+                var added: [SendAttachment] = []
+                var left = cap - original.reduce(0) { $0 + $1.byteCount }
+                for url in urls {
+                    if Task.isCancelled { return }
+                    let accessed = url.startAccessingSecurityScopedResource()
+                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                    do {
+                        let type = try url.resourceValues(forKeys: [.contentTypeKey]).contentType ?? UTType(filenameExtension: url.pathExtension)
+                        if type?.conforms(to: .movie) == true {
+                            guard urls.count == 1 else { chat.error = "Choose a video on its own to review the clip or frames."; return }
+                            let snapshot = try await Task.detached { try MediaStaging.stage(url) }.value
+                            guard account == app.inboxAccount else { try? FileManager.default.removeItem(at: snapshot); return }
+                            discardVideo()
+                            pickedVideo = snapshot
+                            chooseVideo = true
+                            return
+                        }
+                        let asset = try await Task.detached(priority: .userInitiated) {
+                            try FileImport.attachment(from: url, maxBytes: cap)
+                        }.value
+                        guard account == app.inboxAccount else { return }
+                        guard chat.draftAttachments.count < 4,
+                              !chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) else { return }
+                        guard asset.mime != "image/jpeg" || imagesAvailable else { chat.error = "This bot cannot receive images."; return }
+                        guard asset.byteCount <= left else { throw FileImport.Failure.tooLarge(cap) }
+                        left -= asset.byteCount
+                        added.append(asset)
+                    } catch {
+                        if !Task.isCancelled { chat.error = error.localizedDescription }
+                        return
+                    }
+                }
+                guard chat.draftAttachments == original, account == app.inboxAccount else { return }
+                chat.draftAttachments.append(contentsOf: added)
+            }
+        }
+    }
+
     private func discardVideo() {
         if let url = pickedVideo { try? FileManager.default.removeItem(at: url) }
         pickedVideo = nil
@@ -357,6 +436,11 @@ struct ChatScreen: View {
     private func send() {
         let text = chat.combinedDraft
         let attachments = chat.draftAttachments
+        let budget = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
+        guard attachments.reduce(0, { $0 + $1.byteCount }) <= budget else {
+            chat.error = "The attachments exceed this bot’s limit. Remove an attachment and try again."
+            return
+        }
         chat.draft = ""
         chat.pastedTexts = []
         followLatest = true

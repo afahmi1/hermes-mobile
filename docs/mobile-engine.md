@@ -39,6 +39,25 @@ Anderton and Young found that simplified contention models can mispredict the wi
 | [VS Code reconnect protocol](https://github.com/microsoft/vscode/blob/58a9245ffe53ec35991e7d5b08bf2e37f2acedb2/src/vs/base/parts/ipc/common/ipc.net.ts#L974-L1032) and [T3 Code shell stream](https://github.com/pingdotgg/t3code/blob/a09738fb435120d08707db0142ca55b3b7b5c7ec/apps/server/src/orchestration-v2/ShellStream.ts#L41-L105) | Advance the receive cursor through contiguous events. Reconnect on a gap and discard replayed duplicates. A durable restart-safe cursor and an explicit snapshot response on replay expiry are further protocol work. |
 | [Hermes gateway internals](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/gateway-internals.md) | Hermes owns admission, steering and execution. Return the actual decision to the phone. This keeps the companion interoperable with turns opened from other clients. |
 
+## Session search uses Hermes's trigram index
+
+The bridge used a `LIKE '%term%'` subquery over every recent user message, then kept the 400 newest matches per profile. On the 967 MB default `state.db` (109k messages, 7.4k user messages) that scan cost 65 ms at p50 across the five profiles on this machine, and grew with history. Hermes already maintains `messages_fts_trigram` for the same content, so search now uses that index when it is settled and the token is at least three characters. Short tokens, a missing index, or a rebuild in progress keep the old scan, and every indexed result is checked against the scan.
+
+`python3 Benchmarks/search_path.py` runs both paths on the installed databases, asserts identical `(profile, session)` results, and reports 12 samples per term. On November 23, 2026:
+
+| Term | Legacy p50 | Indexed p50 | Speedup |
+| --- | ---: | ---: | ---: |
+| kubernetes | 65.6 ms | 5.7 ms | 11.4× |
+| video | 62.9 ms | 7.8 ms | 8.0× |
+| hermes | 18.6 ms | 6.9 ms | 2.7× |
+| the | 9.5 ms | 6.3 ms | 1.5× |
+| refactor | 72.3 ms | 7.6 ms | 9.5× |
+| permission | 64.2 ms | 9.1 ms | 7.1× |
+| grafana | 81.3 ms | 5.8 ms | 13.9× |
+| sqlite | 132.0 ms | 6.8 ms | 19.4× |
+
+Median across terms: **64.9 ms → 6.9 ms (9.4×)**. The common-word case is the floor: its index scan returns many candidates and saves the least. Results were identical for every term.
+
 ## Measured on a Windows gateway over Tailscale HTTPS
 
 These are individual observations on one deployment. Times include the Mac-to-bridge network trip. They exclude iOS drawing time.
@@ -187,3 +206,11 @@ Long pastes (≥2,000 characters in one insertion) leave the composer and ride a
 Attachment chips now badge the source format in the corner of the preview — GIF (first frame), PNG, WebP or HEIC — because the sent bytes are always converted JPEG. The attachment budget per send is configurable on the bridge with `HERMES_MOBILE_MEDIA_MAX_BYTES` (clamped to 256 KiB–8 MiB so an encoded attachment can never exceed the 12 MiB request body cap; the default stays 4 MiB), which the phone picks up automatically from media capabilities.
 
 Sign-in already rejects plain `http://` origins except loopback, so no cleartext bearer can be saved from the sign-in screen; this was verified rather than changed.
+
+## Build 17
+
+Tap the avatar beside any chat to start a selection. The bridge reports each archive or pin result, including partial failures. Selection uses bot and session together. Archived history pages across profiles. A Files selection can contain same-named documents, and the byte budget applies to the whole message. An MP3 is delivered as an original file that the configured Hermes tools can read. A single video opens the clip-or-frames choice.
+
+Stream signatures are verified at entry. Each one-second monitor pass reads the current device grants together, applies each token’s own expiry and disconnects on a registry error. In-process revocation still closes affected sockets immediately. Gateway health scheduling is unchanged. Run `python3 Benchmarks/stream_grants.py` to compare per-stream reads with a shared validation pass.
+
+For a mobile transcript, the bridge applies the installed Hermes display projection before serializing. Hermes still resolves the canonical session and loads history with its own lineage, pagination, hidden diagnostic and compaction semantics. Unsupported reads use the existing gateway. The benchmark compares identical mobile bytes from both implementations. In the installed Hermes Python environment run `python Benchmarks/timeline_read.py` and `python Benchmarks/search_path.py --json`. [Full-session benchmark graphic](benchmarks.html)

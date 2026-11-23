@@ -15,6 +15,10 @@ struct ChatListView: View {
     @State private var results: [SessionSummary]?
     @State private var path = NavigationPath()
     @State private var showNew = false
+    @State private var selecting = false
+    @State private var selection = Set<String>()
+    @State private var batchBusy = false
+    @State private var showSourceGuide = false
     private let fixedProfile: String?
     @State private var selectedBot: String?
     private var profile: String? { fixedProfile ?? selectedBot }
@@ -22,31 +26,75 @@ struct ChatListView: View {
 
 
     enum Filter: String, CaseIterable, Identifiable {
-        case chats = "Chats", desktop = "Desktop & mobile", telegram = "Telegram", all = "Everything", archived = "Archived"
+        case chats = "Chats", desktop = "Desktop & phone", telegram = "Telegram", all = "Everything", archived = "Archived"
         var source: String? {
             switch self {
             case .desktop: "desktop"
             case .telegram: "telegram"
+            case .archived: "archived"
             default: nil
             }
         }
         var id: String { rawValue }
+        var explanation: String {
+            switch self {
+            case .chats: "Every chat you can continue: desktop, phone, Telegram, iMessage and terminal. Scheduled and subagent runs stay out."
+            case .desktop: "Local and GUI conversations saved by Hermes. Desktop and mobile share a source, so Hermes cannot always tell which device started a chat."
+            case .telegram: "Chats Hermes saved from Telegram."
+            case .all: "Every unarchived source, including scheduled, one-shot, subagent and tool runs."
+            case .archived: "Chats you archived. Swipe left to unarchive, or select several."
+            }
+        }
     }
 
     var body: some View {
         NavigationStack(path: $path) {
             content
-                .navigationTitle(profile.map { app.botName($0) } ?? "Chats")
+                .navigationTitle(selecting ? "\(selection.count) selected" : (profile.map { app.botName($0) } ?? "Chats"))
                 .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
                 .searchable(text: $query, prompt: "Search titles and messages")
                 .task(id: [query] + inboxScope) { await runSearch() }
                 .toolbar {
-                    ToolbarItem(placement: .topBarLeading) { ConnectionBadge() }
+                    ToolbarItem(placement: .topBarLeading) {
+                        if selecting {
+                            Button("Cancel") { endSelection() }.disabled(batchBusy)
+                        } else {
+                            ConnectionBadge()
+                        }
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button { startNew() } label: { Image(systemName: "square.and.pencil") }
-                            .accessibilityLabel("New chat")
+                        if selecting {
+                            HStack(spacing: 12) {
+                                if batchBusy { ProgressView().controlSize(.small) }
+                                Menu {
+                                    if filter == .archived {
+                                        Button { Task { await batch(["archived": false]) } } label: { Label("Unarchive", systemImage: "archivebox") }
+                                    } else {
+                                        Button { Task { await batch(["archived": true]) } } label: { Label("Archive", systemImage: "archivebox") }
+                                    }
+                                    Button { Task { await batch(["pinned": true]) } } label: { Label("Pin", systemImage: "pin") }
+                                    Button { Task { await batch(["pinned": false]) } } label: { Label("Unpin", systemImage: "pin.slash") }
+                                    Divider()
+                                    Button { selection = Set(visibleSessions.map(\.key)) } label: { Label("Select loaded chats", systemImage: "checkmark.circle") }
+                                } label: {
+                                    Image(systemName: "ellipsis.circle")
+                                }
+                                .disabled(batchBusy)
+                                .accessibilityLabel("Actions for selected chats")
+                            }
+                        } else {
+                            HStack(spacing: 14) {
+                                Button("Select") { beginSelection() }
+                                    .accessibilityLabel("Select chats")
+                                    .disabled(visibleSessions.isEmpty)
+                                Button { startNew() } label: { Image(systemName: "square.and.pencil") }
+                                    .accessibilityLabel("New chat")
+                            }
+                        }
                     }
                 }
+                .onChange(of: inboxScope) { _, _ in endSelection() }
+                .onChange(of: query) { _, _ in endSelection() }
                 .sheet(isPresented: $showNew) {
                     NewChatSheet { bot in
                         showNew = false
@@ -89,11 +137,20 @@ struct ChatListView: View {
     @ViewBuilder private var content: some View {
         List {
             Section {
-                HStack {
+                HStack(spacing: 10) {
+                    if let fixedProfile {
+                        Button { beginSelection() } label: {
+                            BotAvatar(id: fixedProfile, name: app.botName(fixedProfile), size: 30)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(selecting)
+                        .accessibilityLabel("Select chats")
+                    }
                     Picker("Source", selection: $filter) {
                         ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
                     }
                     .pickerStyle(.menu)
+                    .disabled(selecting)
                     if fixedProfile == nil {
                         Divider()
                         Picker("Bot", selection: $selectedBot) {
@@ -103,12 +160,20 @@ struct ChatListView: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        .disabled(selecting)
                     }
+                    Spacer(minLength: 0)
+                    Button { showSourceGuide = true } label: { Image(systemName: "info.circle") }
+                        .accessibilityLabel("What each source means")
+                        .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 }
                 .labelsHidden()
             } footer: {
-                if let host = API.shared.baseURL?.host {
-                    Label(host, systemImage: "server.rack").lineLimit(1)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(filter.explanation).font(.caption).foregroundStyle(.secondary)
+                    if let host = API.shared.baseURL?.host {
+                        Label(host, systemImage: "server.rack").lineLimit(1)
+                    }
                 }
             }
             if let error {
@@ -137,24 +202,98 @@ struct ChatListView: View {
         .overlay { if loading && sessions.isEmpty { ProgressView() } }
     }
 
-    private func row(_ s: SessionSummary) -> some View {
-        NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
-            SessionRow(session: s, botName: app.botName(s.profile))
+    @ViewBuilder private func row(_ s: SessionSummary) -> some View {
+        if selecting {
+            Button { toggle(s) } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: selection.contains(s.key) ? "checkmark.circle.fill" : "circle")
+                        .font(.title3)
+                        .foregroundStyle(selection.contains(s.key) ? Color.accentColor : Color.secondary)
+                    SessionRow(session: s, botName: app.botName(s.profile))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).disabled(batchBusy)
+            .accessibilityAddTraits(selection.contains(s.key) ? .isSelected : [])
+        } else {
+            HStack(spacing: 10) {
+                Button { beginSelection(); toggle(s) } label: {
+                    BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Select " + s.displayTitle)
+                NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
+                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false)
+                }
+            }
+            .swipeActions(edge: .trailing) {
+                Button {
+                    Task { await setFlag(s, "archived", !(s.archived ?? false)) }
+                } label: {
+                    Label(s.archived == true ? "Unarchive" : "Archive", systemImage: "archivebox")
+                }.tint(.indigo)
+            }
+            .swipeActions(edge: .leading) {
+                Button {
+                    Task { await setFlag(s, "pinned", !(s.pinned ?? false)) }
+                } label: {
+                    Label(s.pinned == true ? "Unpin" : "Pin", systemImage: s.pinned == true ? "pin.slash" : "pin")
+                }.tint(.orange)
+            }
         }
-        .swipeActions(edge: .trailing) {
-            Button {
-                Task { await setFlag(s, "archived", !(s.archived ?? false)) }
-            } label: {
-                Label(s.archived == true ? "Unarchive" : "Archive", systemImage: "archivebox")
-            }.tint(.indigo)
+    }
+
+    private var visibleSessions: [SessionSummary] { results ?? sessions }
+
+    private func beginSelection() {
+        selecting = true
+        selection.removeAll()
+    }
+
+    private func endSelection() {
+        selecting = false
+        selection.removeAll()
+    }
+
+    private func toggle(_ s: SessionSummary) {
+        if selection.contains(s.key) { selection.remove(s.key) } else { selection.insert(s.key) }
+    }
+
+    /// One request per profile; the bridge fans the gateway's per-session PATCH out in parallel.
+    private func batch(_ fields: [String: Bool]) async {
+        guard !batchBusy, !selection.isEmpty else { return }
+        let targets = visibleSessions.filter { selection.contains($0.key) }
+        guard !targets.isEmpty else { endSelection(); return }
+        batchBusy = true
+        defer { batchBusy = false }
+        let api = API.shared
+        let gateway = app.gatewaySession
+        let scope = inboxScope
+        var failures = Set<String>()
+        for (pid, rows) in Dictionary(grouping: targets, by: \.profile) {
+            for start in stride(from: 0, to: rows.count, by: 200) {
+                guard gateway == app.gatewaySession else { return }
+                let chunk = rows[start..<min(start + 200, rows.count)]
+                do {
+                    let response = try await api.updateSessions(profile: pid, ids: chunk.map(\.id), fields: fields)
+                    let updated = Set(response.updated)
+                    failures.formUnion(chunk.filter { !updated.contains($0.id) }.map(\.key))
+                } catch APIError.http(404, _) {
+                    for row in chunk {
+                        guard gateway == app.gatewaySession else { return }
+                        do { try await api.updateSession(profile: pid, session: row.id, fields: fields) }
+                        catch { failures.insert(row.key) }
+                    }
+                } catch { failures.formUnion(chunk.map(\.key)) }
+            }
         }
-        .swipeActions(edge: .leading) {
-            Button {
-                Task { await setFlag(s, "pinned", !(s.pinned ?? false)) }
-            } label: {
-                Label(s.pinned == true ? "Unpin" : "Pin", systemImage: s.pinned == true ? "pin.slash" : "pin")
-            }.tint(.orange)
-        }
+        guard gateway == app.gatewaySession, inboxScope == scope else { return }
+        if failures.isEmpty { endSelection() } else { selection = failures }
+        await reload()
+        if !query.isEmpty { await runSearch() }
+        if failures.isEmpty { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+        else { error = "Updated \(targets.count - failures.count) of \(targets.count) chats. The others are selected for retry." }
     }
 
     private var grouped: [(String, [SessionSummary])] {
@@ -185,23 +324,16 @@ struct ChatListView: View {
         loading = true
         defer { if generation == request { loading = false } }
         do {
-            if filter == .archived {
-                let archived = try await API.shared.search("", archived: true, profile: profile)
-                guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
-                sessions = archived
+            let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, source: filter.source)
+            guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
+            if let warning = page.partialWarning {
+                sessions = dedupe(page.data + sessions)
                 cursor = nil
-            } else {
-                let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, source: filter.source)
-                guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
-                if let warning = page.partialWarning {
-                    sessions = dedupe(page.data + sessions)
-                    cursor = nil
-                    error = warning
-                    return
-                }
-                sessions = dedupe(page.data)
-                cursor = page.next
+                error = warning
+                return
             }
+            sessions = dedupe(page.data)
+            cursor = page.next
             error = nil
             rememberPage(key)
         } catch {
@@ -296,7 +428,7 @@ struct ChatListView: View {
         try? await Task.sleep(for: .milliseconds(300))
         guard !Task.isCancelled else { return }
         do {
-            let found = try await API.shared.search(q, archived: filter == .archived, profile: profile, source: filter.source)
+            let found = try await API.shared.search(q, archived: filter == .archived, profile: profile, source: filter == .archived ? nil : filter.source, scope: filter == .chats ? "chats" : "all")
             guard !Task.isCancelled else { return }
             results = profile.map { p in found.filter { $0.profile == p } } ?? found
             error = nil
@@ -312,6 +444,7 @@ struct ChatListView: View {
             try await API.shared.updateSession(profile: s.profile, session: s.id, fields: [flag: value])
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             await reload()
+            if !query.isEmpty { await runSearch() }
         } catch {
             self.error = error.localizedDescription
         }
@@ -325,10 +458,11 @@ struct ChatListView: View {
 struct SessionRow: View {
     let session: SessionSummary
     let botName: String
+    var showAvatar = true
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            BotAvatar(id: session.profile, name: botName, size: 38)
+            if showAvatar { BotAvatar(id: session.profile, name: botName, size: 38) }
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(session.displayTitle).font(.body.weight(.semibold)).lineLimit(1)
@@ -373,5 +507,65 @@ struct NewChatSheet: View {
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+/// Plain-language guide to the inbox's filters and source labels. The list is intentionally
+/// read-only: it explains what the app already shows instead of adding another control surface.
+private struct GuideEntry: Identifiable {
+    let id: String
+    let detail: String
+}
+
+private struct SourceGuideView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private let views = [
+        GuideEntry(id: "Chats", detail: "Every chat you can continue, from desktop, this phone, Telegram, iMessage or a terminal. Scheduled, one-shot, subagent and tool runs are hidden."),
+        GuideEntry(id: "Desktop & phone", detail: "Local and GUI conversations saved by Hermes. Desktop and mobile share a source, so Hermes cannot always tell which device started a chat."),
+        GuideEntry(id: "Telegram", detail: "Chats Hermes saved from Telegram."),
+        GuideEntry(id: "Everything", detail: "Every unarchived source, including scheduled jobs, one-shot prompts, subagent work and tool runs."),
+        GuideEntry(id: "Archived", detail: "Chats you put away. Swipe left to unarchive, or select several and use the actions menu."),
+    ]
+
+    private let sources = [
+        GuideEntry(id: "Local", detail: "Saved as a local or desktop conversation by this gateway."),
+        GuideEntry(id: "Desktop or phone", detail: "The shared GUI session source used by the desktop and this iPhone."),
+        GuideEntry(id: "Phone / API", detail: "Created through the bridge's API on this phone."),
+        GuideEntry(id: "Telegram, iMessage", detail: "Imported from that messaging platform."),
+        GuideEntry(id: "Terminal", detail: "Started in the Hermes CLI or TUI."),
+        GuideEntry(id: "Scheduled, One-shot, Subagent, Tool run", detail: "Automation. Visible under Everything, not under Chats."),
+    ]
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Views") {
+                    ForEach(views) { entry in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(entry.id).font(.subheadline.weight(.semibold))
+                            Text(entry.detail).font(.footnote).foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                Section("Where a chat came from") {
+                    ForEach(sources) { entry in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(entry.id).font(.subheadline.weight(.semibold))
+                            Text(entry.detail).font(.footnote).foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                Section("Faster actions") {
+                    Text("Swipe left on a chat to archive it. Swipe right to pin it. Tap Select, or tap the avatar beside any chat, to choose several at once.")
+                        .font(.footnote)
+                }
+            }
+            .navigationTitle("Chats, explained")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
     }
 }

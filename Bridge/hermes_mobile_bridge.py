@@ -25,7 +25,11 @@ from contextlib import closing
 from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+
+# The bridge embeds Hermes libraries. A library import must never relaunch the
+# HTTP service under a different interpreter or update the host installation.
+os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
 HOME = Path.home()
 HERMES = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
@@ -400,7 +404,7 @@ def devices():
     return _devices(STATE_DIR)
 
 
-STREAMS = bridge_devices.Streams()
+STREAMS = bridge_devices.Streams(lambda ids: devices().permitted(ids))
 
 
 def make_token(device, owner=False, method="local", pair_code=None):
@@ -626,7 +630,7 @@ def _source_ids(source):
     return (source,) if source else ()
 
 
-def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=False):
+def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=False, archived=False):
     """One fetch round across profiles. Returns (rows, pins, new_offsets, done, errors, more_left)."""
     exhausted = set(offsets.get("_done", []))
     live = [p for p in pids if p not in exhausted]
@@ -642,17 +646,19 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
                 return pid, native_inbox_window(pid, off, limit, exclude, first_page), None
             except Exception as error:
                 return pid, None, type(error).__name__
-        if sources:
+        if sources or archived:
             try:
                 con = _ro(pid)
                 if con is None:
                     return pid, ([], [], False), None
                 try:
-                    placeholders = ",".join("?" for _ in sources)
-                    rows = con.execute("SELECT " + SESSION_COLS + f" FROM sessions WHERE source IN ({placeholders}) "
-                                       "AND coalesce(hidden,0)=0 AND coalesce(archived,0)=0 "
-                                       "ORDER BY last_active DESC, id LIMIT ? OFFSET ?", (*sources, batch + 1, off)).fetchall()
-                    return pid, ([dict(row, archived=False) for row in rows[:batch]], [], len(rows) > batch), None
+                    where = ["coalesce(hidden,0)=0", "coalesce(archived,0)=?"]
+                    if sources:
+                        where.append("source IN (" + ",".join("?" for _ in sources) + ")")
+                    rows = con.execute("SELECT " + _session_cols(con) + " FROM sessions WHERE "
+                                       + " AND ".join(where) + " ORDER BY last_active DESC, id LIMIT ? OFFSET ?",
+                                       (int(archived), *sources, batch + 1, off)).fetchall()
+                    return pid, ([_session_flags(row) for row in rows[:batch]], [], len(rows) > batch), None
                 finally:
                     con.close()
             except sqlite3.Error as error:
@@ -683,7 +689,7 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
     # A profile that still has rows may hold unseen rows as new as its last fetched one: nothing
     # older than that may be emitted yet, or those rows would land on a later page out of order.
     safe = max((_ts(w[-1]) for w, _, more in fetched.values() if more and w), default=None)
-    candidates = sorted((r for w, _, _ in fetched.values() for r in w if keep(r) and not r.get("pinned")),
+    candidates = sorted((r for w, _, _ in fetched.values() for r in w if keep(r) and (sources or archived or not r.get("pinned"))),
                         key=_ts, reverse=True)
     eligible = [r for r in candidates if safe is None or _ts(r) >= safe]
     if len(eligible) >= limit:
@@ -702,7 +708,7 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
         new_off[pid] = off + used
         if not more and used >= len(window):
             done.add(pid)
-    pins = [r for w, bf, _ in fetched.values() for r in w + bf if r.get("pinned") and keep(r)] if first_page else []
+    pins = [r for w, bf, _ in fetched.values() for r in w + bf if r.get("pinned") and keep(r)] if first_page and not sources and not archived else []
     new_off["_done"] = sorted(done)
     # A profile that errored keeps its offset and is retried by the next cursor.
     more_left = any(p not in done for p in pids)
@@ -721,8 +727,9 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
         offsets = {}
     first_page = not offsets
     pids = [p for p in profile_ids() if (not only or p in only) and key_for(p)]
-    sources = _source_ids("telegram" if telegram else source)
-    native = compact and not sources and NATIVE_INBOX and (first_page or offsets.get("_native") == 1)
+    archived = source == "archived"
+    sources = () if archived else _source_ids("telegram" if telegram else source)
+    native = compact and not archived and not sources and NATIVE_INBOX and (first_page or offsets.get("_native") == 1)
     if native:
         served = served_profiles()
         if first_page:
@@ -730,7 +737,7 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
 
     page, pins, errors, more_left = [], [], {}, True
     for _ in range(6):
-        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page, sources, native)
+        rows, round_pins, offsets, _done, errs, more_left = _page_round(offsets, pids, limit, exclude, first_page, sources, native, archived)
         page += rows
         pins += round_pins
         errors.update(errs)
@@ -752,10 +759,97 @@ SESSION_COLS = ("id, source, model, title, started_at, ended_at, message_count, 
                 "coalesce(last_activity_at, started_at) AS last_active, parent_session_id")
 
 
-def search_sessions(q, archived=False, limit=40, profile=None, source=None):
+def _session_cols(con):
+    return SESSION_COLS + (", pinned" if any(r[1] == "pinned" for r in con.execute("PRAGMA table_info(sessions)")) else "")
+
+
+def _session_flags(row):
+    data = dict(row)
+    data["archived"] = bool(data["archived"])
+    if "pinned" in data:
+        data["pinned"] = bool(data["pinned"])
+    return data
+
+
+_FTS_REBUILD_MARKERS = ("fts_rebuild_high_water", "fts_rebuild_progress",
+                         "fts_tool_full_content_high_water")
+
+
+def _fts_phrase(q):
+    """A quoted FTS5 trigram literal, or None when the token is too short for trigram search."""
+    if len(q) < 3:
+        return None
+    return '"' + q.replace('"', '""') + '"'
+
+
+def _fts_ready(con):
+    """The profile has a settled trigram index. A rebuild in progress is incomplete by design."""
+    try:
+        meta = dict(con.execute("SELECT key, value FROM state_meta WHERE key IN (?,?,?,?)",
+                                ("fts_storage_version", *_FTS_REBUILD_MARKERS)))
+    except sqlite3.Error:
+        return False
+    return (bool(meta.get("fts_storage_version"))
+            and not any(marker in meta for marker in _FTS_REBUILD_MARKERS))
+
+
+def _search_profile(con, pid, like, phrase, archived, source, limit, prefer_fts, scope=None):
+    """One profile's title + recent-user-message matches, newest first.
+
+    Hermes maintains a trigram FTS index over messages. Use it for a >=3-character token:
+    the old LIKE subquery scanned every recent user message (78-100 ms on a 967 MB state.db
+    here), while the index returns the same 400 most recent hits in about 1 ms. A short token,
+    a missing/incomplete index, or an FTS error falls back to the original scan.
+    """
+    where = ["coalesce(hidden,0)=0", "archived=%d" % (1 if archived else 0),
+             "1=1"]
+    if scope == "chats":
+        where.append("coalesce(source,'') NOT IN ('cron','oneshot','subagent','tool')")
+    elif scope != "all":
+        where.append("source NOT IN ('subagent','tool')")
+    args = []
+    if source:
+        sources = _source_ids(source)
+        where.append("source IN (" + ",".join("?" for _ in sources) + ")")
+        args.extend(sources)
+    ids = None
+    if like is not None and phrase and prefer_fts and _fts_ready(con):
+        try:
+            ids = [r[0] for r in con.execute(
+                "SELECT m.session_id FROM messages_fts_trigram f JOIN messages m ON m.id=f.rowid "
+                "WHERE f.content MATCH ? AND m.role='user' AND m.content LIKE ? "
+                "ORDER BY f.rowid DESC LIMIT 400", (phrase, like))]
+        except sqlite3.Error:
+            ids = None
+    if like is None:
+        pass
+    elif ids:
+        where.append("(title LIKE ? OR id IN (" + ",".join("?" for _ in ids) + "))")
+        args.append(like)
+        args.extend(ids)
+    elif ids == []:
+        where.append("title LIKE ?")
+        args.append(like)
+    else:
+        where.append("(title LIKE ? OR id IN (SELECT session_id FROM messages WHERE role='user' "
+                     "AND content LIKE ? ORDER BY id DESC LIMIT 400))")
+        args.extend([like, like])
+    sql = "SELECT %s FROM sessions WHERE %s ORDER BY last_active DESC LIMIT %d" % (
+        _session_cols(con), " AND ".join(where), limit)
+    out = []
+    for r in con.execute(sql, args):
+        d = _session_flags(r)
+        d["profile"] = pid
+        out.append(d)
+    return out
+
+
+def search_sessions(q, archived=False, limit=40, profile=None, source=None, prefer_fts=True, scope=None):
     """Title/preview search (and the archived list) straight from each state.db, read-only."""
     out = []
-    like = "%" + q.replace("%", "").replace("_", "") + "%" if q else None
+    cleaned = q.replace("%", "").replace("_", "") if q else ""
+    like = "%" + cleaned + "%" if q else None
+    phrase = _fts_phrase(cleaned) if cleaned else None
     for pid in profile_ids():
         if profile is not None and pid != profile:
             continue
@@ -766,30 +860,40 @@ def search_sessions(q, archived=False, limit=40, profile=None, source=None):
         if con is None:
             continue
         try:
-            where = ["coalesce(hidden,0)=0", "archived=%d" % (1 if archived else 0),
-                     "source NOT IN ('subagent','tool')"]
-            args = []
-            if source:
-                sources = _source_ids(source)
-                where.append("source IN (" + ",".join("?" for _ in sources) + ")")
-                args.extend(sources)
-            if like:
-                where.append("(title LIKE ? OR id IN (SELECT session_id FROM messages WHERE role='user' AND content LIKE ? "
-                             "ORDER BY id DESC LIMIT 400))")
-                args += [like, like]
-            sql = "SELECT %s FROM sessions WHERE %s ORDER BY last_active DESC LIMIT %d" % (
-                SESSION_COLS, " AND ".join(where), limit)
-            for r in con.execute(sql, args):
-                d = dict(r)
-                d["profile"] = pid
-                d["archived"] = bool(d["archived"])
-                out.append(d)
+            out.extend(_search_profile(con, pid, like, phrase, archived, source, limit, prefer_fts, scope))
         except sqlite3.Error as e:
             log("search %s: %s" % (pid, e))
         finally:
             con.close()
     out.sort(key=lambda s: s.get("last_active") or 0, reverse=True)
     return out[:limit]
+
+def set_session_flags(pid, ids, fields):
+    """Apply one flag patch to many sessions of one profile, bounded and parallel.
+
+    The gateway exposes a per-session PATCH. A phone selecting a page should not pay one
+    round trip per row, so fan out here and return per-session outcomes instead of
+    hiding a partial failure. The caller has already validated ids and fields.
+    """
+    def patch(sid):
+        try:
+            status, data = gw("PATCH", pid, "/api/sessions/" + sid, fields)
+        except (OSError, http.client.HTTPException) as exc:
+            return sid, type(exc).__name__
+        if status == 200:
+            return sid, None
+        message = data.get("error") if isinstance(data, dict) else None
+        return sid, str(message or ("HTTP %d" % status))[:160]
+
+    updated, errors = [], {}
+    for sid, error in POOL.map(patch, ids):
+        if error:
+            errors[sid] = error
+        else:
+            updated.append(sid)
+    if updated:
+        invalidate_pages()
+    return updated, errors
 
 
 def session_runtime(pid, sid):
@@ -921,6 +1025,8 @@ def health():
         history = list(reversed(_health_history))
     return {"ok": ok, "gateway_state": api_state, "phase": phase, "reason": reason,
             "image_attachments": image_attachments_supported(),
+            "file_attachments": bool(turns),
+            "max_file_bytes": turns.bridge_media.MAX_BYTES if turns else 0,
             "recent": history, "version": info.get("version"), "platforms": list((info.get("platforms") or {}).keys()),
             "inbox_reader": "native" if NATIVE_INBOX else "gateway", "inbox_fallback": INBOX_FALLBACK}
 
@@ -1201,24 +1307,47 @@ def admissions_dir():
     return Path(override) if override else STATE_DIR / "admissions"
 
 
+def project_timeline_message(message):
+    """One mobile timeline row: visible text and tool names, never tool output or reasoning."""
+    row = {k: message[k] for k in ("id", "role", "timestamp") if k in message}
+    if message.get("role") in ("user", "assistant"):
+        body = message.get("content")
+        if isinstance(body, list):
+            body = "\n".join(p["text"] for p in body if isinstance(p, dict) and isinstance(p.get("text"), str))
+        if isinstance(body, str):
+            row["content"] = body
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            row["tool_calls"] = [{"function": {"name": f["name"]}} for c in calls if isinstance(c, dict)
+                                 and isinstance(f := c.get("function"), dict) and isinstance(f.get("name"), str)]
+    return row
+
+
+def timeline_bytes(messages):
+    return json.dumps({"data": [project_timeline_message(m) for m in messages]},
+                      ensure_ascii=False, separators=(",", ":")).encode()
+
+
 def timeline_page(raw):
     """Return exactly the rows consumed by the mobile timeline, retaining pagination positions."""
-    page = json.loads(raw)
-    rows = []
-    for message in page["data"]:
-        row = {k: message[k] for k in ("id", "role", "timestamp") if k in message}
-        if message.get("role") in ("user", "assistant"):
-            body = message.get("content")
-            if isinstance(body, list):
-                body = "\n".join(p["text"] for p in body if isinstance(p, dict) and isinstance(p.get("text"), str))
-            if isinstance(body, str):
-                row["content"] = body
-            calls = message.get("tool_calls")
-            if isinstance(calls, list):
-                row["tool_calls"] = [{"function": {"name": f["name"]}} for c in calls if isinstance(c, dict)
-                                     and isinstance(f := c.get("function"), dict) and isinstance(f.get("name"), str)]
-        rows.append(row)
-    return json.dumps({"data": rows}, ensure_ascii=False, separators=(",", ":")).encode()
+    return timeline_bytes(json.loads(raw)["data"])
+
+
+def native_timeline_page(pid, session_id, limit, offset, latest):
+    """Project before serializing. Hermes owns lineage, display filtering and pagination."""
+    if not NATIVE_INBOX or not session_id or any(c in session_id for c in "/\\\x00") or len(session_id) > 200:
+        return None
+    from gateway.platforms.api_server import APIServerAdapter
+    path = profile_home(pid) / "state.db"
+    if not path.is_file():
+        return None
+    with closing(SessionDB(path, read_only=True)) as db:
+        if not db.get_session(session_id):
+            return None
+        active = db.resolve_resume_session_id(session_id)
+        rows = db.get_messages(active, limit=limit, offset=offset, latest=latest,
+                               include_compacted=False, include_ancestors=True)
+        return timeline_bytes(APIServerAdapter._message_response(row) for row in rows)
 
 
 # ---------- HTTP ----------
@@ -1345,6 +1474,8 @@ class H(BaseHTTPRequestHandler):
                 features.append("replay_checkpoint")
             if image_attachments_supported():
                 features.append("image_attachments_v1")
+            if turns:
+                features.append("file_attachments_v1")
             return self.send(200, {"protocol": 2, "features": features,
                                    "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
         if path == "/m/devices" or path.startswith("/m/devices/"):
@@ -1370,13 +1501,15 @@ class H(BaseHTTPRequestHandler):
                     return self.send(503, {"error": "The Hermes status dashboard on your Mac (%s) isn't answering: %s."
                                                     % (STATUS_URL, why)})
                 return self.send(200, d)
-            if path in ("/m/sessions", "/m/telegram", "/m/desktop"):
+            if path == "/m/sessions/flags" and self.command == "POST":
+                return self.session_flags()
+            if path in ("/m/sessions", "/m/telegram", "/m/desktop", "/m/archived"):
                 limit = max(1, min(int(q.get("limit", "40") or 40), 100))
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
-                return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact", "desktop" if path == "/m/desktop" else None))
+                return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact", {"/m/desktop": "desktop", "/m/archived": "archived"}.get(path)))
             if path == "/m/search":
-                return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"))})
+                return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"), scope=q.get("scope"))})
             m = re.match(r"^/m/runtime/([^/]+)/([^/]+)$", path)
             if m:
                 d = session_runtime(m.group(1), m.group(2)) if (m.group(1) == "default" or PROFILE_RE.match(m.group(1))) else None
@@ -1405,6 +1538,28 @@ class H(BaseHTTPRequestHandler):
         devices().revoke(target)
         STREAMS.revoked(target)
         return self.send(200, {"ok": True})
+
+    def session_flags(self):
+        d = self.json_body()
+        pid, ids, fields = d.get("profile"), d.get("ids"), d.get("fields")
+        if not isinstance(pid, str) or pid not in profile_ids():
+            return self.send(404, {"error": "unknown bot"})
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 200 or any(
+                not isinstance(sid, str) or not _WS_SID.fullmatch(sid) for sid in ids):
+            return self.send(400, {"error": "Choose up to 200 chats."})
+        if (not isinstance(fields, dict) or not fields
+                or set(fields) - {"archived", "pinned"}
+                or any(not isinstance(value, bool) for value in fields.values())):
+            return self.send(400, {"error": "Only archive and pin flags can change."})
+        if not key_for(pid):
+            return self.send(404, {"error": "unknown or unreachable bot"})
+        unique = list(dict.fromkeys(ids))
+        try:
+            updated, errors = set_session_flags(pid, unique, fields)
+        except Exception as e:
+            log("session flags failed: %s: %s" % (type(e).__name__, e))
+            return self.send(502, {"error": "Hermes could not update those chats."})
+        return self.send(200, {"updated": updated, "errors": errors})
 
     def projects_route(self, u):
         if self.command != "GET":
@@ -1814,8 +1969,10 @@ class H(BaseHTTPRequestHandler):
                 if pid not in profile_ids():
                     return self.send(404, {"error": "unknown bot"})
                 return self.send(200, {"images": image_attachments_supported(),
+                                       "files": True,
                                        "video": turns.bridge_media.video_supported(profile_home(pid)),
-                                       "max_video_bytes": turns.bridge_media.MAX_BYTES})
+                                       "max_video_bytes": turns.bridge_media.MAX_BYTES,
+                                       "max_file_bytes": turns.bridge_media.MAX_BYTES})
             m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|runtime))$", path)
             if not m or self.command != "POST":
                 return self.send(404, {"error": "not found"})
@@ -1876,7 +2033,7 @@ class H(BaseHTTPRequestHandler):
     def tail(self, turn, offset):
         """SSE of a turn's buffered events from `offset`; resumable with Last-Event-ID."""
         try:
-            with STREAMS.watch(self.device_claims["did"], self.authed, self.connection) as valid:
+            with STREAMS.watch(self.device_claims, self.authed, self.connection) as valid:
                 if not valid:
                     return self.send(401, {"error": "Sign in again."})
                 self._authorized_tail(turn, offset)
@@ -1952,6 +2109,38 @@ class H(BaseHTTPRequestHandler):
             token = make_token(str(d.get("device", "iphone")), method="password")
         return self.send(200, {"token": token, "ttl": TOKEN_TTL})
 
+    def _native_timeline(self, pid, tail, query):
+        """Serve a timeline page from SQLite when the session has no compression lineage.
+
+        Any other transcript request, including an explicit compacted view, stays on the gateway.
+        """
+        match = re.fullmatch(r"/api/sessions/([^/]+)/messages", tail)
+        if match is None:
+            return None
+        parsed = parse_qs(query, keep_blank_values=True)
+        if set(parsed) - {"include_compacted", "offset", "limit", "order"} or any(len(v) != 1 for v in parsed.values()):
+            return None
+        if (parsed.get("include_compacted") or ["false"])[0].lower() not in ("", "0", "false"):
+            return None
+        order = (parsed.get("order") or [None])[0]
+        if order not in (None, "oldest", "latest"):
+            return None
+        try:
+            offset = int((parsed.get("offset") or ["0"])[0])
+            raw_limit = (parsed.get("limit") or [None])[0]
+            requested = None if raw_limit is None else int(raw_limit)
+        except (TypeError, ValueError):
+            return None
+        if offset < 0 or (requested is not None and requested < 0):
+            return None
+        default_page = requested is None
+        latest = order == "latest" or (order is None and default_page)
+        limit = 500 if default_page else min(requested, 500)
+        try:
+            return native_timeline_page(pid, unquote(match.group(1)), limit, offset, latest)
+        except Exception:
+            return None
+
     def proxy(self, path, query):
         m = re.match(r"^/m/p/([^/]+)(/.*)$", path)
         if not m or not PASS.match(m.group(2)) or ".." in path:
@@ -1973,6 +2162,13 @@ class H(BaseHTTPRequestHandler):
         if data:
             headers["Content-Type"] = self.headers.get("Content-Type", "application/json")
         stream = tail.endswith("/events")
+        if not stream and self.command == "GET" and self.headers.get("X-Hermes-Transcript") == "timeline-v1":
+            compact = H._native_timeline(self, pid, tail, query)
+            if compact is not None:
+                tag = '"' + hashlib.sha256(compact).hexdigest() + '"'
+                if self.headers.get("If-None-Match") == tag:
+                    return self.send(304, validator=tag)
+                return self.send(200, compact, validator=tag)
         try:
             c = http.client.HTTPConnection(*UPSTREAM, timeout=900 if stream else 120)
             c.request(self.command, up, body=data, headers=headers)
@@ -2003,7 +2199,7 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            with STREAMS.watch(self.device_claims["did"], self.authed, self.connection, upstream_socket) as valid:
+            with STREAMS.watch(self.device_claims, self.authed, self.connection, upstream_socket) as valid:
                 if valid:
                     while True:
                         chunk = r.read1(8192)

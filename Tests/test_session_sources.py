@@ -31,6 +31,22 @@ class SessionSourceTests(unittest.TestCase):
                     db.execute("INSERT INTO sessions VALUES(?,?,'test','matching',0,0,1,0,?,null,0)",
                                (str(i), "telegram" if i % 2 == 0 else "gui", i))
 
+    def test_archive_pages_include_automation_and_pinned_rows_without_duplicates(self):
+        for home in (self.home, self.home / "profiles" / "secondary"):
+            with closing(sqlite3.connect(home / "state.db")) as db, db:
+                db.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER DEFAULT 0")
+                db.execute("UPDATE sessions SET archived=1, pinned=1, source='tool'")
+        cursor, rows = None, []
+        for _ in range(30):
+            page = self.bridge.all_sessions(5, cursor, source="archived")
+            rows.extend(page["data"])
+            cursor = page["next"]
+            if cursor is None: break
+        self.assertIsNone(cursor)
+        self.assertEqual(len(rows), 73)
+        self.assertEqual(len({(r["profile"], r["id"]) for r in rows}), 73)
+        self.assertTrue(all(r["pinned"] is True and r["archived"] is True for r in rows))
+
     def test_merge_telegram_pages(self):
         cursor = None
         seen = []

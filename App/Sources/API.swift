@@ -3,11 +3,23 @@ import Security
 
 struct MediaCapabilities: Decodable {
     let images: Bool
+    let files: Bool
     let video: Bool
     let maxVideoBytes: Int
+    let maxFileBytes: Int
     enum CodingKeys: String, CodingKey {
-        case images, video
+        case images, files, video
         case maxVideoBytes = "max_video_bytes"
+        case maxFileBytes = "max_file_bytes"
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        images = try c.decodeIfPresent(Bool.self, forKey: .images) ?? false
+        // Bridges from before file attachments only advertised images/video.
+        files = try c.decodeIfPresent(Bool.self, forKey: .files) ?? false
+        video = try c.decodeIfPresent(Bool.self, forKey: .video) ?? false
+        maxVideoBytes = try c.decodeIfPresent(Int.self, forKey: .maxVideoBytes) ?? 4 * 1024 * 1024
+        maxFileBytes = try c.decodeIfPresent(Int.self, forKey: .maxFileBytes) ?? maxVideoBytes
     }
 }
 
@@ -377,13 +389,30 @@ final class API: @unchecked Sendable {
         if let cursor { q.append("cursor=\(cursor)") }
         if let profile { q.append("profile=\(Self.esc(profile))") }
         if !exclude.isEmpty { q.append("exclude=\(exclude.joined(separator: ","))") }
+        if source == "archived" {
+            do { return try await get("/m/archived?" + q.joined(separator: "&"), as: SessionPage.self) }
+            catch APIError.http(404, _) {
+                let rows = try await search("", archived: true, profile: profile, scope: "all")
+                return SessionPage(errors: nil, reset: nil, data: rows, next: nil)
+            }
+        }
         let path = source == "telegram" ? "/m/telegram?" : source == "desktop" ? "/m/desktop?" : "/m/sessions?"
         return try await get(path + q.joined(separator: "&"), as: SessionPage.self)
     }
-    func search(_ text: String, archived: Bool = false, profile: String? = nil, source: String? = nil) async throws -> [SessionSummary] {
+    /// Archive or pin many sessions in one request. The bridge fans the gateway's
+    /// per-session PATCH out in parallel and returns the rows it could not change.
+    func updateSessions(profile: String, ids: [String], fields: [String: Bool]) async throws -> SessionFlagResult {
+        let d = try await json("/m/sessions/flags", method: "POST",
+                               body: ["profile": profile, "ids": ids, "fields": fields])
+        return SessionFlagResult(updated: d["updated"] as? [String] ?? [],
+                                 errors: d["errors"] as? [String: String] ?? [:])
+    }
+
+    func search(_ text: String, archived: Bool = false, profile: String? = nil, source: String? = nil, scope: String? = nil) async throws -> [SessionSummary] {
         var components = URLComponents()
         components.path = "/m/search"
         var query = [URLQueryItem(name: "q", value: text)]
+        if let scope { query.append(URLQueryItem(name: "scope", value: scope)) }
         if archived { query.append(URLQueryItem(name: "archived", value: "1")) }
         if let profile { query.append(URLQueryItem(name: "profile", value: profile)) }
         if let source { query.append(URLQueryItem(name: "source", value: source)) }
