@@ -28,12 +28,9 @@ enum MediaImportTests {
 
         // Pasted-text collapse: a huge paste is isolated exactly; small edits stay inline.
         let big = String(repeating: "paste ", count: 600)  // 3,600 characters
-        guard let run = PasteSplit.insertion(old: "keep tail", new: "keep " + big + "tail") else {
-            fatalError("a 3,600-char paste was not isolated")
-        }
-        precondition(run == big, "isolated run differs from the pasted text")
-        precondition(PasteSplit.insertion(old: big, new: big + "tail") == nil, "short insertion collapsed")
-        precondition(PasteSplit.insertion(old: "a", new: "ab") == nil, "tiny insertion collapsed")
+        precondition(PasteSplit.collapse(big))
+        precondition(!PasteSplit.collapse(String(repeating: "t", count: 1_999)))
+        precondition(PasteSplit.collapse(String(repeating: "t", count: 2_000)))
 
         // Source-type sniffing names the original format; JPEGs stay unbadged.
         precondition(ChatMedia.originalTypeName(Data("GIF89a".utf8)) == "GIF")
@@ -47,8 +44,17 @@ enum MediaImportTests {
             UIColor.systemRed.setFill(); context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
         }
         let gifAsset = try ChatMedia.jpeg(dot, name: "Photo", sourceType: "GIF")
-        precondition((gifAsset.filename as NSString).pathExtension == "gif", gifAsset.filename)
+        precondition((gifAsset.filename as NSString).pathExtension == "jpg" && gifAsset.sourceFormat == "GIF", gifAsset.filename)
         precondition(gifAsset.mime == "image/jpeg", "a GIF's first frame still rides as JPEG bytes")
+
+        // A pasted image rides as a JPEG under a "Pasted image" filename, within the 1 MiB budget.
+        let pasted = try ChatMedia.pasted(UIImage(data: screenshot)!)
+        precondition(pasted.mime == "image/jpeg", pasted.mime)
+        precondition(pasted.filename.hasPrefix("Pasted image-"), pasted.filename)
+        let pastedBytes = Data(base64Encoded: pasted.base64) ?? Data()
+        precondition(!pastedBytes.isEmpty && pastedBytes.count <= 1024 * 1024,
+                     "pasted image is \(pastedBytes.count) bytes, over budget")
+        precondition(CGImageSourceCreateWithData(pastedBytes as CFData, nil) != nil, "pasted attachment is not a JPEG")
 
         // A HEIC original decodes through the same path (ImageIO reads it on-device).
         if let heic = try? heicFixture(1200) {
@@ -64,6 +70,7 @@ enum MediaImportTests {
         try screenshot.write(to: originalPNG)
         let fromFiles = try FileImport.attachment(from: originalPNG, maxBytes: 1024 * 1024)
         precondition(fromFiles.byteCount <= 1024 * 1024 && fromFiles.mime == "image/jpeg")
+        precondition(fromFiles.filename == "large.jpg" && fromFiles.sourceFormat == "PNG")
         do { _ = try FileImport.attachment(from: originalPNG, maxBytes: 10); fatalError("ignored compressed image budget") }
         catch FileImport.Failure.tooLarge {}
         let audio = Data([0x49, 0x44, 0x33, 0x04, 0x00, 0x00]) + Data(repeating: 0x55, count: 1024)

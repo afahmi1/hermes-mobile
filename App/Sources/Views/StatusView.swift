@@ -218,18 +218,59 @@ struct StatusView: View {
         }
     }
 
+    /// The gateway, grouped runtime → provider → version → heartbeat → platforms, so the process's
+    /// liveness reads first and the integrations it serves read last.
     @ViewBuilder private func gateway(_ p: JV) -> some View {
         let g = p["gateway"]
-        Section("Gateway") {
+        Section {
+            // Runtime — is the process up, and for how long.
             LabeledContent("State") { StatusPill(text: g["state"].string) }
-            if let v = g["version"].string { LabeledContent("Hermes", value: "v\(v)") }
             if let started = g["started_at"].date { LabeledContent("Up since") { RelTime(date: started) } }
-            if let hb = g["heartbeat_age_s"].double { LabeledContent("Heartbeat", value: "\(Int(hb))s ago") }
-            ForEach(Array(g["platforms"].array.enumerated()), id: \.offset) { _, pl in
-                LabeledContent(pl["name"].string ?? "platform") {
-                    StatusPill(text: pl["needs_attention"].bool ? "error" : pl["state"].string)
+            if let store = g["session_store"].string { LabeledContent("Session store") { StatusPill(text: store) } }
+            // Provider — the model provider the gateway falls back to.
+            if let provider = p["providers"]["default_provider"].string {
+                LabeledContent("Provider", value: ProviderUsageSection.displayName(provider))
+            }
+            // Version — the running Hermes build.
+            if let v = g["version"].string {
+                LabeledContent("Version") {
+                    HStack(spacing: 4) {
+                        Text("v\(v)")
+                        if let sha = g["sha"].string { Text(sha).font(.caption).foregroundStyle(.secondary) }
+                    }
                 }
             }
+            // Heartbeat — how recently the gateway reported in.
+            if let hb = g["heartbeat_age_s"].double {
+                let age = max(0, Int(hb.rounded()))
+                LabeledContent("Heartbeat") {
+                    Text(age == 0 ? "now" : "\(age)s ago")
+                        .foregroundStyle(hb > 120 ? Color.orange : Color.primary)
+                }
+            }
+            // Platforms — chat platforms the gateway listens on.
+            let platforms = g["platforms"].array
+            if !platforms.isEmpty {
+                ForEach(Array(platforms.enumerated()), id: \.offset) { _, pl in
+                    platformRow(pl)
+                }
+            }
+        } header: { Text("Gateway") }
+    }
+
+    private func platformRow(_ pl: JV) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(pl["name"].string ?? "platform")
+                Spacer()
+                if pl["needs_attention"].bool {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange).imageScale(.small)
+                        .accessibilityLabel("Needs attention")
+                }
+                StatusPill(text: pl["state"].string)
+            }
+            if let err = pl["error"].string { Text(err).font(.caption).foregroundStyle(.red).lineLimit(2) }
         }
     }
 

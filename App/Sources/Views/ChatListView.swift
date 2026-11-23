@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Every session from every profile, newest first — desktop, phone, iMessage, terminal, scheduled.
+/// Every session from every profile, newest first — GUI, Telegram, iMessage, terminal, scheduled.
 struct ChatListView: View {
     @Environment(AppModel.self) private var app
     @State private var filter: Filter = .chats
@@ -35,20 +35,27 @@ struct ChatListView: View {
 
 
     enum Filter: String, CaseIterable, Identifiable {
-        case chats = "Chats", desktop = "Desktop & phone", telegram = "Telegram", all = "Everything", archived = "Archived"
+        case chats = "Conversations", desktop = "Hermes apps", telegram = "Telegram", all = "Everything", archived = "Archived"
         var source: String? {
             switch self {
-            case .desktop: "desktop"
+            case .desktop: "desktop"   // wire value; the bridge expands it to local/gui/desktop
             case .telegram: "telegram"
             case .archived: "archived"
             default: nil
             }
         }
+        var cacheKey: String {
+            switch self {
+            case .chats: "Chats"
+            case .desktop: "Desktop & phone"
+            default: rawValue
+            }
+        }
         var id: String { rawValue }
         var explanation: String {
             switch self {
-            case .chats: "Every chat you can continue: desktop, phone, Telegram, iMessage and terminal. Scheduled and subagent runs stay out."
-            case .desktop: "Local and GUI conversations saved by Hermes. Desktop and mobile share a source, so Hermes cannot always tell which device started a chat."
+            case .chats: "Every chat you can continue: Hermes's own interface, Telegram, iMessage and terminal. Scheduled and subagent runs stay out."
+            case .desktop: "Conversations in Hermes's own interface. The desktop app and this app share a source, so Hermes can't always say which device started a chat."
             case .telegram: "Chats Hermes saved from Telegram."
             case .all: "Every unarchived source, including scheduled, one-shot, subagent and tool runs."
             case .archived: "Chats you archived. Swipe left to unarchive, or select several."
@@ -131,14 +138,14 @@ struct ChatListView: View {
         loading = false
         let scope = filter
         error = nil
-        let key = app.inboxKey(profile: profile, filter: scope.rawValue)
+        let key = app.inboxKey(profile: profile, filter: scope.cacheKey)
         var saved = key.flatMap { app.inboxes[$0] }
         sessions = saved?.sessions ?? []
         cursor = saved?.cursor
         lastSync = saved?.savedAt
         if saved == nil, let key {
             saved = await InboxDisk.shared.read(key)
-            guard !Task.isCancelled, generation == request, filter == scope, key == app.inboxKey(profile: profile, filter: scope.rawValue) else { return }
+            guard !Task.isCancelled, generation == request, filter == scope, key == app.inboxKey(profile: profile, filter: scope.cacheKey) else { return }
             if let saved {
                 app.inboxes[key] = saved
                 sessions = saved.sessions
@@ -209,7 +216,7 @@ struct ChatListView: View {
             }
             Divider()
             Button("About chat sources", systemImage: "info.circle") { showSourceGuide = true }
-        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease") }
+        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease").fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true) }
         .buttonStyle(.borderless)
         .accessibilityLabel("Source, " + filter.rawValue)
         if fixedProfile == nil {
@@ -275,6 +282,26 @@ struct ChatListView: View {
                 } label: {
                     Label(s.pinned == true ? "Unpin" : "Pin", systemImage: s.pinned == true ? "pin.slash" : "pin")
                 }.tint(.orange)
+            }
+            .contextMenu {
+                Button {
+                    Task { await setFlag(s, "archived", !(s.archived ?? false)) }
+                } label: {
+                    Label(s.archived == true ? "Unarchive" : "Archive",
+                          systemImage: s.archived == true ? "tray.and.arrow.up" : "archivebox")
+                }
+                Button {
+                    Task { await setFlag(s, "pinned", !(s.pinned ?? false)) }
+                } label: {
+                    Label(s.pinned == true ? "Unpin" : "Pin",
+                          systemImage: s.pinned == true ? "pin.slash" : "pin")
+                }
+                Button {
+                    beginSelection()
+                    toggle(s)
+                } label: {
+                    Label("Select", systemImage: "checkmark.circle")
+                }
             }
         }
     }
@@ -355,12 +382,12 @@ struct ChatListView: View {
         let request = UUID()
         generation = request
         let requestedFilter = filter
-        let key = app.inboxKey(profile: profile, filter: requestedFilter.rawValue)
+        let key = app.inboxKey(profile: profile, filter: requestedFilter.cacheKey)
         loading = true
         defer { if generation == request { loading = false } }
         do {
             let page = try await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, source: filter.source)
-            guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
+            guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.cacheKey) else { return }
             if let warning = page.partialWarning {
                 sessions = dedupe(page.data + sessions)
                 cursor = nil
@@ -372,7 +399,7 @@ struct ChatListView: View {
             error = nil
             rememberPage(key)
         } catch {
-            guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
+            guard !Task.isCancelled, generation == request, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.cacheKey) else { return }
             self.error = error.localizedDescription
             if case APIError.http(401, _) = error { app.signOut() }
         }
@@ -389,7 +416,7 @@ struct ChatListView: View {
     private func loadMore() async {
         let request = generation
         let requestedFilter = filter
-        let key = app.inboxKey(profile: profile, filter: requestedFilter.rawValue)
+        let key = app.inboxKey(profile: profile, filter: requestedFilter.cacheKey)
         guard var c = cursor else { return }
         while loading && !Task.isCancelled { try? await Task.sleep(for: .milliseconds(150)) }  // a refresh in flight: wait, don't drop the page
         guard !Task.isCancelled, generation == request, filter == requestedFilter, cursor == c else { return }
@@ -398,11 +425,11 @@ struct ChatListView: View {
         // Keep going while pages come back empty but more remain (all-cron stretches on the Chats filter).
         for _ in 0..<5 {
             guard let page = try? await API.shared.sessions(cursor: c, profile: profile, exclude: exclude, source: filter.source) else {
-                guard !Task.isCancelled, generation == request, filter == requestedFilter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
+                guard !Task.isCancelled, generation == request, filter == requestedFilter, key == app.inboxKey(profile: profile, filter: filter.cacheKey) else { return }
                 error = "Couldn't load older chats. Pull down to retry."
                 return
             }
-            guard !Task.isCancelled, generation == request, filter == requestedFilter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { return }
+            guard !Task.isCancelled, generation == request, filter == requestedFilter, key == app.inboxKey(profile: profile, filter: filter.cacheKey) else { return }
             if let warning = page.partialWarning {
                 error = warning
                 cursor = nil
@@ -424,10 +451,10 @@ struct ChatListView: View {
             try? await Task.sleep(for: .seconds(15))
             let request = generation
             let requestedFilter = filter
-            let key = app.inboxKey(profile: profile, filter: requestedFilter.rawValue)
+            let key = app.inboxKey(profile: profile, filter: requestedFilter.cacheKey)
             guard !Task.isCancelled, results == nil, filter != .archived, !loading,
                   let page = try? await API.shared.sessions(cursor: nil, profile: profile, exclude: exclude, source: filter.source) else { continue }
-            guard !Task.isCancelled, request == generation, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.rawValue) else { continue }
+            guard !Task.isCancelled, request == generation, requestedFilter == filter, key == app.inboxKey(profile: profile, filter: filter.cacheKey) else { continue }
             if let warning = page.partialWarning { error = warning; continue }
             error = nil
             if sessions.isEmpty || page.next == nil { cursor = page.next }
@@ -475,12 +502,16 @@ struct ChatListView: View {
     }
 
     private func setFlag(_ s: SessionSummary, _ flag: String, _ value: Bool) async {
+        let api = API.shared
+        let destination = app.gatewaySession
         do {
-            try await API.shared.updateSession(profile: s.profile, session: s.id, fields: [flag: value])
+            try await api.updateSession(profile: s.profile, session: s.id, fields: [flag: value])
+            guard destination == app.gatewaySession else { return }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             await reload()
             if !query.isEmpty { await runSearch() }
         } catch {
+            guard destination == app.gatewaySession else { return }
             self.error = error.localizedDescription
         }
     }
@@ -510,7 +541,7 @@ struct SessionRow: View {
                 HStack(spacing: 6) {
                     Text(botName)
                     if !session.sourceLabel.isEmpty { Text("·"); Text(session.sourceLabel) }
-                    if let m = session.model, !m.isEmpty { Text("·"); Text(m).lineLimit(1) }
+                    if let m = session.model, !m.isEmpty { Text("·"); Text(m).lineLimit(1).foregroundStyle(.tertiary) }
                     if session.pinned == true { Image(systemName: "pin.fill").font(.caption2) }
                 }
                 .font(.caption).foregroundStyle(.secondary)
@@ -556,10 +587,12 @@ private struct SourceGuideView: View {
     @Environment(\.dismiss) private var dismiss
 
     private let sources = [
-        GuideEntry(id: "Local", detail: "Saved as a local or desktop conversation by this gateway."),
-        GuideEntry(id: "Desktop or phone", detail: "The shared GUI session source used by the desktop and this iPhone."),
-        GuideEntry(id: "Phone / API", detail: "Created through the bridge's API on this phone."),
-        GuideEntry(id: "Telegram, iMessage", detail: "Imported from that messaging platform."),
+        GuideEntry(id: "Mobile", detail: "The mobile bridge recorded the creation of this conversation."),
+        GuideEntry(id: "Hermes app, Local, Desktop", detail: "The source recorded by Hermes. Older shared app sessions have no device recorded."),
+        GuideEntry(id: "API", detail: "Started through Hermes's gateway API server."),
+        GuideEntry(id: "Browser", detail: "Started through Hermes's browser platform."),
+        GuideEntry(id: "iMessage", detail: "Imported from iMessage."),
+        GuideEntry(id: "Telegram", detail: "Imported from Telegram."),
         GuideEntry(id: "Terminal", detail: "Started in the Hermes CLI or TUI."),
         GuideEntry(id: "Scheduled, One-shot, Subagent, Tool run", detail: "Automation. Visible under Everything, not under Chats."),
     ]
@@ -586,7 +619,7 @@ private struct SourceGuideView: View {
                     }
                 }
                 Section("Faster actions") {
-                    Text("Swipe left on a chat to archive it. Swipe right to pin it. Tap Select, or tap the avatar beside any chat, to choose several at once.")
+                    Text("Touch and hold a chat to archive, pin or select it. Swipe left to archive, swipe right to pin. Tap Select, or the avatar beside a chat, to choose several at once.")
                         .font(.footnote)
                 }
             }

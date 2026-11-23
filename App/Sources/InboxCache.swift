@@ -1,3 +1,7 @@
+#if canImport(UIKit)
+import UIKit
+#endif
+import SQLite3
 import CryptoKit
 import Foundation
 
@@ -32,6 +36,7 @@ struct SendAttachment: Codable, Hashable {
     let mime: String
     let filename: String
     let base64: String
+    var sourceFormat: String? = nil
     var byteCount: Int { base64.utf8.count / 4 * 3 - (base64.hasSuffix("==") ? 2 : base64.hasSuffix("=") ? 1 : 0) }
 }
 
@@ -41,6 +46,8 @@ struct PendingSend: Codable {
     let choice: RuntimeChoice
     let project: String?
     let attachments: [SendAttachment]?
+    var composerText: String?
+    var composerPastes: [PastedText]?
 }
 
 actor InboxDisk {
@@ -166,5 +173,112 @@ actor InboxDisk {
             let data = try JSONEncoder().encode(page)
             try data.write(to: url, options: [.atomic, .completeFileProtection])
         } catch { /* An evicted or locked cache is recoverable from the bridge. */ }
+    }
+}
+
+// Drafts are user-authored data. Each committed edit replaces one protected row;
+// typing never re-encodes or rewrites the files attached to the same draft.
+@MainActor
+final class ComposerDisk {
+    static let shared = ComposerDisk()
+    enum Part: String { case text, pastes, media }
+    struct Snapshot {
+        var id: UUID?
+        var text = ""
+        var pastes: [PastedText] = []
+        var media: [SendAttachment] = []
+    }
+    private var databases: [String: OpaquePointer] = [:]
+    private let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("HermesComposer")
+    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    private func open(_ account: String, create: Bool) throws -> OpaquePointer? {
+        #if os(iOS)
+        guard UIApplication.shared.isProtectedDataAvailable else { throw CocoaError(.fileReadNoPermission) }
+        #endif
+        if let db = databases[account] { return db }
+        var folder = root.appendingPathComponent(account)
+        let file = folder.appendingPathComponent("drafts.sqlite")
+        if !create && !FileManager.default.fileExists(atPath: file.path) { return nil }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
+                                                attributes: [.protectionKey: FileProtectionType.complete])
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try folder.setResourceValues(values)
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(file.path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+              let db = handle else { sqlite3_close(handle); throw CocoaError(.fileWriteUnknown) }
+        let schema = """
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA secure_delete=ON;
+            CREATE TABLE IF NOT EXISTS drafts(scope TEXT, part TEXT, id TEXT NOT NULL, value BLOB NOT NULL,
+                PRIMARY KEY(scope, part)) WITHOUT ROWID;
+            """
+        guard sqlite3_exec(db, schema, nil, nil, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            throw CocoaError(.fileWriteUnknown)
+        }
+        databases[account] = db
+        return db
+    }
+
+    private func withStatement<T>(_ db: OpaquePointer, _ sql: String, _ strings: [String],
+                                  _ body: (OpaquePointer) throws -> T) throws -> T {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw CocoaError(.fileWriteUnknown) }
+        defer { sqlite3_finalize(stmt) }
+        for (i, value) in strings.enumerated() {
+            guard sqlite3_bind_text(stmt, Int32(i + 1), value, -1, transient) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+        }
+        return try body(stmt)
+    }
+
+    func read(_ account: String, scope: String) throws -> Snapshot {
+        var snapshot = Snapshot()
+        guard let db = try open(account, create: false) else { return snapshot }
+        return try withStatement(db, "SELECT part,id,value FROM drafts WHERE scope=?", [scope]) { stmt in
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+                let part = String(cString: sqlite3_column_text(stmt, 0))
+                snapshot.id = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 1)))
+                let data = Data(bytes: sqlite3_column_blob(stmt, 2), count: Int(sqlite3_column_bytes(stmt, 2)))
+                switch Part(rawValue: part) {
+                case .text: snapshot.text = String(decoding: data, as: UTF8.self)
+                case .pastes: snapshot.pastes = try JSONDecoder().decode([PastedText].self, from: data)
+                case .media: snapshot.media = try JSONDecoder().decode([SendAttachment].self, from: data)
+                case nil: break
+                }
+                status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw CocoaError(.fileReadUnknown) }
+            return snapshot
+        }
+    }
+
+    func write(_ data: Data?, part: Part, account: String, scope: String, id: UUID) throws {
+        guard let db = try open(account, create: data != nil) else { return }
+        let sql = data == nil ? "DELETE FROM drafts WHERE scope=? AND part=?" :
+            "INSERT OR REPLACE INTO drafts(scope,part,id,value) VALUES(?,?,?,?)"
+        try withStatement(db, sql, [scope, part.rawValue] + (data == nil ? [] : [id.uuidString])) { stmt in
+            if let data {
+                let status = data.withUnsafeBytes { sqlite3_bind_blob(stmt, 4, $0.baseAddress, Int32($0.count), transient) }
+                guard status == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+            }
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw CocoaError(.fileWriteUnknown) }
+        }
+    }
+
+    func move(_ account: String, from: String, to: String, id: UUID) throws {
+        guard let db = try open(account, create: false) else { return }
+        try withStatement(db, "UPDATE drafts SET scope=? WHERE scope=? AND id=?", [to, from, id.uuidString]) { stmt in
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw CocoaError(.fileWriteUnknown) }
+        }
+    }
+
+    func forget(_ account: String) {
+        if let db = databases.removeValue(forKey: account) { sqlite3_close(db) }
+        try? FileManager.default.removeItem(at: root.appendingPathComponent(account))
     }
 }

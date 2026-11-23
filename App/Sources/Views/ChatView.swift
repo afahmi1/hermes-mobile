@@ -27,7 +27,8 @@ struct ChatScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showRuntime = false
     @State private var sendTick = 0
-    @FocusState private var composerFocused: Bool
+    @State private var showFullComposer = false
+    @State private var previewedImage: UIImage?
     @State private var pickerItem: PhotosPickerItem?
     @State private var showPicker = false
     @State private var showFilePicker = false
@@ -92,8 +93,15 @@ struct ChatScreen: View {
                     Button {
                         followLatest = true
                         proxy.scrollTo("bottom", anchor: .bottom)
-                    } label: { Label("Latest", systemImage: "arrow.down") }
-                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                    } label: {
+                        Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityLabel("Jump to latest message")
                     .padding(.trailing, 12).padding(.bottom, 6)
                 }
             }
@@ -110,7 +118,12 @@ struct ChatScreen: View {
                     .disabled(chat.savingRuntime)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                ConnectionBadge()
+                HStack(spacing: 12) {
+                    Button { Task { await chat.load() } } label: { Image(systemName: "arrow.clockwise") }
+                        .disabled(chat.isLoading || chat.isRunning)
+                        .accessibilityLabel("Reload chat")
+                    ConnectionBadge()
+                }
             }
         }
         .sheet(isPresented: $showRuntime) {
@@ -122,13 +135,23 @@ struct ChatScreen: View {
         .sheet(item: $chat.approval) { req in
             ApprovalSheet(req: req, busy: chat.answeringApproval, error: chat.approvalError) { answer in Task { await chat.answer(req, choice: answer) } }
         }
-        .onChange(of: chat.draft) { old, new in
-            // A huge paste leaves the composer and rides as a removable chip (T3-style).
-            if let paste = PasteSplit.insertion(old: old, new: new) {
-                chat.absorbPaste(paste)
-                chat.draft = old
+        .fullScreenCover(isPresented: $showFullComposer) {
+            NavigationStack {
+                VStack(alignment: .leading, spacing: 8) {
+                    draftShelf
+                    composerField(expanded: true).padding(.horizontal, 16)
+                    if let error = chat.error { Text(error).font(.footnote).foregroundStyle(.orange).padding(.horizontal) }
+                }
+                .navigationTitle("Message")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) { Button("Done") { showFullComposer = false } }
+                }
+                .fullScreenCover(isPresented: previewPresented) { imagePreview }
             }
         }
+        .fullScreenCover(isPresented: Binding(get: { !showFullComposer && previewedImage != nil },
+                                             set: { if !$0 { previewedImage = nil } })) { imagePreview }
         .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: .any(of: [.images, .videos]))
         .task(id: pickerItem) { if let pickerItem { await importMedia(pickerItem) } }
         .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
@@ -163,7 +186,6 @@ struct ChatScreen: View {
         .task { await chat.load() }
         .task(id: chat.profile) { mediaCapabilities = try? await API.shared.mediaCapabilities(profile: chat.profile) }
         .task(id: scenePhase) { if scenePhase == .active { await poll() } }
-        .refreshable { await chat.load() }
     }
 
     private var titleBlock: some View {
@@ -212,6 +234,51 @@ struct ChatScreen: View {
         chat.draftAttachments.count >= 4 || chat.draftAttachments.contains { $0.mime == "video/mp4" }
     }
 
+    private var previewPresented: Binding<Bool> {
+        Binding(get: { previewedImage != nil }, set: { if !$0 { previewedImage = nil } })
+    }
+
+    @ViewBuilder private var imagePreview: some View {
+        if let previewedImage { FullImagePreview(image: previewedImage) }
+    }
+
+    private func composerField(expanded: Bool) -> some View {
+        ComposerField(text: $chat.draft, placeholder: "Message \(bot?.name ?? "Hermes")",
+                      expanded: expanded, onPasteText: chat.absorbPaste, onPasteImage: importPastedImage)
+    }
+
+    @ViewBuilder private var draftShelf: some View {
+        if !chat.pastedTexts.isEmpty {
+            ScrollView(.horizontal) {
+                HStack {
+                    ForEach(chat.pastedTexts) { chunk in
+                        PasteChip(text: Binding(get: { chat.pastedTexts.first { $0.id == chunk.id }?.text ?? "" },
+                                               set: { value in
+                                if let index = chat.pastedTexts.firstIndex(where: { $0.id == chunk.id }) { chat.pastedTexts[index].text = value }
+                            })) {
+                            chat.removePastedText(chunk.id)
+                        }
+                    }
+                }.padding(.horizontal, 12)
+            }.scrollIndicators(.hidden)
+        }
+        if !chat.draftAttachments.isEmpty {
+            ScrollView(.horizontal) {
+                HStack {
+                    ForEach(Array(chat.draftAttachments.enumerated()), id: \.offset) { index, asset in
+                        AttachmentChip(attachment: asset, preview: {
+                            if let data = Data(base64Encoded: asset.base64), let image = UIImage(data: data) {
+                                previewedImage = image
+                            }
+                        }) {
+                            if chat.draftAttachments.indices.contains(index) { chat.draftAttachments.remove(at: index) }
+                        }
+                    }
+                }.padding(.horizontal, 12)
+            }.scrollIndicators(.hidden)
+        }
+    }
+
     private var composer: some View {
         VStack(spacing: 6) {
             if let e = chat.error {
@@ -234,26 +301,7 @@ struct ChatScreen: View {
                 }
                 .padding(.horizontal, 16)
             }
-            if !chat.pastedTexts.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack {
-                        ForEach(chat.pastedTexts) { chunk in
-                            PasteChip(text: chunk.text) { chat.removePastedText(chunk.id) }
-                        }
-                    }.padding(.horizontal, 12)
-                }.scrollIndicators(.hidden)
-            }
-            if !chat.draftAttachments.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack {
-                        ForEach(Array(chat.draftAttachments.enumerated()), id: \.offset) { index, asset in
-                            AttachmentChip(attachment: asset) {
-                                if chat.draftAttachments.indices.contains(index) { chat.draftAttachments.remove(at: index) }
-                            }
-                        }
-                    }.padding(.horizontal, 12)
-                }.scrollIndicators(.hidden)
-            }
+            draftShelf
             HStack(alignment: .bottom, spacing: 8) {
                 if canAttach {
                     Menu {
@@ -274,11 +322,17 @@ struct ChatScreen: View {
                     .disabled(attachmentLimitReached || preparingMedia)
                     .accessibilityLabel("Add photo, video or file")
                 }
-                TextField("Message \(bot?.name ?? "Hermes")", text: $chat.draft, axis: .vertical)
-                    .lineLimit(1...8)
-                    .focused($composerFocused)
-                    .padding(.horizontal, 14).padding(.vertical, 9)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20))
+                composerField(expanded: false)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20))
+                .frame(maxWidth: .infinity, alignment: .bottom)
+
+                Button { showFullComposer = true } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 15, weight: .medium)).foregroundStyle(.secondary)
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Expand composer")
                 if chat.isRunning {
                     Button { Task { await chat.stop() } } label: {
                         Image(systemName: "stop.circle.fill").font(.system(size: 32)).foregroundStyle(.red)
@@ -330,6 +384,45 @@ struct ChatScreen: View {
                 if !Task.isCancelled { chat.draftAttachments.append(asset) }
             }
         } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
+    }
+
+    /// An image pasted into the composer becomes a reviewable attachment. The pasteboard is read
+    /// only at paste time (never on load); the budget, the active account and cancellation are all
+    /// re-checked before anything is committed to the draft.
+    private func importPastedImage(_ image: UIImage) {
+        guard imagesAvailable else { chat.error = "This bot cannot receive images."; return }
+        guard !chat.isRunning else { chat.error = "You can attach images when the current reply finishes."; return }
+        guard !preparingMedia else { chat.error = "Wait for the current attachment to finish."; return }
+        if chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) {
+            chat.error = "Remove the video before pasting an image."
+            return
+        }
+        guard chat.draftAttachments.count < 4 else {
+            chat.error = "Remove an attachment before pasting another."
+            return
+        }
+        let account = app.inboxAccount
+        let cap = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
+        preparingMedia = true
+        Task {
+            defer { preparingMedia = false }
+            do {
+                guard let preview = await image.byPreparingThumbnail(ofSize: CGSize(width: 2048, height: 2048)) else {
+                    throw ChatMedia.Failure.unreadable
+                }
+                try Task.checkCancellation()
+                let asset = try ChatMedia.pasted(preview)
+                guard account == app.inboxAccount else { return }
+                guard asset.byteCount <= cap,
+                      chat.draftAttachments.reduce(0, { $0 + $1.byteCount }) + asset.byteCount <= cap else {
+                    chat.error = "The attachments exceed this bot’s limit. Remove an attachment and try again."
+                    return
+                }
+                chat.draftAttachments.append(asset)
+            } catch {
+                if !Task.isCancelled { chat.error = error.localizedDescription }
+            }
+        }
     }
 
     /// Files keeps the original bytes and type; only images reuse the photo pipeline. The
@@ -434,21 +527,20 @@ struct ChatScreen: View {
     }
 
     private func send() {
-        let text = chat.combinedDraft
         let attachments = chat.draftAttachments
         let budget = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
         guard attachments.reduce(0, { $0 + $1.byteCount }) <= budget else {
             chat.error = "The attachments exceed this bot’s limit. Remove an attachment and try again."
             return
         }
-        chat.draft = ""
-        chat.pastedTexts = []
+        // The draft and pasted text are cleared by ChatModel.send only after the outbox is staged,
+        // so a failed send keeps the composer intact instead of wiping it up front.
         followLatest = true
         sendTick += 1
         let context = ProjectContext.chosen(scope: projectScope?.projectID, optedIn: includeProjectContext && !chat.isRunning)
         includeProjectContext = false  // ask every send
         Task {
-            await chat.send(text, projectContext: context, attachments: attachments)
+            await chat.send(chat.combinedDraft, projectContext: context, attachments: chat.draftAttachments)
             app.adopt(chat, draftKey: draftKey)
         }
     }
@@ -462,22 +554,206 @@ struct ChatScreen: View {
     }
 }
 
-/// A collapsed long paste, removable before send.
+/// A collapsed long paste, editable and removable before send.
 struct PasteChip: View {
-    let text: String
+    @Binding var text: String
     let remove: () -> Void
+    @State private var editing = false
+
     var body: some View {
-        Button(action: remove) {
-            HStack(spacing: 5) {
-                Image(systemName: "doc.on.clipboard").font(.caption)
-                Text("Pasted text · \(text.count.formatted()) characters").font(.caption2).lineLimit(1)
-                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+        HStack(spacing: 0) {
+            Button { editing = true } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "doc.on.clipboard").font(.caption)
+                    Text("Pasted text · \(text.count.formatted()) characters").font(.caption2).lineLimit(1)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 8).padding(.vertical, 5)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .buttonStyle(.plain)
+            .accessibilityLabel("Edit pasted text, \(text.count) characters")
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove pasted text, \(text.count) characters")
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Remove pasted text, \(text.count) characters")
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+        .sheet(isPresented: $editing) {
+            PasteEditSheet(text: $text) { remove() }
+        }
+    }
+}
+
+/// Edits one collapsed paste in place; the chip and the sendable draft stay bound to the same text.
+struct PasteEditSheet: View {
+    @Binding var text: String
+    let remove: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            TextEditor(text: $text)
+                .focused($focused)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .navigationTitle("Pasted text")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Remove", role: .destructive) { remove(); dismiss() }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+        }
+        .onAppear { focused = true }
+    }
+}
+
+/// A native, growing text field that intercepts the standard paste gesture so an image on the
+/// pasteboard becomes an attachment instead of being dropped, and long text still rides the
+/// existing PasteSplit path. The pasteboard is never read on load — only inside `paste(_:)`.
+struct ComposerField: UIViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+    var expanded: Bool
+    var onPasteText: (String) -> Void
+    var onPasteImage: (UIImage) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> PasteTextView {
+        let view = PasteTextView()
+        view.delegate = context.coordinator
+        view.font = .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.isScrollEnabled = true
+        view.isEditable = true
+        view.dataDetectorTypes = []
+        view.autocorrectionType = .default
+        view.spellCheckingType = .default
+        view.smartQuotesType = .yes
+        view.smartDashesType = .yes
+        view.smartInsertDeleteType = .yes
+        view.keyboardDismissMode = .interactive
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.onPasteText = onPasteText
+        view.onPasteImage = onPasteImage
+        view.focusOnAppearance = expanded
+        view.accessibilityLabel = placeholder
+        view.placeholder = placeholder
+        view.text = text
+        view.updatePlaceholder()
+        return view
+    }
+
+    func updateUIView(_ view: PasteTextView, context: Context) {
+        context.coordinator.parent = self
+        if view.text != text {
+            view.text = text
+        }
+        view.placeholder = placeholder
+        view.onPasteText = onPasteText
+        view.onPasteImage = onPasteImage
+        view.updatePlaceholder()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: PasteTextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
+        if expanded, let height = proposal.height, height.isFinite { return CGSize(width: width, height: height) }
+        let line = uiView.font?.lineHeight ?? 21
+        let height = min(max(uiView.textHeight(forWidth: width), line), line * 8)
+        return CGSize(width: width, height: height)
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: ComposerField
+        init(_ parent: ComposerField) { self.parent = parent }
+        func textViewDidChange(_ textView: UITextView) {
+            let view = textView as? PasteTextView
+            if textView.text != parent.text { parent.text = textView.text }
+            view?.updatePlaceholder()
+        }
+    }
+}
+
+final class PasteTextView: UITextView {
+    var onPasteText: ((String) -> Void)?
+    var onPasteImage: ((UIImage) -> Void)?
+    var focusOnAppearance = false
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if focusOnAppearance, window != nil {
+            focusOnAppearance = false
+            becomeFirstResponder()
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)), UIPasteboard.general.hasImages { return isEditable }
+        return super.canPerformAction(action, withSender: sender)
+    }
+    var placeholder: String = "" {
+        didSet { placeholderLabel.text = placeholder; updatePlaceholder() }
+    }
+
+    private let placeholderLabel = UILabel()
+
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        placeholderLabel.font = .preferredFont(forTextStyle: .body)
+        placeholderLabel.adjustsFontForContentSizeCategory = true
+        placeholderLabel.textColor = .placeholderText
+        placeholderLabel.numberOfLines = 1
+        addSubview(placeholderLabel)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func updatePlaceholder() {
+        placeholderLabel.isHidden = !text.isEmpty
+    }
+
+    /// Read the pasteboard only at the moment of an actual paste, never on load or appear.
+    override func paste(_ sender: Any?) {
+        if let image = UIPasteboard.general.image {
+            onPasteImage?(image)
+            return
+        }
+        if let pasted = UIPasteboard.general.string, PasteSplit.collapse(pasted) {
+            onPasteText?(pasted)
+            if let selection = selectedTextRange, !selection.isEmpty { replace(selection, withText: "") }
+            return
+        }
+        super.paste(sender)
+    }
+
+    func textHeight(forWidth width: CGFloat) -> CGFloat {
+        let insets = textContainerInset
+        let padding = textContainer.lineFragmentPadding
+        let maxWidth = max(0, width - insets.left - insets.right - padding * 2)
+        let rect = (text as NSString).boundingRect(
+            with: CGSize(width: maxWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font ?? .preferredFont(forTextStyle: .body)],
+            context: nil)
+        return ceil(rect.height) + insets.top + insets.bottom
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let x = textContainerInset.left + textContainer.lineFragmentPadding
+        let y = textContainerInset.top
+        placeholderLabel.sizeToFit()
+        placeholderLabel.frame.origin = CGPoint(x: x, y: y)
     }
 }
 
