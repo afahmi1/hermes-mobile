@@ -14,6 +14,7 @@ private enum WorkspaceTab: String, CaseIterable, Identifiable {
 struct WorkspaceView: View {
     @Environment(AppModel.self) private var app
     let scope: WorkspaceScope
+    private let originClient = API.shared
     @State private var model: WorkspaceProjectModel
     @State private var tab = WorkspaceTab.context
     @State private var importing = false
@@ -53,7 +54,7 @@ struct WorkspaceView: View {
             NewFileSheet(project: scope.projectID, existingCount: model.detail.files.count) { Task { await model.load() } }
         }
         .task { await model.load() }
-        .onChange(of: model.phase) { _, p in if p == .failed(.signedOut) { app.signOut() } }
+        .onChange(of: model.phase) { _, p in if p == .failed(.signedOut), API.shared === originClient { app.signOut() } }
         .alert("Workspace", isPresented: Binding(get: { model.notice != nil }, set: { if !$0 { model.notice = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(model.notice ?? "") }
@@ -115,7 +116,7 @@ struct WorkspaceView: View {
                 Text("Saved on your Mac. Sent to a bot only when you switch project context on for a message.")
             }
             Section {
-                if model.detail.files.isEmpty { Text("No files yet. Use Add to create or import one.").foregroundStyle(.secondary) }
+                if model.detail.files.isEmpty { Text(model.detail.editable ? "No files yet. Use Add to create or import one." : "No files yet.").foregroundStyle(.secondary) }
                 ForEach(model.detail.files) { file in
                     NavigationLink {
                         WorkspaceFileView(file: file, project: scope.projectID) { Task { await model.load() } }
@@ -129,7 +130,9 @@ struct WorkspaceView: View {
                     }
                     .accessibilityIdentifier("ws.file.\(file.name)")
                     .accessibilityHint("Opens this file")
-                    .swipeActions { Button("Remove", role: .destructive) { pendingDelete = file } }
+                    .swipeActions {
+                        if model.detail.editable { Button("Remove", role: .destructive) { pendingDelete = file } }
+                    }
                 }
             } header: { Text("Files (\(model.detail.files.count)/\(WorkspaceLimits.maxFiles))") } footer: {
                 Text(".txt, .md, .csv or .json; UTF-8, up to 8192 bytes each.")
@@ -151,7 +154,7 @@ struct WorkspaceView: View {
                 TextField("Title (optional)", text: $chatTitle)
                 Button {
                     Task {
-                        if let chat = await model.startChat(bots: app.bots, title: chatTitle) {
+                        if let chat = await model.startChat(bots: app.bots, title: chatTitle), API.shared === originClient {
                             chatTitle = ""
                             open(chat)
                         }
@@ -259,6 +262,7 @@ struct ArtifactListView: View {
     }
 
     private func load() async {
+        let account = app.inboxAccount
         do {
             items = try await API.shared.workspaceArtifacts(profile: profile, session: session, project: project)
             failure = nil
@@ -266,7 +270,7 @@ struct ArtifactListView: View {
             if Task.isCancelled { return }
             let f = error as? WorkspacesFailure ?? .network
             failure = f
-            if f == .signedOut { app.signOut() }
+            if f == .signedOut, account == app.inboxAccount { app.signOut() }
         }
     }
 }
@@ -323,6 +327,7 @@ struct ArtifactDetailView: View {
     }
 
     private func fetch() async {
+        let account = app.inboxAccount
         loading = true; failure = nil
         defer { loading = false }
         do { download = try await API.shared.workspaceFile(id: artifact.id, fallbackName: artifact.name) }
@@ -330,7 +335,7 @@ struct ArtifactDetailView: View {
             if Task.isCancelled { return }
             let f = error as? WorkspacesFailure ?? .network
             failure = f
-            if f == .signedOut { app.signOut() }
+            if f == .signedOut, account == app.inboxAccount { app.signOut() }
         }
     }
 }

@@ -79,12 +79,8 @@ only standard HTTPS (`ITSAppUsesNonExemptEncryption = NO`).
 
 Once the build finishes processing (a few minutes to an hour), it appears under the app's **TestFlight** tab.
 
-- **Internal testing** (fastest, no review). The tester must be a user on your App Store Connect team: Users and Access, then
-  **+**, with any role (for example *Developer* or *Customer Support*). Then add them to an internal testing group.
-- **External testing** (up to 10,000 people, by email or public link). The first build goes through Beta App Review.
-  The app only works against the tester's own self-hosted server, so say that in the review notes ("requires the user's own Hermes
-  server on their Mac over Tailscale; no demo account is possible"). A reviewer may still reject a build they can't sign in to,
-  so internal testing is the safer route for a few friends.
+- **Internal testing** is available for eligible App Store Connect team members with access to the app. Assign the processed build to their internal group.
+- **External testing** requires TestFlight App Review for the first build. Supply a beta description, feedback email and a reachable review setup. Use a separate demonstration gateway with synthetic chats and a working demo login for the duration of review. Include instructions for connecting and switching gateways in the review notes. Single-use codes expire after five minutes and are unsuitable as a standing reviewer login. [TestFlight test information](https://developer.apple.com/help/app-store-connect/test-a-beta-version/provide-test-information/) · [Apple’s review access guidance](https://developer.apple.com/help/app-review/before-submitting-for-review/complete-review/)
 
 Testers install the **TestFlight** app on their iPhone and accept the invite. TestFlight builds expire after 90 days, so
 upload a new one before then.
@@ -134,11 +130,29 @@ Everyone needs their own Mac running Hermes. The app only ever talks to the addr
 
 ### On your iPhone
 
-1. Install Tailscale, sign in to the same tailnet and keep it connected.
-2. Open Hermes Mobile and enter your address from step 5, plus the dashboard username and password from step 3.
+1. Install Tailscale, sign in to the same tailnet and keep it connected. You can leave Exit Node set to None. Use the server’s full HTTPS tailnet name and Serve port, even on cellular. The tailnet policy must allow the phone to reach that port.
+2. Open Hermes Mobile and enter your address from step 5. Choose **Password** to use the dashboard credentials from step 3, or **Pairing code** to use a single-use code from the host.
+3. To use another gateway, tap the server name in **Chats → Add gateway** or open **Settings → Add Gateway**. From a Tailscale address you can enter just the other machine’s name when its bridge uses the same port. Search across saved gateways from the Chats gateway picker. Once both are signed in, tapping a server under **Gateways** switches chats, status and cached history together. Each gateway has a separate device credential. [Device access and revocation](docs/device-access.md)
 
 That's it. Your chats from the desktop app, iMessage, the terminal and scheduled runs all show up, and new chats you start
 on the phone appear in the desktop app's Recents.
+
+### Attachments
+
+The composer's **+** menu accepts photos, the camera, video clips, and **Choose file** for anything else: an MP3, a PDF, a
+text file or an archive. Files keep their original bytes and media type; the bridge stages them privately and gives the
+agent the local path, so Hermes decides which tool reads them. Attachments share a 4 MiB total budget per message by
+default (`HERMES_MOBILE_MEDIA_MAX_BYTES`, up to 8 MiB). A single video from Files opens the same clip-or-frames review as a video from Photos.
+
+### Finding and organising chats
+
+**Chats** shows every conversation you can continue. **Desktop & phone** shows local and GUI sessions that Hermes attributes to those clients; **Telegram** narrows it to Telegram; **Everything** adds scheduled, one-shot,
+subagent and tool runs. **Archived** holds what you put away. The **i** button beside the source picker explains each
+view and every source label.
+
+Swipe left to archive and right to pin. Tap **Select** (or the avatar beside any chat) to select several
+chats and archive, unarchive, pin or unpin them in one batch. The bridge fans the gateway's per-session change out in
+parallel and reports any row it could not change.
 
 ---
 

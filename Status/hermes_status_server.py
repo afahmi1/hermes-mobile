@@ -18,6 +18,7 @@ import re
 import sqlite3
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -29,6 +30,8 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "Bridge"))
+from bridge_process import pid_alive
 HERMES_BIN = os.environ.get("HERMES_BIN", str(Path.home() / ".local/bin/hermes"))
 PROVIDER_TTL = 60  # seconds between `hermes auth list` refreshes
 USAGE_TTL = {"openrouter": 300, "anthropic": 600, "openai-codex": 300}  # per-provider poll interval (default 120s)
@@ -47,36 +50,6 @@ def read_json(path: Path, default=None):
         return json.loads(path.read_text())
     except Exception:
         return default
-
-
-def pid_alive(pid) -> bool:
-    try:
-        pid = int(pid)
-        if pid <= 0:
-            return False
-        if os.name == "nt":
-            # Signal zero on Windows is a termination request. A wait-only handle
-            # lets us check whether the process is still running.
-            import ctypes
-            from ctypes import wintypes
-            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel.OpenProcess.restype = wintypes.HANDLE
-            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-            handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
-            if not handle:
-                return ctypes.get_last_error() == 5  # access denied
-            try:
-                return kernel.WaitForSingleObject(handle, 0) == 258  # WAIT_TIMEOUT
-            finally:
-                kernel.CloseHandle(handle)
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except Exception:
-        return False
 
 
 def first_float(path: Path):
@@ -130,8 +103,6 @@ def gateway_status():
     st = read_json(HOME / "gateway_state.json", {}) or {}
     hb = read_json(HOME / "state" / "gateway.heartbeat", {}) or {}
     life = read_json(HOME / "state" / "gateway.lifecycle.json", {}) or {}
-    pid = st.get("pid") or hb.get("pid")
-    alive = bool(pid) and pid_alive(pid)
     hb_at = hb.get("updated_at")
     hb_age = None
     if hb_at:
@@ -139,6 +110,16 @@ def gateway_status():
             hb_age = (datetime.now(timezone.utc) - datetime.fromisoformat(hb_at)).total_seconds()
         except Exception:
             pass
+
+    # During a restart Hermes may update the heartbeat before its state file.
+    fresh_heartbeat = hb_age is not None and -5 <= hb_age < 120
+    candidates = [st.get("pid"), life.get("pid") if life.get("phase") == "running" else None]
+    if fresh_heartbeat:
+        candidates.insert(0, hb.get("pid"))
+    pid = next((candidate for candidate in candidates if candidate and pid_alive(candidate)), None)
+    alive = pid is not None
+    if not alive:
+        pid = next((candidate for candidate in candidates if candidate), hb.get("pid"))
 
     platforms = []
     for name, p in (st.get("platforms") or {}).items():
@@ -171,7 +152,7 @@ def gateway_status():
     except OSError:
         pass
     if not alive:
-        reasons.append("Gateway process is unavailable")
+        reasons.append("Recorded gateway process %s has exited" % pid if pid else "Gateway process has no recorded PID")
     if st.get("gateway_state") != "running":
         reasons.append("Gateway state: " + str(st.get("gateway_state") or "unknown"))
     if estops:

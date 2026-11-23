@@ -9,7 +9,7 @@
 # HERMES_MOBILE_PROJECTS_CATALOG (optional absolute path to a project catalog JSON; off if unset),
 # HERMES_MOBILE_WORKSPACES (optional JSON, off if unset: {"<catalog project id>": ["<exact bot id>", ...]}
 # opts those project/bot pairs in to Project instructions, files, chats and output files. Needs the catalog.
-# Single owner only: every sign-in is the one shared dashboard credential, so any valid token is the owner.
+# Single owner only. Paired phones can chat and approve tools, while owner grants control workspace changes.
 # Do not enable it on a shared or multi-user bridge.)
 set -euo pipefail
 

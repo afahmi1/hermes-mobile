@@ -10,6 +10,7 @@ struct RuntimeSheet: View {
     let current: RuntimeChoice
     let served: ServedRuntime?
     var sessionId: String? = nil
+    var running = false
     @State private var fresh: ServedRuntime?
     let onApply: (RuntimeChoice) -> Void
 
@@ -26,10 +27,17 @@ struct RuntimeSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                if running {
+                    Section {
+                        Label("The current reply will finish with its original model.", systemImage: "arrow.turn.down.right")
+                        Text("Your selection applies to the next message you send or queue.").foregroundStyle(.secondary)
+                    }
+                }
                 Section {
                     effortStrip
                 } header: { Text("Effort") } footer: {
-                    if !reasoningSupported { Text("This model doesn't take a reasoning effort.") }
+                    if !reasoningSupported { Text("This model uses its own reasoning settings.") }
+                    else if !reasoningKnown { Text("Hermes hasn’t reported reasoning support for this model. Default uses its own settings.") }
                 }
                 .disabled(!reasoningSupported)
 
@@ -39,6 +47,12 @@ struct RuntimeSheet: View {
                         ForEach(catalog?.usable ?? []) { p in Text(p.name).tag(Optional(p.slug)) }
                     }
                     .pickerStyle(.menu)
+                    if !loading && (catalog?.usable.isEmpty ?? true) {
+                        Text("Model list unavailable. You can keep this chat’s saved selection.").foregroundStyle(.secondary)
+                        Button("Reload models") {
+                            Task { catalog = await app.catalog(for: profile, refresh: true) }
+                        }
+                    }
                     if loading { HStack { ProgressView(); Text("Loading models…").foregroundStyle(.secondary) } }
                 } header: { Text("Provider") } footer: {
                     if provider == nil, let bot { Text("Uses \(bot.name)'s own setting: \(bot.model) · \(bot.provider).") }
@@ -111,12 +125,12 @@ struct RuntimeSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
+                    Button(running ? "Set for next" : "Done") {
                         onApply(resolved)
                         dismiss()
                     }
                     .bold()
-                    .disabled(provider != nil && model == nil)
+                    .disabled(loading || (provider != nil && model == nil))
                 }
             }
             .onChange(of: provider) { _, slug in
@@ -149,7 +163,7 @@ struct RuntimeSheet: View {
     private var isDirty: Bool { !loading && resolved != current }
 
     private var resolved: RuntimeChoice {
-        RuntimeChoice(provider: provider, model: provider == nil ? nil : model, effort: effort)
+        RuntimeChoice(provider: provider, model: provider == nil ? nil : model, effort: reasoningSupported ? effort : nil)
     }
 
     private var selectedProvider: ModelCatalog.Provider? {
@@ -157,10 +171,14 @@ struct RuntimeSheet: View {
         return catalog?.providers.first { $0.slug == provider }
     }
 
-    private var reasoningSupported: Bool {
-        guard let p = selectedProvider, let m = model else { return true }
-        return p.supportsReasoning(m)
+    private var reportedReasoning: Bool? {
+        let slug = provider ?? bot?.provider
+        let name = model ?? bot?.model
+        guard let name, let p = catalog?.providers.first(where: { $0.slug == slug }) else { return nil }
+        return p.reasoning[name]
     }
+    private var reasoningSupported: Bool { reportedReasoning != false }
+    private var reasoningKnown: Bool { reportedReasoning != nil }
 
     private var effortStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {

@@ -39,6 +39,25 @@ Anderton and Young found that simplified contention models can mispredict the wi
 | [VS Code reconnect protocol](https://github.com/microsoft/vscode/blob/58a9245ffe53ec35991e7d5b08bf2e37f2acedb2/src/vs/base/parts/ipc/common/ipc.net.ts#L974-L1032) and [T3 Code shell stream](https://github.com/pingdotgg/t3code/blob/a09738fb435120d08707db0142ca55b3b7b5c7ec/apps/server/src/orchestration-v2/ShellStream.ts#L41-L105) | Advance the receive cursor through contiguous events. Reconnect on a gap and discard replayed duplicates. A durable restart-safe cursor and an explicit snapshot response on replay expiry are further protocol work. |
 | [Hermes gateway internals](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/gateway-internals.md) | Hermes owns admission, steering and execution. Return the actual decision to the phone. This keeps the companion interoperable with turns opened from other clients. |
 
+## Session search uses Hermes's trigram index
+
+The bridge used a `LIKE '%term%'` subquery over every recent user message, then kept the 400 newest matches per profile. On the 967 MB default `state.db` (109k messages, 7.4k user messages) that scan cost 65 ms at p50 across the five profiles on this machine, and grew with history. Hermes already maintains `messages_fts_trigram` for the same content, so search now uses that index when it is settled and the token is at least three characters. Short tokens, a missing index, or a rebuild in progress keep the old scan, and every indexed result is checked against the scan.
+
+`python3 Benchmarks/search_path.py` runs both paths on the installed databases, asserts identical `(profile, session)` results, and reports 12 samples per term. On November 23, 2026:
+
+| Term | Legacy p50 | Indexed p50 | Speedup |
+| --- | ---: | ---: | ---: |
+| kubernetes | 65.6 ms | 5.7 ms | 11.4× |
+| video | 62.9 ms | 7.8 ms | 8.0× |
+| hermes | 18.6 ms | 6.9 ms | 2.7× |
+| the | 9.5 ms | 6.3 ms | 1.5× |
+| refactor | 72.3 ms | 7.6 ms | 9.5× |
+| permission | 64.2 ms | 9.1 ms | 7.1× |
+| grafana | 81.3 ms | 5.8 ms | 13.9× |
+| sqlite | 132.0 ms | 6.8 ms | 19.4× |
+
+Median across terms: **64.9 ms → 6.9 ms (9.4×)**. The common-word case is the floor: its index scan returns many candidates and saves the least. Results were identical for every term.
+
 ## Measured on a Windows gateway over Tailscale HTTPS
 
 These are individual observations on one deployment. Times include the Mac-to-bridge network trip. They exclude iOS drawing time.
@@ -122,6 +141,9 @@ From the repository root, run the following on macOS with Python 3.11+ and Xcode
 ```sh
 python3 -m unittest discover -s Tests -v
 swiftc App/Sources/StreamRecovery.swift Tests/StreamRecoveryTests.swift -o /tmp/hermes-recovery-tests
+python3 Benchmarks/request_path.py
+xcrun -sdk iphonesimulator swiftc -parse-as-library -target arm64-apple-ios17.0-simulator App/Sources/API.swift App/Sources/AppModel.swift App/Sources/ChatModel.swift App/Sources/InboxCache.swift App/Sources/Management.swift App/Sources/ManagementAPI.swift App/Sources/MediaStaging.swift App/Sources/Models.swift App/Sources/Projects.swift App/Sources/StatusModel.swift App/Sources/StreamRecovery.swift App/Sources/Workspaces.swift App/Sources/Views/ChatMedia.swift Tests/MediaImportTests.swift -o /tmp/media-import-tests
+xcrun simctl spawn <SIMULATOR-UDID> /tmp/media-import-tests
 swiftc App/Sources/Projects.swift App/Sources/Models.swift Tests/ProjectsTests.swift -parse-as-library -o /tmp/hermes-projects-tests
 swiftc App/Sources/Workspaces.swift App/Sources/Models.swift Tests/WorkspaceModelTests.swift -parse-as-library -o /tmp/hermes-workspace-tests
 swiftc App/Sources/Management.swift App/Sources/Projects.swift App/Sources/Workspaces.swift App/Sources/Models.swift Tests/ManagementTests.swift -parse-as-library -o /tmp/hermes-management-tests
@@ -136,3 +158,77 @@ xcodebuild -project App/HermesMobile.xcodeproj -scheme HermesMobile -configurati
 For a Windows host using the per-user Hermes installer, copy the Bridge, Status and Windows directories into one persistent folder. Run Windows/Install-HermesMobile.ps1 as the logged-in Hermes user. Confirm loopback ports 9131 and 9230 are listening, then follow the Tailscale Serve step in the main README. Test unauthenticated rejection, authenticated health, bot discovery, Telegram pagination, transcript read, a new turn and the persisted reply. Each tester enters their own host and bridge credentials. Google sign-in to Tailscale establishes network access. Hermes's dashboard credentials sign into the application.
 
 For TestFlight, record the upload date, processed build number and actual expiration in App Store Connect. Test cold sign-in on a fresh install, because a development installation may already have a token. Upload a replacement before the current beta expires. Apple permits testing a build for up to 90 days. [Apple TestFlight overview](https://developer.apple.com/help/app-store-connect/test-a-beta-version/testflight-overview/)
+
+## Build 12 on top of Build 5
+
+An initial prompt now has one identity on the phone, in the bridge journal and at Hermes admission. Text and opted-in media travel together. On a missed acknowledgment the phone asks about that same prompt. The bridge resumes a journaled admission and reads the terminal receipt after a process restart. Workspace context is frozen at submission. A model change made while busy applies at the next eligible turn; the reply can show when the observed model differs.
+
+The phone keeps protected recent transcript tails, shows their observation time while offline, and checks for changes on return. The optional timeline representation keeps text, tool names, IDs and timestamps. Hidden tool results, tool arguments and reasoning are omitted from this mobile representation. Its validator changes when visible content changes even when row count stays the same. A conditional re-read with an unchanged validator returns an empty 304 after the gateway read.
+
+The live client paints first text immediately and groups subsequent text updates over 40 ms. Scrolling up suspends automatic following. **Latest** returns to the end. Reader backpressure, expired history, changed replay epochs and restored routes all have explicit recovery paths. Current approvals survive unrelated events; multiple pending decisions are ordered and a failed approval stays available to retry.
+
+The media composer follows the T3 pattern of making staged attachments visible and removable. An image goes through Hermes native attachment admission. A video can become a small set of reviewable frames. A full clip is offered only when the selected gateway profile reports a usable video backend. A text-only primary chat model can benefit from Hermes auxiliary analysis. Admission alone cannot prove provider-side analysis. Cua's reconnect and retry UI distinguishes transient failures from states that need an operator action; here the phone distinguishes a missed acknowledgment from a rejected send. [T3 composer uploads](https://github.com/pingdotgg/t3code/blob/76de50bc0d3fdd9fc2c5816de4142fbda1ce8364/apps/mobile/src/state/composer-attachment-uploads.test.ts) · [Cua retry presentation](https://github.com/trycua/cua/blob/186e7cfd8a1707720aabe350c3784f6019bd955c/apps/cua-spaces-web/src/bridge/create-retry.ts)
+
+The inference literature separates first output latency from steady-state delivery and studies chunk size versus scheduling overhead. We applied those questions at the UI and transport layers. Sampling shared replay buffers and tail catch-up tests are companion experiments, not evidence of a faster language model. [DistServe](https://arxiv.org/abs/2401.09670) · [Sarathi-Serve](https://arxiv.org/abs/2403.02310) · [PagedAttention](https://arxiv.org/abs/2309.06180) · [SGLang](https://arxiv.org/abs/2312.07104) · [Interaction snapshots](https://arxiv.org/abs/1806.01499)
+
+| Controlled experiment | Result on the development Mac |
+| --- | --- |
+| 50 simultaneous HTTP readers, 2,000 previously published events each | Three-trial median delivery time fell from 1,210 ms to 108 ms. The test checked every sequence number for every reader. |
+| Latest 100 rows of a synthetic tool-heavy 2,000-row chat in a 10,000-chat fixture | 601,760 bytes rich, 6,260 bytes projected, zero response body on an unchanged conditional read. Ratios depend on actual tool output and text. |
+| Rust transport prototype, 50 readers resuming halfway through 2,000 deltas | Five-trial median 23.2 ms for the batch compared with 38.2 ms in the bounded Python reader. Resident memory was 5.6 versus 34.7 MiB. The prototype lacks production protocol parity and is excluded from the app and bridge deployment. |
+
+Reproduce with `python3 Benchmarks/replay_fanout.py --http`, `python3 Benchmarks/timeline.py`, and the experiment in [Experiments/replay-transport](../Experiments/replay-transport/README.md). These runs cover transport and serialization. A cold or overloaded provider still determines how long it takes to generate the first word.
+
+For Windows installations with a nearly full system volume, set the user environment variable `HERMES_MOBILE_ADMISSIONS_DIR` to a new private directory on a fixed data volume before installing the bridge. Keep that path stable across upgrades. Durable receipt keys and payloads must stay readable only by the operator and system administrators. The Windows installer restricts the companion state folder and initializes permissions when creating an alternate receipt folder.
+
+Public design references also prompted three concrete checks. The state-machine discussion motivated enumerating all 46,656 six-step combinations of progress, duplicates, gaps, stalls and epoch changes against the real Swift consumer. T3's multi-machine connection settings inspired checking that two deliberately different gateways each accept only their own bearer. Hermes's auxiliary-model configuration and the distinction between still frames and a full audiovisual clip informed the capability and consent checks. A photo-capable chat route is insufficient evidence that a video will be understood. [State-machine testing prompt](https://x.com/poteto/status/2119521036660314339) · [T3 connections](https://x.com/maria_rcks/status/2096747115791765520) · [Hermes auxiliary models](https://x.com/Teknium/status/2099168594731106767) · [Video versus still frames](https://x.com/udiWertheimer/status/2096204771984122275)
+
+## Build 14
+
+Photos picker imports first try a copy-on-write file snapshot. The picker may still download its original from iCloud. If the source cannot be cloned, the app permits a regular file copy up to 256 MiB and reserves 64 MiB of free space. Clip export requests the gateway size limit and checks both output size and duration. A size-limited export missing the end of the clip cannot silently enter the draft.
+
+Chat presentation follows the underlying chat model. A send finishing after the user changes gateways can attach a session to the inbox only if the original draft still belongs to that inbox. An explicit profile-level rejection of image input takes precedence over a gateway-wide image capability.
+
+Run the media regression on macOS with `swiftc App/Sources/MediaStaging.swift Tests/MediaStagingTests.swift -o /tmp/media-staging && /tmp/media-staging`. It exercises a source edit after staging, empty input, symlinks and the free-space and full-copy thresholds. For the chat regression, compile the top-level App/Sources Swift files except HermesMobileApp.swift together with Tests/ChatOwnershipTests.swift for the iOS simulator and run with simctl spawn. It constructs two app models that use the same session ID and delivers a late completion from the first to the second.
+
+## Build 15
+
+Photos import through the picker's data transferable instead of one generic `.item` file representation shared by photos and videos. The single generic file import intermittently matched nothing on large or not-yet-local assets and surfaced CoreTransferable's raw error text in the chat. Photos now decode straight from bytes through ImageIO (PNG screenshots, HEIC originals, GIF first frames), download by the system when only an iCloud original exists, render at 2048 px with one extra compression step before the 1 MiB budget, and report a human failure message. Videos stage through a movie-typed file representation into the existing snapshot pipeline. Two 23 MB noise photos and a video were imported end-to-end in the simulator: photo chips, the receive-choice dialog and two review frames all appeared with no error banner.
+
+The import regression compiles the top-level App/Sources files plus App/Sources/Views/ChatMedia.swift and Tests/MediaImportTests.swift for the iOS simulator and runs with simctl spawn. It covers a screenshot-sized noise PNG staying inside the send budget, a readable JPEG result, refused junk bytes, and a HEIC original.
+
+## Build 16
+
+The bridge cached its repeated config parsing by file (mtime, size): every bot-list request had re-run `yaml.safe_load` on each profile's config.yaml (~20 ms per profile; five profiles made `/m/bots` a 92 ms median request). The cache invalidates on any write, verified by rewrite-and-recheck. `Benchmarks/request_path.py` now measures the bridge's hot request paths against the real Hermes home: bots() fell from 92 ms median / 97 ms p95 to 0.16 ms / 0.22 ms; the inbox first page (6 s shared cache), cursor pages, auth token verification and search were already sub-millisecond or ~10 ms and are unchanged. The 234-test bridge suite passes unchanged.
+
+Long pastes (≥2,000 characters in one insertion) leave the composer and ride as removable "Pasted text · N characters" chips, sent with the next message — the T3 pattern. A 7,200-character per-key typing session was exercised in the simulator without producing a chip (no false positives); the isolation logic is unit-verified exactly (mid-string paste extraction, short insertions stay inline).
+
+Attachment chips now badge the source format in the corner of the preview — GIF (first frame), PNG, WebP or HEIC — because the sent bytes are always converted JPEG. The attachment budget per send is configurable on the bridge with `HERMES_MOBILE_MEDIA_MAX_BYTES` (clamped to 256 KiB–8 MiB so an encoded attachment can never exceed the 12 MiB request body cap; the default stays 4 MiB), which the phone picks up automatically from media capabilities.
+
+Sign-in already rejects plain `http://` origins except loopback, so no cleartext bearer can be saved from the sign-in screen; this was verified rather than changed.
+
+## Build 17
+
+Tap the avatar beside any chat to start a selection. The bridge reports each archive or pin result, including partial failures. Selection uses bot and session together. Archived history pages across profiles. A Files selection can contain same-named documents, and the byte budget applies to the whole message. An MP3 is delivered as an original file that the configured Hermes tools can read. A single video opens the clip-or-frames choice.
+
+Stream signatures are verified at entry. Each one-second monitor pass reads the current device grants together, applies each token’s own expiry and disconnects on a registry error. In-process revocation still closes affected sockets immediately. Gateway health scheduling is unchanged. Run `python3 Benchmarks/stream_grants.py` to compare per-stream reads with a shared validation pass.
+
+For a mobile transcript, the bridge applies the installed Hermes display projection before serializing. Hermes still resolves the canonical session and loads history with its own lineage, pagination, hidden diagnostic and compaction semantics. Unsupported reads use the existing gateway. The benchmark compares identical mobile bytes from both implementations. In the installed Hermes Python environment run `python Benchmarks/timeline_read.py` and `python Benchmarks/search_path.py --json`. [Full-session benchmark graphic](benchmarks.html)
+
+## Gateway isolation and attachments in build 19
+
+The inbox names its active gateway beside its health indicator. Bot and source filters operate inside that gateway. Search, transcripts, pending submissions and model choices stay scoped to a signed-in destination. A chat view retained across a gateway switch loses its authority to update the new account. Select the avatar to select one row, or use Select and Select all for the currently loaded rows. Archive and pin actions apply to that selection.
+
+A phone that loses an acknowledgement for an attachment can confirm its original submission with the file name, content type and SHA-256 digest of each file, in order, plus the original prompt, model choice and project. The bridge checks the durable receipt. An unknown submission or an older bridge falls back to the same upload with the original UUID. A temporary server failure leaves confirmation pending. Existing receipt databases migrate in place. Unrelated chats can accept and control turns while another file is syncing to disk. Files images are downsampled before applying the transfer limit. Documents and audio keep their original byte limit.
+
+Reproduce the contention comparison by running `python Benchmarks/attachment_contention.py --bridge /path/to/build18/Bridge` and then against the current Bridge directory using the Hermes Python environment. The Swift DeviceAccounts suite measures HTTP body bytes and verifies receipt, missing-receipt and server-error paths against two destinations. The Python primary-receipts suite covers simultaneous sends, original UUID reuse and migration. The benchmark chart distinguishes these component timings from live phone and model latency.
+
+[T3 scopes composer attachments to the intended thread](https://github.com/pingdotgg/t3code/blob/main/apps/web/src/components/chat/ChatComposer.tsx). The Hermes checks additionally bind a pending chat to its original authenticated client. For a private gateway, use its full Tailscale Serve HTTPS address with its configured port. Devices on the same permitted tailnet can use that address with an exit node deselected. [Tailscale exit nodes](https://tailscale.com/docs/features/exit-nodes)
+
+Live testing on Frostbyte caught two differences from the fixtures. The real Hermes image schema accepts exactly the path and MIME type. The bridge now keeps the display filename and size locally and submits only the two accepted fields. The bulk archive and pin handler now accepts a real authenticated POST at the top-level HTTP dispatcher. Previously it sat inside the GET branch, so mobile fell back to one PATCH per chat.
+
+On Hermes releases with native client creation IDs, each composer draft sends its own stable UUID when creating its session. A lost creation reply can be checked against the profile's existing SQLite creation receipt, keyed by the gateway's own identity function. The lookup checks the profile, OS principal, GUI source, session ID, request ID and any requested title. It opens existing storage read-only. Older Hermes installations retain their previous creation RPC. Explicit permission and validation errors propagate.
+
+Frostbyte acceptance used a temporary paired grant on tailnet-only HTTPS with the exit node deselected. The iOS simulator displayed the named gateway, live health, chat rows and the full HTTPS endpoint. A synthetic text file and JPEG traveled in the same real send. The final assistant message matched the file-only random string and the color of the original, hash-verified JPEG. The saved transcript arrived via the same HTTPS API, and the bulk endpoint archived the test chat. Before the image schema fix the same scenario ended in Hermes rejecting the prompt parameters.
+
+To check creation recovery, post a new GUI chat with a stable UUID, then repeat the same request with that ID. On Frostbyte a previously committed draft used to time out after 32.93 s. The updated bridge returned its existing ID in 89.1 ms. A different untitled draft took 7.08 s to create and 0.05 s to confirm. These are single live cases. Compare them separately from controlled 31-run bridge contention measurements. Across the fault and load tests the loop occasionally saw the network or gateway time out; the durable receipt and later transcript checks reconcile completed work.

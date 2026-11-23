@@ -220,13 +220,15 @@ struct WorkspaceDetail: Decodable, Equatable {
     var instructionsRevision: String? = nil
     var assignment: WorkspaceAssignment? = nil
     var hiddenChats: Int = 0
+    var editable = true
 
     private enum CodingKeys: String, CodingKey {
-        case instructions, files, chats, artifacts, profiles, mode, assignment
+        case instructions, files, chats, artifacts, profiles, mode, assignment, editable
         case instructionsRevision = "instructions_revision", hiddenChats = "hidden_chats"
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        editable = try c.decodeIfPresent(Bool.self, forKey: .editable) ?? true
         instructions = try c.decodeIfPresent(String.self, forKey: .instructions) ?? ""
         files = try c.decodeIfPresent([WorkspaceFile].self, forKey: .files) ?? []
         chats = try c.decodeIfPresent([WorkspaceChat].self, forKey: .chats) ?? []
@@ -437,8 +439,8 @@ final class WorkspaceProjectModel {
 
     var instructionBytes: Int { instructionsDraft.utf8.count }
     var instructionsOverLimit: Bool { instructionBytes > WorkspaceLimits.instructionBytes }
-    var canSaveInstructions: Bool { !busy && !instructionsOverLimit && instructionsDraft != savedInstructions }
-    var canAddFile: Bool { !busy && detail.files.count < WorkspaceLimits.maxFiles }
+    var canSaveInstructions: Bool { detail.editable && !busy && !instructionsOverLimit && instructionsDraft != savedInstructions }
+    var canAddFile: Bool { detail.editable && !busy && detail.files.count < WorkspaceLimits.maxFiles }
 
     func selectableBots(_ bots: [Bot]) -> [Bot] { WorkspaceBots.selectable(profiles: detail.profiles, bots: bots) }
 
@@ -464,7 +466,7 @@ final class WorkspaceProjectModel {
 
     private func restore() { if phase == .loading { phase = .idle } }
 
-    func beginEditInstructions() { instructionsEditing = true }
+    func beginEditInstructions() { instructionsEditing = detail.editable }
 
     func cancelEditInstructions() {
         instructionsDraft = savedInstructions
@@ -473,6 +475,7 @@ final class WorkspaceProjectModel {
     }
 
     func saveInstructions() async {
+        guard detail.editable else { return }
         do { try WorkspaceValidation.checkInstructions(instructionsDraft) }
         catch { notice = (error as? WorkspaceValidation.Problem)?.message; return }
         guard !busy else { return }
@@ -505,6 +508,7 @@ final class WorkspaceProjectModel {
     }
 
     func addFile(name: String, data: Data) async {
+        guard detail.editable else { return }
         do { try WorkspaceValidation.checkFile(name: name, data: data, existingCount: detail.files.count) }
         catch { notice = (error as? WorkspaceValidation.Problem)?.message; return }
         guard !busy else { return }
@@ -518,6 +522,7 @@ final class WorkspaceProjectModel {
     }
 
     func deleteFile(_ file: WorkspaceFile) async {
+        guard detail.editable else { return }
         guard !busy else { return }
         busy = true; defer { busy = false }
         do {
@@ -678,6 +683,10 @@ final class WorkspaceFileEditorModel {
     var bytes: Int { draft.utf8.count }
     var overLimit: Bool { bytes > WorkspaceLimits.fileBytes }
     var isNew: Bool { mode == .new }
+    var editable: Bool {
+        if case .existing(let file) = mode { return file.editable != false }
+        return true
+    }
 
     /// Why the draft can't be saved (nil if fine or merely empty).
     var problem: String? {
@@ -695,7 +704,7 @@ final class WorkspaceFileEditorModel {
     }
 
     var canSave: Bool {
-        guard !busy, isEditing, !draft.isEmpty, problem == nil else { return false }
+        guard editable, !busy, isEditing, !draft.isEmpty, problem == nil else { return false }
         if isNew { return !name.isEmpty }
         return phase == .loaded && draft != original && sha != nil
     }
@@ -713,7 +722,7 @@ final class WorkspaceFileEditorModel {
         }
     }
 
-    func beginEdit() { if phase == .loaded { isEditing = true } }
+    func beginEdit() { if editable && phase == .loaded { isEditing = true } }
 
     /// Cancel discards the draft (back to what the Mac last sent).
     func cancel() {
@@ -755,7 +764,7 @@ final class WorkspaceFileEditorModel {
     }
 
     func delete() async -> Bool {
-        guard case .existing(let f) = mode, !busy else { return false }
+        guard case .existing(let f) = mode, editable, !busy else { return false }
         busy = true; defer { busy = false }
         do { try await client.deleteFile(f.id); return true }
         catch { notice = (error as? WorkspacesFailure ?? .network).message; return false }

@@ -6,6 +6,9 @@ $runtime = Join-Path $env:HERMES_HOME 'hermes-agent'
 $python = Join-Path $runtime '.venv/Scripts/python.exe'
 $env:PYTHONPATH = $runtime
 $env:PYTHONUTF8 = '1'
+if (-not $env:HERMES_MOBILE_ADMISSIONS_DIR) {
+    $env:HERMES_MOBILE_ADMISSIONS_DIR = [Environment]::GetEnvironmentVariable('HERMES_MOBILE_ADMISSIONS_DIR', 'User')
+}
 $env:HERMES_BIN = Join-Path $env:HERMES_HOME 'bin/hermes.exe'
 $env:HERMES_STATUS_STATE = Join-Path $env:HERMES_HOME 'mobile/seen.json'
 $env:HERMES_MOBILE_BIND = '127.0.0.1'

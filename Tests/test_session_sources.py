@@ -31,6 +31,22 @@ class SessionSourceTests(unittest.TestCase):
                     db.execute("INSERT INTO sessions VALUES(?,?,'test','matching',0,0,1,0,?,null,0)",
                                (str(i), "telegram" if i % 2 == 0 else "gui", i))
 
+    def test_archive_pages_include_automation_and_pinned_rows_without_duplicates(self):
+        for home in (self.home, self.home / "profiles" / "secondary"):
+            with closing(sqlite3.connect(home / "state.db")) as db, db:
+                db.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER DEFAULT 0")
+                db.execute("UPDATE sessions SET archived=1, pinned=1, source='tool'")
+        cursor, rows = None, []
+        for _ in range(30):
+            page = self.bridge.all_sessions(5, cursor, source="archived")
+            rows.extend(page["data"])
+            cursor = page["next"]
+            if cursor is None: break
+        self.assertIsNone(cursor)
+        self.assertEqual(len(rows), 73)
+        self.assertEqual(len({(r["profile"], r["id"]) for r in rows}), 73)
+        self.assertTrue(all(r["pinned"] is True and r["archived"] is True for r in rows))
+
     def test_merge_telegram_pages(self):
         cursor = None
         seen = []
@@ -50,6 +66,24 @@ class SessionSourceTests(unittest.TestCase):
     def test_search_scopes_before_the_limit(self):
         rows = self.bridge.search_sessions("matching", profile="secondary", source="telegram", limit=2)
         self.assertEqual([(r["profile"], r["id"]) for r in rows], [("secondary", "6"), ("secondary", "4")])
+
+    def test_desktop_scope_matches_source_aliases_and_preserves_bot_identity(self):
+        with closing(sqlite3.connect(self.home / "profiles" / "secondary" / "state.db")) as db, db:
+            for source, activity in [("local",80), ("desktop",90), ("cli",100)]:
+                db.execute("INSERT INTO sessions VALUES(?,?,'test','matching',0,0,1,0,?,null,0)",
+                           (source,source,activity))
+        seen = []
+        cursor = None
+        while True:
+            page = self.bridge.all_sessions(2, cursor, only=["secondary"], source="desktop")
+            self.assertFalse(page["errors"])
+            seen.extend((row["profile"], row["id"]) for row in page["data"])
+            cursor = page["next"]
+            if not cursor:
+                break
+        self.assertEqual(seen, [("secondary", sid) for sid in ("desktop","local","7","5","3","1")])
+        found = self.bridge.search_sessions("matching", profile="secondary", source="desktop")
+        self.assertEqual([(r["profile"], r["id"]) for r in found], seen)
 
     def test_first_page_cache_invalidates_after_mutation(self):
         b = self.bridge

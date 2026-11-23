@@ -42,13 +42,15 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     /// Where the chat came from, in plain words.
     var sourceLabel: String {
         switch source ?? "" {
-        case "local", "gui", "desktop": return "Desktop"
-        case "hermes_browser", "api_server": return "Phone/API"
+        case "local", "desktop": return "Local"
+        case "gui": return "Desktop or phone"
+        case "hermes_browser", "api_server": return "Phone / API"
         case "bluebubbles": return "iMessage"
         case "tui", "cli": return "Terminal"
         case "cron": return "Scheduled"
         case "oneshot": return "One-shot"
         case "subagent": return "Subagent"
+        case "tool": return "Tool run"
         case let s where s.isEmpty: return ""
         case let s: return s.capitalized
         }
@@ -65,6 +67,11 @@ struct SessionPage: Codable {
     }
     let data: [SessionSummary]
     let next: String?
+}
+
+struct SessionFlagResult {
+    let updated: [String]
+    let errors: [String: String]
 }
 
 struct SearchPage: Codable { let data: [SessionSummary] }
@@ -218,11 +225,16 @@ struct HealthInfo: Codable {
     let phase: String?
     let recent: [Transition]?
     let reason: String?
+    let imageAttachments: Bool?
+    let fileAttachments: Bool?
+    let maxFileBytes: Int?
     let inboxFallback: String?
     let ok: Bool
     let gatewayState: String?
     let version: String?
-    enum CodingKeys: String, CodingKey { case ok, version, phase, recent, reason, inboxFallback = "inbox_fallback", gatewayState = "gateway_state" }
+    enum CodingKeys: String, CodingKey { case ok, version, phase, recent, reason, imageAttachments = "image_attachments",
+                                              fileAttachments = "file_attachments", maxFileBytes = "max_file_bytes",
+                                              inboxFallback = "inbox_fallback", gatewayState = "gateway_state" }
 }
 
 // MARK: - Live run events
@@ -231,6 +243,146 @@ struct RunEvent {
     let seq: Int?
     let name: String
     let raw: [String: Any]
+    var replayEpoch: String? = nil
 
     func string(_ k: String) -> String? { raw[k] as? String }
+}
+
+struct BridgeCapabilities: Decodable {
+    let features: [String]
+    let deviceID: String
+    let manageDevices: Bool
+    enum CodingKeys: String, CodingKey {
+        case features, deviceID = "device_id", manageDevices = "manage_devices"
+    }
+}
+
+struct DeviceGrant: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let method: String
+    let expires: Double
+}
+
+struct DevicePairCode: Decodable {
+    let code: String
+    let expires: Double
+}
+
+
+/// Legacy preferences belonged to the account already signed in when this version was installed.
+enum DevicePreferences {
+    static func migrate(account: String?, defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: "scopedDevicePreferences") else { return }
+        for (key, value) in defaults.dictionaryRepresentation() {
+            if key == "status.seenEvents" {
+                if let account { defaults.set(value, forKey: "device." + account + "." + key) }
+            } else if key.hasPrefix("runtime.") {
+                let parts = key.dropFirst("runtime.".count).split(separator: "/", maxSplits: 1)
+                if let account, parts.count == 2 {
+                    defaults.set(value, forKey: [account, String(parts[0]), "runtime/" + String(parts[1])].joined(separator: "|"))
+                }
+            } else {
+                continue
+            }
+            defaults.removeObject(forKey: key)
+        }
+        defaults.set(true, forKey: "scopedDevicePreferences")
+    }
+
+    static func forget(_ account: String, defaults: UserDefaults = .standard) {
+        for key in defaults.dictionaryRepresentation().keys
+        where key.hasPrefix("device." + account + ".") || key.hasPrefix(account + "|") {
+            defaults.removeObject(forKey: key)
+        }
+    }
+}
+
+struct GatewayLogin: Equatable {
+    let server: URL
+    let token: String
+}
+
+/// Stores server addresses in defaults and calls the injected credential store for each origin.
+struct SavedGateways {
+    let defaults: UserDefaults
+    let read: (String) -> String?
+    let write: (String, String) -> Bool
+    let remove: (String) -> Bool
+
+    static func origin(_ url: URL) -> URL? {
+        guard var c = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = c.host?.lowercased(), !host.isEmpty,
+              let scheme = c.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              c.user == nil, c.password == nil, c.query == nil, c.fragment == nil,
+              c.path.isEmpty || c.path == "/" else { return nil }
+        c.scheme = scheme
+        c.host = host
+        if (scheme == "https" && c.port == 443) || (scheme == "http" && c.port == 80) { c.port = nil }
+        c.path = ""
+        return c.url
+    }
+
+    /// Only expand a single DNS label on the active gateway's known Tailscale domain.
+    static func peerOrigin(_ input: String, relativeTo active: URL?) -> URL? {
+        let name = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let active, active.scheme == "https", let host = active.host?.lowercased(),
+              host.hasSuffix(".ts.net"), host.split(separator: ".").count == 4,
+              name.range(of: #"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"#, options: .regularExpression) != nil,
+              name != "localhost", !name.allSatisfy(\.isNumber),
+              var parts = URLComponents(url: active, resolvingAgainstBaseURL: false),
+              let dot = host.firstIndex(of: ".") else { return nil }
+        parts.host = name + String(host[dot...])
+        return parts.url.flatMap(origin)
+    }
+
+    static func displayName(_ url: URL) -> String {
+        guard let host = url.host else { return url.absoluteString }
+        if host.hasSuffix(".ts.net"), let first = host.split(separator: ".").first { return String(first) }
+        return host
+    }
+
+    var servers: [URL] {
+        (defaults.stringArray(forKey: "savedGatewayOrigins") ?? []).compactMap(URL.init(string:))
+    }
+
+    func credential(_ server: URL) -> GatewayLogin? {
+        guard let url = Self.origin(server), servers.contains(url),
+              let token = read("gateway." + url.absoluteString) else { return nil }
+        return GatewayLogin(server: url, token: token)
+    }
+
+    func remember(_ login: GatewayLogin) -> Bool {
+        guard let server = Self.origin(login.server), !login.token.isEmpty,
+              write("gateway." + server.absoluteString, login.token) else { return false }
+        var items = servers
+        if !items.contains(server) { items.append(server) }
+        defaults.set(items.map(\.absoluteString), forKey: "savedGatewayOrigins")
+        defaults.set(server.absoluteString, forKey: "server")
+        defaults.set(true, forKey: "migratedGatewayCredentials")
+        return true
+    }
+
+    func restore() -> GatewayLogin? {
+        guard let raw = defaults.string(forKey: "server"), let url = URL(string: raw),
+              let origin = Self.origin(url) else { return nil }
+        if let prior = credential(origin) { return prior }
+        // Bind a pre-upgrade single token exactly once to its existing server.
+        guard !defaults.bool(forKey: "migratedGatewayCredentials"), let old = read("token") else { return nil }
+        let login = GatewayLogin(server: origin, token: old)
+        guard remember(login) else { return nil }
+        _ = remove("token")
+        return login
+    }
+
+    func forget(_ server: URL) -> Bool {
+        guard let origin = Self.origin(server) else { return false }
+        let deleted = remove("gateway." + origin.absoluteString)
+        defaults.set(true, forKey: "migratedGatewayCredentials")
+        // An earlier upgrade may have completed just before legacy cleanup was interrupted.
+        if let raw = defaults.string(forKey: "server"), let active = URL(string: raw),
+           Self.origin(active) == origin { _ = remove("token") }
+        defaults.set(servers.filter { $0 != origin }.map(\.absoluteString), forKey: "savedGatewayOrigins")
+        return deleted
+    }
 }

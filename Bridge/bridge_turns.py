@@ -18,10 +18,17 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import functools
+import bridge_receipts
+import bridge_media
+import json
+from collections import OrderedDict
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+import weakref
+import sqlite3
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 LOOP = asyncio.new_event_loop()
@@ -68,8 +75,22 @@ async def _rpc(c, method, **params):
         raise TurnError("%s: %s" % (method, e), 409 if str(e) in ("session_busy", "revision_conflict") else 400)
 
 
+@functools.lru_cache(maxsize=1)
+def _resume_options():
+    try:
+        from tui_gateway.contracts.canonical_sessions import CanonicalResumeParams
+        return {"omit_messages": True} if "omit_messages" in CanonicalResumeParams.__annotations__ else {}
+    except ImportError:
+        return {}
+
+
+async def _resume(c, sid):
+    # The phone already pages the transcript. Controls and send need only the session metadata.
+    return await _rpc(c, "session.resume", session_id=sid, **_resume_options())
+
+
 async def _mutate(c, sid, operation, payload):
-    snap = await _rpc(c, "session.resume", session_id=sid)
+    snap = await _resume(c, sid)
     res = await _rpc(c, "session.mutate", session_id=sid, request_id=uuid.uuid4().hex, operation=operation,
                      expected_revision=snap["revision"], expected_generation=snap["execution_generation"],
                      payload=payload) or {}
@@ -99,14 +120,25 @@ def clean_choice(choice: dict | None) -> dict:
     return out
 
 
+def _admission_runtime(choice):
+    """Freeze the selected route on this admission, including a queued turn."""
+    if not choice.get("model"):
+        return {}
+    return {"model_override": {key: choice[field] for key, field in (
+        ("model", "model"), ("provider", "provider"), ("reasoning", "effort")) if choice.get(field)}}
+
+
 async def _apply(c, sid, choice: dict) -> dict:
     applied = {}
     if choice.get("model"):
         payload = {"model": choice["model"], **({"provider": choice["provider"]} if choice.get("provider") else {})}
+        if choice.get("effort"):
+            # The gateway commits (or defers) a model plus reasoning as one fenced mutation.
+            payload["reasoning"] = choice["effort"]
         applied["model"] = await _mutate(c, sid, "model", payload)
     elif choice.get("reset_model"):
         applied["model"] = await _mutate(c, sid, "model", {"model": "reset"})
-    if choice.get("effort"):
+    if choice.get("effort") and not choice.get("model"):
         applied["reasoning"] = await _mutate(c, sid, "reasoning", {"effort": choice["effort"]})
     elif choice.get("reset_effort"):
         applied["reasoning"] = await _mutate(c, sid, "reasoning", {"effort": None})
@@ -115,24 +147,77 @@ async def _apply(c, sid, choice: dict) -> dict:
 
 # ---------- one-shot operations ----------
 
-async def _create(home, profile, title):
-    async with connect(home) as c:
-        # The ticketed connection binds the owner profile; it isn't a create field.
-        params = {"source": "gui"}
-        if title:
-            params["title"] = title[:120]
-        created = await _rpc(c, "session.create", **params)
-        sid = created.get("session_id") or created.get("stored_session_id")
-        if not sid:
-            raise TurnError("session.create returned no session id", 502)
-        out = {"session_id": sid}
-        if created.get("stored_session_id"):
-            out["stored_session_id"] = created["stored_session_id"]
-        return out
+@functools.lru_cache(maxsize=1)
+def _supports_create_id():
+    try:
+        from tui_gateway.contracts.canonical_sessions import CanonicalCreateParams
+        return "request_id" in CanonicalCreateParams.__annotations__
+    except ImportError:
+        return False
 
 
-def create_session(home, profile, title=None):
-    return run(_create(home, profile, title))
+def _created_draft(home, request_id, title):
+    """Read the native creation receipt left behind when the WebSocket reply is lost."""
+    try:
+        from gateway.owner_identity import host_owner_subject
+        from hermes_state_keys import local_identity
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_cli.gateway_runtime import gateway_profile_home
+        profile_id = str(gateway_profile_home(home))
+        subject = host_owner_subject()
+        sid = local_identity(profile_id, subject, request_id)
+        uri = (Path(home) / "state.db").resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as db:
+            row = db.execute("""
+                SELECT 1 FROM state_meta r JOIN sessions s ON s.id = ?
+                WHERE r.key = ? AND json_extract(r.value, '$.policy.source') = 'gui'
+                AND (? IS NULL OR s.title = ?)
+                AND json_extract(r.value, '$.session_id') = s.id
+                AND json_extract(r.value, '$.request_id') = ?
+                AND json_extract(r.value, '$.profile_id') = ?
+                AND json_extract(r.value, '$.principal_id') = ?
+                """, (sid, POLICY_PREFIX + sid, title, title, request_id, profile_id, subject)).fetchone()
+        return {"session_id": sid, "stored_session_id": sid} if row else None
+    except (ImportError, OSError, ValueError, sqlite3.Error):
+        # Remote-only and older installs keep using the canonical gateway RPC.
+        return None
+
+
+async def _create(home, profile, title, request_id=None):
+    params = {"source": "gui"}
+    if title:
+        params["title"] = title[:120]
+    key = None
+    if request_id is not None and _supports_create_id():
+        try:
+            key = uuid.UUID(str(request_id)).hex
+        except ValueError:
+            raise TurnError("Invalid draft ID.") from None
+        params["request_id"] = key
+        previous = await asyncio.to_thread(_created_draft, home, key, params.get("title"))
+        if previous:
+            return previous
+    try:
+        async with connect(home) as c:
+            created = await _rpc(c, "session.create", **params)
+    except Exception as exc:
+        # Only transport failures can hide an acknowledged creation. Preserve RPC refusals.
+        if key and (isinstance(exc, OSError) or isinstance(exc.__cause__, OSError)):
+            previous = await asyncio.to_thread(_created_draft, home, key, params.get("title"))
+            if previous:
+                return previous
+        raise
+    sid = created.get("session_id") or created.get("stored_session_id")
+    if not sid:
+        raise TurnError("session.create returned no session id", 502)
+    out = {"session_id": sid}
+    if created.get("stored_session_id"):
+        out["stored_session_id"] = created["stored_session_id"]
+    return out
+
+
+def create_session(home, profile, title=None, request_id=None):
+    return run(_create(home, profile, title, request_id))
 
 
 async def _set_runtime(home, sid, choice):
@@ -149,12 +234,19 @@ def set_runtime(home, sid, choice):
 
 async def _interrupt(turn):
     """Stop a turn. session.interrupt is generation-fenced; a turn still queued is cancelled instead."""
+    if not turn.admission:
+        raise TurnError("Hermes is still confirming this send. Try Stop again once it starts.", 409)
+
     async def go(c):
-        snap = await _rpc(c, "session.resume", session_id=turn.canonical_sid)
-        gen = turn.generation if turn.generation is not None else snap.get("execution_generation")
+        snap = await _resume(c, turn.canonical_sid)
         row = next((r for r in snap.get("pending") or [] if r.get("admission_id") == turn.admission), {})
-        if turn.admission and row.get("status") == "queued":
+        if row.get("status") == "queued":
             return await _rpc(c, "prompt.cancel", session_id=turn.canonical_sid, admission_id=turn.admission)
+        gen = turn.generation
+        if gen is None and row.get("status") == "started":
+            gen = row.get("execution_generation")
+        if gen is None:
+            raise TurnError("This reply has no confirmed execution to stop. Refresh the conversation.", 409)
         return await _rpc(c, "session.interrupt", session_id=turn.canonical_sid, execution_generation=gen)
     if turn.client is not None:
         return await go(turn.client)
@@ -171,21 +263,44 @@ async def _approve(turn, choice, prompt_id, generation):
     if turn.client is not None:
         return await go(turn.client)
     async with connect(turn.home) as c:
-        await _rpc(c, "session.resume", session_id=turn.canonical_sid)
+        await _resume(c, turn.canonical_sid)
         return await go(c)
 
 
 # ---------- live turns ----------
 
+# Per-turn SSE history. All readers share the immutable wire representation.
+REPLAY_BYTES = 2 * 1024 * 1024
+REPLAY_SECONDS = 600
+REPLAY_BATCH_BYTES = 64 * 1024
+REPLAY_BATCH_FRAMES = 128
+_SSE_ENCODER = json.JSONEncoder(separators=(",", ":"))
+
+
+def _sse(event):
+    payload = _SSE_ENCODER.encode(event).encode()
+    return b"id: %d\ndata: " % event["seq"] + payload + b"\n\n"
+
+
 class Turn:
     def __init__(self, profile, home, sid, text, choice, workspace=None):
         self.id = "turn_" + uuid.uuid4().hex
         self.profile, self.home, self.sid, self.text, self.choice = profile, home, sid, text, choice
-        self.events: list[dict] = []
+        self.replay_epoch = uuid.uuid4().hex
+        self._frames = OrderedDict()  # absolute sequence -> (monotonic insertion time, wire bytes)
+        self._wire_bytes = 0
+        self._head = 0  # next sequence; independent of eviction
+        self._approval_frames = {}
+        self._terminal = None
         self.cond = threading.Condition()
         self.done = False
         self.started = time.time()
         self.ended = 0.0
+        self.journal = None
+        self.prepared = False
+        self.frozen_text = None
+        self.media = []
+        self.restored = False
         self.canonical_sid = sid
         self.submission = None
         self.admission = None
@@ -199,12 +314,63 @@ class Turn:
         self.captured = False
         self.steered = False
 
+    def _trim(self, now):
+        while self._frames:
+            when, _ = next(iter(self._frames.values()))
+            if self._wire_bytes <= REPLAY_BYTES and now - when < REPLAY_SECONDS:
+                break
+            _, (_, wire) = self._frames.popitem(last=False)
+            self._wire_bytes -= len(wire)
+
     def push(self, name, **fields):
         with self.cond:
-            ev = {"event": name, "seq": len(self.events), "turn_id": self.id, "session_id": self.sid,
-                  "timestamp": time.time(), **fields}
-            self.events.append(ev)
+            ev = {**fields, "event": name, "seq": self._head, "turn_id": self.id,
+                  "session_id": self.sid, "timestamp": time.time()}
+            wire = _sse(ev)
+            now = time.monotonic()
+            self._frames[self._head] = (now, wire)
+            self._head += 1
+            self._wire_bytes += len(wire)
+            self._trim(now)
+            prompt = fields.get("request_id")
+            if name == "approval.request" and prompt:
+                self._approval_frames[prompt] = ev
+            elif name == "approval.resolved":
+                self._approval_frames.pop(prompt, None)
+            elif name in ("run.failed", "run.completed", "run.cancelled"):
+                # The transcript holds the answer. Keep just its outcome after replay expires.
+                self._terminal = {"event": name, "error": str(fields.get("error", ""))[:2000]}
+                self._approval_frames.clear()
             self.cond.notify_all()
+
+    def replay(self, offset, timeout=15, *, reset=False):
+        """Return immutable frames, next offset, completion and whether this is a checkpoint."""
+        with self.cond:
+            self._trim(time.monotonic())
+            if not reset and offset == self._head and not self.done:
+                self.cond.wait_for(lambda: self._head != offset or self.done, timeout)
+                self._trim(time.monotonic())
+            first = next(iter(self._frames), self._head)
+            if reset or offset < first or offset > self._head:
+                checkpoint = {"event": "stream.checkpoint", "seq": self._head - 1, "turn_id": self.id,
+                              "session_id": self.sid, "approvals": list(self._approval_frames.values()),
+                              "terminal": self._terminal}
+                return [_sse(checkpoint)], self._head, self.done, True
+            frames = []
+            size = 0
+            while offset < self._head and len(frames) < REPLAY_BATCH_FRAMES and size < REPLAY_BATCH_BYTES:
+                wire = self._frames[offset][1]
+                frames.append(wire)
+                size += len(wire)
+                offset += 1
+            return frames, offset, self.done and offset == self._head, False
+
+    @property
+    def events(self):
+        """Decoded retained history for diagnostic callers. SSE readers use replay()."""
+        with self.cond:
+            self._trim(time.monotonic())
+            return [json.loads(wire.split(b"\ndata: ", 1)[1]) for _, wire in self._frames.values()]
 
     def finish(self):
         with self.cond:
@@ -213,7 +379,9 @@ class Turn:
 
     def summary(self):
         return {"turn_id": self.id, "profile": self.profile, "session_id": self.sid, "done": self.done,
-                "age": int(time.time() - self.started), "events": len(self.events)}
+                "age": int(time.time() - self.started), "events": self._head,
+                "attachments": [{"mime": m["mime"], "status": "staged" if self.admission is None else "submitted"}
+                                for m in self.media]}
 
 
 def _tool_name(pl):
@@ -259,6 +427,23 @@ def _outcome(pl):
     return kinds.pop() if len(kinds) == 1 else "failed"
 
 
+def _record_runtime(turn, usage):
+    """A policy's provider can differ from the provider that answered after a fallback."""
+    if not isinstance(usage, dict):
+        return
+    model = usage.get("fallback_model") or usage.get("model")
+    if model:
+        if turn.served.get("model") != model:
+            turn.served.pop("provider", None)
+        turn.served["model"] = model
+    if model and (provider := usage.get("billing_provider") or usage.get("provider")):
+        turn.served["provider"] = provider
+    if usage.get("fallback_model"):
+        turn.served["fallback"] = True
+    if usage.get("reasoning") is not None:
+        turn.served["reasoning_tokens"] = usage["reasoning"]
+
+
 def _settle(turn, pl):
     """End the turn from a completion payload. An unknown outcome never confirms completion."""
     kind = _outcome(pl)
@@ -271,17 +456,18 @@ def _settle(turn, pl):
             msg = "Hermes lost track of this reply. Check the chat on your Mac before sending it again."
         turn.push("run.failed", error=msg)
     else:
-        u = pl.get("usage") or {}
-        if u.get("model"):
-            turn.served["model"] = u["model"]
+        _record_runtime(turn, pl.get("usage"))
+        # Native admission receipts report the actual route at the top level.
+        if pl.get("model"):
+            _record_runtime(turn, {"model": pl["model"], "provider": pl.get("provider")})
         turn.push("run.completed", output=pl.get("content") or pl.get("text") or "",
-                  runtime=dict(turn.served), outcome=outcome or "completed")
+                  runtime=dict(turn.served), requested_model=turn.choice.get("model"), outcome=outcome or "completed")
     return kind
 
 
-async def _recover_gap(c, turn):
+async def _recover_gap(c, turn, snapshot=None):
     """The event stream lost frames. True when the turn turned out to be finished (and was settled)."""
-    snap = await _rpc(c, "session.resume", session_id=turn.canonical_sid)
+    snap = snapshot if snapshot is not None else await _resume(c, turn.canonical_sid)
     row = next((r for r in snap.get("pending") or [] if r.get("admission_id") == turn.admission), None)
     if row is not None and row.get("status") != "unknown":
         return False  # still queued or running: its completion is still owed to this socket
@@ -306,121 +492,181 @@ async def _recover_gap(c, turn):
 
 
 def _turn_text(turn):
+    if turn.frozen_text is not None:
+        return turn.frozen_text
     text = turn.text
     suffix = (turn.workspace or {}).get("suffix")
     if suffix:
         text = (text + "\n\n" if text else "") + suffix
+    for item in turn.media:
+        if item["mime"] == bridge_media.MP4:
+            text += ("\n\nThe user attached a video clip and consented to auxiliary video processing. "
+                     "Use video_analyze with video_url set to the following local file path to answer their question. "
+                     "If analysis fails, explain the limitation. Local file path: " + json.dumps(item["path"]))
+        elif item["mime"] != bridge_media.JPEG:
+            name = item.get("name") or Path(item["path"]).name
+            size = item.get("size")
+            if not isinstance(size, int) or size <= 0:
+                try:
+                    size = Path(item["path"]).stat().st_size
+                except OSError:
+                    size = 0
+            text += ("\n\nThe user attached a file named %s (%s, %d bytes). It is saved at the following "
+                     "local path. Use an appropriate available tool to read or process it; do not execute it. "
+                     "Local file path: %s" % (json.dumps(name), item["mime"], size, json.dumps(item["path"])))
     return text
 
 
-async def _drive(turn: Turn):
-    try:
-        async with connect(turn.home) as c:
-            snapshot = await _rpc(c, "session.resume", session_id=turn.sid)
-            turn.canonical_sid = snapshot.get("session_id") or turn.sid
-            if turn.workspace and (snapshot.get("stored_session_id") != turn.sid or turn.canonical_sid != turn.sid):
-                # The chat the phone named is not the one the gateway resumed: send nothing, attach nothing.
-                turn.push("run.failed", error="This chat's identity could not be confirmed. Nothing was sent.")
+async def _drive_connection(turn: Turn):
+    if turn.journal and turn.admission is None and time.time() - turn.started >= 3 * 3600:
+        turn.push("run.failed", error="The original send expired. Check the saved chat before sending again.")
+        return
+    async with connect(turn.home) as c:
+        snapshot = await _resume(c, turn.sid)
+        canonical = snapshot.get("session_id") or turn.sid
+        if turn.prepared and turn.canonical_sid != canonical:
+            raise TurnError("The original chat identity changed. Check its history before sending again.", 409)
+        turn.canonical_sid = canonical
+        if turn.workspace and (snapshot.get("stored_session_id") != turn.sid or turn.canonical_sid != turn.sid):
+            # The chat the phone named is not the one the gateway resumed: send nothing, attach nothing.
+            turn.push("run.failed", error="This chat's identity could not be confirmed. Nothing was sent.")
+            return
+        following_queue = turn.admission is not None
+        applied = await _apply(c, turn.sid, turn.choice) if turn.choice and not following_queue and not turn.prepared else {}
+        if turn.journal and not turn.prepared:
+            await asyncio.to_thread(turn.journal.prepared, turn)
+            turn.prepared = True
+        params = {"session_id": turn.sid, "submission_id": turn.submission or uuid.uuid4().hex, "text": _turn_text(turn)}
+        images = [m for m in turn.media if m["mime"] == bridge_media.JPEG]
+        if images:
+            params["attachments"] = [{"path": m["path"], "mime": m["mime"]} for m in images]
+        params.update(_admission_runtime(turn.choice))
+        if following_queue:
+            if await _recover_gap(c, turn, snapshot):
                 return
-            following_queue = turn.admission is not None
-            applied = await _apply(c, turn.sid, turn.choice) if turn.choice else {}
-            params = {"session_id": turn.sid, "submission_id": uuid.uuid4().hex, "text": _turn_text(turn)}
-            if turn.choice.get("model"):
-                params["model_override"] = {k: v for k, v in (
-                    ("model", turn.choice.get("model")), ("provider", turn.choice.get("provider")),
-                    ("reasoning", turn.choice.get("effort"))) if v}
-            if following_queue:
+            for prompt in snapshot.get("prompts") or []:
+                if (prompt.get("kind") == "approval" and prompt.get("prompt_id") and turn.generation is not None
+                        and prompt.get("execution_generation") == turn.generation):
+                    pid = prompt["prompt_id"]
+                    turn.prompts[pid] = turn.generation
+                    turn.push("approval.request", request_id=pid, execution_generation=turn.generation,
+                              command=prompt.get("command") or "", description=prompt.get("description") or "",
+                              choices=prompt.get("choices") or ["once", "deny"])
+        else:
+            params["session_id"] = turn.canonical_sid
+            receipt = await _rpc(c, "prompt.submit", **params)
+            turn.admission = receipt["admission_id"]
+            turn.generation = receipt.get("execution_generation")
+            if turn.journal:
+                await asyncio.to_thread(turn.journal.admitted, turn)
+                await asyncio.to_thread(bridge_media.discard, images)
+                if receipt.get("status") == "terminal" and await _recover_gap(c, turn):
+                    return
+        turn.client = c
+        extra = {"project_context": turn.workspace["summary"]} if (turn.workspace or {}).get("summary") else {}
+        turn.push("run.started", requested=turn.choice, applied=bool(applied), **extra)
+        deadline = turn.started + 3 * 3600
+        while time.time() < deadline:
+            try:
+                frame = await asyncio.wait_for(c.events.get(), 20 if following_queue or turn.journal else 1800)
+            except asyncio.TimeoutError:
+                if not following_queue and not turn.journal:
+                    raise
                 if await _recover_gap(c, turn):
                     return
-            else:
-                params["session_id"] = turn.canonical_sid
-                receipt = await _rpc(c, "prompt.submit", **params)
-                turn.admission = receipt["admission_id"]
-                turn.generation = receipt.get("execution_generation")
-            turn.client = c
-            extra = {"project_context": turn.workspace["summary"]} if (turn.workspace or {}).get("summary") else {}
-            turn.push("run.started", requested=turn.choice, applied=bool(applied), **extra)
-            deadline = time.time() + 3 * 3600
-            while time.time() < deadline:
-                try:
-                    frame = await asyncio.wait_for(c.events.get(), 20 if following_queue else 1800)
-                except asyncio.TimeoutError:
-                    if not following_queue:
-                        raise
-                    if await _recover_gap(c, turn):
-                        return
-                    continue
-                if isinstance(frame, BaseException):
-                    # The gateway connection died (restart, sleep, crash): nothing more will arrive here.
-                    turn.push("run.failed", error="Lost the connection to Hermes. The reply may still finish on "
-                              "your Mac; pull down in the chat to refresh.")
-                    return
-                if not isinstance(frame, dict):
-                    continue
-                method = frame.get("method")
-                p = frame.get("params") or {}
-                pl = p.get("payload") if isinstance(p.get("payload"), dict) else {}
-                if method and method != "event" and "id" in frame:
-                    # A server->client request (older surfaces). Approvals arrive as events below.
-                    if "clarify" in method:
-                        turn.push("notice", text="Hermes asked a question it needs answered in the desktop app: "
-                                  + str(p.get("question") or p.get("prompt") or "")[:300])
-                    continue
-                # Only this turn's own frames: the session may run other turns (a desktop prompt, a queued
-                # one ahead of ours) on the same subscription.
-                admission = p.get("admission_id") or pl.get("admission_id")
-                if turn.admission and admission and admission != turn.admission:
-                    continue
-                if following_queue and not admission and (turn.generation is None or
-                        p.get("execution_generation") != turn.generation) and p.get("type") != "session.replay_gap":
-                    continue
-                if p.get("execution_generation") is not None:
-                    turn.generation = p["execution_generation"]
-                t = p.get("type")
-                if t == "message.delta":
-                    turn.push("message.delta", delta=pl.get("text") or pl.get("delta") or "")
-                elif t == "reasoning.delta":
-                    turn.push("reasoning.delta", delta=pl.get("text") or "")
-                elif t == "thinking.delta" and pl.get("text"):
-                    turn.push("status", text=pl.get("text"))
-                elif t in ("tool.start", "tool.started"):
-                    turn.push("tool.started", tool_name=_tool_name(pl), preview=str(pl.get("preview") or "")[:200])
-                elif t in ("tool.complete", "tool.completed"):
-                    turn.push("tool.completed", tool_name=_tool_name(pl))
-                elif t == "approval.request":
-                    pid, gen = pl.get("prompt_id"), pl.get("execution_generation", turn.generation)
-                    if pid:
-                        turn.prompts[pid] = gen
-                    turn.push("approval.request", request_id=pid, execution_generation=gen,
-                              command=pl.get("command") or "", description=pl.get("description") or "",
-                              choices=pl.get("choices") or ["once", "deny"])
-                elif t in ("approval.responded", "approval.resolved"):
-                    pid = pl.get("prompt_id")
-                    turn.prompts.pop(pid, None)
-                    turn.push("approval.resolved", request_id=pid)
-                elif t == "clarify.request":
+                continue
+            if isinstance(frame, BaseException):
+                if turn.journal:
+                    raise ConnectionError("Hermes disconnected before confirming the final receipt.")
+                # The gateway connection died (restart, sleep, crash): nothing more will arrive here.
+                turn.push("run.failed", error="Lost the connection to Hermes. The reply may still finish on "
+                          "your Mac; pull down in the chat to refresh.")
+                return
+            if not isinstance(frame, dict):
+                continue
+            method = frame.get("method")
+            p = frame.get("params") or {}
+            pl = p.get("payload") if isinstance(p.get("payload"), dict) else {}
+            if method and method != "event" and "id" in frame:
+                # A server->client request (older surfaces). Approvals arrive as events below.
+                if "clarify" in method:
                     turn.push("notice", text="Hermes asked a question it needs answered in the desktop app: "
-                              + str(pl.get("question") or "")[:300])
-                elif t == "session.usage":
-                    u = pl.get("usage") or {}
-                    if u.get("model"):
-                        turn.served["model"] = u["model"]
-                    turn.served["reasoning_tokens"] = u.get("reasoning")
-                elif t == "session.info" and pl.get("provider"):
-                    turn.served["provider"] = pl["provider"]
-                elif t == "session.replay_gap":
-                    if await _recover_gap(c, turn):
-                        return
-                elif t == "message.complete":
-                    if not pl.get("admission_id") and not pl.get("outcome") and not pl.get("status"):
-                        continue  # an interim summary, not this turn's end
-                    await _capture(turn, {**pl, "admission_id": admission}, _outcome(pl))
-                    _settle(turn, pl)
+                              + str(p.get("question") or p.get("prompt") or "")[:300])
+                continue
+            # Only this turn's own frames: the session may run other turns (a desktop prompt, a queued
+            # one ahead of ours) on the same subscription.
+            admission = p.get("admission_id") or pl.get("admission_id")
+            if turn.admission and admission and admission != turn.admission:
+                continue
+            if following_queue and not admission and (turn.generation is None or
+                    p.get("execution_generation") != turn.generation) and p.get("type") != "session.replay_gap":
+                continue
+            if p.get("execution_generation") is not None:
+                turn.generation = p["execution_generation"]
+            t = p.get("type")
+            if t == "message.delta":
+                turn.push("message.delta", delta=pl.get("text") or pl.get("delta") or "")
+            elif t == "reasoning.delta":
+                turn.push("reasoning.delta", delta=pl.get("text") or "")
+            elif t == "thinking.delta" and pl.get("text"):
+                turn.push("status", text=pl.get("text"))
+            elif t in ("tool.start", "tool.started"):
+                turn.push("tool.started", tool_name=_tool_name(pl), preview=str(pl.get("preview") or "")[:200])
+            elif t in ("tool.complete", "tool.completed"):
+                turn.push("tool.completed", tool_name=_tool_name(pl))
+            elif t == "approval.request":
+                pid, gen = pl.get("prompt_id"), pl.get("execution_generation", turn.generation)
+                if pid:
+                    turn.prompts[pid] = gen
+                turn.push("approval.request", request_id=pid, execution_generation=gen,
+                          command=pl.get("command") or "", description=pl.get("description") or "",
+                          choices=pl.get("choices") or ["once", "deny"])
+            elif t in ("approval.responded", "approval.resolved"):
+                pid = pl.get("prompt_id")
+                turn.prompts.pop(pid, None)
+                turn.push("approval.resolved", request_id=pid)
+            elif t == "clarify.request":
+                turn.push("notice", text="Hermes asked a question it needs answered in the desktop app: "
+                          + str(pl.get("question") or "")[:300])
+            elif t == "session.usage":
+                _record_runtime(turn, pl.get("usage"))
+            elif t == "session.replay_gap":
+                if await _recover_gap(c, turn):
                     return
-                elif t in ("error", "turn.failed"):
-                    turn.push("run.failed", error=pl.get("message") or pl.get("error") or "The turn failed.")
-                    return
-            turn.push("run.failed", error="The turn ran too long without finishing.")
+            elif t == "message.complete":
+                if not pl.get("admission_id") and not pl.get("outcome") and not pl.get("status"):
+                    continue  # an interim summary, not this turn's end
+                await _capture(turn, {**pl, "admission_id": admission}, _outcome(pl))
+                _settle(turn, pl)
+                return
+            elif t in ("error", "turn.failed"):
+                turn.push("run.failed", error=pl.get("message") or pl.get("error") or "The turn failed.")
+                return
+        turn.push("run.failed", error="The turn ran too long without finishing.")
+
+async def _drive(turn: Turn):
+    try:
+        # RPC acknowledgments can be lost after a durable write. Reopening the same
+        # canonical session with the same native submission_id retrieves that write.
+        delay = 1
+        while True:
+            try:
+                await _drive_connection(turn)
+                break
+            except Exception as exc:
+                unavailable = isinstance(exc, (OSError, asyncio.TimeoutError, EOFError)) or (
+                    isinstance(exc, TurnError) and exc.code == 503
+                ) or type(exc).__name__ in ("ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK",
+                                             "GatewayClientError", "GatewayUnavailableError")
+                if not turn.journal or not unavailable:
+                    raise
+                if time.time() - turn.started > 3 * 3600:
+                    turn.push("run.failed", error="The receipt is unavailable. Check the saved chat before sending again.")
+                    break
+                turn.client = None
+                turn.push("status", text="Reconnecting to your original send…")
+                await asyncio.sleep(delay)
+                delay = min(60, delay * 2)
     except asyncio.TimeoutError:
         turn.push("run.failed", error="Hermes went quiet for 30 minutes; check the chat on your Mac.")
     except TurnError as e:
@@ -437,12 +683,31 @@ async def _drive(turn: Turn):
                 ws["store"].discard_output(ws["output_dir"])
             except Exception:
                 pass
-        turn.finish()
+        try:
+            if turn.journal and turn._terminal:
+                await asyncio.to_thread(bridge_media.discard, turn.media)
+                await asyncio.to_thread(turn.journal.terminal, turn, turn._terminal)
+        finally:
+            turn.finish()
+
+
+# Contenders keep their lock alive while waiting. Idle chat/submission keys disappear.
+_admission_locks = weakref.WeakValueDictionary()
+_admission_registry_lock = threading.Lock()
+
+
+def _admission_lock(key):
+    with _admission_registry_lock:
+        lock = _admission_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _admission_locks[key] = lock
+        return lock
 
 
 def start_turn(profile, home, sid, text, choice, workspace=None) -> Turn:
     purge()
-    with TURNS_LOCK:
+    with _admission_lock((profile, sid)), TURNS_LOCK:
         busy = [t for t in TURNS.values() if t.sid == sid and t.profile == profile and not t.done]
         if busy:
             raise TurnError("This chat is still working on the last message.", 409)
@@ -450,6 +715,138 @@ def start_turn(profile, home, sid, text, choice, workspace=None) -> Turn:
         TURNS[turn.id] = turn
     asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
     return turn
+
+
+@functools.lru_cache(maxsize=8)
+def primary_journal(directory):
+    return bridge_receipts.Journal(directory)
+
+
+def restored_turn(row, home, journal, restore_workspace):
+    metadata = json.loads(row["workspace"] or "null")
+    workspace = restore_workspace(metadata, row["profile"], row["sid"]) if metadata else None
+    turn = Turn(row["profile"], home, row["sid"], "", json.loads(row["choice"]), workspace)
+    turn.id = row["id"]
+    turn.media = json.loads(row["media"] or "[]")
+    turn.submission = turn.id[5:]
+    turn.journal, turn.restored = journal, True
+    turn.started, turn.steered = row["started"], bool(row["steered"])
+    turn.prepared = row["canonical"] is not None
+    turn.canonical_sid = row["canonical"] or turn.sid
+    turn.admission, turn.generation, turn.frozen_text = row["admission"], row["generation"], row["prompt"]
+    if row["terminal"]:
+        marker = json.loads(row["terminal"])
+        turn.push(marker["event"], **({"error": marker["error"]} if marker.get("error") else {}))
+        turn.finish()
+    else:
+        turn.push("turn.restored")
+    with TURNS_LOCK:
+        TURNS[turn.id] = turn
+    if not turn.done:
+        asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
+    return turn
+
+
+def match_receipt(profile, sid, text, request, directory):
+    """Read-only confirmation of the exact durable send, even after media cleanup."""
+    try:
+        turn_id = "turn_" + uuid.UUID(str(request.get("submission_id"))).hex
+    except ValueError:
+        raise TurnError("Invalid submission ID.") from None
+    manifest = request.get("manifest")
+    if not isinstance(manifest, list) or not 1 <= len(manifest) <= bridge_media.MAX_ITEMS:
+        raise TurnError("Invalid attachment manifest.")
+    frames = []
+    for item in manifest:
+        if not isinstance(item, dict) or any(not isinstance(item.get(k), str) for k in ("filename", "mime", "sha256")):
+            raise TurnError("Invalid attachment manifest.")
+        frames.append((item["filename"], item["sha256"], None, item["mime"]))
+    row = primary_journal(directory).get(turn_id)
+    if row is None or row["media_types"] is None:
+        # Older receipts omitted image/video types from their fingerprint. Use
+        # the original validated upload path when those types cannot be proved.
+        raise TurnError("No media receipt available.", 404)
+    digest = bridge_receipts.fingerprint(profile, sid, text, clean_choice(request), request.get("project_context"), frames)
+    if row["fingerprint"] != digest or json.loads(row["media_types"]) != [frame[3] for frame in frames]:
+        raise TurnError("This submission ID belongs to a different send.", 409)
+    return {"turn_id": turn_id}
+
+
+def start_primary(profile, home, sid, text, choice, submission, project, directory, prepare, restore_workspace, attachments=None, video_consent=False):
+    try:
+        id = "turn_" + uuid.UUID(str(submission)).hex
+    except (TypeError, ValueError):
+        raise TurnError("A stable submission UUID is required.")
+    choice = clean_choice(choice)
+    try:
+        frames = bridge_media.decode(attachments)
+    except bridge_media.MediaError as exc:
+        raise TurnError(str(exc)) from None
+    clip = bool(frames and frames[0][3] == bridge_media.MP4)
+    if clip and video_consent is not True:
+        raise TurnError("Select the clip option to allow auxiliary video processing.")
+    digest = bridge_receipts.fingerprint(profile, sid, text, choice, project, frames)
+    journal = primary_journal(directory)
+    # Probe outside the global admission lock. A retry of an existing request
+    # still recovers its original receipt if the profile later disables video.
+    if clip and journal.get(id) is None and not bridge_media.video_supported(home):
+        raise TurnError("This bot cannot analyze video clips. Send reviewed frames instead.")
+    purge()
+    # Always take submission then chat. Disk staging and SQLite commits must not
+    # block unrelated sends, stop/steer lookups, or a different phone's live list.
+    with _admission_lock(id), _admission_lock((profile, sid)):
+        existing = journal.get(id)
+        if existing:
+            if (existing["fingerprint"] != digest or
+                    existing["media_types"] is not None and json.loads(existing["media_types"]) != [frame[3] for frame in frames]):
+                raise TurnError("This submission ID belongs to a different send.", 409)
+            return get_turn(id) or restored_turn(existing, home, journal, restore_workspace)
+        with TURNS_LOCK:
+            if any(t.profile == profile and t.sid == sid and not t.done for t in TURNS.values()):
+                raise TurnError("This chat is still working on the last message.", 409)
+        ws = prepare()
+        turn = Turn(profile, home, sid, text, choice, ws)
+        turn.id, turn.submission, turn.journal = id, id[5:], journal
+        try:
+            turn.media = bridge_media.stage(frames, home)
+            journal.create(turn, digest, _turn_text(turn))
+        except BaseException:
+            bridge_media.discard(turn.media)
+            if ws:
+                ws["store"].discard_output(ws["output_dir"])
+            raise
+        with TURNS_LOCK:
+            TURNS[id] = turn
+        asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
+        return turn
+
+
+def recover_primary(directory, profile_home, restore_workspace):
+    journal = primary_journal(directory)
+    for row in journal.pending():
+        with _admission_lock(row["id"]), _admission_lock((row["profile"], row["sid"])):
+            if get_turn(row["id"]) is not None:
+                continue
+            try:
+                restored_turn(row, profile_home(row["profile"]), journal, restore_workspace)
+            except TurnError:
+                # A project grant or identity was withdrawn. Never revive its context.
+                turn = Turn(row["profile"], profile_home(row["profile"]), row["sid"], "", {})
+                turn.id = row["id"]
+                bridge_media.discard(json.loads(row["media"] or "[]"))
+                journal.terminal(turn, {"event": "run.failed"})
+
+
+def completed_primary(turn_id, directory, profile_home):
+    with _admission_lock(turn_id):
+        live = get_turn(turn_id)
+        if live is not None:
+            return live
+        journal = primary_journal(directory)
+        row = journal.get(turn_id)
+        if row is not None and row["terminal"]:
+            return restored_turn(row, profile_home(row["profile"]), journal, None)
+    return None
 
 
 def get_turn(turn_id) -> Turn | None:
@@ -481,7 +878,10 @@ def approve(turn: Turn, choice, prompt_id, generation=None):
     return run(_approve(turn, choice, prompt_id, gen))
 
 
-async def _follow_up(turn, mode, text, submission):
+async def _follow_up(turn, mode, text, submission, choice=None):
+    choice = clean_choice(choice) if mode == "queue" else {}
+    if choice.get("effort") and not choice.get("model"):
+        raise TurnError("Select a model to set an effort for this queued message.")
     if mode == "queue":
         try:
             submission = uuid.UUID(str(submission)).hex
@@ -491,8 +891,8 @@ async def _follow_up(turn, mode, text, submission):
             prior = next((t for t in TURNS.values() if t.profile == turn.profile and
                           t.sid == turn.sid and t.submission == submission), None)
         if prior:
-            if prior.text != text:
-                raise TurnError("Submission ID already used for another message.", 409)
+            if prior.text != text or prior.choice != choice:
+                raise TurnError("Submission ID already used for another message or runtime.", 409)
             return {"status": "queued", "turn_id": prior.id}
     steer_id = None
     if mode == "steer" and submission is not None:
@@ -512,6 +912,10 @@ async def _follow_up(turn, mode, text, submission):
         if turn.generation is None:
             raise TurnError("The gateway has not started this turn yet.", 409)
         async def steer(generation):
+            if turn.journal and turn.workspace:
+                # A lost steer acknowledgment must never allow mixed project output to be captured.
+                await asyncio.to_thread(turn.journal.suppress_capture, turn)
+                turn.steered = True
             result = await _rpc(client, "session.steer", session_id=turn.canonical_sid, text=text,
                                 execution_generation=generation)
             if result.get("status") != "queued":
@@ -526,7 +930,7 @@ async def _follow_up(turn, mode, text, submission):
         return await asyncio.shield(delivery)
 
     receipt = await _rpc(client, "prompt.submit", session_id=turn.canonical_sid,
-                         text=text, submission_id=submission)
+                         text=text, submission_id=submission, **_admission_runtime(choice))
     admission = receipt.get("admission_id")
     if not admission or receipt.get("status") not in ("queued", "started", "terminal"):
         raise TurnError("Hermes could not confirm admission. Check the chat before retrying.", 409)
@@ -535,7 +939,7 @@ async def _follow_up(turn, mode, text, submission):
                          and t.sid == turn.sid), None)
         if existing:
             return {"status": "queued", "turn_id": existing.id}
-        queued = Turn(turn.profile, turn.home, turn.sid, text, {})
+        queued = Turn(turn.profile, turn.home, turn.sid, text, choice)
         queued.canonical_sid = turn.canonical_sid
         queued.admission = admission
         queued.submission = submission
@@ -546,7 +950,7 @@ async def _follow_up(turn, mode, text, submission):
     return {"status": "queued", "turn_id": queued.id}
 
 
-def follow_up(turn, mode, text, submission=None):
+def follow_up(turn, mode, text, submission=None, choice=None):
     if mode not in ("queue", "steer") or not isinstance(text, str) or not text.strip():
         raise TurnError("Enter a message to queue or steer.")
-    return run(_follow_up(turn, mode, text.strip(), submission))
+    return run(_follow_up(turn, mode, text.strip(), submission, choice))
