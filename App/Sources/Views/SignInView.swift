@@ -35,8 +35,13 @@ struct SignInView: View {
                 if !adding && !app.savedGateways.isEmpty {
                     Section("Saved gateways") {
                         ForEach(app.savedGateways, id: \.self) { gateway in
-                            Button(gateway.absoluteString) {
+                            Button {
                                 do { try app.switchGateway(gateway) } catch { self.error = error.localizedDescription }
+                            } label: {
+                                VStack(alignment: .leading) {
+                                    Text(SavedGateways.displayName(gateway)).font(.headline)
+                                    Text(gateway.absoluteString).font(.caption).foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }

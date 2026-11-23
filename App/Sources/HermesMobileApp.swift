@@ -10,9 +10,15 @@ struct HermesMobileApp: App {
             RootView()
                 .environment(app)
                 .tint(Color.accentColor)
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
+                    app.retryDraftStorage()
+                }
         }
         .onChange(of: phase) { _, now in
-            if now == .active { app.resumeLiveRuns() }
+            if now == .active {
+                app.retryDraftStorage()
+                app.resumeLiveRuns()
+            }
         }
     }
 }

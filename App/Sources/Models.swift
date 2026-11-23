@@ -17,6 +17,7 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     let id: String
     let profile: String
     let source: String?
+    var createdVia: String? = nil
     let model: String?
     let title: String?
     let preview: String?
@@ -28,7 +29,7 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     let endedAt: Double?
 
     enum CodingKeys: String, CodingKey {
-        case id, profile, source, model, title, preview, pinned, archived
+        case id, profile, source, model, title, preview, pinned, archived, createdVia = "created_via"
         case startedAt = "started_at", lastActive = "last_active", messageCount = "message_count", endedAt = "ended_at"
     }
 
@@ -40,14 +41,18 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     }
     var date: Date { Date(timeIntervalSince1970: lastActive ?? startedAt ?? 0) }
 
-    /// Where the chat came from, in plain words.
+    /// Preserve the gateway source. Only a recorded mobile creation identifies the client.
     var sourceLabel: String {
+        if createdVia == "mobile_bridge" { return "Mobile" }
         switch source ?? "" {
-        case "local", "desktop": return "Local"
-        case "gui": return "Desktop or phone"
-        case "hermes_browser", "api_server": return "Phone / API"
+        case "local": return "Local"
+        case "desktop": return "Desktop"
+        case "gui": return "Hermes app"
+        case "api_server": return "API"
+        case "hermes_browser": return "Browser"
         case "bluebubbles": return "iMessage"
         case "tui", "cli": return "Terminal"
+        case "telegram": return "Telegram"
         case "cron": return "Scheduled"
         case "oneshot": return "One-shot"
         case "subagent": return "Subagent"

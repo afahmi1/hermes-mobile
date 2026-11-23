@@ -25,6 +25,8 @@ final class AppModel {
     private(set) var savedGateways = API.accounts.servers
     var inboxPath: [ChatRef] = []
     var bots: [Bot] = []
+    private(set) var botsLoaded = false
+    @ObservationIgnored private var botRequest = UUID()
     var health: HealthInfo?
     var checkedConnection = false
     var lastHealthCheck: Date?
@@ -48,6 +50,7 @@ final class AppModel {
     func catalogScope(_ profile: String) -> CatalogScope? { inboxAccount.map { CatalogScope(account: $0, profile: profile) } }
     @ObservationIgnored private var chats: [String: ChatModel] = [:]
     @ObservationIgnored private var recentChatKeys: [String] = []
+    @ObservationIgnored private var newChats: [String: ChatModel] = [:]
     private let visibleChats = NSMapTable<NSString, ChatModel>.strongToWeakObjects()
 
 
@@ -79,14 +82,17 @@ final class AppModel {
     func botName(_ id: String) -> String { bot(id)?.name ?? id }
 
     func refreshBots() async {
-        guard let account = inboxAccount else { return }
+        guard inboxAccount != nil else { return }
+        let request = UUID()
+        botRequest = request
         do {
             let latest = try await API.shared.bots()
-            guard account == inboxAccount, !Task.isCancelled else { return }
+            guard request == botRequest, !Task.isCancelled else { return }
+            botsLoaded = true
             bots = latest
             loadError = nil
         } catch {
-            guard account == inboxAccount, !Task.isCancelled else { return }
+            guard request == botRequest, !Task.isCancelled else { return }
             loadError = error.localizedDescription
             if case APIError.http(401, _) = error { signOut() }
         }
@@ -127,17 +133,20 @@ final class AppModel {
     /// One live ChatModel per session, so a reply keeps streaming while you look at other chats.
     func chat(for ref: ChatRef) -> ChatModel {
         let key = ref.id
+        let unfinished = newChats[ref.profile]
         let chat = chats[key] ?? visibleChats.object(forKey: key as NSString)
+            ?? (ref.sessionId == nil && unfinished?.sessionId == nil ? unfinished : nil)
             ?? ChatModel(profile: ref.profile, sessionId: ref.sessionId, app: self, draftID: ref.draft)
         if recentChatKeys.last != key {
             recentChatKeys.removeAll { $0 == key }
             recentChatKeys.append(key)
         }
         chats[key] = chat
+        if ref.sessionId == nil && chat.sessionId == nil { newChats[ref.profile] = chat }
         visibleChats.setObject(chat, forKey: key as NSString)
         if recentChatKeys.count > 12 {
             for old in Array(recentChatKeys.dropLast(12)) {
-                guard let candidate = chats[old], !candidate.isRunning, candidate.draft.isEmpty, candidate.draftAttachments.isEmpty else { continue }
+                guard let candidate = chats[old], !candidate.isRunning, candidate.canEvictDraft else { continue }
                 chats.removeValue(forKey: old)
                 recentChatKeys.removeAll { $0 == old }
             }
@@ -147,11 +156,16 @@ final class AppModel {
 
     func adopt(_ chat: ChatModel, draftKey: String) {
         guard visibleChats.object(forKey: draftKey as NSString) === chat, let sid = chat.sessionId else { return }
+        if newChats[chat.profile] === chat { newChats.removeValue(forKey: chat.profile) }
         let key = "\(chat.profile)/\(sid)"
         chats[key] = chat
         visibleChats.setObject(chat, forKey: key as NSString)
         if !recentChatKeys.contains(key) { recentChatKeys.append(key) }
         visibleChats.setObject(chat, forKey: draftKey as NSString)
+    }
+
+    func retryDraftStorage() {
+        for chat in chats.values { chat.retryDraftStorage() }
     }
 
     func resumeLiveRuns() {
@@ -166,6 +180,7 @@ final class AppModel {
         }
         if let prior, oldURL == login.server, API.shared.token != login.token {
             Task { await InboxDisk.shared.forget(prior) }
+            ComposerDisk.shared.forget(prior)
             DevicePreferences.forget(prior)
         }
         changeGateway(login)
@@ -187,6 +202,7 @@ final class AppModel {
         if let server = API.shared.baseURL { _ = API.accounts.forget(server) }
         if let account = inboxAccount {
             Task { await InboxDisk.shared.forget(account) }
+            ComposerDisk.shared.forget(account)
             DevicePreferences.forget(account)
         }
         changeGateway(nil)
@@ -208,8 +224,11 @@ final class AppModel {
         healthFailure = nil
         needsLogin = false
         bots = []
+        botsLoaded = false
+        botRequest = UUID()
         signedIn = login != nil
         chats = [:]
+        newChats.removeAll()
         recentChatKeys.removeAll()
         visibleChats.removeAllObjects()
         catalogStore.reset()
