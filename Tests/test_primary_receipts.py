@@ -65,6 +65,16 @@ class PrimaryReceipts(unittest.TestCase):
                     kwargs = rpc.await_args.kwargs
                     self.assertEqual(kwargs, {"source": "gui", **({"request_id": self.submission} if supported else {})})
 
+    def test_only_proven_mobile_creations_are_labeled_across_profiles(self):
+        self.journal.record_mobile_origin("first", "same")
+        self.journal.record_mobile_origin("first", "same")
+        rows = [{"profile": "first", "id": "same", "source": "gui"},
+                {"profile": "second", "id": "same", "source": "gui"},
+                {"profile": "first", "id": "existing", "source": "telegram"}]
+        engine.bridge_receipts.annotate_origins(self.journal.path, rows)
+        self.assertEqual([r.get("created_via") for r in rows], ["mobile_bridge", None, None])
+        self.assertEqual(rows[0]["source"], "gui")
+
     def test_creation_receipt_is_bound_to_the_profile_owner_source_and_request(self):
         import json
         import sqlite3

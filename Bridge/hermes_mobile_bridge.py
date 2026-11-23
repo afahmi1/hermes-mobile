@@ -50,6 +50,7 @@ POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
 import bridge_devices
+import bridge_receipts
 from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 try:
@@ -715,6 +716,16 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
     return page, pins, new_off, done, errors, more_left
 
 
+def with_mobile_origins(rows):
+    # A missing optional ledger must never make otherwise available chats disappear.
+    if rows:
+        try:
+            bridge_receipts.annotate_origins(admissions_dir() / "send-receipts.sqlite3", rows)
+        except (OSError, sqlite3.Error) as exc:
+            log("Mobile origins unavailable: %s" % type(exc).__name__)
+    return rows
+
+
 def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=False, source=None):
     """Merge every profile's /api/sessions (each sorted by last activity) into one page.
 
@@ -752,7 +763,7 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
             uniq.append(r)
     if native:
         offsets["_native"] = 1
-    return {"data": uniq, "reset": reset, "next": _cursor_encode(offsets) if more_left else None, "errors": errors}
+    return {"data": with_mobile_origins(uniq), "reset": reset, "next": _cursor_encode(offsets) if more_left else None, "errors": errors}
 
 
 SESSION_COLS = ("id, source, model, title, started_at, ended_at, message_count, archived, "
@@ -866,7 +877,7 @@ def search_sessions(q, archived=False, limit=40, profile=None, source=None, pref
         finally:
             con.close()
     out.sort(key=lambda s: s.get("last_active") or 0, reverse=True)
-    return out[:limit]
+    return with_mobile_origins(out[:limit])
 
 def set_session_flags(pid, ids, fields):
     """Apply one flag patch to many sessions of one profile, bounded and parallel.
@@ -1984,7 +1995,16 @@ class H(BaseHTTPRequestHandler):
             home = profile_home(pid)
             d = self.json_body()
             if m.group(2) == "new":
-                return self.send(201, turns.create_session(home, pid, d.get("title"), d.get("request_id")))
+                created = turns.create_session(home, pid, d.get("title"), d.get("request_id"))
+                # A titled create can reopen an existing desktop chat by name.
+                # Only an untitled create through the mobile endpoint proves origin.
+                if not d.get("title") and created.get("session_id"):
+                    try:
+                        journal = turns.primary_journal(admissions_dir())
+                        journal.record_mobile_origin(pid, created["session_id"])
+                    except (OSError, sqlite3.Error) as exc:
+                        log("Could not record mobile origin: %s" % type(exc).__name__)
+                return self.send(201, created)
             sid, action = m.group(2).rsplit("/", 1)
             if action == "runtime":
                 applied = turns.set_runtime(home, sid, d)
