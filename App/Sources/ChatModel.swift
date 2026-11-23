@@ -11,6 +11,8 @@ struct ChatItem: Identifiable, Hashable {
     var footer: String?
     var failed = false
     var timestamp: Double?
+    /// Shown under a user message that carried project context (this send only).
+    var contextNote: String?
 }
 
 struct ApprovalRequest: Identifiable, Hashable {
@@ -223,11 +225,15 @@ final class ChatModel {
 
     // MARK: sending
 
-    func send(_ raw: String) async {
+    /// `projectContext` is a project ID only when the person switched context on for this send from a
+    /// project scope; follow-ups (queue / steer) never carry it.
+    func send(_ raw: String, projectContext: String? = nil) async {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isRunning else { return }
         error = nil
-        items.append(ChatItem(id: "local-\(UUID().uuidString)", kind: .user, text: text))
+        var local = ChatItem(id: "local-\(UUID().uuidString)", kind: .user, text: text)
+        if projectContext != nil { local.contextNote = "Project instructions + reference files sent with this message" }
+        items.append(local)
         isRunning = true
         status = "Sending…"
         if picked && sessionId != nil { await refreshServed() }  // a switch made on the desktop wins over a stale pick
@@ -238,7 +244,7 @@ final class ChatModel {
                 if !choice.isDefault { AppModel.saveChoice(choice, profile: profile, session: sid) }
             }
             let run = try await API.shared.startRun(profile: profile, session: sessionId!, text: text,
-                                                    choice: picked ? choice : .botDefault)
+                                                    choice: picked ? choice : .botDefault, projectContext: projectContext)
             recovery = StreamRecovery()
             liveToolGroup = nil
             runId = run
@@ -370,6 +376,12 @@ final class ChatModel {
                 items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name]))
             }
             status = "Using \(name.replacingOccurrences(of: "_", with: " "))…"
+        case "run.started":
+            // The bridge says what context it accepted; replace the optimistic badge with it.
+            if let summary = ProjectContext.summary(from: ev.raw),
+               let i = items.lastIndex(where: { $0.kind == .user && $0.contextNote != nil }) {
+                items[i].contextNote = summary
+            }
         case "reasoning.available", "reasoning.delta":
             status = "Thinking…"
         case "status":

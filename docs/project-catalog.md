@@ -54,3 +54,21 @@ The filename is known only to the local process. Every valid bridge bearer token
 ## HTTP contract
 
 `GET /m/projects` uses the existing bridge bearer authentication. It accepts no query or body and returns `Cache-Control: no-store`. The bridge adds `configured: true` to a valid catalog; that field does not go in the file. Without a configured file, it returns `200` with `{"schema_version":1,"configured":false,"roots":[],"projects":[]}`. An explicitly configured but unreadable or invalid file returns a generic `503`, without paths or catalog content. An older bridge returns `404`; the app shows an upgrade hint and keeps the other tabs usable.
+
+## Project workspaces (optional, off by default)
+
+`HERMES_MOBILE_WORKSPACES` is a JSON object mapping a catalog project ID to the exact bot IDs you opt in, for example `{"alpha":["bot-a"]}`. **This allowlist is the source of authority**: nothing is inferred, and no bot is enabled unless you list it. Each request narrows it by the live state:
+
+- the project must exist in the current catalog;
+- if the catalog project lists `bot_ids`, the bot must also be listed there (an empty or omitted `bot_ids` adds no restriction, because the catalog is display metadata and the real catalog carries none);
+- the bot must be a live profile with an API key, not marked `# hermes-mobile: no-key`, and not a protected profile (names containing health, journal, trading, robinhood, captain, wellness, portfolio, stocks, doctor, medical, bacta, finance, bank, therapy, secrets, vault). The name list is a backstop only; do not allowlist any bot you would not hand project files to.
+
+Malformed JSON disables the feature. It never reads or writes extra paths named in the catalog.
+
+Visibility: files a bot produced are shown only inside the project and chat that produced them. The chat view requires the chat to be linked to a currently enabled project/bot pair. The bot library is per project (`/m/workspace-artifacts/<bot>?project=<id>` is required; there is no cross-project list). Disabling a project or bot hides its chats, files and downloads immediately.
+
+Storage limits (all fail closed with HTTP 507 and a message; nothing is dropped silently or partly saved): per file 8 KiB (4 per project, 128 total, 64 projects holding data); per artifact 8 MiB, 10 per turn, 50 per chat, 200 / 64 MiB per project, 1000 / 256 MiB overall; 200 chats per project, 1000 overall; 32 concurrent turn output directories (stale ones are swept after 24 h). There is no in-app delete for generated files yet; when a limit is reached, free space by removing `workspaces.db` under the bridge state directory (this deletes all project data) or ask for a pruning tool.
+
+Generated files: only `MEDIA:/abs/path` lines in a completed reply, only direct regular-file children of that turn's private output directory (no symlinks, hard links, special files or foreign owners), allowed types only, content-checked, copied into the bridge database. Downloads serve those stored bytes as `attachment`/`nosniff`, never a path. The bot itself runs with its normal profile permissions and can copy any file it can read into that directory; the bridge cannot sandbox the bot, so allowlist only bots you trust with that.
+
+Single owner only: every sign-in verifies the one shared dashboard credential, so any valid token is the owner; the token's device label and nonce identify nobody. Don't enable this on a shared or multi-user bridge.

@@ -8,6 +8,7 @@ struct ProjectsView: View {
     @Environment(AppModel.self) private var app
     @State private var model = ProjectsModel(fetch: { try await API.shared.projects() })
     @State private var path = NavigationPath()
+    @State private var workspaces = WorkspaceIndexModel(fetch: { try await API.shared.workspaceIndex() })
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -16,15 +17,21 @@ struct ProjectsView: View {
                 .navigationDestination(for: Selection.self) { selection in
                     if case .loaded(let snapshot) = model.state,
                        let project = snapshot.projects.first(where: { $0.id == selection.id }) {
-                        ProjectDetailView(project: project, snapshot: snapshot)
+                        ProjectDetailView(project: project, snapshot: snapshot, workspaces: workspaces)
                     } else {
                         ContentUnavailableView("Project unavailable", systemImage: "folder")
                     }
                 }
                 .navigationDestination(for: Bot.self) { BotDetailView(bot: $0) }
                 .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
+                .navigationDestination(for: WorkspaceRoute.self) { WorkspaceView(scope: $0.scope) }
+                .navigationDestination(for: WorkspaceChatRoute.self) { ChatView(ref: $0.ref, projectScope: $0.scope) }
+                .onReceive(NotificationCenter.default.publisher(for: .workspaceOpenChat)) { note in
+                    if let route = note.object as? WorkspaceChatRoute { path.append(route) }
+                }
         }
         .task { await model.load() }
+        .task { await workspaces.load() }  // separate from the catalog: its failure never hides it
         .onChange(of: model.state) { _, state in
             if state == .failed(.signedOut) { app.signOut() }
         }
@@ -104,6 +111,7 @@ struct ProjectDetailView: View {
     @Environment(AppModel.self) private var app
     let project: Project
     let snapshot: ProjectsSnapshot
+    var workspaces: WorkspaceIndexModel
     @State private var copied: String?
 
     var body: some View {
@@ -111,6 +119,13 @@ struct ProjectDetailView: View {
         List {
             if let summary = project.summary, !summary.isEmpty {
                 Section { Text(summary) }
+            }
+            if workspaces.isEnabled(project.id) {
+                Section {
+                    NavigationLink(value: WorkspaceRoute(scope: WorkspaceScope(projectID: project.id, title: project.title))) {
+                        Label("Workspace", systemImage: "square.stack.3d.up")
+                    }
+                } footer: { Text("Instructions, reference files, chats and artifacts.") }
             }
             Section("Bots") {
                 let links = snapshot.botLinks(for: project, bots: app.bots)

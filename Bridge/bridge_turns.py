@@ -117,14 +117,18 @@ async def _apply(c, sid, choice: dict) -> dict:
 
 async def _create(home, profile, title):
     async with connect(home) as c:
-        params = {"profile": profile, "source": "gui"}
+        # The ticketed connection binds the owner profile; it isn't a create field.
+        params = {"source": "gui"}
         if title:
             params["title"] = title[:120]
         created = await _rpc(c, "session.create", **params)
         sid = created.get("session_id") or created.get("stored_session_id")
         if not sid:
             raise TurnError("session.create returned no session id", 502)
-        return {"session_id": sid}
+        out = {"session_id": sid}
+        if created.get("stored_session_id"):
+            out["stored_session_id"] = created["stored_session_id"]
+        return out
 
 
 def create_session(home, profile, title=None):
@@ -174,7 +178,7 @@ async def _approve(turn, choice, prompt_id, generation):
 # ---------- live turns ----------
 
 class Turn:
-    def __init__(self, profile, home, sid, text, choice):
+    def __init__(self, profile, home, sid, text, choice, workspace=None):
         self.id = "turn_" + uuid.uuid4().hex
         self.profile, self.home, self.sid, self.text, self.choice = profile, home, sid, text, choice
         self.events: list[dict] = []
@@ -190,6 +194,10 @@ class Turn:
         self.steer_receipts = {}
         self.prompts: dict = {}  # prompt_id -> execution_generation of approvals still open
         self.served = {}
+        # Projects scope for this one turn (None = off): {store, project, profile, output_dir, suffix, summary}.
+        self.workspace = workspace
+        self.captured = False
+        self.steered = False
 
     def push(self, name, **fields):
         with self.cond:
@@ -219,15 +227,42 @@ _STATUS_OUTCOME = {"complete": "completed", "completed": "completed",
                    "interrupted": "cancelled", "cancelled": "cancelled", "stopped": "cancelled"}
 
 
-def _settle(turn, pl):
-    """End the turn from a completion payload. Only a real completion counts as success: an outcome of
-    ``unknown`` (a lost worker), ``failed`` or any error status is reported as a failure."""
+async def _capture(turn, pl, kind):
+    """Save a project turn's output files, only from this turn's own successful terminal admission."""
+    ws = turn.workspace
+    if not ws or turn.captured:
+        return
+    turn.captured = True  # one attempt; whatever happens the output directory is gone afterwards
+    admission = pl.get("admission_id")
+    text = pl.get("content") or pl.get("text") or ""
+    matched = bool(turn.admission) and admission == turn.admission and not turn.steered and isinstance(text, str)
+    try:
+        if kind == "completed" and matched:
+            await asyncio.to_thread(ws["store"].capture, ws["project"], turn.profile, turn.canonical_sid,
+                                    ws["output_dir"], text)
+    except Exception as e:  # never echo paths or content; only the store's own fixed limit message
+        full = getattr(e, "code", None) == 507 and type(e).__name__ == "WorkspaceError"
+        turn.push("status", text=str(e) if full else "Couldn't save this turn's project files.")
+    finally:
+        try:
+            await asyncio.to_thread(ws["store"].discard_output, ws["output_dir"])
+        except Exception:
+            pass
+
+
+def _outcome(pl):
     status = str(pl.get("status") or "").lower()
     outcome = str(pl.get("outcome") or "").lower()
     # Both fields describe the same terminal event. An unknown or conflicting value
     # cannot confirm that a reply completed.
     kinds = {_STATUS_OUTCOME.get(value, "failed") for value in (status, outcome) if value}
-    kind = kinds.pop() if len(kinds) == 1 else "failed"
+    return kinds.pop() if len(kinds) == 1 else "failed"
+
+
+def _settle(turn, pl):
+    """End the turn from a completion payload. An unknown outcome never confirms completion."""
+    kind = _outcome(pl)
+    outcome = str(pl.get("outcome") or "").lower()
     if kind == "cancelled":
         turn.push("run.cancelled", output=pl.get("content") or pl.get("text") or "")
     elif kind == "failed":
@@ -241,6 +276,7 @@ def _settle(turn, pl):
             turn.served["model"] = u["model"]
         turn.push("run.completed", output=pl.get("content") or pl.get("text") or "",
                   runtime=dict(turn.served), outcome=outcome or "completed")
+    return kind
 
 
 async def _recover_gap(c, turn):
@@ -253,14 +289,28 @@ async def _recover_gap(c, turn):
         receipt = await _rpc(c, "prompt.receipt", session_id=turn.canonical_sid, admission_id=turn.admission, include_result=True)
     except TurnError:
         receipt = {}
-    result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+    result = receipt.get("result")
+    if not isinstance(result, dict):
+        result = {}
     if receipt.get("status") in ("started", "queued"):
         return False
     # "terminal" includes cancellation and worker loss. The admission's outcome
     # determines which event the phone should paint after a gap.
     outcome = receipt.get("outcome") if receipt.get("status") == "terminal" else "unknown"
-    _settle(turn, {**result, "status": result.get("status") or "", "outcome": outcome or "unknown"})
+    merged = {**result, "text": result.get("text") or result.get("final_response") or "",
+              "status": result.get("status") or "", "outcome": outcome or "unknown",
+              "admission_id": receipt.get("admission_id") or result.get("admission_id")}
+    await _capture(turn, merged, _outcome(merged))
+    _settle(turn, merged)
     return True
+
+
+def _turn_text(turn):
+    text = turn.text
+    suffix = (turn.workspace or {}).get("suffix")
+    if suffix:
+        text = (text + "\n\n" if text else "") + suffix
+    return text
 
 
 async def _drive(turn: Turn):
@@ -268,9 +318,13 @@ async def _drive(turn: Turn):
         async with connect(turn.home) as c:
             snapshot = await _rpc(c, "session.resume", session_id=turn.sid)
             turn.canonical_sid = snapshot.get("session_id") or turn.sid
+            if turn.workspace and (snapshot.get("stored_session_id") != turn.sid or turn.canonical_sid != turn.sid):
+                # The chat the phone named is not the one the gateway resumed: send nothing, attach nothing.
+                turn.push("run.failed", error="This chat's identity could not be confirmed. Nothing was sent.")
+                return
             following_queue = turn.admission is not None
             applied = await _apply(c, turn.sid, turn.choice) if turn.choice else {}
-            params = {"session_id": turn.sid, "submission_id": uuid.uuid4().hex, "text": turn.text}
+            params = {"session_id": turn.sid, "submission_id": uuid.uuid4().hex, "text": _turn_text(turn)}
             if turn.choice.get("model"):
                 params["model_override"] = {k: v for k, v in (
                     ("model", turn.choice.get("model")), ("provider", turn.choice.get("provider")),
@@ -284,7 +338,8 @@ async def _drive(turn: Turn):
                 turn.admission = receipt["admission_id"]
                 turn.generation = receipt.get("execution_generation")
             turn.client = c
-            turn.push("run.started", requested=turn.choice, applied=bool(applied))
+            extra = {"project_context": turn.workspace["summary"]} if (turn.workspace or {}).get("summary") else {}
+            turn.push("run.started", requested=turn.choice, applied=bool(applied), **extra)
             deadline = time.time() + 3 * 3600
             while time.time() < deadline:
                 try:
@@ -359,6 +414,7 @@ async def _drive(turn: Turn):
                 elif t == "message.complete":
                     if not pl.get("admission_id") and not pl.get("outcome") and not pl.get("status"):
                         continue  # an interim summary, not this turn's end
+                    await _capture(turn, {**pl, "admission_id": admission}, _outcome(pl))
                     _settle(turn, pl)
                     return
                 elif t in ("error", "turn.failed"):
@@ -368,21 +424,29 @@ async def _drive(turn: Turn):
     except asyncio.TimeoutError:
         turn.push("run.failed", error="Hermes went quiet for 30 minutes; check the chat on your Mac.")
     except TurnError as e:
-        turn.push("run.failed", error=str(e))
+        turn.push("run.failed", error="Hermes couldn't process this project turn." if turn.workspace else str(e))
     except Exception as e:  # never leave the phone hanging
-        turn.push("run.failed", error="%s: %s" % (type(e).__name__, str(e)[:300]))
+        turn.push("run.failed", error="Hermes couldn't process this project turn." if turn.workspace else
+                  "%s: %s" % (type(e).__name__, str(e)[:300]))
     finally:
         turn.client = None
+        ws = turn.workspace
+        if ws and not turn.captured:
+            turn.captured = True
+            try:
+                ws["store"].discard_output(ws["output_dir"])
+            except Exception:
+                pass
         turn.finish()
 
 
-def start_turn(profile, home, sid, text, choice) -> Turn:
+def start_turn(profile, home, sid, text, choice, workspace=None) -> Turn:
     purge()
     with TURNS_LOCK:
         busy = [t for t in TURNS.values() if t.sid == sid and t.profile == profile and not t.done]
         if busy:
             raise TurnError("This chat is still working on the last message.", 409)
-        turn = Turn(profile, home, sid, text, clean_choice(choice))
+        turn = Turn(profile, home, sid, text, clean_choice(choice), workspace)
         TURNS[turn.id] = turn
     asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
     return turn
@@ -452,6 +516,7 @@ async def _follow_up(turn, mode, text, submission):
                                 execution_generation=generation)
             if result.get("status") != "queued":
                 raise TurnError("Hermes declined this instruction. You can send it as the next turn.", 409)
+            turn.steered = True  # the answer may now blend a second instruction: never captured as project output
             return {"status": "steer_accepted", "execution_generation": generation}
 
         if steer_id is None:

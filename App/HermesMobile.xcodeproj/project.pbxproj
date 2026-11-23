@@ -7,7 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		040EECE81F4B000CAF3EFD44 /* Workspaces.swift in Sources */ = {isa = PBXBuildFile; fileRef = F13CB626AADCB78BCEFD62E2 /* Workspaces.swift */; };
 		0CEE5C7B2A1CF628C67B9D67 /* ChatListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 398143EB1C4D7C38BC6B945F /* ChatListView.swift */; };
+		0FBF1FA94B0C0D38F486FBDA /* WorkspaceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7AC94C0A7E3ECC0AA98E648 /* WorkspaceViews.swift */; };
 		13EC70EBF845B6FBB26EADC7 /* ProjectsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 587EB11B4B0982F2A981F8F5 /* ProjectsView.swift */; };
 		2B813FA6CBE1A2730D43ED05 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C32D8FB93B9E6002372A230 /* SettingsView.swift */; };
 		2D4D15E7A8B918383BC236CB /* RuntimeSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A6A9D75E969CDFA904BF436 /* RuntimeSheet.swift */; };
@@ -51,7 +53,9 @@
 		CBF6F2AB0BD3858AAAAF4FFA /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		D2DA9159DDC16BE2AF3476DE /* StatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusView.swift; sourceTree = "<group>"; };
 		D7223536BDFD6A8A524C9B2B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		D7AC94C0A7E3ECC0AA98E648 /* WorkspaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViews.swift; sourceTree = "<group>"; };
 		E11909D98B0F5781E0DA91D1 /* HermesMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = HermesMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F13CB626AADCB78BCEFD62E2 /* Workspaces.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Workspaces.swift; sourceTree = "<group>"; };
 		F1ED146FEC9A4A8EC318137C /* BotsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BotsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -68,6 +72,7 @@
 				AAD07289071E7483A587F926 /* Projects.swift */,
 				785C4DB8C31E64EB728F4674 /* StatusModel.swift */,
 				84E690DA9F04A70286E6A83B /* StreamRecovery.swift */,
+				F13CB626AADCB78BCEFD62E2 /* Workspaces.swift */,
 				FD05A63C1F8FBADBE8115E39 /* Views */,
 			);
 			path = Sources;
@@ -121,6 +126,7 @@
 				2C32D8FB93B9E6002372A230 /* SettingsView.swift */,
 				77BE1304B3824EAD4CAE8086 /* SignInView.swift */,
 				D2DA9159DDC16BE2AF3476DE /* StatusView.swift */,
+				D7AC94C0A7E3ECC0AA98E648 /* WorkspaceViews.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -215,6 +221,8 @@
 				4F01CC9DBF27354A9230DABF /* StatusModel.swift in Sources */,
 				A361553D096D10E613B2CFEE /* StatusView.swift in Sources */,
 				ED1266216A5741C7D9F1F39B /* StreamRecovery.swift in Sources */,
+				0FBF1FA94B0C0D38F486FBDA /* WorkspaceViews.swift in Sources */,
+				040EECE81F4B000CAF3EFD44 /* Workspaces.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

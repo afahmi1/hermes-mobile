@@ -11,6 +11,11 @@ chat state. It does three things the gateway API server cannot do for a phone on
 3. A whitelisted pass-through to /p/<profile>/... (sessions, runs, model catalog) that adds the
    right key and streams SSE untouched.
 
+5. Optional Projects workspaces (HERMES_MOBILE_WORKSPACES, off by default): per-project instructions, files and
+   chats, plus files a project turn produces. This is a SINGLE-OWNER feature. Every hm1 bearer is minted only
+   after the one shared dashboard Basic credential verifies, so any valid bearer is the owner; the token's
+   device label and nonce are not a principal. Do not enable it on a shared or multi-user bridge.
+
 Binds to loopback only; reach it through `tailscale serve`. Stdlib only (system python3).
 """
 import base64, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
@@ -33,6 +38,9 @@ PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 PASS = re.compile(r"^/(api/sessions(/[^/]+(/(messages|model|fork))?)?|v1/runs(/[^/]+(/(events|stop|approval|steer))?)?"
                   r"|api/model/options|v1/models|health)$")
 MAX_BODY = 12 * 1024 * 1024
+WS_MAX_BODY = 32 * 1024  # Fits an 8 KiB base64 file or 4 KiB JSON-escaped instructions.
+WS_BODY_TIMEOUT = 10
+WS_SETTING = "HERMES_MOBILE_WORKSPACES"
 POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
@@ -41,6 +49,16 @@ try:
     TURNS_ERROR = None
 except Exception as _e:  # pragma: no cover
     turns, TURNS_ERROR = None, "%s: %s" % (type(_e).__name__, _e)
+try:
+    import bridge_workspaces as workspaces_mod  # separate module; the feature is unavailable without it
+    WorkspaceError = workspaces_mod.WorkspaceError
+except Exception:  # pragma: no cover
+    workspaces_mod = None
+
+    class WorkspaceError(Exception):
+        def __init__(self, message, code=400):
+            super().__init__(message)
+            self.code = code
 
 
 def log(msg):
@@ -746,6 +764,148 @@ def session_page(limit, cursor, only, exclude, telegram, compact=False):
             _pending_pages.pop(flight, None)
 
 
+
+# ---------- Projects workspaces (opt-in, single owner) ----------
+_WS_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_WS_FILE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_WS_SID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_WS_STORE = None
+_WS_STORE_LOCK = threading.Lock()
+
+
+def workspace_allowlist():
+    """{project_id: frozenset(profile_ids)} from HERMES_MOBILE_WORKSPACES, or {} (feature off).
+    Any malformed value turns the whole feature off rather than guessing."""
+    raw = os.environ.get(WS_SETTING)
+    if not raw:
+        return {}
+    try:
+        doc = json.loads(raw)
+        if not isinstance(doc, dict):
+            return {}
+        out = {}
+        for project, bots in doc.items():
+            if (not isinstance(project, str) or not _WS_ID.match(project) or not isinstance(bots, list)
+                    or any(not isinstance(b, str) or not (b == "default" or PROFILE_RE.match(b)) for b in bots)):
+                return {}
+            out[project] = frozenset(bots)
+        return out
+    except (ValueError, RecursionError):
+        return {}
+
+
+def profile_protected(pid):
+    """Generic exclusions on top of the explicit allowlist: unreachable bots and bots the owner opted out
+    of the phone (the same `# hermes-mobile: no-key` marker the key watcher honours)."""
+    # This is independent of current availability/keys. The operator allowlist must
+    # also exclude any differently named private or special-purpose profile.
+    parts = set(re.split(r"[-_]", pid))
+    if parts & {"health", "journal", "journaling", "trading", "robinhood", "captains", "captain", "wellness",
+                "portfolio", "stocks", "trader", "doctor", "medical", "bacta", "finance", "bank", "banking",
+                   "therapy", "secrets", "vault"} or not key_for(pid):
+        return True
+    try:
+        return OPT_OUT in (profile_home(pid) / ".env").read_text()
+    except OSError:
+        return False
+
+
+def workspace_grants():
+    """Live permission map {project_id: set(profile_ids)}. The owner's HERMES_MOBILE_WORKSPACES allowlist is
+    the source of authority for which bot may use which project; it is narrowed, never widened, by: the
+    project existing in the current catalog; the catalog's `bot_ids` when that list is non-empty (an
+    empty/absent list means the catalog expresses no opinion, since it is display metadata and today's real
+    catalogs carry none); and the profile being live and not protected. Evaluated on every request."""
+    allow = workspace_allowlist()
+    if not allow:
+        return {}
+    code, body = bridge_projects.catalog_response()
+    if code != 200:
+        return {}
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return {}
+    catalog = {p["id"]: set(p.get("bot_ids") or []) for p in doc.get("projects") or [] if doc.get("configured")}
+    live = set(profile_ids())
+    grants = {}
+    for project, bots in allow.items():
+        if project not in catalog:
+            continue
+        listed = catalog[project]
+        ok = {b for b in bots if (not listed or b in listed) and b in live and not profile_protected(b)}
+        if ok:
+            grants[project] = ok
+    return grants
+
+
+def workspace_store():
+    global _WS_STORE
+    with _WS_STORE_LOCK:
+        if _WS_STORE is None:
+            if workspaces_mod is None:
+                raise WorkspaceError("Projects storage is unavailable.", 503)
+            try:
+                _WS_STORE = workspaces_mod.WorkspaceStore(STATE_DIR / "workspaces")
+            except WorkspaceError:
+                raise
+            except Exception:
+                raise WorkspaceError("Projects storage is unavailable.", 503)
+        return _WS_STORE
+
+
+def safe_name(name):
+    """Final path component only, no controls; '' when nothing usable remains."""
+    if not isinstance(name, str):
+        return ""
+    base = name.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip()
+    base = "".join(c for c in base if c.isprintable() and c not in '"\\')
+    return "" if base in ("", ".", "..") else base[:200]
+
+
+def content_disposition(name):
+    from urllib.parse import quote
+    base = safe_name(name) or "file"
+    ascii_name = base.encode("ascii", "replace").decode().replace("?", "_").replace(";", "_")
+    return "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (ascii_name, quote(base, safe=""))
+
+
+ARTIFACT_NOTE = ("Project output: save any file you want to hand back only inside this directory: %s\n"
+                 "For each saved file, add a line `MEDIA:<full path>` to your final reply.")
+
+
+def prepare_workspace_turn(pid, sid, payload):
+    """Scope for one turn, or None when the chat is not a project chat on a currently allowed pair.
+    Raises WorkspaceError for an explicit project_context that does not match."""
+    explicit = payload.get("project_context")
+    if explicit is not None:
+        project = explicit.get("project") if isinstance(explicit, dict) else explicit
+        if not isinstance(project, str) or not _WS_ID.match(project):
+            raise WorkspaceError("Bad project.", 400)
+    grants = workspace_grants()
+    if not any(pid in allowed for allowed in grants.values()):
+        if explicit is not None:
+            raise WorkspaceError("That chat doesn't belong to this project.", 403)
+        return None
+    store = workspace_store()
+    linked = store.project_for(pid, sid)
+    if explicit is not None:
+        if pid not in grants.get(project, ()) or linked != project:
+            raise WorkspaceError("That chat doesn't belong to this project.", 403)
+    elif linked is None or pid not in grants.get(linked, ()):
+        return None
+    else:
+        project = linked
+    suffix, summary = store.context(project) if explicit is not None else ("", None)
+    out_dir = store.artifact_dir()
+    note = ARTIFACT_NOTE % out_dir
+    suffix = (suffix + "\n\n" if suffix else "") + note
+    if summary is not None:  # structured only: whether instructions apply and file names, never the text
+        summary = {"project": project, "instructions": bool(summary.get("instructions")),
+                   "files": [safe_name(n) for n in summary.get("files") or [] if safe_name(n)]}
+    return {"store": store, "project": project, "output_dir": out_dir, "suffix": suffix, "summary": summary}
+
+
 # ---------- HTTP ----------
 class H(BaseHTTPRequestHandler):
     server_version = "HermesMobile/1"
@@ -787,11 +947,23 @@ class H(BaseHTTPRequestHandler):
             n = int(raw)
         except ValueError:
             n = -1
-        if n < 0 or n > MAX_BODY:
+        scoped = urlsplit(self.path).path.startswith("/m/workspace")
+        cap = WS_MAX_BODY if scoped else MAX_BODY
+        if n < 0 or n > cap:
             self.close_connection = True
-            self.send(413 if n > MAX_BODY else 400, {"error": "Bad request body."}, close=True)
+            self.send(413 if n > cap else 400, {"error": "Bad request body."}, close=True)
             return False
-        self._body = self.rfile.read(n) if n else b""
+        if scoped:
+            self.connection.settimeout(WS_BODY_TIMEOUT)
+        try:
+            self._body = self.rfile.read(n) if n else b""
+        except OSError:
+            self.close_connection = True
+            self.send(408, {"error": "Request timed out."}, close=True)
+            return False
+        finally:
+            if scoped:
+                self.connection.settimeout(None)
         return True
 
     def authed(self):
@@ -811,6 +983,8 @@ class H(BaseHTTPRequestHandler):
             return self.send(401, {"error": "Sign in again."})
         if path == "/m/projects":
             return self.projects_route(u)
+        if path == "/m/workspaces" or path.startswith(("/m/workspaces/", "/m/workspace-artifacts", "/m/workspace-file/")):
+            return self.workspace_route(path, q)
         if self.command == "GET":
             if path == "/m/health":
                 return self.send(200, health())
@@ -850,6 +1024,123 @@ class H(BaseHTTPRequestHandler):
             return self.send(400, {"error": "Bad request."})
         code, body = bridge_projects.catalog_response()
         self.send(code, body)
+
+    # ---- Projects workspaces (single owner; every route sits behind the bearer check in route()) ----
+    def workspace_route(self, path, q=None):
+        q = q or {}
+        try:
+            grants = workspace_grants()
+            if path == "/m/workspaces":
+                if self.command != "GET":
+                    return self.send(405, {"error": "Method not allowed."})
+                return self.send(200, {"projects": sorted(grants), "profiles": sorted(set().union(*grants.values()))})
+            m = re.match(r"^/m/workspace-artifacts/([^/]+)(?:/([^/]+))?$", path)
+            if m:
+                if self.command != "GET":
+                    return self.send(405, {"error": "Method not allowed."})
+                profile, sid = m.group(1), m.group(2)
+                if not (profile == "default" or PROFILE_RE.match(profile)) or (sid and not _WS_SID.match(sid)):
+                    return self.send(404, {"error": "Not found."})
+                if set(q) - {"project"}:
+                    return self.send(400, {"error": "Bad request."})
+                project = q.get("project")
+                if sid:
+                    # One chat's files: the chat must be linked to a project this bot is currently granted.
+                    linked = workspace_store().project_for(profile, sid) if grants else None
+                    if linked is None or profile not in grants.get(linked, ()) or project not in (None, linked):
+                        return self.send(200, {"artifacts": []})
+                    project = linked
+                else:
+                    # Bot library: always one explicit, currently enabled project. Never cross-project.
+                    if not isinstance(project, str) or not _WS_ID.match(project):
+                        return self.send(400, {"error": "A project is required."})
+                    if profile not in grants.get(project, ()):
+                        return self.send(200, {"artifacts": []})
+                rows = workspace_store().list_artifacts(profile, sid, project)
+                return self.send(200, {"artifacts": [r for r in rows if r.get("project_id") == project
+                                                     and r.get("profile") in grants.get(project, ())]})
+            m = re.match(r"^/m/workspace-file/([A-Za-z0-9_-]{1,80})$", path)
+            if m:
+                if self.command != "GET":
+                    return self.send(405, {"error": "Method not allowed."})
+                if not grants:
+                    return self.send(404, {"error": "Not found."})
+                row, data = workspace_store().read_artifact(m.group(1))
+                if row.get("profile") not in grants.get(row.get("project_id"), ()):
+                    return self.send(404, {"error": "Not found."})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", content_disposition(row.get("name")))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+                return
+            m = re.match(r"^/m/workspaces/([^/]+)(?:/(instructions|files|chats)(?:/([^/]+))?)?$", path)
+            if not m or not _WS_ID.match(m.group(1)):
+                return self.send(404, {"error": "Not found."})
+            project, part, item = m.groups()
+            allowed = grants.get(project)
+            if not allowed:
+                return self.send(404, {"error": "Not found."})
+            store = workspace_store()
+            if part is None and not item:
+                if self.command != "GET":
+                    return self.send(405, {"error": "Method not allowed."})
+                d = dict(store.detail(project))
+                d["chats"] = [c for c in d.get("chats") or [] if c.get("profile") in allowed]
+                d["artifacts"] = [a for a in d.get("artifacts") or [] if a.get("profile") in allowed]
+                d["profiles"] = sorted(allowed)
+                return self.send(200, d)
+            if part == "instructions" and not item:
+                if self.command != "PUT":
+                    return self.send(405, {"error": "Method not allowed."})
+                value = self.json_body().get("instructions")
+                if not isinstance(value, str):
+                    return self.send(400, {"error": "Instructions must be text."})
+                store.save_instructions(project, value)
+                return self.send(200, {"ok": True})
+            if part == "files" and not item and self.command == "POST":
+                d = self.json_body()
+                name = safe_name(d.get("name"))
+                if not name or not isinstance(d.get("data"), str):
+                    return self.send(400, {"error": "A file name and data are required."})
+                return self.send(201, store.add_file(project, name, d["data"]))
+            if part == "files" and item and self.command == "DELETE":
+                if not _WS_FILE_ID.match(item):
+                    return self.send(404, {"error": "Not found."})
+                store.delete_file(project, item)
+                return self.send(200, {"ok": True})
+            if part == "chats" and not item and self.command == "POST":
+                return self.workspace_new_chat(store, project, allowed)
+            return self.send(405 if part else 404, {"error": "Method not allowed."})
+        except WorkspaceError as e:
+            return self.send(e.code, {"error": str(e)})
+        except Exception as e:  # type only: never a path, token, prompt or body
+            log("workspace route failed: %s" % type(e).__name__)
+            return self.send(502, {"error": "Projects request failed."})
+
+    def workspace_new_chat(self, store, project, allowed):
+        if turns is None:
+            return self.send(503, {"error": "Turn engine unavailable."})
+        d = self.json_body()
+        profile, title = d.get("profile"), d.get("title")
+        if not isinstance(profile, str) or profile not in allowed:
+            return self.send(403, {"error": "That bot isn't enabled for this project."})
+        if title is not None and not isinstance(title, str):
+            return self.send(400, {"error": "Bad title."})
+        try:
+            # A titled upstream create can resume an existing chat by name. Mint an
+            # untitled chat; the requested display title belongs to workspace metadata.
+            created = turns.create_session(profile_home(profile), profile)
+        except turns.TurnError as e:
+            return self.send(e.code, {"error": "Hermes couldn't create this project chat."})
+        stored = created.get("stored_session_id")  # the canonical id; never a client-supplied one
+        if not isinstance(stored, str) or not _WS_SID.match(stored):
+            return self.send(502, {"error": "Hermes didn't return a canonical chat id."})
+        return self.send(201, store.link_chat(project, profile, stored, (title or "").strip()[:120] or "New chat"))
 
     # ---- chats through the gateway's canonical session protocol (the desktop app's) ----
     def chat_route(self, path, q):
@@ -906,9 +1197,21 @@ class H(BaseHTTPRequestHandler):
             text = str(d.get("text") or "").strip()
             if not text:
                 return self.send(400, {"error": "Empty message."})
-            turn = turns.start_turn(pid, home, sid, text, {k: d.get(k) for k in ("provider", "model", "effort", "reset_model", "reset_effort")})
+            workspace = prepare_workspace_turn(pid, sid, d)
+            try:
+                turn = turns.start_turn(pid, home, sid, text, {k: d.get(k) for k in ("provider", "model", "effort", "reset_model", "reset_effort")},
+                                        workspace=workspace)
+            except BaseException:
+                if workspace:
+                    try:
+                        workspace["store"].discard_output(workspace["output_dir"])
+                    except Exception:
+                        pass
+                raise
             return self.send(202, turn.summary())
         except turns.TurnError as e:
+            return self.send(e.code, {"error": str(e)})
+        except WorkspaceError as e:
             return self.send(e.code, {"error": str(e)})
         except Exception as e:
             log("chat route %s failed: %s: %s" % (path, type(e).__name__, e))
@@ -953,7 +1256,7 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    do_GET = do_POST = do_PATCH = do_DELETE = lambda self: self.route()
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = lambda self: self.route()
 
     def login(self):
         who = (self.headers.get("Tailscale-User-Login") or "local").strip().lower()[:120]

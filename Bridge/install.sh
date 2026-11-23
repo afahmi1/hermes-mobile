@@ -6,7 +6,11 @@
 #
 # Env overrides: HERMES_HOME (default ~/.hermes), HERMES_PYTHON (Hermes's venv python),
 # HERMES_MOBILE_PORT (default 9131), HERMES_MOBILE_LABEL (default local.hermes-mobile.bridge),
-# HERMES_MOBILE_PROJECTS_CATALOG (optional absolute path to a project catalog JSON; off if unset).
+# HERMES_MOBILE_PROJECTS_CATALOG (optional absolute path to a project catalog JSON; off if unset),
+# HERMES_MOBILE_WORKSPACES (optional JSON, off if unset: {"<catalog project id>": ["<exact bot id>", ...]}
+# opts those project/bot pairs in to Project instructions, files, chats and output files. Needs the catalog.
+# Single owner only: every sign-in is the one shared dashboard credential, so any valid token is the owner.
+# Do not enable it on a shared or multi-user bridge.)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -53,6 +57,9 @@ sed -e "s#__LABEL__#$LABEL#g" -e "s#__PYTHON__#$PY#g" -e "s#__BRIDGE__#$HERE/her
     -e "s#__PORT__#$PORT#g" -e "s#__LOG__#$LOG#g" "$HERE/hermes-mobile-bridge.plist.template" > "$PLIST"
 if [[ -n "${HERMES_MOBILE_PROJECTS_CATALOG:-}" ]]; then
   plutil -insert EnvironmentVariables.HERMES_MOBILE_PROJECTS_CATALOG -string "$HERMES_MOBILE_PROJECTS_CATALOG" "$PLIST"
+fi
+if [[ -n "${HERMES_MOBILE_WORKSPACES:-}" ]]; then
+  plutil -insert EnvironmentVariables.HERMES_MOBILE_WORKSPACES -string "$HERMES_MOBILE_WORKSPACES" "$PLIST"
 fi
 plutil -lint "$PLIST" >/dev/null
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
