@@ -140,7 +140,7 @@ final class AppModel {
     }
 
     func adopt(_ chat: ChatModel, draftKey: String) {
-        guard let sid = chat.sessionId else { return }
+        guard visibleChats.object(forKey: draftKey as NSString) === chat, let sid = chat.sessionId else { return }
         let key = "\(chat.profile)/\(sid)"
         chats[key] = chat
         visibleChats.setObject(chat, forKey: key as NSString)

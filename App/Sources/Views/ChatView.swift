@@ -9,7 +9,9 @@ struct ChatView: View {
     var projectScope: WorkspaceScope?
 
     var body: some View {
-        ChatScreen(chat: app.chat(for: ref), draftKey: ref.id, projectScope: projectScope)
+        let chat = app.chat(for: ref)
+        ChatScreen(chat: chat, draftKey: ref.id, projectScope: projectScope)
+            .id(ObjectIdentifier(chat))
     }
 }
 
@@ -142,6 +144,7 @@ struct ChatScreen: View {
             Button("Choose from up to 3 frames") { prepareFrames() }
             Button("Cancel", role: .cancel) { discardVideo() }
         } message: { Text(mediaCapabilities?.video == true ? "A clip includes audio and may be processed by the gateway’s video provider. Frames are still images you can review before sending." : "This gateway accepts still images. Review and remove frames before sending. Frames contain no audio.") }
+        .onDisappear { discardVideo() }
         .sensoryFeedback(.impact(weight: .light), trigger: sendTick)
         .sensoryFeedback(.success, trigger: chat.completedTick)
         .sensoryFeedback(.error, trigger: chat.failedTick)
@@ -190,7 +193,8 @@ struct ChatScreen: View {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                     Text(e).font(.footnote)
                     Spacer()
-                    Button { chat.error = nil } label: { Image(systemName: "xmark").font(.caption) }
+                    Button { chat.error = nil } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
+                        .accessibilityLabel("Dismiss error")
                 }
                 .padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
                 .padding(.horizontal, 12)
@@ -216,7 +220,7 @@ struct ChatScreen: View {
                 }.scrollIndicators(.hidden)
             }
             HStack(alignment: .bottom, spacing: 8) {
-                if (mediaCapabilities?.images == true || app.health?.imageAttachments == true) && !chat.isRunning {
+                if (mediaCapabilities?.images == true || (mediaCapabilities == nil && app.health?.imageAttachments == true)) && !chat.isRunning {
                     Menu {
                         Button { showPicker = true } label: { Label("Photo or video", systemImage: "photo.on.rectangle") }
                         if UIImagePickerController.isSourceTypeAvailable(.camera) {

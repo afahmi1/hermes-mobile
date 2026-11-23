@@ -22,6 +22,7 @@
 		38D5ABE86429FF25D8801AE5 /* ManagementAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7064B9C91B578271B8CD8CC /* ManagementAPI.swift */; };
 		4F01CC9DBF27354A9230DABF /* StatusModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 785C4DB8C31E64EB728F4674 /* StatusModel.swift */; };
 		569136F100411902E2211011 /* HermesMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6686DC90CF4C5218AD9EE3C5 /* HermesMobileApp.swift */; };
+		6BFCE82C26EA31F0239C7BC8 /* MediaStaging.swift in Sources */ = {isa = PBXBuildFile; fileRef = C87199BB4AB4041206610E84 /* MediaStaging.swift */; };
 		76D6BA0E07AD7BC36AE172AA /* DeletionPinView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 149305800C6FA857809273F1 /* DeletionPinView.swift */; };
 		8A4FEE22C59ED755F87C1232 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBA5B61C8421B891EEEAE3A8 /* ChatView.swift */; };
 		9871CAA201B1E5134B060C34 /* ProviderUsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFA9E6B699E7BB76519F7CD /* ProviderUsageView.swift */; };
@@ -60,6 +61,7 @@
 		AAD07289071E7483A587F926 /* Projects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Projects.swift; sourceTree = "<group>"; };
 		AEDE9C050CDF0DF9C49E0B64 /* Management.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Management.swift; sourceTree = "<group>"; };
 		B2964B8E32E7A6E7CAE8E6CD /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		C87199BB4AB4041206610E84 /* MediaStaging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaStaging.swift; sourceTree = "<group>"; };
 		CAFA9E6B699E7BB76519F7CD /* ProviderUsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderUsageView.swift; sourceTree = "<group>"; };
 		CBA5B61C8421B891EEEAE3A8 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		CBF6F2AB0BD3858AAAAF4FFA /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
@@ -84,6 +86,7 @@
 				44E6169EEAB809871675DAC1 /* InboxCache.swift */,
 				AEDE9C050CDF0DF9C49E0B64 /* Management.swift */,
 				A7064B9C91B578271B8CD8CC /* ManagementAPI.swift */,
+				C87199BB4AB4041206610E84 /* MediaStaging.swift */,
 				B2964B8E32E7A6E7CAE8E6CD /* Models.swift */,
 				AAD07289071E7483A587F926 /* Projects.swift */,
 				785C4DB8C31E64EB728F4674 /* StatusModel.swift */,
@@ -238,6 +241,7 @@
 				11047681052764C050F89289 /* Management.swift in Sources */,
 				38D5ABE86429FF25D8801AE5 /* ManagementAPI.swift in Sources */,
 				2DA9ED00AD66FD68506A0E7F /* MarkdownText.swift in Sources */,
+				6BFCE82C26EA31F0239C7BC8 /* MediaStaging.swift in Sources */,
 				DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */,
 				B16507F21903C2EEF6219FFB /* Projects.swift in Sources */,
 				13EC70EBF845B6FBB26EADC7 /* ProjectsView.swift in Sources */,

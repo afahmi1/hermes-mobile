@@ -10,10 +10,7 @@ struct PickedMedia: Transferable {
     let url: URL
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(importedContentType: .item) { file in
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                .appendingPathExtension(file.file.pathExtension)
-            try FileManager.default.copyItem(at: file.file, to: url)
-            return Self(url: url)
+            try Self(url: MediaStaging.stage(file.file))
         }
     }
 }
@@ -55,6 +52,8 @@ enum ChatMedia {
 
     static func clip(from url: URL, maxBytes: Int) async throws -> SendAttachment {
         let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration).seconds
+        guard duration.isFinite, duration > 0 else { throw Failure.unreadable }
         let target = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
         defer { try? FileManager.default.removeItem(at: target) }
         for preset in [AVAssetExportPresetMediumQuality, AVAssetExportPresetLowQuality] {
@@ -62,6 +61,7 @@ enum ChatMedia {
                   export.supportedFileTypes.contains(.mp4) else { continue }
             export.outputURL = target
             export.outputFileType = .mp4
+            export.fileLengthLimit = Int64(maxBytes)
             export.metadata = []
             export.shouldOptimizeForNetworkUse = true
             try? FileManager.default.removeItem(at: target)
@@ -75,6 +75,8 @@ enum ChatMedia {
             guard export.status == .completed else { continue }
             let size = try target.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             if size > 0 && size <= maxBytes {
+                let exportedDuration = try await AVURLAsset(url: target).load(.duration).seconds
+                guard exportedDuration.isFinite, abs(exportedDuration - duration) <= min(0.25, duration * 0.02) else { continue }
                 return SendAttachment(mime: "video/mp4", filename: "Video-" + UUID().uuidString.prefix(6) + ".mp4",
                                       base64: try Data(contentsOf: target).base64EncodedString())
             }
