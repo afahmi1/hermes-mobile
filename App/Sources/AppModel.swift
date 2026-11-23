@@ -41,7 +41,11 @@ final class AppModel {
     func inboxKey(profile: String?, filter: String) -> String? {
         inboxAccount.map { [$0, profile ?? "*", filter].joined(separator: "|") }
     }
-    private var catalogs: [String: ModelCatalog] = [:]
+    /// Live provider model catalog, per account + profile (TTL, coalesced, cadence-bounded refresh).
+    let catalogStore = ModelCatalogStore(currentAccount: { AppModel.currentAccount }) { scope, fetch in
+        try await API.shared.catalog(profile: scope.profile, fetch: fetch)
+    }
+    func catalogScope(_ profile: String) -> CatalogScope? { inboxAccount.map { CatalogScope(account: $0, profile: profile) } }
     @ObservationIgnored private var chats: [String: ChatModel] = [:]
     @ObservationIgnored private var recentChatKeys: [String] = []
     private let visibleChats = NSMapTable<NSString, ChatModel>.strongToWeakObjects()
@@ -116,11 +120,8 @@ final class AppModel {
     }
 
     func catalog(for profile: String, refresh: Bool = false) async -> ModelCatalog? {
-        if !refresh, let c = catalogs[profile] { return c }
-        guard let account = inboxAccount, let c = try? await API.shared.catalog(profile: profile),
-              account == inboxAccount else { return nil }
-        catalogs[profile] = c
-        return c
+        guard let scope = catalogScope(profile) else { return nil }
+        return refresh ? await catalogStore.refresh(scope) : await catalogStore.load(scope)
     }
 
     /// One live ChatModel per session, so a reply keeps streaming while you look at other chats.
@@ -211,7 +212,7 @@ final class AppModel {
         chats = [:]
         recentChatKeys.removeAll()
         visibleChats.removeAllObjects()
-        catalogs = [:]
+        catalogStore.reset()
     }
 
     // MARK: per-chat runtime choice (device-local mirror of the session lock in state.db)

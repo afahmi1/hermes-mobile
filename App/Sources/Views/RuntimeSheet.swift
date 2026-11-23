@@ -14,7 +14,6 @@ struct RuntimeSheet: View {
     @State private var fresh: ServedRuntime?
     let onApply: (RuntimeChoice) -> Void
 
-    @State private var catalog: ModelCatalog?
     @State private var provider: String?
     @State private var model: String?
     @State private var effort: String?
@@ -23,6 +22,10 @@ struct RuntimeSheet: View {
     /// Set once the sheet has been filled from the chat's current setting; only later provider changes
     /// (the user's) may re-pick the model, so a custom model name survives reopening the sheet.
     @State private var seeded = false
+
+    private var scope: CatalogScope? { app.catalogScope(profile) }
+    private var catalogState: CatalogState { scope.map { app.catalogStore.state($0) } ?? CatalogState() }
+    private var catalog: ModelCatalog? { catalogState.catalog }
 
     var body: some View {
         NavigationStack {
@@ -49,13 +52,15 @@ struct RuntimeSheet: View {
                     .pickerStyle(.menu)
                     if !loading && (catalog?.usable.isEmpty ?? true) {
                         Text("Model list unavailable. You can keep this chat’s saved selection.").foregroundStyle(.secondary)
-                        Button("Reload models") {
-                            Task { catalog = await app.catalog(for: profile, refresh: true) }
-                        }
                     }
+                    Button("Refresh models") {
+                        Task { _ = await app.catalog(for: profile, refresh: true) }
+                    }
+                    .disabled(catalogState.isRefreshing)
                     if loading { HStack { ProgressView(); Text("Loading models…").foregroundStyle(.secondary) } }
                 } header: { Text("Provider") } footer: {
                     if provider == nil, let bot { Text("Uses \(bot.name)'s own setting: \(bot.model) · \(bot.provider).") }
+                    if !loading { Text(catalogState.caption(now: Date())) }
                 }
 
                 if let p = selectedProvider {
@@ -137,7 +142,7 @@ struct RuntimeSheet: View {
                 guard seeded else { return }
                 modelQuery = ""
                 guard let slug else { model = nil; return }
-                guard let p = catalog?.providers.first(where: { $0.slug == slug }) else { return }  // catalog still loading
+                guard let p = catalog?.provider(slug: slug) else { return }  // catalog still loading
                 if !p.models.contains(model ?? "") { model = p.models.first(where: { $0 == bot?.model }) ?? p.models.first }
             }
             .sensoryFeedback(.selection, trigger: provider)
@@ -151,8 +156,9 @@ struct RuntimeSheet: View {
             model = current.model
             provider = current.provider
             effort = current.effort
-            catalog = await app.catalog(for: profile)
+            await app.catalog(for: profile)
             loading = false
+            if let scope { Task { await app.catalogStore.openCheck(scope) } }
             if let sid = sessionId { fresh = try? await API.shared.served(profile: profile, session: sid) }
             if let m = current.model, let p = selectedProvider, !p.models.contains(m) { modelQuery = m }  // show the custom row
             seeded = true
@@ -174,7 +180,7 @@ struct RuntimeSheet: View {
     private var reportedReasoning: Bool? {
         let slug = provider ?? bot?.provider
         let name = model ?? bot?.model
-        guard let name, let p = catalog?.providers.first(where: { $0.slug == slug }) else { return nil }
+        guard let name, let slug, let p = catalog?.provider(slug: slug) else { return nil }
         return p.reasoning[name]
     }
     private var reasoningSupported: Bool { reportedReasoning != false }
