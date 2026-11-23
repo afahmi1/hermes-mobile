@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 /// One Hermes profile ("bot"). `id` is the profile name; "default" is the front door.
 struct Bot: Codable, Identifiable, Hashable {
@@ -157,6 +158,134 @@ struct ModelCatalog: Decodable {
     }
 
     var usable: [Provider] { providers.filter { $0.authenticated && !$0.models.isEmpty } }
+    /// Exact slug match: `openai-codex` and `openai-api` are different providers.
+    func provider(slug: String) -> Provider? { providers.first { $0.slug == slug } }
+}
+
+// MARK: - Live model catalog
+
+/// `.cached` is a normal read (Hermes may serve its own disk cache); `.refresh` asks Hermes to re-probe providers.
+enum CatalogFetch: Sendable {
+    case cached, refresh
+    func path(escapedProfile: String) -> String {
+        "/m/p/\(escapedProfile)/api/model/options" + (self == .refresh ? "?refresh=1" : "")
+    }
+}
+
+/// The account id already hashes server origin + token, so it keeps gateways and sign-ins apart.
+struct CatalogScope: Hashable, Sendable { let account: String; let profile: String }
+
+struct CatalogState {
+    var catalog: ModelCatalog?
+    var fetchedAt: Date?
+    var lastRefreshAt: Date?       // last successful live (`refresh=1`) read
+    var lastAttemptAt: Date?       // last live attempt, success or not (bounds cadence)
+    var lastError: String?
+    var isRefreshing = false
+
+    func isStale(now: Date, ttl: TimeInterval = ModelCatalogStore.ttl) -> Bool {
+        lastError != nil || fetchedAt.map { now.timeIntervalSince($0) > ttl } ?? true
+    }
+
+    /// Footer text for pickers and provider detail.
+    func caption(now: Date) -> String {
+        let rel = RelativeDateTimeFormatter()
+        rel.unitsStyle = .short
+        func ago(_ d: Date) -> String { now.timeIntervalSince(d) < 45 ? "just now" : rel.localizedString(for: d, relativeTo: now) }
+        if isRefreshing { return "Refreshing…" }
+        guard let at = fetchedAt else { return lastError ?? "Not loaded yet" }
+        if lastError != nil { return "Couldn’t refresh — showing the list from \(ago(at))" }
+        return "Checked \(ago(at))"
+    }
+}
+
+@MainActor @Observable
+final class ModelCatalogStore {
+    nonisolated static let ttl: TimeInterval = 300
+    nonisolated static let minRefreshInterval: TimeInterval = 60
+    nonisolated static let failureText = "Couldn’t reach Hermes’s model catalog."
+
+    typealias Fetcher = @Sendable (CatalogScope, CatalogFetch) async throws -> ModelCatalog
+
+    private(set) var entries: [CatalogScope: CatalogState] = [:]
+    @ObservationIgnored private var inFlight: [CatalogScope: (kind: CatalogFetch, task: Task<Void, Never>)] = [:]
+    @ObservationIgnored private var generation = 0
+    @ObservationIgnored private let now: () -> Date
+    @ObservationIgnored private let currentAccount: () -> String?
+    @ObservationIgnored private let fetcher: Fetcher
+
+    init(now: @escaping () -> Date = Date.init, currentAccount: @escaping () -> String?, fetcher: @escaping Fetcher) {
+        self.now = now
+        self.currentAccount = currentAccount
+        self.fetcher = fetcher
+    }
+
+    func state(_ scope: CatalogScope) -> CatalogState { entries[scope] ?? CatalogState() }
+
+    /// Account/server switch or sign-out: drop everything; late responses are discarded.
+    func reset() {
+        generation += 1
+        for (_, f) in inFlight { f.task.cancel() }
+        inFlight = [:]
+        entries = [:]
+    }
+
+    /// Fresh entries are served without network; otherwise one coalesced plain read.
+    @discardableResult
+    func load(_ scope: CatalogScope) async -> ModelCatalog? {
+        if let e = entries[scope], e.catalog != nil, !e.isStale(now: now()) { return e.catalog }
+        if let f = inFlight[scope] { await f.task.value } else { await start(scope, .cached).value }
+        return entries[scope]?.catalog
+    }
+
+    /// Live re-probe, at most once per `minRefreshInterval` per scope; extra calls join or return the cached list.
+    @discardableResult
+    func refresh(_ scope: CatalogScope) async -> ModelCatalog? {
+        if let f = inFlight[scope] {
+            await f.task.value
+            if f.kind == .refresh { return entries[scope]?.catalog }
+        }
+        if let at = entries[scope]?.lastAttemptAt, now().timeIntervalSince(at) < Self.minRefreshInterval {
+            return entries[scope]?.catalog
+        }
+        if let f = inFlight[scope] { await f.task.value } else { await start(scope, .refresh).value }
+        return entries[scope]?.catalog
+    }
+
+    /// On open: publish the cached/plain read right away, then one live check if the last one is old or missing.
+    func openCheck(_ scope: CatalogScope) async {
+        await load(scope)
+        if let at = entries[scope]?.lastRefreshAt, now().timeIntervalSince(at) <= Self.ttl { return }
+        await refresh(scope)
+    }
+
+    private func start(_ scope: CatalogScope, _ kind: CatalogFetch) -> Task<Void, Never> {
+        let gen = generation
+        var e = state(scope)
+        e.isRefreshing = true
+        if kind == .refresh { e.lastAttemptAt = now() }
+        entries[scope] = e
+        let task = Task { @MainActor [weak self, fetcher] in
+            let result: Result<ModelCatalog, Error>
+            do { result = .success(try await fetcher(scope, kind)) } catch { result = .failure(error) }
+            guard let self, gen == self.generation else { return }
+            self.inFlight[scope] = nil
+            var e = self.state(scope)
+            e.isRefreshing = false
+            if self.currentAccount() == scope.account {
+                switch result {
+                case .success(let c):
+                    e.catalog = c; e.fetchedAt = self.now(); e.lastError = nil
+                    if kind == .refresh { e.lastRefreshAt = e.fetchedAt }
+                case .failure:
+                    e.lastError = Self.failureText   // keep the last-good list
+                }
+                self.entries[scope] = e
+            } else { self.entries[scope] = nil }
+        }
+        inFlight[scope] = (kind, task)
+        return task
+    }
 }
 
 /// What the user picked for a chat. All nil = the bot's own default.

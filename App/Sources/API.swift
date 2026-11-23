@@ -460,8 +460,8 @@ final class API: @unchecked Sendable {
         guard http.statusCode == 200 else { throw APIError.http(http.statusCode, Self.errorText(data)) }
         return (try JSONDecoder().decode(MessagesPage.self, from: data).data, http.value(forHTTPHeaderField: "ETag"))
     }
-    func catalog(profile: String) async throws -> ModelCatalog {
-        try await get(p(profile, "/api/model/options"), as: ModelCatalog.self)
+    func catalog(profile: String, fetch: CatalogFetch = .cached) async throws -> ModelCatalog {
+        try await get(fetch.path(escapedProfile: Self.esc(profile)), as: ModelCatalog.self)
     }
     func served(profile: String, session: String) async throws -> ServedRuntime {
         try await get("/m/runtime/\(Self.esc(profile))/\(Self.esc(session))", as: ServedRuntime.self)
