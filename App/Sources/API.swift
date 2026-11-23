@@ -72,9 +72,7 @@ final class API: @unchecked Sendable {
     private let transport = BridgeTransport()
     private init(_ login: GatewayLogin?) {
         self.login = login
-        self.accountID = login.map {
-            SHA256.hash(data: Data(($0.server.absoluteString + "|" + $0.token).utf8)).map { String(format: "%02x", $0) }.joined()
-        }
+        self.accountID = login.map(Self.accountID(for:))
         self.session = Self.makeSession(stream: false, transport: transport)
         self.streamSession = Self.makeSession(stream: true, transport: transport)
     }
@@ -193,6 +191,19 @@ final class API: @unchecked Sendable {
 
     func revokeDevice(_ id: String) async throws {
         _ = try await send(request("/m/devices/\(Self.esc(id))", method: "DELETE"))
+    }
+
+    /// Revoke the grant a saved, non-active gateway issued to this phone. Best effort: the host may be
+    /// asleep, and the caller removes the local credential either way.
+    func revokeSavedDevice(_ login: GatewayLogin) async throws {
+        var r = try request("/m/devices/current", method: "DELETE", auth: false, server: login.server)
+        r.setValue("Bearer " + login.token, forHTTPHeaderField: "Authorization")
+        r.timeoutInterval = 6
+        _ = try await send(r)
+    }
+
+    static func accountID(for login: GatewayLogin) -> String {
+        SHA256.hash(data: Data((login.server.absoluteString + "|" + login.token).utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: reads

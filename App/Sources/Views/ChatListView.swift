@@ -159,27 +159,35 @@ struct ChatListView: View {
     @ViewBuilder private var content: some View {
         List {
             Section {
-                HStack {
-                    if let url = API.shared.baseURL {
-                        Button { showGateways = true } label: {
-                            Label {
-                                HStack(spacing: 4) {
+                // One quiet strip above the list: where you are, how it is doing, and what is shown.
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        if let url = API.shared.baseURL {
+                            Button { showGateways = true } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "server.rack").imageScale(.small)
                                     Text(SavedGateways.displayName(url)).lineLimit(1)
-                                    Image(systemName: "chevron.up.chevron.down").imageScale(.small)
+                                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold))
                                 }
-                            } icon: { Image(systemName: "server.rack") }
+                                .font(.subheadline.weight(.semibold))
+                                .frame(minHeight: 44)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(selecting || fixedProfile != nil)
+                            .accessibilityLabel("Choose gateway, current gateway " + SavedGateways.displayName(url))
                         }
-                        .buttonStyle(.borderless)
-                        .disabled(selecting || fixedProfile != nil)
-                        .accessibilityLabel("Choose gateway, current gateway " + SavedGateways.displayName(url))
+                        Spacer(minLength: 6)
+                        ConnectionBadge().buttonStyle(.borderless)
                     }
-                    Spacer(minLength: 6)
-                    ConnectionBadge().buttonStyle(.borderless)
+                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 8))
+                    layout { filters }
+                    .disabled(selecting)
                 }
-                let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 16))
-                layout { filters }
-                .disabled(selecting)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
             }
+            .listSectionSpacing(.compact)
             if let error {
                 VStack(alignment: .leading, spacing: 4) {
                     Label(error, systemImage: "wifi.exclamationmark")
@@ -235,10 +243,12 @@ struct ChatListView: View {
         HStack(spacing: 5) {
             Image(systemName: symbol).imageScale(.small)
             Text(title).lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
-            Image(systemName: "chevron.down").font(.caption2)
+            Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
         }
         .font(.subheadline.weight(.medium))
         .foregroundStyle(.primary)
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(Color(.tertiarySystemFill), in: Capsule())
         .frame(minHeight: 44)
         .contentShape(Rectangle())
     }
@@ -285,12 +295,6 @@ struct ChatListView: View {
             }
             .contextMenu {
                 Button {
-                    Task { await setFlag(s, "archived", !(s.archived ?? false)) }
-                } label: {
-                    Label(s.archived == true ? "Unarchive" : "Archive",
-                          systemImage: s.archived == true ? "tray.and.arrow.up" : "archivebox")
-                }
-                Button {
                     Task { await setFlag(s, "pinned", !(s.pinned ?? false)) }
                 } label: {
                     Label(s.pinned == true ? "Unpin" : "Pin",
@@ -301,6 +305,18 @@ struct ChatListView: View {
                     toggle(s)
                 } label: {
                     Label("Select", systemImage: "checkmark.circle")
+                }
+                Button {
+                    UIPasteboard.general.string = s.displayTitle
+                } label: {
+                    Label("Copy Title", systemImage: "doc.on.doc")
+                }
+                Divider()
+                Button {
+                    Task { await setFlag(s, "archived", !(s.archived ?? false)) }
+                } label: {
+                    Label(s.archived == true ? "Unarchive" : "Archive",
+                          systemImage: s.archived == true ? "tray.and.arrow.up" : "archivebox")
                 }
             }
         }
@@ -541,7 +557,7 @@ struct SessionRow: View {
                 HStack(spacing: 6) {
                     Text(botName)
                     if !session.sourceLabel.isEmpty { Text("·"); Text(session.sourceLabel) }
-                    if let m = session.model, !m.isEmpty { Text("·"); Text(m).lineLimit(1).foregroundStyle(.tertiary) }
+                    if let m = session.model, !m.isEmpty { Text("·"); Text(Self.shortModel(m)).lineLimit(1).truncationMode(.middle).foregroundStyle(.tertiary) }
                     if session.pinned == true { Image(systemName: "pin.fill").font(.caption2) }
                 }
                 .font(.caption).foregroundStyle(.secondary)
@@ -549,6 +565,14 @@ struct SessionRow: View {
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
+    }
+
+    /// "deepseek/deepseek-v4.1-pro" reads as "deepseek-v4.1-pro": the provider prefix repeats the family
+    /// and pushes the part that differs off the row. Bracketed routing suffixes are dropped the same way.
+    static func shortModel(_ model: String) -> String {
+        var name = model.split(separator: "/").last.map(String.init) ?? model
+        if let bracket = name.firstIndex(of: "["), bracket > name.startIndex { name = String(name[..<bracket]) }
+        return name
     }
 
     private var relative: Date.FormatStyle {

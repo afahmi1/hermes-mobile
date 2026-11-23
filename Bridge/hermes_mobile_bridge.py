@@ -16,7 +16,7 @@ chat state. It does three things the gateway API server cannot do for a phone on
 
 Binds to loopback only; reach it through `tailscale serve`. Stdlib only (system python3).
 """
-import base64, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
+import base64, gzip, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
 from tempfile import NamedTemporaryFile
 from functools import lru_cache
 from collections import deque
@@ -44,6 +44,7 @@ PASS = re.compile(r"^/(api/sessions(/[^/]+(/(messages|model|fork))?)?|v1/runs(/[
 MAX_BODY = 12 * 1024 * 1024
 WS_MAX_BODY = 64 * 1024  # Fits an 8 KiB file JSON-escaped (\u00XX per control byte) or 4 KiB instructions.
 WS_BODY_TIMEOUT = 10
+BODY_TIMEOUT = 120             # an 8 MiB attachment on a weak cellular link still fits; a stalled peer does not
 WS_SETTING = "HERMES_MOBILE_WORKSPACES"
 WS_BOTS_SETTING = "HERMES_MOBILE_WORKSPACE_BOTS"
 POOL = ThreadPoolExecutor(max_workers=16)
@@ -122,7 +123,10 @@ def env_value(path, key):
 
 
 def basic_auth():
-    text = (HERMES / "config.yaml").read_text()
+    try:
+        text = (HERMES / "config.yaml").read_text()
+    except (OSError, UnicodeError):
+        text = ""  # no readable config means no password login, not a dropped connection
     m = re.search(r"^dashboard:\n(?:[ \t]+.*\n)*?[ \t]+basic_auth:\n((?:[ \t]{4,}.*\n)+)", text, re.M)
     block = m.group(1) if m else ""
 
@@ -675,7 +679,10 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
         # missed are back-filled after it. The window therefore ends at the last unpinned row.
         last_unpinned = max((i for i, r in enumerate(data) if not r.get("pinned")), default=-1)
         window, backfill = data[:last_unpinned + 1], data[last_unpinned + 1:]
-        more = len(window) >= batch  # the gateway's own has_more ignores in-window pins
+        # A full reply means the window was full, even when its last rows are in-window pins that the
+        # line above set aside. Judging by the trimmed window alone ended the profile one pin early
+        # and every older chat became unreachable. An all-pin reply has nothing left to page.
+        more = len(data) >= batch and last_unpinned >= 0
         return pid, (window, backfill, more), None
 
     fetched, errors = {}, {}
@@ -1362,6 +1369,18 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
 
 
 # ---------- HTTP ----------
+def _bounded_int(raw, default, low, high):
+    try:
+        return max(low, min(int(raw or default), high))
+    except (TypeError, ValueError):
+        return default
+
+
+GZIP_MIN_BYTES = 1024          # below one packet the header and CPU cost more than they save
+GZIP_LEVEL = 5                 # measured in Benchmarks/response_bytes.py: most of level 9's saving at a fraction of its CPU
+GZIP_TYPES = ("application/json", "text/")
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "HermesMobile/1"
     protocol_version = "HTTP/1.1"
@@ -1376,13 +1395,22 @@ class H(BaseHTTPRequestHandler):
             invalidate_pages()
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
+        encoded = code != 304 and self._compressible(len(body), ctype)
+        if encoded:
+            # mtime=0 keeps identical bodies byte-identical, so the bytes on the wire stay cacheable.
+            body = gzip.compress(body, compresslevel=GZIP_LEVEL, mtime=0)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if encoded:
+            self.send_header("Content-Encoding", "gzip")
         if code != 304:
             self.send_header("Content-Length", str(len(body)))
         if validator:
             self.send_header("ETag", validator)
-            self.send_header("Vary", "X-Hermes-Transcript, Authorization")
+        vary = (["X-Hermes-Transcript", "Authorization"] if validator else []) + (
+            ["Accept-Encoding"] if ctype.startswith(GZIP_TYPES) else [])
+        if vary:
+            self.send_header("Vary", ", ".join(vary))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         if close:
@@ -1390,6 +1418,17 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _compressible(self, size, ctype):
+        """JSON and text replies of a useful size, for a client that asked for gzip. Tailscale Serve
+        forwards bytes as they are, so without this a transcript page crosses cellular uncompressed."""
+        if size < GZIP_MIN_BYTES or not ctype.startswith(GZIP_TYPES):
+            return False
+        for part in (self.headers.get("Accept-Encoding") or "").lower().split(","):
+            name, _, params = part.strip().partition(";")
+            if name.strip() in ("gzip", "*"):
+                return params.replace(" ", "") not in ("q=0", "q=0.0", "q=0.00", "q=0.000")
+        return False
 
     def body(self):
         return getattr(self, "_body", b"")
@@ -1416,8 +1455,9 @@ class H(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send(413 if n > cap else 400, {"error": "Bad request body."}, close=True)
             return False
-        if scoped:
-            self.connection.settimeout(WS_BODY_TIMEOUT)
+        # A declared body that never arrives must not hold a handler thread for the life of the socket.
+        if n:
+            self.connection.settimeout(WS_BODY_TIMEOUT if scoped else BODY_TIMEOUT)
         try:
             self._body = self.rfile.read(n) if n else b""
         except OSError:
@@ -1425,7 +1465,7 @@ class H(BaseHTTPRequestHandler):
             self.send(408, {"error": "Request timed out."}, close=True)
             return False
         finally:
-            if scoped:
+            if n:
                 self.connection.settimeout(None)
         return True
 
@@ -1517,7 +1557,7 @@ class H(BaseHTTPRequestHandler):
                                                     % (STATUS_URL, why)})
                 return self.send(200, d)
             if path in ("/m/sessions", "/m/telegram", "/m/desktop", "/m/archived"):
-                limit = max(1, min(int(q.get("limit", "40") or 40), 100))
+                limit = _bounded_int(q.get("limit"), 40, 1, 100)
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
                 return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact", {"/m/desktop": "desktop", "/m/archived": "archived"}.get(path)))
@@ -2001,7 +2041,9 @@ class H(BaseHTTPRequestHandler):
                 if not d.get("title") and created.get("session_id"):
                     try:
                         journal = turns.primary_journal(admissions_dir())
-                        journal.record_mobile_origin(pid, created["session_id"])
+                        # Inbox rows carry the stored id, which differs once Hermes resumes a lineage.
+                        for sid in {created["session_id"], created.get("stored_session_id") or created["session_id"]}:
+                            journal.record_mobile_origin(pid, sid)
                     except (OSError, sqlite3.Error) as exc:
                         log("Could not record mobile origin: %s" % type(exc).__name__)
                 return self.send(201, created)
@@ -2099,7 +2141,28 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = lambda self: self.route()
+    def _guarded(self):
+        """A handler that raises would close the socket with no reply; the phone then sees a transport
+        failure and Tailscale Serve reports 502. Answer once instead, unless a reply already started."""
+        self._replied = False
+        try:
+            return self.route()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as error:
+            log("Unhandled %s on %s %s" % (type(error).__name__, self.command, urlsplit(self.path).path))
+            self.close_connection = True
+            if not self._replied:
+                try:
+                    self.send(500, {"error": "The bridge could not handle this request."}, close=True)
+                except OSError:
+                    pass
+
+    def send_response(self, code, message=None):
+        self._replied = True
+        super().send_response(code, message)
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = lambda self: self._guarded()
 
     def login(self):
         who = (self.headers.get("Tailscale-User-Login") or "local").strip().lower()[:120]
@@ -2199,6 +2262,7 @@ class H(BaseHTTPRequestHandler):
             upstream_socket = c.sock
             r = c.getresponse()
         except Exception as e:
+            c.close()
             return self.send(502, {"error": "Hermes gateway is not answering (%s)." % type(e).__name__})
         try:
             if not stream:

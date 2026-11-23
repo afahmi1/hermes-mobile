@@ -7,6 +7,14 @@ struct SettingsView: View {
     @State private var addingGateway = false
     @State private var gatewayError: String?
     @State private var capabilities: BridgeCapabilities?
+    @State private var forgetting: URL?
+
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (\(build))"
+    }
 
     /// Reachability is a count only once the bot list has loaded; before then it is unknown, not zero.
     private var botsSummary: String {
@@ -32,6 +40,9 @@ struct SettingsView: View {
                             GatewayRow(name: SavedGateways.displayName(url), detail: url.absoluteString, isCurrent: false)
                         }
                         .accessibilityLabel("Switch to gateway \(SavedGateways.displayName(url))")
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button("Remove", systemImage: "trash", role: .destructive) { forgetting = url }
+                        }
                     }
                     Button("Add Gateway", systemImage: "plus") { addingGateway = true }
                     if let gatewayError { Text(gatewayError).foregroundStyle(.red) }
@@ -66,6 +77,11 @@ struct SettingsView: View {
                 }
                 Section {
                     Button("Sign Out", role: .destructive) { confirmSignOut = true }
+                } footer: {
+                    Text("Hermes Mobile \(appVersion)")
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 8)
+                        .accessibilityLabel("App version \(appVersion)")
                 }
             }
             .navigationTitle("Settings")
@@ -81,6 +97,15 @@ struct SettingsView: View {
                 async let bots: Void = app.refreshBots()
                 await app.status.refresh(force: true, app: app)
                 _ = await (health, bots)
+            }
+            .confirmationDialog("Remove this gateway from the phone?", isPresented: Binding(
+                get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }
+            ), titleVisibility: .visible, presenting: forgetting) { url in
+                Button("Remove " + SavedGateways.displayName(url), role: .destructive) {
+                    Task { await app.forgetGateway(url) }
+                }
+            } message: { _ in
+                Text("Its saved sign-in, cached chats and drafts are deleted from this phone. Chats stay on the gateway.")
             }
             .confirmationDialog("Sign out of this server?", isPresented: $confirmSignOut, titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) {

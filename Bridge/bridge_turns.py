@@ -22,6 +22,7 @@ import functools
 import bridge_receipts
 import bridge_media
 import json
+import sys
 from collections import OrderedDict
 import threading
 import time
@@ -821,20 +822,34 @@ def start_primary(profile, home, sid, text, choice, submission, project, directo
         return turn
 
 
+RECEIPT_RETENTION = 30 * 86400
+
+
 def recover_primary(directory, profile_home, restore_workspace):
     journal = primary_journal(directory)
+    try:
+        journal.prune(RECEIPT_RETENTION)
+    except sqlite3.Error as error:
+        print("Could not prune send receipts: %s" % type(error).__name__, file=sys.stderr, flush=True)
     for row in journal.pending():
         with _admission_lock(row["id"]), _admission_lock((row["profile"], row["sid"])):
             if get_turn(row["id"]) is not None:
                 continue
             try:
                 restored_turn(row, profile_home(row["profile"]), journal, restore_workspace)
-            except TurnError:
-                # A project grant or identity was withdrawn. Never revive its context.
-                turn = Turn(row["profile"], profile_home(row["profile"]), row["sid"], "", {})
-                turn.id = row["id"]
-                bridge_media.discard(json.loads(row["media"] or "[]"))
-                journal.terminal(turn, {"event": "run.failed"})
+            except Exception as error:
+                # TurnError: a project grant or identity was withdrawn, so never revive its context.
+                # Anything else (workspace storage offline, a damaged row) fails this one send. Letting
+                # it escape would stop the bridge at startup and loop under its supervisor.
+                if not isinstance(error, TurnError):
+                    print("Could not recover send %s: %s" % (row["id"], type(error).__name__), file=sys.stderr, flush=True)
+                try:
+                    turn = Turn(row["profile"], profile_home(row["profile"]), row["sid"], "", {})
+                    turn.id = row["id"]
+                    bridge_media.discard(json.loads(row["media"] or "[]"))
+                    journal.terminal(turn, {"event": "run.failed"})
+                except Exception as nested:
+                    print("Could not close send %s: %s" % (row["id"], type(nested).__name__), file=sys.stderr, flush=True)
 
 
 def completed_primary(turn_id, directory, profile_home):

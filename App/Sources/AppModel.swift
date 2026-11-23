@@ -198,6 +198,19 @@ final class AppModel {
         inboxPath = [ChatRef(profile: chat.profile, sessionId: chat.id)]
     }
 
+    /// Remove a saved gateway that is not the active one: revoke its grant when the host answers, then
+    /// delete its credential, cached inboxes, drafts and per-gateway preferences from this phone.
+    func forgetGateway(_ url: URL) async {
+        guard url != API.shared.baseURL, let login = API.accounts.credential(url) else { return }
+        try? await API.shared.revokeSavedDevice(login)
+        let account = API.accountID(for: login)
+        _ = API.accounts.forget(login.server)
+        await InboxDisk.shared.forget(account)
+        ComposerDisk.shared.forget(account)
+        DevicePreferences.forget(account)
+        savedGateways = API.accounts.servers
+    }
+
     func signOut() {
         if let server = API.shared.baseURL { _ = API.accounts.forget(server) }
         if let account = inboxAccount {
