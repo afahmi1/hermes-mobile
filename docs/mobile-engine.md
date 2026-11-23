@@ -122,6 +122,8 @@ From the repository root, run the following on macOS with Python 3.11+ and Xcode
 ```sh
 python3 -m unittest discover -s Tests -v
 swiftc App/Sources/StreamRecovery.swift Tests/StreamRecoveryTests.swift -o /tmp/hermes-recovery-tests
+swiftc App/Sources/Projects.swift App/Sources/Models.swift Tests/ProjectsTests.swift -parse-as-library -o /tmp/hermes-projects-tests
+/tmp/hermes-projects-tests
 /tmp/hermes-recovery-tests
 xcodebuild -project App/HermesMobile.xcodeproj -scheme HermesMobile -configuration Debug \
   -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build

@@ -35,6 +35,7 @@ PASS = re.compile(r"^/(api/sessions(/[^/]+(/(messages|model|fork))?)?|v1/runs(/[
 MAX_BODY = 12 * 1024 * 1024
 POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bridge_projects
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
     TURNS_ERROR = None
@@ -808,6 +809,8 @@ class H(BaseHTTPRequestHandler):
             return self.login()
         if not self.authed():
             return self.send(401, {"error": "Sign in again."})
+        if path == "/m/projects":
+            return self.projects_route(u)
         if self.command == "GET":
             if path == "/m/health":
                 return self.send(200, health())
@@ -839,6 +842,14 @@ class H(BaseHTTPRequestHandler):
         if path.startswith("/m/chat/") or path.startswith("/m/turns"):
             return self.chat_route(path, q)
         self.send(404, {"error": "not found"})
+
+    def projects_route(self, u):
+        if self.command != "GET":
+            return self.send(405, {"error": "Method not allowed."})
+        if "?" in self.path or u.query or self.body():
+            return self.send(400, {"error": "Bad request."})
+        code, body = bridge_projects.catalog_response()
+        self.send(code, body)
 
     # ---- chats through the gateway's canonical session protocol (the desktop app's) ----
     def chat_route(self, path, q):
