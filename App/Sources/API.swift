@@ -482,6 +482,31 @@ final class API: @unchecked Sendable {
 
     /// Create a chat the way the desktop app does (canonical `session.create`, source `gui`),
     /// so it lands in the desktop's Recents and model/effort switches persist on it.
+    func commandPalette(profile: String) async throws -> CommandPalette {
+        try await get("/m/commands?profile=\(Self.esc(profile))", as: CommandPalette.self)
+    }
+
+    func slash(profile: String, session: String, command: String) async throws -> SlashResult {
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/slash", method: "POST", body: ["command": command])
+        return SlashResult(output: obj["output"] as? String, warning: obj["warning"] as? String,
+                           type: obj["type"] as? String, message: obj["message"] as? String,
+                           display: obj["display"] as? String, notice: obj["notice"] as? String)
+    }
+
+    func chatMedia(profile: String, session: String, digest: String) async throws -> Data {
+        try await send(try request("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/media/\(Self.esc(digest))"))
+    }
+
+    /// Create a skill file, or append a note to one this bot already has. Returns the names Hermes now lists.
+    func saveSkill(profile: String, action: String, name: String, description: String = "", body: String = "", note: String = "") async throws -> [String] {
+        var payload: [String: Any] = ["profile": profile, "action": action, "name": name]
+        if !description.isEmpty { payload["description"] = description }
+        if !body.isEmpty { payload["body"] = body }
+        if !note.isEmpty { payload["note"] = note }
+        let obj = try await json("/m/skills", method: "POST", body: payload)
+        return obj["skills"] as? [String] ?? []
+    }
+
     func createSession(profile: String, draftID: UUID) async throws -> String {
         let obj = try await json("/m/chat/\(Self.esc(profile))/new", method: "POST", body: ["request_id": draftID.uuidString])
         guard let id = obj["session_id"] as? String else { throw APIError.badResponse }

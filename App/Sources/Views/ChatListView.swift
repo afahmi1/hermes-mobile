@@ -274,12 +274,9 @@ struct ChatListView: View {
             .accessibilityAddTraits(selection.contains(s.key) ? .isSelected : [])
         } else {
             HStack(spacing: 10) {
-                Button { beginSelection(); toggle(s) } label: {
-                    BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Select " + s.displayTitle)
+                BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
+                    .frame(width: 44, height: 44)
+                    .accessibilityHidden(true)
                 NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
                     SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
@@ -670,7 +667,7 @@ private struct SourceGuideView: View {
                     }
                 }
                 Section("Faster actions") {
-                    Text("Touch and hold a chat to archive, pin or select it. Swipe left to archive, swipe right to pin. Tap Select, or the avatar beside a chat, to choose several at once.")
+                    Text("Touch and hold a chat to archive, pin or select it. Swipe left to archive, swipe right to pin. Tap Select to choose several at once.")
                         .font(.footnote)
                 }
             }

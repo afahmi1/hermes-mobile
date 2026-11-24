@@ -131,28 +131,37 @@ struct ConnectionBadge: View {
         return app.status.payload?["gateway"]
     }
 
+    private var hostName: String {
+        guard let url = API.shared.baseURL else { return "" }
+        return SavedGateways.displayName(url)
+    }
+
+    private func named(_ label: String) -> String {
+        hostName.isEmpty ? label : "\(hostName) · \(label)"
+    }
+
     private var state: (label: String, symbol: String, color: Color) {
-        guard app.checkedConnection else { return ("Checking", "clock.fill", .yellow) }
-        if app.needsLogin { return ("Sign in", "lock.fill", .yellow) }
-        if app.healthFailure != nil { return ("Unreachable", "wifi.slash", .red) }
-        guard let health = app.health else { return ("Offline", "xmark.circle.fill", .red) }
+        guard app.checkedConnection else { return (named("Checking"), "clock.fill", .yellow) }
+        if app.needsLogin { return (named("Sign in"), "lock.fill", .yellow) }
+        if app.healthFailure != nil { return (named("Unreachable"), "wifi.slash", .red) }
+        guard let health = app.health else { return (named("Offline"), "xmark.circle.fill", .red) }
         switch health.phase {
-        case "starting": return ("Starting", "clock.fill", .yellow)
-        case "restarting": return ("Restarting", "arrow.clockwise.circle.fill", .yellow)
-        case "draining": return ("Finishing work", "clock.fill", .yellow)
-        case "waiting": return ("Waiting", "clock.fill", .yellow)
-        case "stopping": return ("Stopping", "clock.fill", .yellow)
-        case "stopped", "unavailable": return ("Gateway down", "xmark.circle.fill", .red)
+        case "starting": return (named("Starting"), "clock.fill", .yellow)
+        case "restarting": return (named("Restarting"), "arrow.clockwise.circle.fill", .yellow)
+        case "draining": return (named("Finishing work"), "clock.fill", .yellow)
+        case "waiting": return (named("Waiting"), "clock.fill", .yellow)
+        case "stopping": return (named("Stopping"), "clock.fill", .yellow)
+        case "stopped", "unavailable": return (named("Gateway down"), "xmark.circle.fill", .red)
         default: break
         }
         let gateway = health.gatewayState?.lowercased() ?? ""
         if !health.ok || ["stopped", "down", "failed", "offline"].contains(gateway) {
-            return ("Gateway down", "xmark.circle.fill", .red)
+            return (named("Gateway down"), "xmark.circle.fill", .red)
         }
         if ["degraded", "down"].contains(diagnostic?["health"].string ?? "") || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
-            return ("Degraded", "exclamationmark.triangle.fill", .yellow)
+            return (named("Degraded"), "exclamationmark.triangle.fill", .yellow)
         }
-        return ("Online", "checkmark.circle.fill", .green)
+        return (named("Online"), "checkmark.circle.fill", .green)
     }
 
     var body: some View {

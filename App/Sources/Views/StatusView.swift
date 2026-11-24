@@ -34,7 +34,6 @@ struct StatusView: View {
                     }
                     running(p)
                     changes(p)
-                    bots(p)
                     jobs(p)
                     incidents(p)
                     recent(p)
@@ -84,8 +83,9 @@ struct StatusView: View {
         let failing = jobs.filter { ($0["failure_streak"].int ?? 0) > 0 || ["failed", "error"].contains($0["last_status"].string ?? "") }
         let tokens = J["tokens_24h"].array.reduce(0) { $0 + ($1["prompt"].int ?? 0) + ($1["completion"].int ?? 0) }
         let health = g["health"].string ?? "unknown"
+        let gatewayName = API.shared.baseURL.map(SavedGateways.displayName) ?? "Gateway"
         return LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            Kpi(label: "Gateway", value: health.capitalized,
+            Kpi(label: gatewayName, value: health.capitalized,
                 tint: health == "healthy" ? .green : health == "down" ? .red : .orange)
             Kpi(label: "Bots", value: "\(p["bots"].array.count)",
                 tint: p["bots"].array.contains { $0["new"].bool } ? .blue : nil)
@@ -137,20 +137,6 @@ struct StatusView: View {
                         Spacer()
                         RelTime(date: e["at"].date).font(.caption).foregroundStyle(.secondary)
                     }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder private func bots(_ p: JV) -> some View {
-        Section("Bots") {
-            ForEach(Array(p["bots"].array.enumerated()), id: \.offset) { _, b in
-                let id = b["id"].string ?? ""
-                let label = BotStatusRow(bot: b)
-                if let bot = app.bot(id), bot.reachable {
-                    NavigationLink(value: bot) { label }
-                } else {
-                    label
                 }
             }
         }
@@ -312,8 +298,6 @@ private struct Kpi: View {
     }
 }
 
-func plural(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
-
 struct StatusPill: View {
     let text: String?
     var label: String? = nil
@@ -371,32 +355,6 @@ private struct AgentRow: View {
     }
 }
 
-private struct BotStatusRow: View {
-    let bot: JV
-    var body: some View {
-        let id = bot["id"].string ?? ""
-        HStack(alignment: .top, spacing: 12) {
-            BotAvatar(id: id, name: bot["name"].string ?? id, size: 36)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(bot["name"].string ?? id).font(.subheadline.weight(.semibold))
-                    if bot["new"].bool { NewBadge() }
-                    if (bot["running"].int ?? 0) > 0 { StatusPill(text: "running") }
-                }
-                Text("\(bot["model"].string ?? "") · \(bot["provider"].string ?? "")").font(.caption).foregroundStyle(.secondary)
-                Text(plural(bot["sessions"].int ?? 0, "chat") + " · " + plural(bot["jobs"].int ?? 0, "cron job")
-                     + ((bot["jobs_paused"].int ?? 0) > 0 ? " (\(bot["jobs_paused"].int ?? 0) paused)" : ""))
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack(spacing: 6) {
-                    if !bot["served"].bool { StatusPill(text: "not served") }
-                    if let n = bot["jobs_failing"].int, n > 0 { StatusPill(text: "failed", label: "\(n) failing") }
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.vertical, 2)
-    }
-}
 
 private struct JobRow: View {
     let job: JV

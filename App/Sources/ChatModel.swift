@@ -1,12 +1,23 @@
 import Foundation
 import Observation
 
+struct ToolActivity: Hashable, Identifiable {
+    var id: String
+    var name: String
+    var preview: String
+    var result: String
+    var state: String
+}
+
 struct ChatItem: Identifiable, Hashable {
-    enum Kind: Hashable { case user, assistant, tools, notice, control }
+    enum Kind: Hashable { case user, assistant, tools, notice, control, activity }
     let id: String
     var kind: Kind
     var text: String
     var tools: [String] = []
+    var activities: [ToolActivity] = []
+    var media: [ChatMediaRef] = []
+    var detail: String = ""
     var streaming = false
     var footer: String?
     var failed = false
@@ -40,6 +51,9 @@ final class ChatModel {
     var title: String?
     var isLoading = false
     var isRunning = false
+    var slashBusy = false
+    var slashCommands: [SlashCommand] = SlashCommand.builtIn
+    var skillCommands: [String] = []
     var status: String?
     var error: String?
     var approval: ApprovalRequest?
@@ -73,6 +87,7 @@ final class ChatModel {
     private var nextReceiptAttempt = Date.distantPast
     private var receiptBackoff = 1.0
 
+    private var localNotes: [ChatItem] = []
     private var runId: String?
     private var streamTask: Task<Void, Never>?
     private var liveToolGroup: Int?
@@ -336,6 +351,7 @@ final class ChatModel {
             let next = rows.firstIndex { ($0.timestamp ?? 0) > t } ?? rows.endIndex
             rows.insert(receipt.item, at: next)
         }
+        rows += localNotes.filter { note in !rows.contains { $0.kind == note.kind && $0.text == note.text } }
         return rows
     }
 
@@ -343,28 +359,68 @@ final class ChatModel {
         var out: [ChatItem] = []
         var toolGroup: Int?
         for (i, m) in msgs.enumerated() {
+            if m.displayKind == "hidden" { continue }
             let key = m.id.map(String.init) ?? "i\(i)"
             let text = (m.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if isActivity(m, text: text) {
+                toolGroup = nil
+                let trimmedNotice = m.notice?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let title = trimmedNotice.isEmpty ? activityTitle(text) : trimmedNotice
+                let failed = m.ok == false || text.localizedCaseInsensitiveContains("status=failed") || text.contains("✗")
+                out.append(ChatItem(id: key, kind: .activity, text: title, detail: text == title ? "" : text,
+                                    failed: failed, timestamp: m.timestamp))
+                continue
+            }
             switch m.role {
             case "user":
                 toolGroup = nil
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .user, text: text, timestamp: m.timestamp)) }
+                if !text.isEmpty || !(m.media ?? []).isEmpty {
+                    out.append(ChatItem(id: key, kind: .user, text: text, media: m.media ?? [], timestamp: m.timestamp))
+                }
             case "assistant":
-                let names = (m.toolCalls ?? []).compactMap { $0.function?.name }
-                if !names.isEmpty {
+                let calls = m.toolCalls ?? []
+                if !calls.isEmpty {
+                    let activities = calls.enumerated().map { offset, call in
+                        ToolActivity(id: key + "-\(offset)", name: call.function?.name ?? "tool",
+                                     preview: call.preview ?? "", result: "", state: "done")
+                    }
                     if let toolGroup {
-                        out[toolGroup].tools += names
+                        out[toolGroup].activities += activities
+                        out[toolGroup].tools += activities.map(\.name)
                     } else {
                         toolGroup = out.count
-                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: names, timestamp: m.timestamp))
+                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: activities.map(\.name),
+                                            activities: activities, timestamp: m.timestamp))
                     }
                 }
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .assistant, text: text, timestamp: m.timestamp)) }
+                if !text.isEmpty || !(m.media ?? []).isEmpty {
+                    out.append(ChatItem(id: key, kind: .assistant, text: text, media: m.media ?? [], timestamp: m.timestamp))
+                }
+            case "tool":
+                guard let toolGroup, let idx = out[toolGroup].activities.firstIndex(where: {
+                    $0.result.isEmpty && (m.toolName == nil || m.toolName == $0.name || m.toolName?.isEmpty == true)
+                }) else { continue }
+                if m.ok == false { out[toolGroup].activities[idx].state = "failed" }
+                if let preview = m.preview, !preview.isEmpty { out[toolGroup].activities[idx].result = preview }
             default:
                 continue
             }
         }
         return out
+    }
+
+    private static func isActivity(_ m: StoredMessage, text: String) -> Bool {
+        if m.displayKind == "async_delegation_complete" || m.displayKind == "process_complete" { return true }
+        if m.role == "system" { return !text.isEmpty || m.notice?.isEmpty == false }
+        let opened = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return opened.hasPrefix("[ASYNC DELEGATION") || opened.hasPrefix("[BACKGROUND PROCESS")
+            || opened.hasPrefix("[PROCESS COMPLETE") || opened.hasPrefix("[SUBAGENT")
+    }
+
+    private static func activityTitle(_ text: String) -> String {
+        if text.hasPrefix("[") { return "Background work finished" }
+        let line = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? "Background work finished"
+        return line.count > 180 ? String(line.prefix(180)) : line
     }
 
     // MARK: runtime choice
@@ -397,14 +453,71 @@ final class ChatModel {
 
     /// `projectContext` is a project ID only when the person switched context on for this send from a
     /// project scope; follow-ups (queue / steer) never carry it.
-    func send(_ raw: String, projectContext: String? = nil, attachments: [SendAttachment] = []) async {
+    func loadPalette() async {
+        guard let page = try? await api.commandPalette(profile: profile), app != nil else { return }
+        if !page.commands.isEmpty { slashCommands = page.commands }
+        skillCommands = page.skills
+    }
+
+    func acceptsSlash(_ raw: String) -> Bool {
+        guard draftAttachments.isEmpty, let name = SlashCommand.name(in: raw) else { return false }
+        return slashCommands.contains { $0.name == name } || skillCommands.contains(name)
+    }
+
+    /// Hermes runs the command. A `send` result becomes the next turn, with the short label in the bubble.
+    func runSlash(_ raw: String) async {
+        let command = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isRunning, !slashBusy, acceptsSlash(command) else { return }
+        let account = app?.inboxAccount
+        let authored = draft
+        let authoredPastes = pastedTexts
+        slashBusy = true
+        error = nil
+        status = "Running /\(SlashCommand.name(in: command) ?? "command")…"
+        do {
+            guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
+            if sessionId == nil {
+                let sid = try await api.createSession(profile: profile, draftID: draftID)
+                guard account == app?.inboxAccount else { throw APIError.notSignedIn }
+                try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
+                sessionId = sid
+                if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
+            }
+            guard let sid = sessionId else { throw APIError.notSignedIn }
+            draft = ""
+            pastedTexts = []
+            let result = try await api.slash(profile: profile, session: sid, command: command)
+            guard account == app?.inboxAccount else { throw APIError.notSignedIn }
+            let title = result.display ?? result.notice ?? command
+            if let output = result.output ?? result.warning, !output.isEmpty {
+                let note = ChatItem(id: "slash-\(UUID().uuidString)", kind: .activity, text: title, detail: output)
+                items.append(note)
+                localNotes.append(note)
+            } else if result.message == nil {
+                items.append(ChatItem(id: "slash-\(UUID().uuidString)", kind: .notice, text: title))
+            }
+            slashBusy = false
+            status = nil
+            if let message = result.message, ["send", "skill", "prefill"].contains(result.type ?? "") {
+                await send(message, shown: result.display ?? title)
+            }
+        } catch {
+            draft = authored
+            pastedTexts = authoredPastes
+            slashBusy = false
+            status = nil
+            self.error = error.localizedDescription
+        }
+    }
+
+    func send(_ raw: String, projectContext: String? = nil, attachments: [SendAttachment] = [], shown: String? = nil) async {
         if needsDraftRestore {
             retryDraftStorage()
             // A restore can merge a previously hidden paste or attachment. Review before sending.
             if needsDraftRestore || raw != combinedDraft || attachments != draftAttachments { return }
         }
         let message = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isRunning, !message.isEmpty || !attachments.isEmpty else { return }
+        guard !isRunning, !slashBusy, !message.isEmpty || !attachments.isEmpty else { return }
         let text = message.isEmpty ? "Describe the attached media." : message
         if pendingSend != nil {
             error = "Reconnecting the previous send. Your next message is saved in the composer."
@@ -433,7 +546,7 @@ final class ChatModel {
             pendingSend = send
             ReplyNotifier.shared.askOnce()
             clearStagedComposer(send)
-            var local = ChatItem(id: send.id.uuidString, kind: .user, text: text)
+            var local = ChatItem(id: send.id.uuidString, kind: .user, text: shown ?? text)
             if projectContext != nil { local.contextNote = "Project instructions + reference files sent with this message" }
             items.append(local)
             await deliver(send, session: sid, key: key, allowLegacy: true)
@@ -759,14 +872,35 @@ final class ChatModel {
             if status != nil { status = nil }
         case "tool.started", "tool.start":
             let name = ev.string("tool_name") ?? ev.string("tool") ?? ev.string("name") ?? "tool"
+            let activity = ToolActivity(id: "live-\(UUID().uuidString)", name: name, preview: ev.string("preview") ?? "",
+                                        result: "", state: "running")
             closeStreamingBubble()
             if let i = liveToolGroup, items.indices.contains(i), items[i].kind == .tools {
                 items[i].tools.append(name)
+                items[i].activities.append(activity)
             } else {
                 liveToolGroup = items.count
-                items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name]))
+                items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name], activities: [activity]))
             }
             status = "Using \(name.replacingOccurrences(of: "_", with: " "))…"
+        case "tool.completed":
+            let name = ev.string("tool_name") ?? ev.string("name") ?? ""
+            let ok = ev.raw["ok"] as? Bool ?? true
+            if let i = liveToolGroup, items.indices.contains(i),
+               let idx = items[i].activities.lastIndex(where: { $0.state == "running" && (name.isEmpty || $0.name == name) }) {
+                items[i].activities[idx].state = ok ? "done" : "failed"
+                if let preview = ev.string("preview"), !preview.isEmpty, items[i].activities[idx].result.isEmpty {
+                    items[i].activities[idx].result = preview
+                }
+                if items[i].activities.contains(where: { $0.state == "running" }) {
+                    status = "Using \(items[i].activities.last { $0.state == "running" }?.name.replacingOccurrences(of: "_", with: " ") ?? "a tool")…"
+                } else {
+                    status = ok ? nil : "A tool failed"
+                }
+            }
+        case "subagent":
+            let title = ev.string("title") ?? "Background task"
+            status = ev.string("state") == "done" ? "Background task finished · \(title)" : "Waiting on \(title)…"
         case "run.started":
             // The bridge says what context it accepted; replace the optimistic badge with it.
             if let summary = ProjectContext.summary(from: ev.raw),

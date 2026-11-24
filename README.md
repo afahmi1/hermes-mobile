@@ -8,8 +8,9 @@ The **Projects** tab shows an optional, read-only [project catalog](docs/project
 
 The **Status** tab mirrors the Mac status dashboard (`Status/`, a web page on port 9230). It shows:
 - what's running right now: chats, subagents and cron runs;
-- every bot and every cron job;
-- incidents, recent runs, provider usage, and a "What's new" log.
+- cron jobs, incidents, recent runs, provider usage, and a "What's new" log.
+
+Bots, including the skills each one has, live on the **Bots** tab. The connection pill names the gateway (`mothership · Online`, `mothership · Degraded`) so a healthy machine is not confused with a degraded one.
 
 Both the Mac page and the phone re-discover everything on each refresh, so a bot or cron job you create shows up within
 seconds, with a "new" badge for a day. Removals and renames show up too. The phone refreshes every 5 s while the Status
@@ -144,14 +145,19 @@ text file or an archive. Files keep their original bytes and media type; the bri
 agent the local path, so Hermes decides which tool reads them. Attachments share a 4 MiB total budget per message by
 default (`HERMES_MOBILE_MEDIA_MAX_BYTES`, up to 8 MiB). A single video from Files opens the same clip-or-frames review as a video from Photos.
 
+Images the desktop already attached (`[Image attached at: …]` or a `MEDIA:` line) show in the chat when the file is still under your Hermes home. Tool runs open into what they did: the skill that loaded, the command, the delegate's goal, and a failed delegate reads as failed. A background task that is still going shows **Will resume when N background tasks finish**.
+
+### Slash commands and skills
+
+Type `/`, or tap the `/` button, and the composer lists the commands Hermes can run from a chat (`/learn`, `/status`, `/agents`, `/compress`, and the rest that are not desktop-only). Picking one inserts it. Sending `/learn how I name plates` runs that command on the Mac; it is not handed to the model as a normal message. On a bot, **Teach a skill** writes a new skill, and tapping a skill appends a note, then Hermes rescans its skill folders.
+
 ### Finding and organising chats
 
 **Chats** shows every conversation you can continue. **Desktop & phone** shows local and GUI sessions that Hermes attributes to those clients; **Telegram** narrows it to Telegram; **Everything** adds scheduled, one-shot,
 subagent and tool runs. **Archived** holds what you put away. The **i** button beside the source picker explains each
 view and every source label.
 
-Swipe left to archive and right to pin. Tap **Select** (or the avatar beside any chat) to select several
-chats and archive, unarchive, pin or unpin them in one batch. The bridge fans the gateway's per-session change out in
+Swipe left to archive and right to pin. Tap **Select** to select several chats and archive, unarchive, pin or unpin them in one batch. The bridge fans the gateway's per-session change out in
 parallel and reports any row it could not change.
 
 ---

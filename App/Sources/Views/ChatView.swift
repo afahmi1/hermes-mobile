@@ -63,7 +63,23 @@ struct ChatScreen: View {
                         emptyState.padding(.top, 60)
                     }
                     ForEach(chat.items) { item in
-                        MessageRow(item: item).id(item.id)
+                        MessageRow(item: item, profile: chat.profile, session: chat.sessionId).id(item.id)
+                    }
+                    if !chat.isRunning, !backgroundTasks.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(backgroundTasks.count == 1
+                                 ? "Will resume when 1 background task finishes"
+                                 : "Will resume when \(backgroundTasks.count) background tasks finish")
+                                .font(.subheadline.weight(.semibold))
+                            ForEach(Array(backgroundTasks.enumerated()), id: \.offset) { _, task in
+                                Text(task.model.isEmpty ? task.title : "\(task.title) · \(task.model)")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+                        .padding(.horizontal, 12)
                     }
                     if let s = chat.status {
                         HStack(spacing: 8) {
@@ -184,6 +200,7 @@ struct ChatScreen: View {
         .sensoryFeedback(.success, trigger: chat.completedTick)
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
+        .task { await chat.loadPalette() }
         // Re-ask when the gateway comes back: one failed probe must not hide attachments for the visit.
         .task(id: [chat.profile, app.health?.ok == true ? "up" : "down"]) {
             if let latest = try? await API.shared.mediaCapabilities(profile: chat.profile), !Task.isCancelled {
@@ -207,10 +224,20 @@ struct ChatScreen: View {
     private var runtimeLabel: String {
         if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
-        if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + (c.model ?? bot?.model ?? "Bot default") }
         let model = c.model ?? bot?.model ?? "default"
+        let provider = c.provider ?? bot?.provider ?? ""
+        let who = provider.isEmpty ? model : "\(model) · \(provider)"
+        if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
         let effort = c.effort.flatMap { Effort(rawValue: $0)?.label } ?? "default effort"
-        return c.isDefault ? "\(model) · bot default" : "\(model) · \(effort)"
+        return c.isDefault ? "\(who) · bot default" : "\(who) · \(effort)"
+    }
+
+    private var backgroundTasks: [(title: String, model: String)] {
+        guard let session = chat.sessionId else { return [] }
+        return (app.status.payload?["agents"].array ?? []).compactMap { row in
+            guard row["kind"].string == "subagent", row["parent_session_id"].string == session else { return nil }
+            return (row["title"].string ?? row["name"].string ?? "Background task", row["model"].string ?? "")
+        }
     }
 
     private var emptyState: some View {
@@ -314,6 +341,11 @@ struct ChatScreen: View {
                 }
                 .padding(.horizontal, 16)
             }
+            if let filter = SlashCommand.filter(in: chat.draft), chat.draftAttachments.isEmpty, !chat.isRunning {
+                SlashMenu(commands: chat.slashCommands, skills: chat.skillCommands, filter: filter) { name in
+                    chat.draft = "/" + name + " "
+                }
+            }
             draftShelf
             HStack(alignment: .bottom, spacing: 8) {
                 if canAttach {
@@ -337,6 +369,15 @@ struct ChatScreen: View {
                     .disabled(attachmentLimitReached || preparingMedia)
                     .accessibilityLabel("Add photo, video or file")
                 }
+                if chat.draft.isEmpty || chat.draft.hasPrefix("/") {
+                    Button {
+                        if chat.draft.isEmpty { chat.draft = "/" }
+                    } label: {
+                        Text("/").font(.title2.weight(.medium)).frame(width: 36, height: 44)
+                    }
+                    .disabled(chat.isRunning || chat.slashBusy)
+                    .accessibilityLabel("Slash commands")
+                }
                 composerField(expanded: false)
                 .padding(.horizontal, 14).padding(.vertical, 9)
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20))
@@ -359,7 +400,7 @@ struct ChatScreen: View {
                         Image(systemName: "arrow.up.circle.fill").font(.system(size: 32))
                             .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
                     }
-                    .disabled(preparingMedia || chat.savingRuntime || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
+                    .disabled(preparingMedia || chat.savingRuntime || chat.slashBusy || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     .accessibilityLabel("Send")
                 }
             }
@@ -557,6 +598,12 @@ struct ChatScreen: View {
         let text = chat.combinedDraft
         if let problem = issue(for: attachments) {
             chat.error = problem
+            return
+        }
+        if attachments.isEmpty, chat.acceptsSlash(text) {
+            followLatest = true
+            sendTick += 1
+            Task { await chat.runSlash(text) }
             return
         }
         // The draft and pasted text are cleared by ChatModel.send only after the outbox is staged,
@@ -791,7 +838,10 @@ final class PasteTextView: UITextView {
 
 struct MessageRow: View {
     @State private var toolsExpanded = false
+    @State private var activityExpanded = false
     let item: ChatItem
+    var profile: String = ""
+    var session: String?
 
     var body: some View {
         switch item.kind {
@@ -802,26 +852,32 @@ struct MessageRow: View {
                     if let note = item.contextNote {
                         Label(note, systemImage: "folder.badge.gearshape").font(.caption2).foregroundStyle(.secondary)
                     }
-                    Text(item.text)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 14).padding(.vertical, 10)
-                        .foregroundStyle(.white)
-                        .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    if !item.text.isEmpty {
+                        Text(item.text)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 14).padding(.vertical, 10)
+                            .foregroundStyle(.white)
+                            .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    }
+                    TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .trailing)
                 }
             }
             .padding(.horizontal, 12)
         case .assistant:
             VStack(alignment: .leading, spacing: 4) {
-                Group {
-                    if item.streaming { Text(verbatim: item.text).textSelection(.enabled) }
-                    else { MarkdownText(text: item.text) }
-                }
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                    .contextMenu {
-                        Button { UIPasteboard.general.string = item.text } label: { Label("Copy", systemImage: "doc.on.doc") }
-                        ShareLink(item: item.text)
+                if !item.text.isEmpty {
+                    Group {
+                        if item.streaming { Text(verbatim: item.text).textSelection(.enabled) }
+                        else { MarkdownText(text: item.text) }
                     }
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .contextMenu {
+                            Button { UIPasteboard.general.string = item.text } label: { Label("Copy", systemImage: "doc.on.doc") }
+                            ShareLink(item: item.text)
+                        }
+                }
+                TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
                 if let f = item.footer {
                     Label(f, systemImage: "cpu").font(.caption2).foregroundStyle(.secondary).padding(.leading, 10)
                         .accessibilityLabel("Answered by \(f)")
@@ -844,16 +900,46 @@ struct MessageRow: View {
             .accessibilityElement(children: .combine)
         case .tools:
             DisclosureGroup(isExpanded: $toolsExpanded) {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(item.tools.enumerated()), id: \.offset) { _, tool in
-                        Text(tool.replacingOccurrences(of: "_", with: " ")).font(.caption.monospaced())
+                VStack(alignment: .leading, spacing: 8) {
+                    if item.activities.isEmpty {
+                        ForEach(Array(item.tools.enumerated()), id: \.offset) { _, tool in
+                            Text(tool.replacingOccurrences(of: "_", with: " ")).font(.caption.monospaced())
+                        }
+                    } else {
+                        ForEach(item.activities) { row in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(ToolLanguage.title(row))
+                                    .font(.caption)
+                                    .strikethrough(row.state == "failed", color: .red)
+                                    .foregroundStyle(row.state == "failed" ? Color.red : Color.primary)
+                                if !row.result.isEmpty {
+                                    Text(row.result).font(.caption2).foregroundStyle(.secondary).lineLimit(3)
+                                }
+                            }
+                        }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             } label: {
-                Label("\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")", systemImage: "wrench.and.screwdriver")
+                Label(item.activities.isEmpty
+                      ? "\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")"
+                      : ToolLanguage.summary(item.activities),
+                      systemImage: "wrench.and.screwdriver")
                     .font(.subheadline)
             }
             .foregroundStyle(.secondary)
+            .padding(.horizontal, 18)
+        case .activity:
+            DisclosureGroup(isExpanded: $activityExpanded) {
+                if !item.detail.isEmpty {
+                    Text(item.detail).font(.caption).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } label: {
+                Label(item.text, systemImage: item.failed ? "exclamationmark.triangle" : "arrow.triangle.branch")
+                    .font(.subheadline)
+                    .foregroundStyle(item.failed ? Color.red : Color.secondary)
+                    .strikethrough(item.failed, color: .red)
+            }
             .padding(.horizontal, 18)
         case .notice:
             Text(item.text).font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
@@ -896,6 +982,159 @@ struct ApprovalSheet: View {
         case "always": "Always allow"
         case "deny": "Deny"
         default: c.capitalized
+        }
+    }
+}
+
+private enum ToolLanguage {
+    static func title(_ row: ToolActivity) -> String {
+        let preview = row.preview
+        switch row.name {
+        case "skill_view": return preview.isEmpty ? "Loaded a skill" : "Loaded skill · \(preview)"
+        case "terminal", "execute_code": return preview.isEmpty ? "Ran a command" : "Ran · \(preview)"
+        case "read_file", "search_files", "list_files": return preview.isEmpty ? "Explored files" : "Explored · \(preview)"
+        case "web_search", "web_extract": return preview.isEmpty ? "Searched" : "Searched · \(preview)"
+        case "delegate_task": return preview.isEmpty ? "Delegated a task" : "Delegated · \(preview)"
+        case "tool_search": return "Looked up tools"
+        default:
+            let spoken = row.name.replacingOccurrences(of: "_", with: " ")
+            return preview.isEmpty ? spoken : "\(spoken) · \(preview)"
+        }
+    }
+
+    static func summary(_ rows: [ToolActivity]) -> String {
+        var ran = 0, explored = 0, searched = 0, delegated = 0, skills = 0, other = 0
+        for row in rows {
+            switch row.name {
+            case "terminal", "execute_code": ran += 1
+            case "read_file", "search_files", "list_files": explored += 1
+            case "web_search", "web_extract": searched += 1
+            case "delegate_task": delegated += 1
+            case "skill_view": skills += 1
+            default: other += 1
+            }
+        }
+        var parts: [String] = []
+        if skills > 0 { parts.append(skills == 1 ? "Loaded a skill" : "Loaded \(skills) skills") }
+        if explored > 0 { parts.append(explored == 1 ? "Explored files" : "Explored \(explored) places") }
+        if ran > 0 { parts.append(ran == 1 ? "Ran 1 command" : "Ran \(ran) commands") }
+        if searched > 0 { parts.append(searched == 1 ? "Searched" : "Searched \(searched) times") }
+        if delegated > 0 { parts.append(delegated == 1 ? "Delegated a task" : "Delegated \(delegated) tasks") }
+        if other > 0 { parts.append(other == 1 ? "1 other action" : "\(other) other actions") }
+        var text = parts.isEmpty ? "\(rows.count) tool calls" : parts.joined(separator: ", ")
+        let failed = rows.filter { $0.state == "failed" }.count
+        if failed > 0 { text += failed == 1 ? " · 1 failed" : " · \(failed) failed" }
+        if rows.contains(where: { $0.state == "running" }) { text += " · still running" }
+        return text
+    }
+}
+
+private struct SlashMenu: View {
+    let commands: [SlashCommand]
+    let skills: [String]
+    let filter: String
+    let pick: (String) -> Void
+
+    var body: some View {
+        let shown = commands.filter { filter.isEmpty || $0.name.hasPrefix(filter) }.prefix(8)
+        let skillHits = skills.filter { filter.isEmpty || $0.hasPrefix(filter) }.prefix(6)
+        if !shown.isEmpty || !skillHits.isEmpty {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(shown)) { cmd in
+                        Button { pick(cmd.name) } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("/" + cmd.name).font(.subheadline.weight(.semibold))
+                                Text(cmd.hint.isEmpty ? cmd.description : "\(cmd.description) \(cmd.hint)")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if !skillHits.isEmpty {
+                        Text("Skills").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 12).padding(.top, 4)
+                        ForEach(Array(skillHits), id: \.self) { name in
+                            Button { pick(name) } label: {
+                                Text("/" + name).font(.subheadline)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 240)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .padding(.horizontal, 12)
+        }
+    }
+}
+
+private struct TranscriptImages: View {
+    let refs: [ChatMediaRef]
+    let profile: String
+    let session: String?
+    var alignment: HorizontalAlignment = .leading
+    @State private var preview: UIImage?
+
+    var body: some View {
+        if !refs.isEmpty, session != nil {
+            VStack(alignment: alignment, spacing: 6) {
+                ForEach(refs, id: \.digest) { ref in
+                    if ref.kind == "image" {
+                        TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name) {
+                            preview = $0
+                        }
+                    } else {
+                        Label(ref.name, systemImage: "doc").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .fullScreenCover(isPresented: Binding(get: { preview != nil }, set: { if !$0 { preview = nil } })) {
+                if let preview { FullImagePreview(image: preview) }
+            }
+        }
+    }
+}
+
+private struct TranscriptImage: View {
+    let profile: String
+    let session: String
+    let digest: String
+    let name: String
+    let open: (UIImage) -> Void
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Button { open(image) } label: {
+                    Image(uiImage: image).resizable().scaledToFit()
+                        .frame(maxWidth: 240, maxHeight: 220)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(name)
+            } else if failed {
+                Label(name, systemImage: "photo").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView().frame(width: 44, height: 44)
+            }
+        }
+        .task {
+            guard image == nil, !failed else { return }
+            do {
+                let data = try await API.shared.chatMedia(profile: profile, session: session, digest: digest)
+                if let decoded = UIImage(data: data) { image = decoded } else { failed = true }
+            } catch {
+                failed = true
+            }
         }
     }
 }

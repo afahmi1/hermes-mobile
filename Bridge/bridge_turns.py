@@ -614,7 +614,16 @@ async def _drive_connection(turn: Turn):
             elif t in ("tool.start", "tool.started"):
                 turn.push("tool.started", tool_name=_tool_name(pl), preview=str(pl.get("preview") or "")[:200])
             elif t in ("tool.complete", "tool.completed"):
-                turn.push("tool.completed", tool_name=_tool_name(pl))
+                preview = pl.get("preview") if isinstance(pl.get("preview"), str) else ""
+                turn.push("tool.completed", tool_name=_tool_name(pl),
+                          ok=not pl.get("is_error") and not pl.get("error"),
+                          preview=" ".join(preview.split())[:160])
+            elif isinstance(t, str) and t.startswith("subagent."):
+                title = pl.get("title") or pl.get("goal") or pl.get("name") or "Background task"
+                detail = pl.get("error") or pl.get("status") or ""
+                turn.push("subagent", title=str(title)[:120],
+                          state="done" if t.endswith("complete") else "running",
+                          detail=" ".join(str(detail).split())[:160])
             elif t == "approval.request":
                 pid, gen = pl.get("prompt_id"), pl.get("execution_generation", turn.generation)
                 if pid:
@@ -958,6 +967,30 @@ async def _follow_up(turn, mode, text, submission, choice=None):
         TURNS[queued.id] = queued
     asyncio.create_task(_drive(queued))
     return {"status": "queued", "turn_id": queued.id}
+
+
+async def _slash(home, sid, command):
+    async with connect(home) as client:
+        snapshot = await _resume(client, sid)
+        canonical = snapshot.get("session_id") or sid
+        return await _rpc(client, "slash.exec", session_id=canonical, command=command)
+
+
+def run_slash(home, sid, command):
+    """Run a Hermes slash command on this chat. The phone displays the result; it does not interpret it."""
+    if not isinstance(command, str) or not command.startswith("/") or len(command) > 4000:
+        raise TurnError("Type one slash command, like /learn or /status.")
+    try:
+        return run(_slash(home, sid, command.strip()), timeout=180)
+    except TimeoutError:
+        raise TurnError("That command is still running on your Mac. Check the chat in a moment.", 504)
+
+
+def reload_skills(home, profile):
+    async def go():
+        async with connect(home) as client:
+            return await _rpc(client, "skills.reload", profile=profile)
+    return run(go(), timeout=30)
 
 
 def follow_up(turn, mode, text, submission=None, choice=None):

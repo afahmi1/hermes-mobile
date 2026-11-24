@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import bridge_transcript as transcript
+
 # The bridge embeds Hermes libraries. A library import must never relaunch the
 # HTTP service under a different interpreter or update the host installation.
 os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
@@ -234,7 +236,8 @@ def bots():
             name = nm or pid.replace("-", " ").replace("_", " ").title().replace("Captains", "Captain's")
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
                     "reachable": bool(key_for(pid)), "served": pid in served,
-                    "front": pid == "default", "managed": False})
+                    "front": pid == "default", "managed": False,
+                    "skills": transcript.skill_names(profile_home(pid))})
     return out
 
 
@@ -1362,29 +1365,36 @@ def admissions_dir():
 
 
 def project_timeline_message(message):
-    """One mobile timeline row: visible text and tool names, never tool output or reasoning."""
-    row = {k: message[k] for k in ("id", "role", "timestamp") if k in message}
-    if message.get("role") in ("user", "assistant"):
-        body = message.get("content")
-        if isinstance(body, list):
-            body = "\n".join(p["text"] for p in body if isinstance(p, dict) and isinstance(p.get("text"), str))
-        if isinstance(body, str):
-            row["content"] = body
-        calls = message.get("tool_calls")
-        if isinstance(calls, list):
-            row["tool_calls"] = [{"function": {"name": f["name"]}} for c in calls if isinstance(c, dict)
-                                 and isinstance(f := c.get("function"), dict) and isinstance(f.get("name"), str)]
-    return row
+    """One mobile timeline row. Reasoning and unbounded tool bodies stay on the Mac."""
+    return transcript.project_timeline_message(message, [HERMES])
 
 
 def timeline_bytes(messages):
-    return json.dumps({"data": [project_timeline_message(m) for m in messages]},
-                      ensure_ascii=False, separators=(",", ":")).encode()
+    rows = [row for row in (project_timeline_message(m) for m in messages) if row]
+    return json.dumps({"data": rows}, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def timeline_page(raw):
     """Return exactly the rows consumed by the mobile timeline, retaining pagination positions."""
     return timeline_bytes(json.loads(raw)["data"])
+
+
+def session_bodies(pid, session_id):
+    """Raw transcript text for one chat, so a media digest can be re-derived instead of trusted."""
+    if not NATIVE_INBOX or not session_id or any(c in session_id for c in "/\\\x00") or len(session_id) > 200:
+        return []
+    from hermes_state import SessionDB
+    from gateway.platforms.api_server import APIServerAdapter
+    path = profile_home(pid) / "state.db"
+    if not path.is_file():
+        return []
+    with closing(SessionDB(path, read_only=True)) as db:
+        if not db.get_session(session_id):
+            return []
+        active = db.resolve_resume_session_id(session_id)
+        rows = db.get_messages(active, limit=1000, offset=0, latest=True,
+                               include_compacted=False, include_ancestors=True)
+        return [transcript.content_text(APIServerAdapter._message_response(row).get("content")) for row in rows]
 
 
 def native_timeline_page(pid, session_id, limit, offset, latest):
@@ -1594,6 +1604,12 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, health())
             if path == "/m/bots":
                 return self.send(200, {"bots": bots()})
+            if path == "/m/commands":
+                pid = q.get("profile") or "default"
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                return self.send(200, {"commands": transcript.phone_commands(),
+                                       "skills": transcript.skill_names(profile_home(pid))})
             if path == "/m/status":
                 why = "it answered with an error"
                 try:
@@ -1617,6 +1633,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200 if d else 404, d or {"error": "not found"})
         if path.startswith("/m/p/"):
             return self.proxy(path, u.query)
+        if path == "/m/skills" and self.command == "POST":
+            return self.skill_route()
         if path.startswith("/m/chat/") or path.startswith("/m/turns"):
             return self.chat_route(path, q)
         self.send(404, {"error": "not found"})
@@ -2032,6 +2050,36 @@ class H(BaseHTTPRequestHandler):
             return self.send(502, {"error": "Hermes didn't return a canonical chat id."})
         return self.send(201, store.link_chat(project, profile, stored, (title or "").strip()[:120] or "New chat"))
 
+    def skill_route(self):
+        """Create a skill file, or append a note to one this bot already has, then rescan."""
+        if turns is None:
+            return self.send(503, {"error": "Turn engine unavailable: %s" % TURNS_ERROR})
+        d = self.json_body()
+        pid = str(d.get("profile") or "")
+        if pid not in profile_ids():
+            return self.send(404, {"error": "unknown bot"})
+        home = profile_home(pid)
+        action = d.get("action")
+        try:
+            if action == "create":
+                saved = transcript.create_skill(home, str(d.get("name") or ""), str(d.get("description") or ""),
+                                                str(d.get("body") or ""))
+            elif action == "append":
+                saved = transcript.append_skill(home, str(d.get("name") or ""), str(d.get("note") or ""))
+            else:
+                return self.send(400, {"error": "Say whether to create a skill or append a note."})
+        except ValueError as e:
+            return self.send(400, {"error": str(e)})
+        except OSError:
+            return self.send(500, {"error": "Could not write that skill."})
+        reloaded = False
+        try:
+            turns.reload_skills(home, pid)
+            reloaded = True
+        except Exception:
+            log("skill reload failed")
+        return self.send(200, {**saved, "reloaded": reloaded, "skills": transcript.skill_names(home)})
+
     # ---- chats through the gateway's canonical session protocol (the desktop app's) ----
     def chat_route(self, path, q):
         if turns is None:
@@ -2064,6 +2112,33 @@ class H(BaseHTTPRequestHandler):
                 if not action and self.command == "GET":
                     return self.send(200, turn.summary())
                 return self.send(405, {"error": "method not allowed"})
+            preview = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/media/([0-9a-f]{64})", path)
+            if preview:
+                if self.command != "GET":
+                    return self.send(405, {"error": "method not allowed"})
+                pid, sid, digest = preview.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                found = transcript.file_for_digest(session_bodies(pid, sid), digest, [HERMES])
+                if found is None:
+                    return self.send(404, {"error": "That file is not in this chat."})
+                types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                         ".webp": "image/webp", ".heic": "image/heic", ".pdf": "application/pdf",
+                         ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
+                         ".json": "application/json", ".csv": "text/plain; charset=utf-8"}
+                try:
+                    data = found.read_bytes()
+                except OSError:
+                    return self.send(404, {"error": "That file is not in this chat."})
+                return self.send(200, data, types.get(found.suffix.lower(), "application/octet-stream"))
+            slash = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/slash", path)
+            if slash and self.command == "POST":
+                pid, sid = slash.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                command = str(self.json_body().get("command") or "").strip()
+                result = turns.run_slash(profile_home(pid), sid, command)
+                return self.send(200, transcript.public_slash(result))
             media = re.fullmatch(r"/m/chat/([^/]+)/media-capabilities", path)
             if media and self.command == "GET":
                 pid = media.group(1)

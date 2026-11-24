@@ -19,8 +19,10 @@ class TimelineTest(unittest.TestCase):
                     {"function": {"name": "lookup", "arguments": "large arguments"}}]}]
         actual = json.loads(bridge.timeline_page(json.dumps({"data": rows})))["data"]
         self.assertEqual(actual, [{"role": "user", "id": 1, "timestamp": 12, "content": "hello\nworld"},
-                                  {"role": "tool", "id": 2},
+                                  {"role": "tool", "id": 2, "preview": "a large private tool result", "ok": True},
                                   {"role": "assistant", "id": 3, "content": "OK", "tool_calls": [{"function": {"name": "lookup"}}]}])
+        self.assertNotIn("hidden", json.dumps(actual))
+        self.assertNotIn("large arguments", json.dumps(actual))
 
     def test_conditional_proxy_revalidates_even_if_number_of_rows_stays_constant(self):
         handler = MagicMock()

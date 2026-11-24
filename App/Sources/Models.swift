@@ -10,6 +10,82 @@ struct Bot: Codable, Identifiable, Hashable {
     let provider: String
     let reachable: Bool
     let front: Bool
+    var skills: [String] = []
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, blurb, model, provider, reachable, front, skills
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        blurb = try c.decode(String.self, forKey: .blurb)
+        model = try c.decode(String.self, forKey: .model)
+        provider = try c.decode(String.self, forKey: .provider)
+        reachable = try c.decode(Bool.self, forKey: .reachable)
+        front = try c.decode(Bool.self, forKey: .front)
+        skills = (try? c.decode([String].self, forKey: .skills)) ?? []
+    }
+}
+
+/// One gateway slash command the composer can offer. Typing it still runs on the Mac.
+struct SlashCommand: Codable, Identifiable, Hashable {
+    let name: String
+    let description: String
+    let hint: String
+    let category: String
+    var id: String { name }
+
+    /// The command word in `/learn something`, while the rest of the line is the argument.
+    static func name(in raw: String) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.hasPrefix("/") else { return nil }
+        let token = text.dropFirst().prefix { $0 != " " && $0 != "\n" }
+        guard !token.isEmpty, token.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else { return nil }
+        return String(token)
+    }
+
+    /// What the person has typed after `/`, while they are still picking a command.
+    static func filter(in raw: String) -> String? {
+        guard raw.hasPrefix("/"), !raw.contains(" "), !raw.contains("\n") else { return nil }
+        let token = raw.dropFirst()
+        guard token.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else { return nil }
+        return String(token)
+    }
+
+    static let builtIn: [SlashCommand] = [
+        .init(name: "learn", description: "Learn a reusable skill from what you describe, a URL, or this chat", hint: "<what to learn from>", category: "Tools & Skills"),
+        .init(name: "reload-skills", description: "Rescan skill folders", hint: "", category: "Tools & Skills"),
+        .init(name: "status", description: "Session and gateway status", hint: "", category: "Status"),
+        .init(name: "agents", description: "Background tasks for this chat", hint: "", category: "Status"),
+        .init(name: "usage", description: "Token use for this chat", hint: "", category: "Status"),
+        .init(name: "compress", description: "Summarize earlier turns to free context", hint: "", category: "Session"),
+        .init(name: "goal", description: "Set or show the goal for this chat", hint: "<goal>", category: "Session"),
+        .init(name: "btw", description: "A side question that does not steer the chat", hint: "<question>", category: "Session"),
+        .init(name: "title", description: "Rename this chat", hint: "<title>", category: "Session"),
+        .init(name: "help", description: "Commands Hermes can run from this chat", hint: "", category: "Help"),
+    ]
+}
+
+struct CommandPalette: Decodable {
+    let commands: [SlashCommand]
+    let skills: [String]
+}
+
+struct SlashResult {
+    var output: String?
+    var warning: String?
+    var type: String?
+    var message: String?
+    var display: String?
+    var notice: String?
+}
+
+struct ChatMediaRef: Codable, Hashable {
+    let name: String
+    let digest: String
+    let kind: String
 }
 
 /// A session row as the gateway lists it (plus `profile`, added by the bridge).
@@ -92,9 +168,13 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     let timestamp: Double?
     let reasoning: String?
     let displayKind: String?
+    let notice: String?
+    let preview: String?
+    let ok: Bool?
+    let media: [ChatMediaRef]?
 
     enum CodingKeys: String, CodingKey {
-        case id, role, content, timestamp, reasoning
+        case id, role, content, timestamp, reasoning, notice, preview, ok, media
         case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind"
     }
 
@@ -108,6 +188,10 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         timestamp = try? c.decode(Double.self, forKey: .timestamp)
         reasoning = try? c.decode(String.self, forKey: .reasoning)
         displayKind = try? c.decode(String.self, forKey: .displayKind)
+        notice = try? c.decode(String.self, forKey: .notice)
+        preview = try? c.decode(String.self, forKey: .preview)
+        ok = try? c.decode(Bool.self, forKey: .ok)
+        media = try? c.decode([ChatMediaRef].self, forKey: .media)
     }
 
     /// Content may be a string or a list of OpenAI-style parts.
@@ -123,6 +207,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     struct ToolCall: Codable, Hashable {
         let id: String?
         let function: Fn?
+        let preview: String?
         struct Fn: Codable, Hashable { let name: String?; let arguments: String? }
     }
 }
