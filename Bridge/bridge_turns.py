@@ -491,6 +491,32 @@ async def _recover_gap(c, turn, snapshot=None):
     return True
 
 
+def _native_image(item):
+    """Only a validated JPEG (new protocol) or an image the bridge itself sniffed and signed (legacy
+    upload) goes to the gateway as a native attachment. A client MIME label alone never does."""
+    if item.get("legacy"):
+        return item.get("native") is True and item.get("kind") == "image"
+    return item["mime"] == bridge_media.JPEG
+
+
+def _is_clip(item):
+    """Video processing needs the new protocol's validated clip, whose consent start_primary verified."""
+    return not item.get("legacy") and item["mime"] == bridge_media.MP4
+
+
+async def _attach_legacy_files(c, turn):
+    """Legacy true file refs: the gateway's bounded ``file.attach`` turns a staged file into an ``@file:``
+    ref. If it is unavailable the path-in-prompt text below is used instead."""
+    for item in turn.media:
+        if item.get("legacy") and not _native_image(item):
+            try:
+                ref = ((await _rpc(c, "file.attach", session_id=turn.sid, path=item["path"], name=item.get("name"))) or {}).get("ref_text")
+            except TurnError:
+                ref = None
+            if isinstance(ref, str) and ref.strip():
+                item["ref_text"] = ref.strip()[:2000]
+
+
 def _turn_text(turn):
     if turn.frozen_text is not None:
         return turn.frozen_text
@@ -499,11 +525,13 @@ def _turn_text(turn):
     if suffix:
         text = (text + "\n\n" if text else "") + suffix
     for item in turn.media:
-        if item["mime"] == bridge_media.MP4:
+        if _is_clip(item):
             text += ("\n\nThe user attached a video clip and consented to auxiliary video processing. "
                      "Use video_analyze with video_url set to the following local file path to answer their question. "
                      "If analysis fails, explain the limitation. Local file path: " + json.dumps(item["path"]))
-        elif item["mime"] != bridge_media.JPEG:
+        elif item.get("ref_text"):
+            text += "\n\n" + item["ref_text"]
+        elif not _native_image(item):
             name = item.get("name") or Path(item["path"]).name
             size = item.get("size")
             if not isinstance(size, int) or size <= 0:
@@ -536,8 +564,10 @@ async def _drive_connection(turn: Turn):
         if turn.journal and not turn.prepared:
             await asyncio.to_thread(turn.journal.prepared, turn)
             turn.prepared = True
+        if not following_queue and any(m.get("legacy") for m in turn.media):
+            await _attach_legacy_files(c, turn)
         params = {"session_id": turn.sid, "submission_id": turn.submission or uuid.uuid4().hex, "text": _turn_text(turn)}
-        images = [m for m in turn.media if m["mime"] == bridge_media.JPEG]
+        images = [m for m in turn.media if _native_image(m)]
         if images:
             params["attachments"] = [{"path": m["path"], "mime": m["mime"]} for m in images]
         params.update(_admission_runtime(turn.choice))
@@ -705,13 +735,16 @@ def _admission_lock(key):
         return lock
 
 
-def start_turn(profile, home, sid, text, choice, workspace=None) -> Turn:
+def start_turn(profile, home, sid, text, choice, workspace=None, media=None) -> Turn:
     purge()
     with _admission_lock((profile, sid)), TURNS_LOCK:
         busy = [t for t in TURNS.values() if t.sid == sid and t.profile == profile and not t.done]
         if busy:
             raise TurnError("This chat is still working on the last message.", 409)
         turn = Turn(profile, home, sid, text, clean_choice(choice), workspace)
+        # Legacy /m/upload refs: already staged by bridge_uploads and kept by its own sweep. This
+        # non-journaled turn never discards them (discard only runs for journaled turns).
+        turn.media = list(media or [])
         TURNS[turn.id] = turn
     asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
     return turn

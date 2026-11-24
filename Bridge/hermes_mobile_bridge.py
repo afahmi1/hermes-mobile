@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
 import bridge_devices
 from bridge_process import pid_alive
+import bridge_uploads as uploads_mod  # stdlib only: legacy chunked /m/upload + /m/media for older app builds
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
@@ -320,11 +321,19 @@ def ensure_profile_keys():
 
 
 def _key_watcher():
+    n = 0
     while True:
         try:
             ensure_profile_keys()
         except Exception as e:
             log("key watcher: %s" % e)
+        if n % 180 == 0:  # about hourly: drop month-old staged phone files and stale partial uploads
+            try:
+                UPLOADS.sweep()
+                UPLOADS.sweep_staged([profile_home(p) for p in profile_ids()])
+            except Exception as e:
+                log("upload sweep: %s" % e)
+        n += 1
         time.sleep(20)
 
 
@@ -387,6 +396,7 @@ def _secret():
 
 
 SECRET = _secret()
+UPLOADS = uploads_mod.Uploads(STATE_DIR, SECRET, lambda pid: profile_home(pid), log)
 # Login throttle, kept per Tailscale identity (tailscale serve sets Tailscale-User-Login), so one
 # device's bad guesses can't lock the owner out. One login is checked at a time, so the 0.6 s delay
 # really bounds the guess rate instead of being raced past with parallel requests.
@@ -1516,6 +1526,8 @@ class H(BaseHTTPRequestHandler):
             if m:
                 d = session_runtime(m.group(1), m.group(2)) if (m.group(1) == "default" or PROFILE_RE.match(m.group(1))) else None
                 return self.send(200 if d else 404, d or {"error": "not found"})
+        if path.startswith("/m/upload/") or path.startswith("/m/media/"):
+            return self.upload_route(path, q)
         if path.startswith("/m/p/"):
             return self.proxy(path, u.query)
         if path.startswith("/m/chat/") or path.startswith("/m/turns"):
@@ -1996,9 +2008,19 @@ class H(BaseHTTPRequestHandler):
             text = str(d.get("text") or "").strip()
             if action == "send-receipt":
                 return self.send(200, turns.match_receipt(pid, sid, text or "Describe the attached media.", d, admissions_dir()))
+            legacy = []
+            refs = d.get("attachments")
+            if (action == "send" and "submission_id" not in d and isinstance(refs, list) and refs
+                    and all(isinstance(r, str) for r in refs)):
+                # Older app builds name refs returned by /m/upload; resolve them for this bot only.
+                if len(refs) > uploads_mod.MAX_PER_TURN:
+                    return self.send(400, {"error": "Up to %d attachments per message." % uploads_mod.MAX_PER_TURN})
+                legacy = [UPLOADS.resolve(r, pid) for r in refs]
+                legacy = [dict(a, legacy=True, native=a["kind"] == "image") for a in legacy]
+                d = {k: v for k, v in d.items() if k != "attachments"}
             if d.get("attachments") and action != "send-once":
                 return self.send(400, {"error": "Media requires a durable send."})
-            if not text and not d.get("attachments"):
+            if not text and not d.get("attachments") and not legacy:
                 return self.send(400, {"error": "Empty message."})
             if not text:
                 text = "Describe the attached media."
@@ -2010,7 +2032,7 @@ class H(BaseHTTPRequestHandler):
             workspace = persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d))
             try:
                 turn = turns.start_turn(pid, home, sid, text, {k: d.get(k) for k in ("provider", "model", "effort", "reset_model", "reset_effort")},
-                                        workspace=workspace)
+                                        workspace=workspace, media=legacy)
             except BaseException:
                 if workspace:
                     try:
@@ -2019,6 +2041,8 @@ class H(BaseHTTPRequestHandler):
                         pass
                 raise
             return self.send(202, turn.summary())
+        except uploads_mod.UploadError as e:
+            return self.send(e.code, {"error": str(e)})
         except turns.TurnError as e:
             return self.send(e.code, {"error": str(e)})
         except WorkspaceError as e:
@@ -2026,6 +2050,49 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             log("chat route %s failed: %s: %s" % (path, type(e).__name__, e))
             return self.send(502, {"error": "%s: %s" % (type(e).__name__, str(e)[:200])})
+
+    # ---- uploads (photos, scans, files) and reading transcript images back ----
+    def upload_route(self, path, q):
+        try:
+            m = re.match(r"^/m/media/([^/]+)$", path)
+            if m and self.command == "GET":
+                pid = m.group(1)
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                data, ctype = UPLOADS.media(pid, q.get("path", ""), q.get("thumb") == "1")
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "private, max-age=86400")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            m = re.match(r"^/m/upload/([^/]+)$", path)
+            if not m:
+                return self.send(404, {"error": "not found"})
+            key = m.group(1)
+            if self.command == "POST":  # start: /m/upload/<bot>  {name, size, mime}
+                if key not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                d = self.json_body()
+                return self.send(201, UPLOADS.start(key, d.get("name"), d.get("size"), d.get("mime")))
+            if self.command == "PUT":   # a chunk: /m/upload/<upload_id>?offset=N, raw bytes
+                return self.send(200, UPLOADS.append(key, q.get("offset"), self.body()))
+            if self.command == "GET":   # where to resume
+                return self.send(200, UPLOADS.status(key))
+            if self.command == "DELETE":
+                UPLOADS.cancel(key)
+                return self.send(200, {"ok": True})
+            return self.send(405, {"error": "method not allowed"})
+        except uploads_mod.UploadError as e:
+            msg = str(e)
+            if msg.startswith("offset_mismatch:"):
+                return self.send(409, {"error": "offset_mismatch", "offset": int(msg.split(":", 1)[1])})
+            return self.send(e.code, {"error": msg})
+        except Exception as e:
+            log("upload route %s failed: %s: %s" % (path, type(e).__name__, e))
+            return self.send(500, {"error": "The Mac couldn't save that file (%s)." % type(e).__name__})
 
     def json_body(self):
         try:
