@@ -8,8 +8,6 @@ extension Notification.Name {
     static let hermesCopied = Notification.Name("hermesCopied")
     /// Posted after the app returns from the background and its connections were reset.
     static let hermesForeground = Notification.Name("hermesForeground")
-    /// The network came back or switched paths (Wi-Fi to cellular, Tailscale reconnect).
-    static let hermesNetworkChanged = Notification.Name("hermesNetworkChanged")
     /// A file path in a reply was tapped; the chat downloads it through the bridge and opens Quick Look.
     static let hermesOpenPath = Notification.Name("hermesOpenPath")
 }

@@ -140,3 +140,8 @@ final class StreamRoutes: @unchecked Sendable {
         }
     }
 }
+
+extension Notification.Name {
+    /// The network came back or switched paths (Wi-Fi to cellular, Tailscale reconnect).
+    static let hermesNetworkChanged = Notification.Name("hermesNetworkChanged")
+}
