@@ -403,6 +403,7 @@ struct ChatScreen: View {
                 }
             }
             draftShelf
+            modelChip
             HStack(alignment: .bottom, spacing: 6) {
                 VStack(spacing: 0) {
                     // Every command and skill, browsable. Typing "/" still filters them inline.
@@ -696,7 +697,128 @@ struct ChatScreen: View {
         }
     }
 
+    /// Model name without a `vendor/` prefix.
+    private func shortModel(_ m: String) -> String { m.split(separator: "/").last.map(String.init) ?? m }
+
+    private var chipLabel: String {
+        let c = chat.choice
+        let model = shortModel(c.model ?? bot?.model ?? "Bot default")
+        guard let e = c.effort.flatMap({ Effort(rawValue: $0)?.label }) else { return model }
+        return model + " · " + e
+    }
+
+    private func isCurrent(_ c: RuntimeChoice) -> Bool {
+        chat.choice.model == c.model && (chat.choice.provider == nil || c.provider == nil || chat.choice.provider == c.provider)
+    }
+
+    /// Current model first, then recents, then the bot's own model, deduped and capped.
+    private var menuModels: [RuntimeChoice] {
+        let current = chat.choice.model == nil ? [] : [chat.choice]
+        let botModel = bot.map { [RuntimeChoice(provider: $0.provider, model: $0.model)] } ?? []
+        return RecentModels.merged(current, RecentModels.load(profile: chat.profile) + botModel)
+    }
+
+    /// One-tap model switch above the input. Everything goes through `chat.apply`, so it is saved on
+    /// the session and waits for the next message while a reply is running.
+    private var modelChip: some View {
+        HStack {
+            Menu {
+                ForEach(menuModels, id: \.self) { c in
+                    Button {
+                        var next = c
+                        next.effort = chat.choice.effort
+                        Task { await chat.apply(next) }
+                    } label: {
+                        if isCurrent(c) { Label(shortModel(c.model ?? ""), systemImage: "checkmark") } else { Text(shortModel(c.model ?? "")) }
+                    }
+                }
+                Button { Task { await chat.apply(.botDefault) } } label: {
+                    if chat.choice.isDefault { Label("Bot default", systemImage: "checkmark") } else { Text("Bot default") }
+                }
+                if !chat.choice.isDefault, chat.choice.model != nil {
+                    Menu("Effort") {
+                        ForEach(Effort.allCases) { e in
+                            Button {
+                                var next = chat.choice
+                                next.effort = e.rawValue
+                                Task { await chat.apply(next) }
+                            } label: {
+                                if chat.choice.effort == e.rawValue { Label(e.label, systemImage: "checkmark") } else { Text(e.label) }
+                            }
+                        }
+                    }
+                }
+                Button { showRuntime = true } label: { Label("All models…", systemImage: "ellipsis.circle") }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu").font(.caption2)
+                    Text(chat.savingRuntime ? "Saving…" : chipLabel).lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .bold))
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(Color(.secondarySystemBackground), in: Capsule())
+                .frame(minHeight: 44)
+            }
+            .disabled(chat.savingRuntime)
+            .accessibilityLabel("Switch model")
+            .accessibilityValue(chipLabel)
+            if chat.isRunning, let n = chat.runtimeNotice {
+                Text(n).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+    }
+
+    /// Handles `/model` and `/effort` lines. They are never sent to the agent. Returns true when
+    /// the draft is such a command (the draft is cleared once it has been applied).
+    private func runModelCommand() -> Bool {
+        guard chat.pastedTexts.isEmpty, chat.draftAttachments.isEmpty,
+              let cmd = ModelCommand.parse(chat.draft) else { return false }
+        let line = chat.draft
+        if case .picker = cmd {} else if case .badEffort = cmd {} else { chat.error = nil }
+        func done() { if chat.draft == line { chat.draft = "" } }
+        switch cmd {
+        case .picker:
+            showRuntime = true
+            done()
+        case .reset:
+            Task { await chat.apply(.botDefault); if chat.error == nil { done() } }
+        case .effort(let level):
+            var next = chat.choice
+            next.effort = level
+            Task { await chat.apply(next); if chat.error == nil { done() } }
+        case .badEffort:
+            chat.error = "Use /effort " + Effort.allCases.map(\.rawValue).joined(separator: ", ") + "."
+        case .model(let query, let provider):
+            let profile = chat.profile
+            Task {
+                guard let catalog = await app.catalog(for: profile) else {
+                    chat.error = "Model list isn’t available yet. Try again in a moment."
+                    return
+                }
+                let table = Dictionary(catalog.usable.map { ($0.slug, $0.models) }, uniquingKeysWith: { a, _ in a })
+                switch ModelCommand.resolve(query, provider: provider, catalog: table) {
+                case .found(let p, let m):
+                    var next = chat.choice
+                    next.provider = p
+                    next.model = m
+                    chat.error = nil
+                    await chat.apply(next)
+                    if chat.error == nil { done() }
+                case .ambiguous(let names):
+                    chat.error = "More than one model matches “\(query)”: " + names.prefix(3).joined(separator: ", ") + (names.count > 3 ? ", …" : "")
+                case .unknown:
+                    chat.error = "No model matches “\(query)”. Type /model to browse."
+                }
+            }
+        }
+        return true
+    }
+
     private func followUp(_ mode: String) {
+        if runModelCommand() { return }
         let draftAtSend = chat.draft
         let pastedAtSend = chat.pastedTexts
         let text = chat.combinedDraft
@@ -711,6 +833,7 @@ struct ChatScreen: View {
     }
 
     private func send() {
+        if runModelCommand() { return }
         let attachments = chat.draftAttachments
         let text = chat.combinedDraft
         if let problem = issue(for: attachments) {

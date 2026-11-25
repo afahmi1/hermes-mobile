@@ -24,6 +24,7 @@
 		569136F100411902E2211011 /* HermesMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6686DC90CF4C5218AD9EE3C5 /* HermesMobileApp.swift */; };
 		6BFCE82C26EA31F0239C7BC8 /* MediaStaging.swift in Sources */ = {isa = PBXBuildFile; fileRef = C87199BB4AB4041206610E84 /* MediaStaging.swift */; };
 		76D6BA0E07AD7BC36AE172AA /* DeletionPinView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 149305800C6FA857809273F1 /* DeletionPinView.swift */; };
+		808875C4E9669A8894F742F5 /* RecentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8B09A12DF8227E0055AF3A1 /* RecentModels.swift */; };
 		8A4FEE22C59ED755F87C1232 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBA5B61C8421B891EEEAE3A8 /* ChatView.swift */; };
 		9871CAA201B1E5134B060C34 /* ProviderUsageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFA9E6B699E7BB76519F7CD /* ProviderUsageView.swift */; };
 		9DA17B9EB323216AE4CB9A1C /* BotsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1ED146FEC9A4A8EC318137C /* BotsView.swift */; };
@@ -70,6 +71,7 @@
 		D2DA9159DDC16BE2AF3476DE /* StatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusView.swift; sourceTree = "<group>"; };
 		D7223536BDFD6A8A524C9B2B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		D7AC94C0A7E3ECC0AA98E648 /* WorkspaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViews.swift; sourceTree = "<group>"; };
+		D8B09A12DF8227E0055AF3A1 /* RecentModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecentModels.swift; sourceTree = "<group>"; };
 		E11909D98B0F5781E0DA91D1 /* HermesMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = HermesMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E7B82EEB179DC61751CFE04C /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		F13CB626AADCB78BCEFD62E2 /* Workspaces.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Workspaces.swift; sourceTree = "<group>"; };
@@ -91,6 +93,7 @@
 				C87199BB4AB4041206610E84 /* MediaStaging.swift */,
 				B2964B8E32E7A6E7CAE8E6CD /* Models.swift */,
 				AAD07289071E7483A587F926 /* Projects.swift */,
+				D8B09A12DF8227E0055AF3A1 /* RecentModels.swift */,
 				0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */,
 				785C4DB8C31E64EB728F4674 /* StatusModel.swift */,
 				84E690DA9F04A70286E6A83B /* StreamRecovery.swift */,
@@ -249,6 +252,7 @@
 				B16507F21903C2EEF6219FFB /* Projects.swift in Sources */,
 				13EC70EBF845B6FBB26EADC7 /* ProjectsView.swift in Sources */,
 				9871CAA201B1E5134B060C34 /* ProviderUsageView.swift in Sources */,
+				808875C4E9669A8894F742F5 /* RecentModels.swift in Sources */,
 				B720454FD199801DFD0CDB87 /* ReplyNotifier.swift in Sources */,
 				2D4D15E7A8B918383BC236CB /* RuntimeSheet.swift in Sources */,
 				2B813FA6CBE1A2730D43ED05 /* SettingsView.swift in Sources */,

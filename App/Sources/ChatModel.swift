@@ -441,6 +441,12 @@ final class ChatModel {
             choice = new
             picked = !new.isDefault
             app?.saveChoice(new, profile: profile, session: sid)
+            RecentModels.record(new, profile: profile)
+            if !items.isEmpty {
+                // Local marker only: not sent to Hermes, and it may vanish when history reloads.
+                let text = new.isDefault ? "Back to bot default" : "Switched to " + [new.model ?? "bot default model", new.effort.flatMap { Effort(rawValue: $0)?.label }].compactMap { $0 }.joined(separator: " · ")
+                items.append(ChatItem(id: "n-switch-\(UUID().uuidString)", kind: .notice, text: text))
+            }
             if deferred || isRunning {
                 runtimeNotice = "Saved for the next message"
             } else {
