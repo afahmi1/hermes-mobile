@@ -24,6 +24,8 @@ struct ChatItem: Identifiable, Hashable {
     var footer: String?
     var failed = false
     var timestamp: Double?
+    /// Last tool-result time in a tool group, so the row can say how long the burst took.
+    var ended: Double?
     /// Shown under a user message that carried project context (this send only).
     var contextNote: String?
 }
@@ -182,6 +184,8 @@ final class ChatModel {
     }
     private var loadingTranscript = false
     private(set) var hasOlder = false
+    /// Raw-row offset already consumed. Projected rows are fewer, so this is not `stored.count`.
+    private var historyOffset = 0
     private(set) var loadingOlder = false
     /// The user picked a model/effort on this phone for this chat; it rides every turn until another
     /// device changes the session's setting.
@@ -264,7 +268,9 @@ final class ChatModel {
                     stored.replaceSubrange(index..., with: msgs)
                 } else {
                     stored = msgs
-                    hasOlder = msgs.count == 100
+                    let paging = HistoryPaging.first(count: msgs.count, hasMore: page.hasMore, nextOffset: page.nextOffset)
+                    historyOffset = paging.offset
+                    hasOlder = paging.hasOlder
                 }
                 lastPage = msgs
                 items = transcriptWithReceipts()
@@ -303,18 +309,27 @@ final class ChatModel {
     }
 
     func loadOlder() async {
-        guard let sid = sessionId, hasOlder, !loadingOlder, !loadingTranscript, !isRunning else { return }
+        guard let sid = sessionId, hasOlder, !loadingOlder, !loadingTranscript else { return }
         loadingOlder = true
         defer { loadingOlder = false }
-        let offset = stored.count
+        let offset = historyOffset
         do {
             let page = try await api.messages(profile: profile, session: sid, offset: offset)
-            guard !isRunning, !Task.isCancelled, stored.count == offset else { return }
+            guard !Task.isCancelled, sessionId == sid else { return }
             let ids = Set(stored.compactMap(\.id))
-            let older = page.filter { row in row.id.map { !ids.contains($0) } ?? true }
+            let older = page.data.filter { row in row.id.map { !ids.contains($0) } ?? true }
+            let paging = HistoryPaging.advance(offset: offset, added: older.count, hasMore: page.hasMore, nextOffset: page.nextOffset)
+            historyOffset = paging.offset
+            hasOlder = paging.hasOlder
+            guard !older.isEmpty else { return }
+            // A live reply lives only in `items` (the stream bubble and the running tool group). Rebuilding
+            // the transcript from storage must keep that tail, or loading history mid-reply wipes the answer.
+            let tailStart = items.firstIndex { $0.streaming || $0.id.hasPrefix("stream-") || $0.activities.contains { $0.id.hasPrefix("live-") } }
+            let tail = tailStart.map { Array(items[$0...]) } ?? []
             stored.insert(contentsOf: older, at: 0)
-            hasOlder = page.count == 100
-            items = transcriptWithReceipts()
+            items = transcriptWithReceipts() + tail
+            if let index = items.lastIndex(where: \.streaming) { streamingIndex = index }
+            if let index = items.lastIndex(where: { $0.activities.contains { $0.state == "running" } }) { liveToolGroup = index }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -406,6 +421,7 @@ final class ChatModel {
                 }) else { continue }
                 if m.ok == false { out[toolGroup].activities[idx].state = "failed" }
                 if let preview = m.preview, !preview.isEmpty { out[toolGroup].activities[idx].result = preview }
+                if let end = m.timestamp { out[toolGroup].ended = end }
             default:
                 continue
             }
@@ -532,7 +548,7 @@ final class ChatModel {
     func reveal(_ pin: MessagePin) async -> Bool {
         var pages = 0
         while !items.contains(where: { $0.id == pin.itemID }) {
-            guard hasOlder, !isRunning, pages < 20 else { return false }
+            guard hasOlder, pages < 40 else { return false }
             let before = stored.count
             await loadOlder()
             pages += 1
@@ -860,13 +876,16 @@ final class ChatModel {
         guard runId == run, sessionId == sid else { throw CancellationError() }
         closeStreamingBubble()
         liveToolGroup = nil
-        if let id = page.first?.id, let index = stored.firstIndex(where: { $0.id == id }) {
-            stored.replaceSubrange(index..., with: page)
+        let rows = page.data
+        if let id = rows.first?.id, let index = stored.firstIndex(where: { $0.id == id }) {
+            stored.replaceSubrange(index..., with: rows)
         } else {
-            stored = page
-            hasOlder = page.count == 100
+            stored = rows
+            let paging = HistoryPaging.first(count: rows.count, hasMore: page.hasMore, nextOffset: page.nextOffset)
+            historyOffset = paging.offset
+            hasOlder = paging.hasOlder
         }
-        lastPage = page
+        lastPage = rows
         items = transcriptWithReceipts()
         recovery.restore(checkpoint: seq, epoch: ev.replayEpoch)
         if let terminal = ev.raw["terminal"] as? [String: Any], let name = terminal["event"] as? String {

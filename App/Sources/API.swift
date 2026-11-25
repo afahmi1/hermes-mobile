@@ -489,23 +489,24 @@ final class API: @unchecked Sendable {
         guard let path = components.string else { throw APIError.badResponse }
         return path
     }
-    func messages(profile: String, session: String, limit: Int = 100, offset: Int = 0) async throws -> [StoredMessage] {
+    func messages(profile: String, session: String, limit: Int = 100, offset: Int = 0) async throws -> MessagesPage {
         let page = try await timeline(profile: profile, session: session, limit: limit, offset: offset)
         guard let rows = page.rows else { throw APIError.badResponse }
-        return rows
+        return MessagesPage(data: rows, hasMore: page.hasMore, nextOffset: page.nextOffset)
     }
 
     func timeline(profile: String, session id: String, limit: Int = 100, offset: Int = 0,
-                  validator: String? = nil) async throws -> (rows: [StoredMessage]?, validator: String?) {
+                  validator: String? = nil) async throws -> (rows: [StoredMessage]?, validator: String?, hasMore: Bool?, nextOffset: Int?) {
         var r = try request(p(profile, "/api/sessions/\(Self.esc(id))/messages?limit=\(limit)&offset=\(offset)&order=latest"))
         r.cachePolicy = .reloadIgnoringLocalCacheData
         r.setValue("timeline-v1", forHTTPHeaderField: "X-Hermes-Transcript")
         r.setValue(validator, forHTTPHeaderField: "If-None-Match")
         let (data, response) = try await session.data(for: r)
         guard let http = response as? HTTPURLResponse else { throw APIError.badResponse }
-        if http.statusCode == 304, let validator { return (nil, validator) }
+        if http.statusCode == 304, let validator { return (nil, validator, nil, nil) }
         guard http.statusCode == 200 else { throw APIError.http(http.statusCode, Self.errorText(data)) }
-        return (try JSONDecoder().decode(MessagesPage.self, from: data).data, http.value(forHTTPHeaderField: "ETag"))
+        let page = try JSONDecoder().decode(MessagesPage.self, from: data)
+        return (page.data, http.value(forHTTPHeaderField: "ETag"), page.hasMore, page.nextOffset)
     }
     func catalog(profile: String, fetch: CatalogFetch = .cached) async throws -> ModelCatalog {
         try await get(fetch.path(escapedProfile: Self.esc(profile)), as: ModelCatalog.self)

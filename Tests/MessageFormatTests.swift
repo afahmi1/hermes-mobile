@@ -82,6 +82,19 @@ func run() async {
     check(items2.count == 1 && items2[0].kind == .activity && items2[0].entries.count == 1, "activity item: \(items2)")
     check(items2[0].text == "build.py --mesh failed (exit 2)" && items2[0].failed, "activity title and failure")
 
+    let first = HistoryPaging.first(count: 100, hasMore: nil, nextOffset: nil)
+    check(first.offset == 100 && first.hasOlder, "a full first page can continue")
+    let short = HistoryPaging.first(count: 40, hasMore: nil, nextOffset: nil)
+    check(short.offset == 100 && !short.hasOlder, "a short first page with no bridge flag is the end")
+    let probed = HistoryPaging.first(count: 40, hasMore: true, nextOffset: 100)
+    check(probed.hasOlder && probed.offset == 100, "bridge has_more beats the projected count")
+    let cont = HistoryPaging.advance(offset: 100, added: 37, hasMore: nil, nextOffset: nil)
+    check(cont.offset == 200 && cont.hasOlder, "a short later page is not the end")
+    let done = HistoryPaging.advance(offset: 200, added: 0, hasMore: nil, nextOffset: nil)
+    check(!done.hasOlder, "nothing new means history is exhausted")
+    let flagged = HistoryPaging.advance(offset: 100, added: 10, hasMore: false, nextOffset: 200)
+    check(flagged.offset == 200 && !flagged.hasOlder, "bridge has_more false stops")
+
     print("Message format parsing, activity entries and transcript activity tests passed")
 }
 

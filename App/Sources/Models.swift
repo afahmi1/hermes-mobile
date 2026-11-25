@@ -311,7 +311,32 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     }
 }
 
-struct MessagesPage: Codable { let data: [StoredMessage] }
+struct MessagesPage: Codable {
+    let data: [StoredMessage]
+    /// Present when the bridge knows whether another raw page exists. Absent on older bridges.
+    let hasMore: Bool?
+    let nextOffset: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case data
+        case hasMore = "has_more"
+        case nextOffset = "next_offset"
+    }
+}
+
+/// How far back the transcript can still go. A projected page is often shorter than the 100 raw
+/// rows the bridge fetched (hidden tool rows are dropped), so a short page is not the end.
+enum HistoryPaging {
+    static func first(count: Int, limit: Int = 100, hasMore: Bool?, nextOffset: Int?) -> (offset: Int, hasOlder: Bool) {
+        if let hasMore { return (nextOffset ?? limit, hasMore) }
+        return (limit, count == limit)
+    }
+
+    static func advance(offset: Int, limit: Int = 100, added: Int, hasMore: Bool?, nextOffset: Int?) -> (offset: Int, hasOlder: Bool) {
+        if let hasMore { return (nextOffset ?? offset + limit, hasMore) }
+        return (offset + limit, added > 0)
+    }
+}
 
 // MARK: - Model catalog
 

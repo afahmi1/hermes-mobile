@@ -1406,9 +1406,13 @@ def project_timeline_message(message):
     return transcript.project_timeline_message(message, [HERMES], assistant_media_roots())
 
 
-def timeline_bytes(messages):
+def timeline_bytes(messages, has_more=None, next_offset=None):
     rows = [row for row in (project_timeline_message(m) for m in messages) if row]
-    return json.dumps({"data": rows}, ensure_ascii=False, separators=(",", ":")).encode()
+    doc = {"data": rows}
+    if has_more is not None:
+        doc["has_more"] = bool(has_more)
+        doc["next_offset"] = next_offset
+    return json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def timeline_page(raw):
@@ -1450,9 +1454,17 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
         if not db.get_session(session_id):
             return None
         active = db.resolve_resume_session_id(session_id)
-        rows = db.get_messages(active, limit=limit, offset=offset, latest=latest,
+        # One extra raw row tells the phone whether another page exists. Projected pages are shorter
+        # (hidden tool rows are dropped), so the phone cannot infer this from the row count.
+        probe = None if limit is None else limit + 1
+        rows = db.get_messages(active, limit=probe, offset=offset, latest=latest,
                                include_compacted=False, include_ancestors=True)
-        return timeline_bytes(APIServerAdapter._message_response(row) for row in rows)
+        if limit is not None and len(rows) > limit:
+            page, has_more = rows[-limit:], True
+        else:
+            page, has_more = rows, False
+        return timeline_bytes([APIServerAdapter._message_response(row) for row in page],
+                              has_more=has_more, next_offset=offset + (limit or 0))
 
 
 # ---------- HTTP ----------

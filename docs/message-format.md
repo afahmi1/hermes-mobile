@@ -34,7 +34,7 @@ Rows with `display_kind: "hidden"` never reach the phone. Reasoning never reache
 | **tools** | assistant `tool_calls` | One collapsed line summarizing the group ("Explored 3 places, Ran 2 commands · 1 failed"). Open it for one row per call with an icon per tool kind; running calls pulse. |
 | **activity** | `display_kind` `process_complete` or `async_delegation_complete`, or a body starting `[IMPORTANT: Background process`, `[ASYNC DELEGATION ...`, `[SUBAGENT`, `[BACKGROUND PROCESS` | An activity card (section 4). |
 | **notice** | Slash command results, stops, local notes (including the local "Switched to …" row after a model change) | Small centered caption. |
-| **control** | A "Send next" or "Guide this reply" the phone sent | Right-aligned receipt: "Queued for the next turn · 2 files" or "Steer received by Hermes". |
+| **control** | A "Send next" or "Guide this reply" the phone sent | Their own bubble, with a tag: "Sends after this reply · 2 files" or "Guided this reply". |
 
 A new calendar day in the transcript gets a separator: Today, Yesterday, the weekday, or the date.
 

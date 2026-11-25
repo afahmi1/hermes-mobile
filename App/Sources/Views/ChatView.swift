@@ -59,7 +59,7 @@ struct ChatScreen: View {
                         Text("Saved on this iPhone \(saved, style: .relative) ago")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    if chat.hasOlder && !chat.isRunning {
+                    if chat.hasOlder {
                         Button(chat.loadingOlder ? "Loading earlier messages…" : "Load earlier messages") {
                             followLatest = false
                             let anchor = chat.items.first?.id
@@ -1115,6 +1115,17 @@ struct MessageRow: View {
     @State private var showFull = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private static func toolLabel(_ item: ChatItem) -> String {
+        let base = item.activities.isEmpty
+            ? "\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")"
+            : ToolLanguage.summary(item.activities)
+        guard let start = item.timestamp, let end = item.ended, end > start else { return base }
+        let seconds = Int(end - start)
+        guard seconds >= 1 else { return base }
+        let span = seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
+        return base + " · " + span
+    }
+
     private var quoted: String {
         let clipped = item.text.count > 600 ? String(item.text.prefix(600)) + "…" : item.text
         return clipped.split(separator: "\n", omittingEmptySubsequences: false).map { "> " + $0 }.joined(separator: "\n") + "\n\n"
@@ -1193,6 +1204,10 @@ struct MessageRow: View {
                             .frame(minHeight: HMDesign.touch)
                     }
                     TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .trailing)
+                    if let ts = item.timestamp {
+                        Text(Date(timeIntervalSince1970: ts), style: .time)
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
                 }
             }
             .padding(.horizontal, 12)
@@ -1234,28 +1249,38 @@ struct MessageRow: View {
                             Label(f, systemImage: "cpu").font(.caption).foregroundStyle(.secondary)
                                 .accessibilityLabel("Answered by \(f)")
                         }
-                        if showActions, let ts = item.timestamp {
-                            Text(Date(timeIntervalSince1970: ts), style: .time).font(.caption).foregroundStyle(.secondary)
-                        }
                     }
                     .padding(.leading, HMDesign.micro)
+                }
+                if let ts = item.timestamp {
+                    Text(Date(timeIntervalSince1970: ts), style: .time)
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .control:
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(item.text).textSelection(.enabled)
-                HStack(spacing: 5) {
-                    Image(systemName: "arrow.turn.up.right")
-                    Text(item.footer ?? "Received")
-                    if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
-                }.font(.caption).foregroundStyle(.secondary)
+            // Their words, not a gray system card. The tag says whether it was queued or used to guide the reply.
+            HStack {
+                Spacer(minLength: 48)
+                VStack(alignment: .trailing, spacing: 4) {
+                    if !item.text.isEmpty {
+                        Text(item.text).textSelection(.enabled)
+                            .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
+                            .foregroundStyle(.primary)
+                            .background(HMDesign.selectedFill, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
+                    }
+                    HStack(spacing: 4) {
+                        Image(systemName: (item.footer ?? "").hasPrefix("Guided") ? "arrow.turn.up.right" : "clock")
+                        Text(item.footer ?? "Sent")
+                        if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
+                    }
+                    .font(.caption2).foregroundStyle(.secondary)
+                }
             }
-            .padding(.horizontal, 14).padding(.vertical, 10)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
-            .frame(maxWidth: .infinity, alignment: .trailing).padding(.horizontal, 14)
+            .padding(.horizontal, 12)
             .accessibilityElement(children: .combine)
         case .tools:
             DisclosureGroup(isExpanded: $toolsExpanded) {
@@ -1286,10 +1311,7 @@ struct MessageRow: View {
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             } label: {
-                Label(item.activities.isEmpty
-                      ? "\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")"
-                      : ToolLanguage.summary(item.activities),
-                      systemImage: "wrench.and.screwdriver")
+                Label(Self.toolLabel(item), systemImage: "wrench.and.screwdriver")
                     .font(.subheadline)
             }
             .foregroundStyle(.secondary)

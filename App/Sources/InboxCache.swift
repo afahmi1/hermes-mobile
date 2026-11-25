@@ -28,7 +28,7 @@ struct ControlReceipt: Codable, Identifiable {
     var files: Int? = nil
 
     var item: ChatItem {
-        let base = mode == "queue" ? "Queued for the next turn" : "Steer received by Hermes"
+        let base = mode == "queue" ? "Sends after this reply" : "Guided this reply"
         let attached = files.map { $0 == 1 ? " · 1 file" : " · \($0) files" } ?? ""
         return ChatItem(id: id.uuidString, kind: .control, text: text.isEmpty ? "Attachments" : text,
                         footer: base + ((files ?? 0) > 0 ? attached : ""), timestamp: at.timeIntervalSince1970)
