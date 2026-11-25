@@ -12,8 +12,22 @@ import re
 from pathlib import Path
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"}
-FILE_EXT = IMAGE_EXT | {".pdf", ".txt", ".md", ".json", ".csv"}
-MAX_MEDIA = 8 * 1024 * 1024
+# Files a reply can hand to the phone. The phone opens them in Quick Look (documents, code, audio, video,
+# 3D models) and can share or save them from there.
+FILE_EXT = IMAGE_EXT | {
+    ".pdf", ".txt", ".md", ".json", ".csv", ".tsv", ".log", ".rtf", ".html", ".htm", ".xml", ".svg",
+    ".yaml", ".yml", ".toml", ".ini", ".py", ".js", ".ts", ".tsx", ".swift", ".sh", ".rb", ".go", ".rs",
+    ".c", ".h", ".cpp", ".java", ".kt", ".sql", ".ipynb",
+    ".docx", ".xlsx", ".pptx", ".pages", ".numbers", ".keynote", ".epub", ".zip",
+    ".mp3", ".m4a", ".wav", ".aac", ".mp4", ".mov", ".m4v",
+    ".stl", ".3mf", ".obj", ".usdz", ".step", ".stp",
+}
+MAX_MEDIA = 32 * 1024 * 1024
+# Never hand these to a phone, whatever a message says: credentials, keys and private config.
+_SECRET_DIRS = {".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".gcloud", "keychains", ".password-store",
+                ".netrc", ".config"}
+_SECRET_NAMES = re.compile(r"(?i)(^|[._-])(auth|credential|credentials|secret|secrets|token|tokens|password|passwd|"
+                           r"id_rsa|id_ed25519|id_ecdsa|cookies?|keystore)([._-]|$)|\.(pem|p12|pfx|key|env|db|sqlite3?)$")
 _CREATE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 _SKIP_COMMANDS = {"approve", "deny"}
 _ARG_KEYS = ("command", "code", "query", "search_term", "path", "file", "filepath",
@@ -115,8 +129,163 @@ def _tool_calls(calls):
     return rows
 
 
+_PROC = re.compile(r"\[IMPORTANT: Background process (\S+) ([^\n(]*?)\s*"
+                   r"\(exit code (-?\d+|None)[^)]*\)\.?\]?[^\n]*\n(?:(?!Command: )[^\n]*\n)*?Command: (.*?)(?:\nOutput:\n(.*?))?"
+                   r"(?=\n\[IMPORTANT: Background process |\Z)", re.S)
+_TASK_BLOCK = re.compile(r"^---\s*([✓✗⚠])\s*TASK\s+(\d+)/(\d+):?\s*(.*?)\s*\(status=([a-z_]+)"
+                         r"(?:,\s*api_calls=(\d+))?(?:,\s*([\d.]+)s)?\)\s*-*\s*$\n?(.*?)(?=^---\s*[✓✗⚠]\s*TASK|\Z)", re.M | re.S)
+_MODEL = re.compile(r"Model:\s*(\S+)")
+# Older batch form: "- proc_x: exit_code=-15, reason=exited" followed by its output.
+_PROC_LINE = re.compile(r"^- (proc_\w+): exit_code=(-?\d+), reason=(\w+)\n(.*?)(?=^- proc_\w+: exit_code=|\Z)", re.M | re.S)
+# Early warning for one failed subagent while its siblings still run.
+_TASK_EARLY = re.compile(r"^\[ASYNC DELEGATION TASK (FAILED|COMPLETE)[^\]]*task (\d+)/(\d+)\]", re.M)
+_TASK_FIELD = re.compile(r"^(Task|Status|Duration|Error):\s*(.*)$", re.M)
+_INTERPRETERS = {"python", "python3", "bash", "sh", "zsh", "node", "bun", "deno", "ruby", "perl", "uv", "uvx", "npx",
+                 "pnpm", "npm", "yarn", "swift", "go", "cargo", "make", "xcodebuild", "git", "gh", "hermes", "docker"}
+_SKIP_PROGRAMS = {"cd", "mkdir", "export", "source", ".", "set", "sleep", "true", "echo", "cp", "mv", "rm", "env"}
+
+
+def _seconds(text):
+    try:
+        s = float(text)
+    except (TypeError, ValueError):
+        return None
+    if s < 60:
+        return "%ds" % round(s)
+    if s < 3600:
+        return "%dm%02ds" % (s // 60, s % 60)
+    return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
+
+
+def command_label(command):
+    """("build.py --mesh", "plate B") for a long shell line: the program that mattered and the folder it ran in."""
+    import shlex
+    cwd = ""
+    label = ""
+    for segment in re.split(r"\s*(?:&&|\|\||;|\n)\s*", command or ""):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            words = shlex.split(segment, posix=True)
+        except ValueError:
+            words = segment.split()
+        while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] == "env"):
+            if words[0] == "env":
+                words.pop(0)
+                while words and words[0].startswith("-"):
+                    flag = words.pop(0)
+                    if flag in ("-u", "-C", "-S") and words:
+                        words.pop(0)
+            else:
+                words.pop(0)
+        if not words:
+            continue
+        # Wrappers that only change how a command runs: name what they wrap.
+        while words and os.path.basename(words[0]) in ("timeout", "gtimeout", "nohup", "time", "caffeinate", "exec", "sudo", "nice"):
+            words.pop(0)
+            while words and (words[0].startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", words[0])):
+                words.pop(0)
+        if not words:
+            continue
+        program = os.path.basename(words[0])
+        if program == "cd" and len(words) > 1:
+            cwd = os.path.basename(words[1].rstrip("/")) or words[1]
+            continue
+        if program in _SKIP_PROGRAMS or program.startswith("for") or program in ("do", "done", "if", "then", "fi"):
+            continue
+        rest = []
+        for w in words[1:]:
+            if w in ("|", ">", ">>", "<", "2>", "&>") or re.match(r"^(\d?>|&>|<|\|)", w):
+                break  # redirections and pipes end the part worth naming
+            if len(w) > 24 and re.fullmatch(r"[0-9A-Fa-f-]+", w):
+                continue  # device and run ids
+            rest.append(w)
+        base = re.sub(r"\d+(\.\d+)*$", "", program)
+        if base in _INTERPRETERS and rest:
+            script = next((w for w in rest if not w.startswith("-")), "")
+            if script and ("/" in script or "." in script) and base not in ("git", "gh", "npm", "pnpm", "yarn", "cargo", "make", "docker", "hermes"):
+                tail = rest[rest.index(script) + 1:]
+                label = " ".join([os.path.basename(script)] + tail[:2])
+            else:
+                label = " ".join([program] + [w for w in rest[:3] if len(w) < 40])
+        else:
+            label = " ".join([program] + [w for w in rest[:2] if len(w) < 40 and not w.startswith("/")])
+        break
+    return _clip(label or _one_line(command) or "command", 64), _clip(cwd, 48)
+
+
+def activity_details(body):
+    """Structured cards for background work: one entry per command or subagent task, or None."""
+    body = body or ""
+    items = []
+    for proc, how, code, command, output in _PROC.findall(body):
+        code = int(code) if code != "None" else None
+        label, cwd = command_label(command)
+        out = (output or "").strip()
+        stopped = code is None or code in (-15, -9, 137, 143)
+        items.append({"type": "process", "id": proc, "exit_code": code,
+                      "status": "ok" if code == 0 else ("stopped" if stopped else "failed"),
+                      "label": label, "cwd": cwd, "command": command.strip()[:1500],
+                      "output": out[-1500:] if len(out) > 1500 else out})
+    if not items:
+        for proc, code, reason, output in _PROC_LINE.findall(body):
+            code = int(code)
+            out = output.strip()
+            killed = code in (-15, -9, 137, 143)
+            items.append({"type": "process", "id": proc, "status": "ok" if code == 0 else ("stopped" if killed else "failed"),
+                          "exit_code": code, "label": "Stopped by signal" if killed else "Background command",
+                          "cwd": "", "command": "", "output": out[-1500:]})
+    early = _TASK_EARLY.search(body)
+    if early and not _TASK_BLOCK.search(body):
+        fields = {}
+        for key, value in _TASK_FIELD.findall(body):
+            fields.setdefault(key, value.strip())
+        status_word = (fields.get("Status") or "").split()[0] if fields.get("Status") else ""
+        secs = re.search(r"Duration:\s*([\d.]+)s", body)
+        failed = early.group(1) == "FAILED"
+        items.append({"type": "task", "status": "failed" if failed else "ok", "state": status_word or None,
+                      "label": _clip(fields.get("Task") or "Subagent task %s of %s" % (early.group(2), early.group(3)), 160),
+                      "duration": _seconds(secs.group(1)) if secs else None, "api_calls": None, "model": None,
+                      "output": _clip(fields.get("Error") or "", 600)})
+    model = _MODEL.search(body)
+    for icon, index, total, goal, status, calls, secs, result in _TASK_BLOCK.findall(body):
+        failed = icon == "✗" or status in _FAILED
+        items.append({"type": "task", "status": "failed" if failed else ("ok" if icon == "✓" else "warning"),
+                      "state": status, "label": _clip(goal, 160) or "Background task",
+                      "duration": _seconds(secs), "api_calls": int(calls) if calls else None,
+                      "model": model.group(1) if model else None,
+                      "output": "\n".join(line for line in result.strip().splitlines() if line.strip())[:1200]})
+    if not items:
+        return None
+    failed = sum(1 for item in items if item["status"] == "failed")
+    stopped = sum(1 for item in items if item["status"] == "stopped")
+    procs = [i for i in items if i["type"] == "process"]
+    tasks = [i for i in items if i["type"] == "task"]
+    if len(items) == 1:
+        one = items[0]
+        if one["type"] == "process":
+            title = ("%s failed (exit %s)" % (one["label"], one["exit_code"]) if failed
+                     else "%s was stopped" % one["label"] if stopped else "%s finished" % one["label"])
+        else:
+            title = ("Subagent failed: " if failed else "Subagent done: ") + _clip(one["label"], 90)
+    else:
+        parts = []
+        if procs:
+            parts.append("%d command%s" % (len(procs), "" if len(procs) == 1 else "s"))
+        if tasks:
+            parts.append("%d subagent task%s" % (len(tasks), "" if len(tasks) == 1 else "s"))
+        title = (" and ".join(parts) + " finished" + (" · %d failed" % failed if failed else "")
+                 + (" · %d stopped" % stopped if stopped else ""))
+    return {"title": _clip(title, 180), "failed": bool(failed), "items": items[:12]}
+
+
 def _activity(kind, body):
     """A desktop notice title, plus the task lines worth opening. The model wall stays off the phone."""
+    rich = activity_details(body)
+    if rich and any(item["type"] == "process" for item in rich["items"]):
+        lines = ["%s · %s" % ("Failed" if i["status"] == "failed" else "Done", i["label"]) for i in rich["items"]]
+        return rich["title"], "\n".join(lines)[:800], rich["failed"]
     tasks = _TASK.findall(body or "")
     if tasks:
         titles, labels = [], []
@@ -143,11 +312,34 @@ def _activity(kind, body):
 
 def _is_wall(text):
     opened = text.lstrip()
-    return opened.startswith(("[ASYNC DELEGATION", "[BACKGROUND PROCESS", "[PROCESS COMPLETE", "[SUBAGENT"))
+    return (opened.startswith(("[ASYNC DELEGATION", "[BACKGROUND PROCESS", "[PROCESS COMPLETE", "[SUBAGENT"))
+            or re.match(r"\[IMPORTANT: (\d+ )?background (process|subagent)", opened, re.I) is not None)
+
+
+def _sensitive(path, base):
+    """True for credentials and private config anywhere under a root (a dotted folder other than .hermes)."""
+    if _SECRET_NAMES.search(path.name):
+        return True
+    try:
+        parts = path.relative_to(base).parts[:-1]
+    except ValueError:
+        return True
+    # A Hermes home (or a profile inside it) keeps config.yaml, .env and auth at its top level: never served.
+    try:
+        home = hermes_home().resolve()
+    except OSError:
+        home = None
+    if home is not None and (path.parent == home or path.parent.parent == home / "profiles"):
+        return True
+    for part in parts:
+        low = part.lower()
+        if low in _SECRET_DIRS or (low.startswith(".") and low not in (".hermes", ".t3")):
+            return True
+    return False
 
 
 def safe_file(raw, roots):
-    """A regular file the session already named, still inside a Hermes home, and small enough to preview."""
+    """A regular file the session already named, still inside an allowed root, not a secret, and small enough."""
     text = (raw or "").strip().strip("\"'").strip()
     if text.startswith("file://"):
         text = text[7:]
@@ -165,7 +357,7 @@ def safe_file(raw, roots):
             base = Path(root).resolve()
         except OSError:
             continue
-        if real == base or base in real.parents:
+        if (real == base or base in real.parents) and not _sensitive(real, base):
             return real
     return None
 
@@ -196,19 +388,25 @@ def _refs(text, roots):
     return cleaned, found
 
 
-def file_for_digest(texts, digest, roots):
-    """The file a timeline digest pointed at, re-derived from this session's own messages."""
+def file_for_digest(texts, digest, roots, assistant_roots=()):
+    """The file a timeline digest pointed at, re-derived from this session's own messages.
+
+    `texts` holds message bodies, or (role, body) pairs. Only Hermes's own replies may point outside the
+    Hermes home (into `assistant_roots`); what a phone typed is confined to `roots`.
+    """
     if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         return None
-    for text in texts:
+    for entry in texts:
+        role, text = entry if isinstance(entry, tuple) else ("user", entry)
+        allowed = list(roots) + (list(assistant_roots) if role == "assistant" else [])
         for match in _IMAGE_AT.findall(text or "") + _MEDIA.findall(text or "") + _MD_IMAGE.findall(text or ""):
-            path = safe_file(match, roots)
+            path = safe_file(match, allowed)
             if path is not None and _digest(path) == digest:
                 return path
     return None
 
 
-def project_timeline_message(message, roots=None):
+def project_timeline_message(message, roots=None, assistant_roots=()):
     """One mobile timeline row. Hidden diagnostics disappear. Delegation walls become activity cards."""
     if not isinstance(message, dict):
         return None
@@ -217,6 +415,8 @@ def project_timeline_message(message, roots=None):
         return None
     roots = list(roots) if roots is not None else [hermes_home()]
     role = message.get("role") or "assistant"
+    if role == "assistant":
+        roots += list(assistant_roots)
     body = content_text(message.get("content"))
     shown, media = _refs(body, roots)
     row = {k: message[k] for k in ("id", "timestamp") if k in message}
@@ -227,6 +427,9 @@ def project_timeline_message(message, roots=None):
         title, detail, failed = _activity(kind, body)
         row.update(role="system", display_kind=kind or "async_delegation_complete",
                    notice=title, content=detail, ok=not failed)
+        rich = activity_details(body)
+        if rich:
+            row["activity"] = rich["items"]
         return row
     if role == "assistant":
         calls = _tool_calls(message.get("tool_calls"))

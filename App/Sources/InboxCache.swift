@@ -24,11 +24,14 @@ struct ControlReceipt: Codable, Identifiable {
     let mode: String
     let text: String
     let at: Date
+    /// Files that rode along with this follow-up. Absent in receipts saved by older builds.
+    var files: Int? = nil
 
     var item: ChatItem {
-        ChatItem(id: id.uuidString, kind: .control, text: text,
-                 footer: mode == "queue" ? "Queued for the next turn" : "Steer received by Hermes",
-                 timestamp: at.timeIntervalSince1970)
+        let base = mode == "queue" ? "Queued for the next turn" : "Steer received by Hermes"
+        let attached = files.map { $0 == 1 ? " · 1 file" : " · \($0) files" } ?? ""
+        return ChatItem(id: id.uuidString, kind: .control, text: text.isEmpty ? "Attachments" : text,
+                        footer: base + ((files ?? 0) > 0 ? attached : ""), timestamp: at.timeIntervalSince1970)
     }
 }
 

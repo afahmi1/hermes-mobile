@@ -76,6 +76,11 @@ final class AppModel {
                 #endif
             }
         }
+        // `-HMOpenChat <bot>/<session id>` opens that chat at launch, for screenshot QA with no taps.
+        if signedIn, let open = env["HMOpenChat"] ?? d.string(forKey: "HMOpenChat"),
+           let slash = open.firstIndex(of: "/") {
+            inboxPath = [ChatRef(profile: String(open[..<slash]), sessionId: String(open[open.index(after: slash)...]))]
+        }
         #endif
         savedGateways = accounts.servers
         DevicePreferences.migrate(account: inboxAccount)

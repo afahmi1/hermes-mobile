@@ -17,6 +17,7 @@ the app; the turn keeps going and the phone re-attaches to the buffered event lo
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import functools
 import bridge_receipts
@@ -301,6 +302,7 @@ class Turn:
         self.prepared = False
         self.frozen_text = None
         self.media = []
+        self.media_key = ""  # digest of a follow-up's attachments, for idempotent retries
         self.restored = False
         self.canonical_sid = sid
         self.submission = None
@@ -499,23 +501,52 @@ def _turn_text(turn):
     suffix = (turn.workspace or {}).get("suffix")
     if suffix:
         text = (text + "\n\n" if text else "") + suffix
-    for item in turn.media:
+    return text + _media_notes(turn.media)
+
+
+def _media_notes(media, images_by_path=False):
+    """Text that hands staged files to the model by local path. Native image attachments need no note,
+    except on a steer: Hermes's session.steer takes text only, so images are described by path too."""
+    text = ""
+    for item in media:
         if item["mime"] == bridge_media.MP4:
             text += ("\n\nThe user attached a video clip and consented to auxiliary video processing. "
                      "Use video_analyze with video_url set to the following local file path to answer their question. "
                      "If analysis fails, explain the limitation. Local file path: " + json.dumps(item["path"]))
-        elif item["mime"] != bridge_media.JPEG:
-            name = item.get("name") or Path(item["path"]).name
-            size = item.get("size")
-            if not isinstance(size, int) or size <= 0:
-                try:
-                    size = Path(item["path"]).stat().st_size
-                except OSError:
-                    size = 0
-            text += ("\n\nThe user attached a file named %s (%s, %d bytes). It is saved at the following "
-                     "local path. Use an appropriate available tool to read or process it; do not execute it. "
-                     "Local file path: %s" % (json.dumps(name), item["mime"], size, json.dumps(item["path"])))
+            continue
+        name = item.get("name") or Path(item["path"]).name
+        if item["mime"] == bridge_media.JPEG:
+            if images_by_path:
+                text += ("\n\nThe user attached an image named %s. It is saved at the following local path. "
+                         "Use vision_analyze on it to see it. Local file path: %s" % (json.dumps(name), json.dumps(item["path"])))
+            continue
+        size = item.get("size")
+        if not isinstance(size, int) or size <= 0:
+            try:
+                size = Path(item["path"]).stat().st_size
+            except OSError:
+                size = 0
+        text += ("\n\nThe user attached a file named %s (%s, %d bytes). It is saved at the following "
+                 "local path. Use an appropriate available tool to read or process it; do not execute it. "
+                 "Local file path: %s" % (json.dumps(name), item["mime"], size, json.dumps(item["path"])))
     return text
+
+
+def _follow_up_frames(attachments):
+    """Decoded follow-up attachments. Clips need the consent flow of a new message, so they are refused here."""
+    if not attachments:
+        return []
+    try:
+        frames = bridge_media.decode(attachments)
+    except bridge_media.MediaError as exc:
+        raise TurnError(str(exc)) from None
+    if any(frame[3] == bridge_media.MP4 for frame in frames):
+        raise TurnError("Send a video clip as a new message so you can choose how Hermes processes it.")
+    return frames
+
+
+def _frames_digest(frames):
+    return hashlib.sha256(b"".join(hashlib.sha256(raw).digest() + mime.encode() for _, _, raw, mime in frames)).hexdigest() if frames else ""
 
 
 async def _drive_connection(turn: Turn):
@@ -897,7 +928,9 @@ def approve(turn: Turn, choice, prompt_id, generation=None):
     return run(_approve(turn, choice, prompt_id, gen))
 
 
-async def _follow_up(turn, mode, text, submission, choice=None):
+async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
+    frames = list(frames or [])
+    media_key = _frames_digest(frames)
     choice = clean_choice(choice) if mode == "queue" else {}
     if choice.get("effort") and not choice.get("model"):
         raise TurnError("Select a model to set an effort for this queued message.")
@@ -910,9 +943,9 @@ async def _follow_up(turn, mode, text, submission, choice=None):
             prior = next((t for t in TURNS.values() if t.profile == turn.profile and
                           t.sid == turn.sid and t.submission == submission), None)
         if prior:
-            if prior.text != text or prior.choice != choice:
+            if prior.text != text or prior.choice != choice or prior.media_key != media_key:
                 raise TurnError("Submission ID already used for another message or runtime.", 409)
-            return {"status": "queued", "turn_id": prior.id}
+            return {"status": "queued", "turn_id": prior.id, "attachments": len(prior.media)}
     steer_id = None
     if mode == "steer" and submission is not None:
         try:
@@ -921,7 +954,7 @@ async def _follow_up(turn, mode, text, submission, choice=None):
             raise TurnError("Invalid steer submission ID.")
         prior = turn.steer_receipts.get(steer_id)
         if prior:
-            if prior[0] != text:
+            if prior[0] != (text, media_key):
                 raise TurnError("Submission ID already used for another steer.", 409)
             return await asyncio.shield(prior[1])
     client = turn.client
@@ -935,30 +968,53 @@ async def _follow_up(turn, mode, text, submission, choice=None):
                 # A lost steer acknowledgment must never allow mixed project output to be captured.
                 await asyncio.to_thread(turn.journal.suppress_capture, turn)
                 turn.steered = True
-            result = await _rpc(client, "session.steer", session_id=turn.canonical_sid, text=text,
-                                execution_generation=generation)
+            staged = await asyncio.to_thread(bridge_media.stage, frames, turn.home) if frames else []
+            try:
+                result = await _rpc(client, "session.steer", session_id=turn.canonical_sid,
+                                    text=(text + _media_notes(staged, images_by_path=True)).strip(),
+                                    execution_generation=generation)
+            except BaseException:
+                await asyncio.to_thread(bridge_media.discard, staged)
+                raise
             if result.get("status") != "queued":
+                await asyncio.to_thread(bridge_media.discard, staged)
                 raise TurnError("Hermes declined this instruction. You can send it as the next turn.", 409)
+            # Staged files stay on disk: the steered agent reads them by path later in this turn.
             turn.steered = True  # the answer may now blend a second instruction: never captured as project output
-            return {"status": "steer_accepted", "execution_generation": generation}
+            return {"status": "steer_accepted", "execution_generation": generation, "attachments": len(staged)}
 
         if steer_id is None:
             return await steer(turn.generation)
         delivery = asyncio.create_task(steer(turn.generation))
-        turn.steer_receipts[steer_id] = (text, delivery)
+        turn.steer_receipts[steer_id] = ((text, media_key), delivery)
         return await asyncio.shield(delivery)
 
-    receipt = await _rpc(client, "prompt.submit", session_id=turn.canonical_sid,
-                         text=text, submission_id=submission, **_admission_runtime(choice))
+    staged = await asyncio.to_thread(bridge_media.stage, frames, turn.home) if frames else []
+    images = [m for m in staged if m["mime"] == bridge_media.JPEG]
+    params = {"session_id": turn.canonical_sid, "text": (text + _media_notes(staged)).strip(),
+              "submission_id": submission, **_admission_runtime(choice)}
+    if images:
+        params["attachments"] = [{"path": m["path"], "mime": m["mime"]} for m in images]
+    try:
+        receipt = await _rpc(client, "prompt.submit", **params)
+    except BaseException:
+        await asyncio.to_thread(bridge_media.discard, staged)
+        raise
     admission = receipt.get("admission_id")
     if not admission or receipt.get("status") not in ("queued", "started", "terminal"):
+        await asyncio.to_thread(bridge_media.discard, staged)
         raise TurnError("Hermes could not confirm admission. Check the chat before retrying.", 409)
+    # The gateway copies native images at admission (as for a first send); other files are read by path later.
+    await asyncio.to_thread(bridge_media.discard, images)
     with TURNS_LOCK:
         existing = next((t for t in TURNS.values() if t.admission == admission and t.profile == turn.profile
                          and t.sid == turn.sid), None)
         if existing:
-            return {"status": "queued", "turn_id": existing.id}
+            await asyncio.to_thread(bridge_media.discard, [m for m in staged if m not in images])
+            return {"status": "queued", "turn_id": existing.id, "attachments": len(existing.media)}
         queued = Turn(turn.profile, turn.home, turn.sid, text, choice)
+        queued.media_key = media_key
+        queued.media = list(staged)
         queued.canonical_sid = turn.canonical_sid
         queued.admission = admission
         queued.submission = submission
@@ -966,7 +1022,7 @@ async def _follow_up(turn, mode, text, submission, choice=None):
             queued.generation = receipt.get("execution_generation")
         TURNS[queued.id] = queued
     asyncio.create_task(_drive(queued))
-    return {"status": "queued", "turn_id": queued.id}
+    return {"status": "queued", "turn_id": queued.id, "attachments": len(staged)}
 
 
 async def _slash(home, sid, command):
@@ -993,7 +1049,11 @@ def reload_skills(home, profile):
     return run(go(), timeout=30)
 
 
-def follow_up(turn, mode, text, submission=None, choice=None):
-    if mode not in ("queue", "steer") or not isinstance(text, str) or not text.strip():
-        raise TurnError("Enter a message to queue or steer.")
-    return run(_follow_up(turn, mode, text.strip(), submission, choice))
+def follow_up(turn, mode, text, submission=None, choice=None, attachments=None):
+    """Queue the next message or steer the running reply. Either may carry files: a queued message sends
+    images natively and files by path; a steer (text-only in Hermes) hands every file over by path."""
+    text = text.strip() if isinstance(text, str) else ""
+    frames = _follow_up_frames(attachments)
+    if mode not in ("queue", "steer") or (not text and not frames):
+        raise TurnError("Enter a message or attach a file to queue or steer.")
+    return run(_follow_up(turn, mode, text, submission, choice, frames))
