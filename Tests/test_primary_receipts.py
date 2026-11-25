@@ -272,12 +272,12 @@ class PrimaryReceipts(unittest.TestCase):
                 self.assertFalse(path.exists())
                 self.assertEqual(len(self.native), 1)
             for bad in [dict(row, filename="../unsafe.jpg"), dict(row, mime="video/mp4"),
-                        dict(row, base64="AAAA"), dict(row, base64="A" * 5592412),
+                        dict(row, base64="AAAA"), dict(row, base64="A" * ((bridge_media.MAX_BYTES + 3) // 3 * 4 + 4)),
                         dict(row, path="/tmp/a")]:
                 with self.assertRaises(bridge_media.MediaError):
                     bridge_media.decode([bad])
             with self.assertRaises(bridge_media.MediaError):
-                bridge_media.decode([row] * 5)
+                bridge_media.decode([row] * (bridge_media.MAX_ITEMS + 1))
         with patch.object(bridge_media, "supported", return_value=False), self.assertRaises(bridge_media.MediaError):
             bridge_media.decode([row])
 

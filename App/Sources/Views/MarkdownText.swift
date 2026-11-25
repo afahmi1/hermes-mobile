@@ -6,6 +6,8 @@ import UIKit
 extension Notification.Name {
     /// Posted after any copy, so the chat screen can flash a small "Copied" pill.
     static let hermesCopied = Notification.Name("hermesCopied")
+    /// Posted after the app returns from the background and its connections were reset.
+    static let hermesForeground = Notification.Name("hermesForeground")
 }
 
 enum Clipboard {
@@ -152,7 +154,7 @@ struct CodeBlockView: View {
                         Image(systemName: "text.alignleft").font(.footnote).hmTouchTarget()
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(wrap ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(wrap ? HMDesign.accent : Color.secondary)
                     .accessibilityLabel(wrap ? "Stop wrapping lines" : "Wrap lines")
                     Button(action: copy) {
                         Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
@@ -160,7 +162,7 @@ struct CodeBlockView: View {
                             .padding(.horizontal, HMDesign.small).hmTouchTarget()
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(copied ? Color.primary : Color.accentColor)
+                    .foregroundStyle(copied ? Color.primary : HMDesign.accent)
                     .disabled(streaming)
                     .accessibilityLabel(copied ? "Copied" : "Copy \(label)")
                 }
@@ -279,7 +281,7 @@ struct TableBlockView: View {
                 }
                 .padding(10)
             }
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+            .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 10))
             Button {
                 Clipboard.copy(rows.map { "| " + $0.joined(separator: " | ") + " |" }.joined(separator: "\n"), what: "Copied table")
             } label: { Label("Copy table", systemImage: "doc.on.doc").font(.caption).hmTouchTarget() }
@@ -297,6 +299,7 @@ struct SelectTextSheet: View {
         NavigationStack {
             SelectableText(text: text)
                 .padding(.horizontal, 12)
+                .hmCanvas()
                 .navigationTitle("Select text")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {

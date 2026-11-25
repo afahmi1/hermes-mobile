@@ -39,6 +39,7 @@ struct DeletionPinView: View {
             if let failure { Section { Text(failure).foregroundStyle(.red).accessibilityIdentifier("pinsetup.error") } }
             if let done { Section { Text(done).accessibilityIdentifier("pinsetup.done") } }
         }
+        .hmCanvas()
         .navigationTitle("Deletion PIN")
         .task { await load() }
         .onDisappear { clear() }

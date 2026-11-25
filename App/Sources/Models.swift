@@ -83,6 +83,46 @@ struct SlashCommand: Codable, Identifiable, Hashable {
 struct CommandPalette: Decodable {
     let commands: [SlashCommand]
     let skills: [String]
+    /// Name, category folder and one-line description. Absent on older bridges (names only).
+    let skillDetails: [SkillInfo]?
+
+    enum CodingKeys: String, CodingKey { case commands, skills, skillDetails = "skill_details" }
+}
+
+struct SkillInfo: Codable, Hashable, Identifiable {
+    let name: String
+    let category: String
+    let description: String
+    var id: String { name }
+
+    init(name: String, category: String = "", description: String = "") {
+        self.name = name; self.category = category; self.description = description
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        category = (try? c.decode(String.self, forKey: .category)) ?? ""
+        description = (try? c.decode(String.self, forKey: .description)) ?? ""
+    }
+
+    /// Ranked search: name prefix, then name contains, then category or description contains. Each word
+    /// of the query must match somewhere, so "web pentest" finds "web-pentest" and "authorized web pentest".
+    static func search(_ skills: [SkillInfo], _ raw: String) -> [SkillInfo] {
+        let words = raw.lowercased().split { $0 == " " || $0 == "/" }.map(String.init)
+        guard !words.isEmpty else { return skills }
+        let joined = words.joined(separator: "-")
+        var scored: [(Int, SkillInfo)] = []
+        for skill in skills {
+            let name = skill.name.lowercased()
+            let hay = name + " " + skill.category.lowercased() + " " + skill.description.lowercased()
+            guard words.allSatisfy({ hay.contains($0) }) else { continue }
+            let score = name.hasPrefix(joined) ? 0 : name.contains(joined) ? 1
+                : words.allSatisfy({ name.contains($0) }) ? 2 : skill.category.lowercased().contains(words[0]) ? 3 : 4
+            scored.append((score, skill))
+        }
+        return scored.sorted { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1.name < $1.1.name }.map(\.1)
+    }
 }
 
 struct SlashResult {
@@ -206,6 +246,34 @@ struct MessagePin: Codable, Identifiable, Hashable {
     }
 }
 
+/// Harness text that lands in user-role rows. The bridge classifies it (bridge_transcript.classify_user_text);
+/// this is the phone's fallback for older bridges, so a system nudge never shows as something the person said.
+enum HarnessText {
+    enum Verdict: Equatable { case user(String, note: String?), notice(String) }
+
+    static func classify(_ raw: String) -> Verdict {
+        var body = raw
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notices: [(String, String)] = [
+            ("You've reached the maximum number of tool-calling iterations", "Hermes hit its tool-call limit for this turn and wrapped up"),
+            ("[CONTEXT COMPACTION", "Earlier turns were compacted into a summary"),
+            ("[Your active task list was preserved", "Task list carried over after compaction"),
+            ("[STILL IN PROGRESS", "Your earlier request carried over after compaction"),
+            ("[System note: Your previous turn was interrupted", "Resumed after an interruption"),
+            ("[IMPORTANT: MCP servers have been reloaded", "Tool servers reloaded"),
+            ("[System:", "System note for Hermes"), ("[SYSTEM:", "System note for Hermes"), ("[System note:", "System note for Hermes"),
+        ]
+        if let hit = notices.first(where: { trimmed.hasPrefix($0.0) }) { return .notice(hit.1) }
+        var note: String?
+        if trimmed.hasPrefix("[OUT-OF-BAND USER MESSAGE") {
+            if let close = body.range(of: "]") { body = String(body[close.upperBound...]) }
+            body = body.replacingOccurrences(of: "[/OUT-OF-BAND USER MESSAGE]", with: "")
+            note = "Sent while Hermes was working"
+        }
+        return .user(body.trimmingCharacters(in: .whitespacesAndNewlines), note: note)
+    }
+}
+
 /// One background command or subagent task in an activity card.
 struct ActivityEntry: Codable, Hashable {
     /// "process" or "task".
@@ -270,9 +338,11 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     let media: [ChatMediaRef]?
     /// Background commands and subagent tasks behind an activity card (bridge-parsed). Absent on older bridges.
     let activity: [ActivityEntry]?
+    /// A short tag under a user bubble ("Sent while Hermes was working · Pasted 6 lines").
+    let note: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, role, content, timestamp, reasoning, notice, preview, ok, media, activity
+        case id, role, content, timestamp, reasoning, notice, preview, ok, media, activity, note
         case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind"
     }
 
@@ -291,6 +361,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         ok = try? c.decode(Bool.self, forKey: .ok)
         media = try? c.decode([ChatMediaRef].self, forKey: .media)
         activity = try? c.decode([ActivityEntry].self, forKey: .activity)
+        note = try? c.decode(String.self, forKey: .note)
     }
 
     /// Content may be a string or a list of OpenAI-style parts.
@@ -935,5 +1006,41 @@ enum MarkdownBlock: Equatable {
         if core.hasPrefix("|") { core.removeFirst() }
         if core.hasSuffix("|") { core.removeLast() }
         return core.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+}
+
+/// Model ids as people say them: "claude-opus-5-5[1m]" reads "Opus 5.5 · 1M", "deepseek-v4-pro" reads
+/// "DeepSeek V4 Pro", "accounts/fireworks/models/glm-5p1" reads "GLM 5.1". Display only; the id is kept everywhere else.
+enum ModelName {
+    private static let upper: Set<String> = ["gpt", "glm", "llm", "ai", "oss", "vl", "moe", "r1", "o1", "o3", "o4"]
+    private static let brands: [String: String] = ["deepseek": "DeepSeek", "openai": "OpenAI", "xai": "xAI",
+                                                   "qwen": "Qwen", "kimi": "Kimi", "minimax": "MiniMax", "grok": "Grok"]
+
+    static func short(_ raw: String) -> String {
+        var id = raw.split(separator: "/").last.map(String.init) ?? raw
+        var context = ""
+        if let open = id.firstIndex(of: "["), id.hasSuffix("]") {
+            context = String(id[id.index(after: open)..<id.index(before: id.endIndex)]).uppercased()
+            id = String(id[..<open])
+        }
+        if id.hasPrefix("claude-") { id.removeFirst("claude-".count) }
+        // Dated snapshots ("-20250514") say nothing a person needs.
+        id = id.replacingOccurrences(of: #"-20\d{6}$"#, with: "", options: .regularExpression)
+        var words: [String] = []
+        for token in id.split(whereSeparator: { $0 == "-" || $0 == "_" || $0 == ":" }).map(String.init) {
+            let fixed = token.replacingOccurrences(of: #"^(\d+)p(\d+)$"#, with: "$1.$2", options: .regularExpression)
+            if let last = words.last, fixed.allSatisfy(\.isNumber), last.allSatisfy({ $0.isNumber || $0 == "." }), !last.contains(".") {
+                words[words.count - 1] = last + "." + fixed
+                continue
+            }
+            let lower = fixed.lowercased()
+            if let brand = brands[lower] { words.append(brand) }
+            else if upper.contains(lower) { words.append(lower.uppercased()) }
+            else if lower.first?.isLetter == true, lower.count > 1, lower.dropFirst().allSatisfy({ $0.isNumber || $0 == "." }) {
+                words.append(lower.uppercased())  // v4, k2
+            } else { words.append(fixed.prefix(1).uppercased() + fixed.dropFirst()) }
+        }
+        let name = words.joined(separator: " ")
+        return context.isEmpty ? name : name + " · " + context
     }
 }

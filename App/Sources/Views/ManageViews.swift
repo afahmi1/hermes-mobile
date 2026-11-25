@@ -56,6 +56,7 @@ struct ArchiveConfirmSheet: View {
                     ManageErrorLabel(failure: model.failure)
                 } footer: { Text("The PIN is checked on your Mac and isn't saved on this phone.") }
             }
+            .hmCanvas()
             .navigationTitle("Archive \(noun)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -142,6 +143,7 @@ struct AddProjectView: View {
                 }
                 if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) } }
             }
+            .hmCanvas()
             .navigationTitle("Add project")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -194,6 +196,7 @@ struct EditProjectView: View {
                 }
                 if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) } }
             }
+            .hmCanvas()
             .navigationTitle("Edit project")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -261,6 +264,7 @@ struct ArchivedView: View {
     var body: some View {
         NavigationStack {
             content
+                .hmCanvas()
                 .navigationTitle("Archived")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
@@ -382,6 +386,7 @@ struct AddBotView: View {
                 } header: { Text("Runs on") }
                 if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) } }
             }
+            .hmCanvas()
             .navigationTitle("Add bot")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -464,6 +469,7 @@ struct PersonaDetailView: View {
                 .accessibilityHint("Asks for your deletion PIN, then hides this bot. You can restore it later")
             } header: { Text("Manage") }
         }
+        .hmCanvas()
         .navigationTitle(persona.name)
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(item: $chat) { ChatView(ref: $0) }

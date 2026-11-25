@@ -51,6 +51,7 @@ struct SettingsView: View {
                 } footer: {
                     Text("Chats, files and approvals stay on the gateway you choose.")
                 }
+                AppearanceSection()
                 Section("Hermes server") {
                     if let caps = capabilities, caps.features.contains("device_grants") {
                         NavigationLink { DeviceAccessView(capabilities: caps) } label: {
@@ -84,6 +85,7 @@ struct SettingsView: View {
                         .accessibilityLabel("App version \(appVersion)")
                 }
             }
+            .hmCanvas()
             .navigationTitle("Settings")
             .sheet(isPresented: $addingGateway) { SignInView(adding: true) }
             .task(id: app.inboxAccount) {
@@ -143,7 +145,7 @@ private struct GatewayRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: HMDesign.medium) {
             Image(systemName: "server.rack")
-                .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
+                .foregroundStyle(isCurrent ? HMDesign.accent : Color.secondary)
                 .frame(width: 28)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: HMDesign.micro) {
@@ -185,6 +187,7 @@ private struct SettingsBotsList: View {
                     .disabled(!bot.reachable)
             }
         }
+        .hmCanvas()
         .navigationTitle("Bots")
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await app.refreshBots() }
@@ -242,6 +245,7 @@ private struct DeviceAccessView: View {
                 }
             }
         }
+        .hmCanvas()
         .navigationTitle("Device access")
         .task { await reload() }
         .refreshable { await reload() }
@@ -352,6 +356,7 @@ struct GatewayDestinationsView: View {
                 }
                 if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
             }
+            .hmCanvas()
             .navigationTitle("Gateways")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
             .sheet(isPresented: $adding) { SignInView(adding: true) }
@@ -385,5 +390,78 @@ struct GatewayDestinationsView: View {
                 states[url] = state
             }
         }
+    }
+}
+
+/// Theme and accent. Swatches show the real canvas, surface and accent, so the choice is visual, not a name.
+struct AppearanceSection: View {
+    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
+    @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
+
+    var body: some View {
+        Section("Appearance") {
+            ForEach(HMThemeChoice.allCases) { theme in
+                Button { themeRaw = theme.rawValue } label: {
+                    HStack(spacing: 12) {
+                        swatch(theme)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(theme.title).foregroundStyle(.primary)
+                            Text(theme.detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if themeRaw == theme.rawValue {
+                            Image(systemName: "checkmark").font(.body.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(themeRaw == theme.rawValue ? .isSelected : [])
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Accent").font(.subheadline)
+                HStack(spacing: 10) {
+                    ForEach(HMAccent.allCases) { accent in
+                        Button { accentRaw = accent.rawValue } label: {
+                            Circle()
+                                .fill(accentFill(accent))
+                                .frame(width: 26, height: 26)
+                                .overlay(Circle().strokeBorder(HMDesign.ink.opacity(accentRaw == accent.rawValue ? 0.9 : 0), lineWidth: 2).padding(-4))
+                                .frame(width: 36, height: 36)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(accent.title + " accent")
+                        .accessibilityAddTraits(accentRaw == accent.rawValue ? .isSelected : [])
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .sensoryFeedback(.selection, trigger: themeRaw + accentRaw)
+    }
+
+    private func accentFill(_ accent: HMAccent) -> Color {
+        guard let pair = accent.hex else { return HMDesign.accent }
+        return Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(hex: pair.1) : UIColor(hex: pair.0) })
+    }
+
+    private func swatch(_ theme: HMThemeChoice) -> some View {
+        let palette: HMPalette = theme == .paper ? .paper : theme == .oled ? .oled : .ash
+        return ZStack(alignment: .bottomTrailing) {
+            RoundedRectangle(cornerRadius: 8).fill(Color(uiColor: UIColor(hex: palette.canvas)))
+            RoundedRectangle(cornerRadius: 4).fill(Color(uiColor: UIColor(hex: palette.surface))).frame(width: 22, height: 12).padding(5)
+            Circle().fill(Color(uiColor: UIColor(hex: palette.accent))).frame(width: 7, height: 7).padding(3)
+        }
+        .overlay {
+            if theme == .system {
+                RoundedRectangle(cornerRadius: 8).fill(Color(uiColor: UIColor(hex: HMPalette.paper.canvas)))
+                    .mask(Rectangle().rotationEffect(.degrees(45)).offset(x: 20, y: 20))
+            }
+        }
+        .frame(width: 40, height: 40)
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(HMDesign.separator, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .accessibilityHidden(true)
     }
 }

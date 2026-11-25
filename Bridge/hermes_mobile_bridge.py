@@ -43,10 +43,21 @@ PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 # Gateway paths the phone may reach (relative to /p/<profile>/).
 PASS = re.compile(r"^/(api/sessions(/[^/]+(/(messages|model|fork))?)?|v1/runs(/[^/]+(/(events|stop|approval|steer))?)?"
                   r"|api/model/options|v1/models|health)$")
-MAX_BODY = 12 * 1024 * 1024
+def _media_body_cap():
+    """Attachments arrive base64 in JSON (4/3 the bytes) plus the message text: size the request cap from
+    the same setting bridge_media uses, so raising one never silently 413s the other."""
+    try:
+        media = int(os.environ.get("HERMES_MOBILE_MEDIA_MAX_BYTES", "") or 0)
+    except ValueError:
+        media = 0
+    media = 50 * 1024 * 1024 if media <= 0 else max(256 * 1024, min(128 * 1024 * 1024, media))
+    return media * 4 // 3 + 2 * 1024 * 1024
+
+
+MAX_BODY = _media_body_cap()
 WS_MAX_BODY = 64 * 1024  # Fits an 8 KiB file JSON-escaped (\u00XX per control byte) or 4 KiB instructions.
 WS_BODY_TIMEOUT = 10
-BODY_TIMEOUT = 120             # an 8 MiB attachment on a weak cellular link still fits; a stalled peer does not
+BODY_TIMEOUT = 600             # a 50 MiB attachment on a weak cellular link still fits; a stalled peer does not
 WS_SETTING = "HERMES_MOBILE_WORKSPACES"
 WS_BOTS_SETTING = "HERMES_MOBILE_WORKSPACE_BOTS"
 POOL = ThreadPoolExecutor(max_workers=16)
@@ -1663,8 +1674,10 @@ class H(BaseHTTPRequestHandler):
                 pid = q.get("profile") or "default"
                 if pid not in profile_ids():
                     return self.send(404, {"error": "unknown bot"})
+                catalog = transcript.skill_catalog(profile_home(pid))
                 return self.send(200, {"commands": transcript.phone_commands(),
-                                       "skills": transcript.skill_names(profile_home(pid))})
+                                       "skills": [row["name"] for row in catalog],
+                                       "skill_details": catalog})
             if path == "/m/status":
                 why = "it answered with an error"
                 try:
@@ -2286,6 +2299,9 @@ class H(BaseHTTPRequestHandler):
             sid, action = m.group(2).rsplit("/", 1)
             if action == "runtime":
                 applied = turns.set_runtime(home, sid, d)
+                guard = next((row for row in applied.values() if row.get("status") == "confirmation_required"), None)
+                if guard:
+                    return self.send(200, {"applied": {}, "timing": "confirm", "confirm": guard})
                 # A deferred pick lands at the next claim; polling here delays the picker and
                 # still reads the old policy throughout a long-running turn.
                 deferred = any(row.get("status") == "deferred" for row in applied.values())

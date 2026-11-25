@@ -31,7 +31,8 @@ enum MediaImportTests {
         precondition(AttachmentSelection.issue([clip], fileLimit: 1, videoLimit: 3) == nil)
         precondition(AttachmentSelection.issue([clip], fileLimit: 6, videoLimit: 2) != nil)
         precondition(AttachmentSelection.issue([fixture, clip], fileLimit: 20, videoLimit: 20) != nil)
-        precondition(AttachmentSelection.issue(Array(repeating: fixture, count: 5), fileLimit: 20, videoLimit: 20) != nil)
+        precondition(AttachmentSelection.issue(Array(repeating: fixture, count: ChatMedia.maxAttachments), fileLimit: 40, videoLimit: 40) == nil)
+        precondition(AttachmentSelection.issue(Array(repeating: fixture, count: ChatMedia.maxAttachments + 1), fileLimit: 40, videoLimit: 40) != nil)
 
         // A HEIC original decodes through the same path (ImageIO reads it on-device).
 

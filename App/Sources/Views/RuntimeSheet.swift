@@ -126,6 +126,7 @@ struct RuntimeSheet: View {
                     }
                 }
             }
+            .hmCanvas()
             .navigationTitle("Model & Effort")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -211,7 +212,7 @@ struct RuntimeSheet: View {
                 .padding(.horizontal, 12).padding(.vertical, 7)
                 .background(on ? HMDesign.selectedFill : Color(uiColor: .tertiarySystemFill), in: Capsule())
                 .foregroundStyle(.primary)
-                .overlay { if on { Capsule().strokeBorder(Color.accentColor, lineWidth: 1) } }
+                .overlay { if on { Capsule().strokeBorder(HMDesign.accent, lineWidth: 1) } }
                 .hmTouchTarget()
         }
         .buttonStyle(.plain)

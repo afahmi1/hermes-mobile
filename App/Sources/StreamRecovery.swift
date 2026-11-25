@@ -94,6 +94,17 @@ final class StreamRoutes: @unchecked Sendable {
         for listener in listeners { listener.yield(()); listener.finish() }
     }
 
+    /// Wake every waiting reader now: the app just came back and its sockets were reset.
+    func nudge() {
+        let listeners: [AsyncStream<Void>.Continuation] = lock.withLock {
+            revision &+= 1
+            let listeners = Array(observers.values)
+            observers.removeAll()
+            return listeners
+        }
+        for listener in listeners { listener.yield(()); listener.finish() }
+    }
+
     /// Registration checks the revision under the same lock used by NWPathMonitor. A transition
     /// between a network error and the retry wait therefore wakes immediately.
     func changes(after previous: UInt64) -> AsyncStream<Void> {

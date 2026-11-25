@@ -28,6 +28,8 @@ struct ChatItem: Identifiable, Hashable {
     var ended: Double?
     /// Shown under a user message that carried project context (this send only).
     var contextNote: String?
+    /// A small tag under a user message: sent mid-reply, pasted lines, replying to, model switched.
+    var annotation: String?
 }
 
 struct ApprovalRequest: Identifiable, Hashable {
@@ -58,6 +60,7 @@ final class ChatModel {
     var slashBusy = false
     var slashCommands: [SlashCommand] = SlashCommand.builtIn
     var skillCommands: [String] = []
+    var skillDetails: [SkillInfo] = []
     var status: String?
     var error: String?
     var approval: ApprovalRequest?
@@ -344,6 +347,7 @@ final class ChatModel {
         runId = t.turnId
         isRunning = true
         status = "Hermes is still working…"
+        Task { await flushLocalQueue() }
         items = items.filter { $0.kind != .assistant || !$0.streaming }
         follow()
     }
@@ -378,7 +382,24 @@ final class ChatModel {
         for (i, m) in msgs.enumerated() {
             if m.displayKind == "hidden" { continue }
             let key = m.id.map(String.init) ?? "i\(i)"
-            let text = (m.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            var text = (m.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if m.displayKind == "system_note" {
+                toolGroup = nil
+                out.append(ChatItem(id: key, kind: .notice, text: m.notice ?? "System note", timestamp: m.timestamp))
+                continue
+            }
+            var annotation = m.note
+            if m.role == "user", m.note == nil, !isActivity(m, text: text) {
+                switch HarnessText.classify(text) {
+                case .notice(let title):
+                    toolGroup = nil
+                    out.append(ChatItem(id: key, kind: .notice, text: title, timestamp: m.timestamp))
+                    continue
+                case .user(let words, let note):
+                    text = words
+                    annotation = note
+                }
+            }
             if isActivity(m, text: text) {
                 toolGroup = nil
                 let trimmedNotice = m.notice?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -394,7 +415,9 @@ final class ChatModel {
             case "user":
                 toolGroup = nil
                 if !text.isEmpty || !(m.media ?? []).isEmpty {
-                    out.append(ChatItem(id: key, kind: .user, text: text, media: m.media ?? [], timestamp: m.timestamp))
+                    var row = ChatItem(id: key, kind: .user, text: text, media: m.media ?? [], timestamp: m.timestamp)
+                    row.annotation = annotation
+                    out.append(row)
                 }
             case "assistant":
                 let calls = m.toolCalls ?? []
@@ -445,14 +468,28 @@ final class ChatModel {
 
     // MARK: runtime choice
 
-    func apply(_ new: RuntimeChoice) async {
-        guard new != choice, !savingRuntime else { return }
+    /// A guarded model waiting for the person's yes: Hermes's own warning, shown before anything is written.
+    struct RuntimeConfirmation: Identifiable, Equatable {
+        let id = UUID()
+        let choice: RuntimeChoice
+        let title: String
+        let message: String
+    }
+    var runtimeConfirmation: RuntimeConfirmation?
+
+    func apply(_ new: RuntimeChoice, confirm: Bool = false) async {
+        guard new != choice || confirm, !savingRuntime else { return }
         guard let sid = sessionId else { choice = new; picked = !new.isDefault; return }
         savingRuntime = true
         defer { savingRuntime = false }
         let previous = lastPolicy ?? choice
         do {
-            let deferred = try await api.lockRuntime(profile: profile, session: sid, choice: new, previous: previous)
+            let lock = try await api.lockRuntime(profile: profile, session: sid, choice: new, previous: previous, confirm: confirm)
+            if case .needsConfirmation(let title, let message) = lock {
+                runtimeConfirmation = RuntimeConfirmation(choice: new, title: title, message: message)
+                return
+            }
+            let deferred = lock == .nextTurn
             guard app != nil else { return }
             choice = new
             picked = !new.isDefault
@@ -483,6 +520,7 @@ final class ChatModel {
         guard let page = try? await api.commandPalette(profile: profile), app != nil else { return }
         if !page.commands.isEmpty { slashCommands = page.commands }
         skillCommands = page.skills
+        skillDetails = page.skillDetails ?? page.skills.map { SkillInfo(name: $0) }
     }
 
     // MARK: pinned messages
@@ -732,9 +770,11 @@ final class ChatModel {
             runId = run
             status = "Thinking…"
             follow()
+            Task { await flushLocalQueue() }
         } catch {
             isRunning = false
             status = nil
+            cancelLocalQueue()
             guard sendKey == key else { return }
             // Auth failures and a missing route on a recovered send can arrive
             // after delivery. Keep that original UUID until the bridge can confirm it.
@@ -755,6 +795,44 @@ final class ChatModel {
     }
 
     var acceptsFollowUp: Bool { isRunning && runId != nil && !sendingFollowUp && !savingRuntime }
+
+    /// A message queued while a reply runs, before the bridge has confirmed the run. It goes out as
+    /// "Send next" the moment the run is known, or as an ordinary message if the run ends first.
+    struct LocalQueue: Equatable { var text: String; var attachments: [SendAttachment] }
+    private(set) var localQueue: LocalQueue?
+
+    /// Send while Hermes is replying: queue it. Works from the first second of a run.
+    func queueNext(_ raw: String, attachments: [SendAttachment]) async -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isRunning, !text.isEmpty || !attachments.isEmpty, localQueue == nil else { return false }
+        if acceptsFollowUp { return await followUp(text, mode: "queue", attachments: attachments) }
+        localQueue = LocalQueue(text: text, attachments: attachments)
+        if draftAttachments == attachments { draftAttachments = [] }
+        return true
+    }
+
+    /// Puts a not-yet-sent queued message back in the composer.
+    func cancelLocalQueue() {
+        guard let q = localQueue else { return }
+        localQueue = nil
+        draft = draft.isEmpty ? q.text : q.text + "\n\n" + draft
+        draftAttachments = q.attachments + draftAttachments
+    }
+
+    private func flushLocalQueue() async {
+        guard let q = localQueue else { return }
+        if isRunning {
+            guard acceptsFollowUp else { return }
+            localQueue = nil
+            if !(await followUp(q.text, mode: "queue", attachments: q.attachments)) {
+                localQueue = q
+                cancelLocalQueue()
+            }
+        } else {
+            localQueue = nil
+            await send(q.text, attachments: q.attachments)
+        }
+    }
     private(set) var sendingFollowUp = false
     private var lastControlAttempt: (run: String, mode: String, text: String, id: UUID, choice: RuntimeChoice)?
     private var lastControlFiles: [SendAttachment] = []
@@ -1102,6 +1180,7 @@ final class ChatModel {
         lastPage = nil
         await load(quiet: true, resumeLive: !gaveUp)
         if gaveUp { error = "The live connection was lost. Tap Reload chat to reconnect." }
+        if gaveUp { cancelLocalQueue() } else { await flushLocalQueue() }
     }
 
     func absorbPaste(_ text: String) {

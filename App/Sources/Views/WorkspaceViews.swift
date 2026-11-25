@@ -46,6 +46,7 @@ struct WorkspaceView: View {
             tabPicker.padding([.horizontal, .top], HMDesign.gutter).padding(.bottom, HMDesign.small)
             content
         }
+        .hmCanvas()
         .navigationTitle(scope.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -274,6 +275,7 @@ struct ArtifactListView: View {
                 HStack { Spacer(); ProgressView("Loading artifacts…"); Spacer() }.listRowBackground(Color.clear)
             }
         }
+        .hmCanvas()
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
@@ -339,6 +341,7 @@ struct ArtifactDetailView: View {
                 }
             }
         }
+        .hmCanvas()
         .navigationTitle(artifact.name)
         .navigationBarTitleDisplayMode(.inline)
         .fileExporter(isPresented: $exporting, document: ArtifactDocument(data: download?.data ?? Data()),

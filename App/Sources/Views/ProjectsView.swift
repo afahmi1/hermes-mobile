@@ -22,6 +22,7 @@ struct ProjectsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             content
+                .hmCanvas()
                 .navigationTitle("Projects")
                 .modifier(ManageProjectsToolbar(reload: { await model.load() }))  // build5 manage hook
                 .navigationDestination(for: Selection.self) { selection in
@@ -208,6 +209,7 @@ struct ProjectDetailView: View {
                 if refs.hidden > 0 { Text("\(refs.hidden) \(refs.hidden == 1 ? "reference is" : "references are") hidden because \(refs.hidden == 1 ? "it isn't" : "they aren't") a safe relative path in a known root.") }
             }
         }
+        .hmCanvas()
         .navigationTitle(project.title)
         .navigationBarTitleDisplayMode(.inline)
         .task(id: hasWorkspace) { if hasWorkspace { await assignment.load() } }

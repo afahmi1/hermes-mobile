@@ -23,6 +23,7 @@ struct BotsView: View {
                 }
                 ManagePersonasSection()  // build5 manage hook
             }
+            .hmCanvas()
             .navigationTitle("Bots")
             .modifier(ManageBotsToolbar())  // build5 manage hook
             .navigationDestination(for: Bot.self) { BotDetailView(bot: $0) }
@@ -113,6 +114,7 @@ struct BotDetailView: View {
                 }
             }
         }
+        .hmCanvas()
         .navigationTitle(bot.name)
         .task(id: showAutomations) { skills = bot.skills; await load() }
         .refreshable { await load() }
@@ -188,6 +190,7 @@ private struct SkillEditorSheet: View {
                 }
                 if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red) }
             }
+            .hmCanvas()
             .navigationTitle(editor.appending ? "Add a note" : "New skill")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

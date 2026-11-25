@@ -138,7 +138,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
     async def test_busy_model_and_effort_share_one_native_mutation_receipt(self):
         with patch.object(engine, "_mutate", AsyncMock(return_value={"status":"deferred"})) as mutate:
             result = await engine._apply(None,"chat",{"model":"new","provider":"p","effort":"high"})
-            mutate.assert_awaited_once_with(None,"chat","model",{"model":"new","provider":"p","reasoning":"high"})
+            mutate.assert_awaited_once_with(None,"chat","model",{"model":"new","provider":"p","reasoning":"high"},ask=False)
             self.assertEqual(result["model"]["status"],"deferred")
 
     async def test_simultaneous_steers_share_the_gateway_ack(self):

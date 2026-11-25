@@ -91,17 +91,31 @@ async def _resume(c, sid):
     return await _rpc(c, "session.resume", session_id=sid, **_resume_options())
 
 
-async def _mutate(c, sid, operation, payload):
-    snap = await _resume(c, sid)
-    res = await _rpc(c, "session.mutate", session_id=sid, request_id=uuid.uuid4().hex, operation=operation,
-                     expected_revision=snap["revision"], expected_generation=snap["execution_generation"],
-                     payload=payload) or {}
-    if res.get("status") == "confirmation_required":
-        # A guarded model (cost / capability warning). The phone already confirmed by picking it.
-        res = await _rpc(c, "session.mutate", session_id=sid, request_id=uuid.uuid4().hex, operation=operation,
-                         expected_revision=snap["revision"], expected_generation=snap["execution_generation"],
-                         payload={**payload, "confirm": res.get("confirm")}) or {}
-    return res
+async def _mutate(c, sid, operation, payload, ask=False):
+    """One fenced session mutation. A guarded model (cost or capability warning) comes back as
+    confirmation_required with Hermes's own warning text when `ask` is set, so the phone can show it;
+    otherwise (a pick the person already made before the first send) it is confirmed. A revision conflict
+    (another device changed the chat at the same moment) is re-read and retried once."""
+    for attempt in (1, 2):
+        snap = await _resume(c, sid)
+        fence = dict(session_id=sid, operation=operation, expected_revision=snap["revision"],
+                     expected_generation=snap["execution_generation"])
+        try:
+            res = await _rpc(c, "session.mutate", request_id=uuid.uuid4().hex, payload=payload, **fence) or {}
+            if res.get("status") == "confirmation_required":
+                if ask:
+                    warnings = res.get("warnings") or []
+                    title = warnings[0].get("title") if len(warnings) == 1 and isinstance(warnings[0], dict) else None
+                    return {"status": "confirmation_required", "title": title or "Model selection warning",
+                            "message": str(res.get("confirm_message") or "This model needs a confirmation.")[:1200]}
+                res = await _rpc(c, "session.mutate", request_id=uuid.uuid4().hex,
+                                 payload={**payload, "confirm": res.get("confirm")}, **fence) or {}
+            return res
+        except TurnError as exc:
+            if attempt == 1 and "revision_conflict" in str(exc):
+                continue
+            raise
+    raise TurnError("This chat changed on another device. Try the model change again.", 409)
 
 
 def clean_choice(choice: dict | None) -> dict:
@@ -130,14 +144,16 @@ def _admission_runtime(choice):
         ("model", "model"), ("provider", "provider"), ("reasoning", "effort")) if choice.get(field)}}
 
 
-async def _apply(c, sid, choice: dict) -> dict:
+async def _apply(c, sid, choice: dict, ask=False) -> dict:
     applied = {}
     if choice.get("model"):
         payload = {"model": choice["model"], **({"provider": choice["provider"]} if choice.get("provider") else {})}
         if choice.get("effort"):
             # The gateway commits (or defers) a model plus reasoning as one fenced mutation.
             payload["reasoning"] = choice["effort"]
-        applied["model"] = await _mutate(c, sid, "model", payload)
+        applied["model"] = await _mutate(c, sid, "model", payload, ask=ask)
+        if applied["model"].get("status") == "confirmation_required":
+            return applied  # nothing written; the effort rides the confirmed retry
     elif choice.get("reset_model"):
         applied["model"] = await _mutate(c, sid, "model", {"model": "reset"})
     if choice.get("effort") and not choice.get("model"):
@@ -222,16 +238,19 @@ def create_session(home, profile, title=None, request_id=None):
     return run(_create(home, profile, title, request_id))
 
 
-async def _set_runtime(home, sid, choice):
+async def _set_runtime(home, sid, choice, ask):
     async with connect(home) as c:
-        return await _apply(c, sid, choice)
+        return await _apply(c, sid, choice, ask=ask)
 
 
 def set_runtime(home, sid, choice):
+    """Change a chat's model/effort from the picker. A guarded model is not applied until the phone shows
+    Hermes's warning and the person confirms (`confirm: true` on the retry)."""
+    ask = not (isinstance(choice, dict) and choice.get("confirm") is True)
     choice = clean_choice(choice)
     if not choice:
         raise TurnError("Nothing to change.")
-    return run(_set_runtime(home, sid, choice))
+    return run(_set_runtime(home, sid, choice, ask))
 
 
 async def _interrupt(turn):

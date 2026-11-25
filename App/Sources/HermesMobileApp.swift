@@ -13,14 +13,25 @@ struct HermesMobileApp: App {
     @State private var selectedTab = 0
     @State private var app = AppModel()
     @Environment(\.scenePhase) private var phase
+    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
+    @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
+
+    init() { HMTheme.applyChrome() }
 
     var body: some Scene {
         WindowGroup {
             RootView(selectedTab: $selectedTab)
                 .environment(app)
-                .tint(Color.accentColor)
+                .tint(HMDesign.accent)
+                .preferredColorScheme(HMThemeChoice(rawValue: themeRaw)?.scheme)
+                // Theme colors resolve when views are built: rebuild once on a theme change.
+                .id(themeRaw + accentRaw)
+                .onChange(of: themeRaw + accentRaw) { _, _ in HMTheme.applyChrome() }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
                     app.retryDraftStorage()
+                }
+                .onOpenURL { url in
+                    if app.open(url) { selectedTab = 0 }
                 }
                 .onChange(of: ReplyNotifier.shared.destination, initial: true) { _, destination in
                     guard let destination else { return }
@@ -28,12 +39,23 @@ struct HermesMobileApp: App {
                     ReplyNotifier.shared.destination = nil
                 }
         }
-        .onChange(of: phase) { _, now in
+        .onChange(of: phase) { old, now in
             if now == .background { ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns) }
             if now == .active {
                 ReplyNotifier.shared.returned()
                 app.retryDraftStorage()
-                app.resumeLiveRuns()
+                if old == .background {
+                    // Fresh sockets first, then everything reconnects at once instead of timing out one by one.
+                    Task {
+                        await API.shared.refreshConnections()
+                        StreamRoutes.shared.nudge()
+                        app.resumeLiveRuns()
+                        NotificationCenter.default.post(name: .hermesForeground, object: nil)
+                        await app.refreshHealth()
+                    }
+                } else {
+                    app.resumeLiveRuns()
+                }
             }
         }
     }
@@ -80,10 +102,14 @@ struct MainTabs: View {
         }
         .task(id: phase) {
             guard phase == .active else { return }
+            var misses = 0
             while !Task.isCancelled {
                 await app.refreshHealth()
+                misses = app.healthFailure == nil ? 0 : misses + 1
                 let transitioning = ["starting", "restarting", "draining", "stopping", "waiting"].contains(app.health?.phase ?? "")
-                try? await Task.sleep(for: .seconds(transitioning ? 3 : 15))
+                // After a miss, retry fast (1, 2, 4 s): a waking tunnel usually answers within seconds.
+                let wait = misses > 0 ? Double(min(1 << (misses - 1), 15)) : transitioning ? 3 : 15
+                try? await Task.sleep(for: .seconds(wait))
             }
         }
         .task(id: phase) { if phase == .active { await app.status.poll(app: app) } }  // keeps the badge and bot lists current from any tab
@@ -125,7 +151,11 @@ struct ConnectionBadge: View {
     /// Icon only (details on tap). Inside a chat the full "frostbyte · Online" label pushed the chat title
     /// and its model picker out of the navigation bar.
     var compact = false
+    var reloadDisabled = false
+    /// Inside a chat: the popover offers Reload chat, so the chat needs no separate refresh button.
+    var onReload: (() async -> Void)? = nil
     @State private var detail = false
+    @State private var reloading = false
     @Environment(AppModel.self) private var app
 
     private var diagnostic: JV? {
@@ -145,7 +175,7 @@ struct ConnectionBadge: View {
 
     private var state: (label: String, symbol: String, color: Color) {
         guard app.checkedConnection else { return (named("Checking"), "clock.fill", .yellow) }
-        if app.needsLogin { return (named("Sign in"), "lock.fill", .yellow) }
+        if app.needsLogin { return (named("Sign in"), "lock.fill", HMDesign.warning) }
         if app.healthFailure != nil { return (named("Unreachable"), "wifi.slash", .red) }
         guard let health = app.health else { return (named("Offline"), "xmark.circle.fill", .red) }
         switch health.phase {
@@ -162,16 +192,22 @@ struct ConnectionBadge: View {
             return (named("Gateway down"), "xmark.circle.fill", .red)
         }
         if ["degraded", "down"].contains(diagnostic?["health"].string ?? "") || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
-            return (named("Degraded"), "exclamationmark.triangle.fill", .yellow)
+            return (named("Degraded"), "exclamationmark.triangle.fill", HMDesign.warning)
         }
-        return (named("Online"), "checkmark.circle.fill", .green)
+        return (named("Online"), "checkmark.circle.fill", HMDesign.success)
     }
 
     var body: some View {
         Button { detail.toggle() } label: {
             HStack(spacing: HMDesign.micro) {
-                Image(systemName: state.symbol).foregroundStyle(state.color)
-                if !compact {
+                if compact {
+                    // A dot, not a badge: green says all is well without taking the title's room.
+                    Circle().fill(state.color).frame(width: 10, height: 10)
+                        .overlay(Circle().strokeBorder(.background, lineWidth: 1.5))
+                        .shadow(color: state.color.opacity(0.55), radius: 3)
+                        .overlay { if reloading { ProgressView().controlSize(.mini) } }
+                } else {
+                    Image(systemName: state.symbol).foregroundStyle(state.color)
                     Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
                 }
             }
@@ -216,11 +252,21 @@ struct ConnectionBadge: View {
                         HStack { Text(change.phase.capitalized); Spacer(); Text(Date(timeIntervalSince1970: change.at), style: .time) }
                     }
                 }
-                Button("Check again") {
-                    Task {
-                        async let health: Void = app.refreshHealth()
-                        await app.status.refresh(app: app)
-                        await health
+                HStack(spacing: 16) {
+                    if let onReload {
+                        Button {
+                            detail = false
+                            reloading = true
+                            Task { await onReload(); reloading = false }
+                        } label: { Label("Reload chat", systemImage: "arrow.clockwise") }
+                        .disabled(reloadDisabled)
+                    }
+                    Button("Check again") {
+                        Task {
+                            async let health: Void = app.refreshHealth()
+                            await app.status.refresh(app: app)
+                            await health
+                        }
                     }
                 }
             }

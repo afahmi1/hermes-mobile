@@ -124,11 +124,36 @@ final class API: @unchecked Sendable {
             r.httpBody = try JSONSerialization.data(withJSONObject: body)
             r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
+        // Reads are small: fail fast and retry rather than staring at a spinner for a minute. A body can be
+        // 30 MB of attachments on a cellular link, so writes get room.
+        r.timeoutInterval = method == "GET" ? 20 : ((r.httpBody?.count ?? 0) > 512 * 1024 ? 600 : 60)
         return r
     }
 
+    /// A read that died on a connection left over from before the app was suspended is retried once on a
+    /// fresh one. The person never sees "cancelled" or a minute-long hang after coming back to the app.
+    private func load(_ r: URLRequest) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(for: r)
+        } catch let error as URLError where !Task.isCancelled && (r.httpMethod ?? "GET") == "GET"
+                    && [.cancelled, .networkConnectionLost, .timedOut, .notConnectedToInternet].contains(error.code) {
+            try await Task.sleep(for: .milliseconds(250))
+            return try await session.data(for: r)
+        }
+    }
+
+    /// Called when the app comes back to the foreground. iOS (and Tailscale's tunnel) drop sockets while the
+    /// app is suspended, but URLSession keeps the dead ones pooled: the next request waits out its whole
+    /// timeout before failing. Cancel stale reads and the live stream, and force new connections.
+    func refreshConnections() async {
+        for s in [session, streamSession] {
+            for task in await s.allTasks where (task.originalRequest?.httpMethod ?? "GET") == "GET" { task.cancel() }
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in s.flush { done.resume() } }
+        }
+    }
+
     private func send(_ r: URLRequest) async throws -> Data {
-        let (data, resp) = try await session.data(for: r)
+        let (data, resp) = try await load(r)
         guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
         guard (200..<300).contains(http.statusCode) else { throw APIError.http(http.statusCode, Self.errorText(data)) }
         return data
@@ -214,7 +239,7 @@ final class API: @unchecked Sendable {
 
     func health() async throws -> HealthInfo {
         var probe = try request("/m/health")
-        probe.timeoutInterval = 8
+        probe.timeoutInterval = 5
         return try JSONDecoder().decode(HealthInfo.self, from: try await send(probe))
     }
 
@@ -501,7 +526,7 @@ final class API: @unchecked Sendable {
         r.cachePolicy = .reloadIgnoringLocalCacheData
         r.setValue("timeline-v1", forHTTPHeaderField: "X-Hermes-Transcript")
         r.setValue(validator, forHTTPHeaderField: "If-None-Match")
-        let (data, response) = try await session.data(for: r)
+        let (data, response) = try await load(r)
         guard let http = response as? HTTPURLResponse else { throw APIError.badResponse }
         if http.statusCode == 304, let validator { return (nil, validator, nil, nil) }
         guard http.statusCode == 200 else { throw APIError.http(http.statusCode, Self.errorText(data)) }
@@ -570,11 +595,24 @@ final class API: @unchecked Sendable {
     /// Persist the chat's model/provider/effort on the session in Hermes (`session.mutate`), exactly
     /// what the desktop's picker does, so every device sees it and the next turn runs on it.
     /// `previous` is what the chat had; fields cleared since then are reset to the bot's own setting.
-    func lockRuntime(profile: String, session: String, choice: RuntimeChoice, previous: RuntimeChoice? = nil) async throws -> Bool {
-        let body = Self.choiceBody(choice, previous: previous)
-        guard !body.isEmpty else { return false }
+    enum RuntimeLock: Equatable { case saved, nextTurn, needsConfirmation(title: String, message: String) }
+
+    /// Save a model/effort pick on the chat. A guarded model (Hermes's cost or capability warning) comes back
+    /// as needsConfirmation with Hermes's own text; send it again with `confirm` once the person agrees.
+    func lockRuntime(profile: String, session: String, choice: RuntimeChoice, previous: RuntimeChoice? = nil,
+                     confirm: Bool = false) async throws -> RuntimeLock {
+        var body = Self.choiceBody(choice, previous: previous)
+        guard !body.isEmpty else { return .saved }
+        if confirm { body["confirm"] = true }
         let result = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/runtime", method: "POST", body: body)
-        return result["timing"] as? String == "next_turn"
+        switch result["timing"] as? String {
+        case "next_turn": return .nextTurn
+        case "confirm":
+            let guardInfo = result["confirm"] as? [String: Any] ?? [:]
+            return .needsConfirmation(title: guardInfo["title"] as? String ?? "Model selection warning",
+                                      message: guardInfo["message"] as? String ?? "This model needs a confirmation.")
+        default: return .saved
+        }
     }
 
     /// Start a turn. The Mac holds it; it keeps running if the phone locks or loses signal.

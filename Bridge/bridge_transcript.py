@@ -310,6 +310,71 @@ def _activity(kind, body):
     return _clip(header, 180), detail, any(word in (body or "").lower() for word in ("status=failed", "✗"))
 
 
+# Text the harness writes into user-role rows. The phone shows the person's own words as their bubble and
+# everything else as a small system notice, never as something they said.
+_OOB_HEAD = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]\n]*\]\s*\n?")
+_OOB_TAIL = re.compile(r"\n?\s*\[/OUT-OF-BAND USER MESSAGE\]\s*$")
+_TRAILING_SYSTEM = re.compile(r"(?:\n\s*\[(?:System|SYSTEM|System note|Note)\s*:[^\]]*\]\s*)+$")
+_SKILL_INVOKED = re.compile(r'^\s*\[(?:SYSTEM|IMPORTANT|System): The user has invoked the "([^"]+)" skill')
+_MODEL_SWITCH = re.compile(r"^\s*\[Note: model was just switched from \S+ to (\S+?)(?: via ([^.\]]+))?\.[^\]]*\]\s*")
+_REPLYING = re.compile(r'^\s*\[Replying to: "(.*?)"\]\s*', re.S)
+_PASTED = re.compile(r"^\s*\[Pasted text #\d+: (\d+) lines? → [^\]]+\]\s*")
+_SPEAKER = re.compile(r"^\s*\[(?!System|SYSTEM|Note|IMPORTANT)[A-Z][\w .'-]{0,30}\] ")
+_NOTICES = (
+    (re.compile(r"^\s*You've reached the maximum number of tool-calling iterations"), "Hermes hit its tool-call limit for this turn and wrapped up"),
+    (re.compile(r"^\s*\[CONTEXT COMPACTION"), "Earlier turns were compacted into a summary"),
+    (re.compile(r"^\s*\[Your active task list was preserved"), "Task list carried over after compaction"),
+    (re.compile(r"^\s*\[System note: Your previous turn was interrupted"), "Resumed after an interruption"),
+    (re.compile(r"^\s*\[System: Your previous response was truncated"), "Hermes continued a reply that ran long"),
+    (re.compile(r"^\s*\[System: Your previous response contained only internal reasoning"), "Hermes was asked to answer instead of thinking"),
+    (re.compile(r"^\s*\[IMPORTANT: MCP servers have been reloaded"), "Tool servers reloaded"),
+    (re.compile(r"^\s*\[(?:System|SYSTEM|System note)\s*:"), "System note for Hermes"),
+)
+
+
+def classify_user_text(text, kind=""):
+    """("user", words, note) for something the person wrote, or ("notice", title, "") for harness text."""
+    body = text or ""
+    skill = _SKILL_INVOKED.match(body)
+    if skill:
+        return "notice", "Loaded the %s skill" % skill.group(1), ""
+    if re.match(r"^\s*\[STILL IN PROGRESS", body):
+        return "notice", "Your earlier request carried over after compaction", ""
+    for pattern, title in _NOTICES:
+        if pattern.match(body):
+            return "notice", title, ""
+    notes = []
+    if _OOB_HEAD.match(body) or kind == "steer":
+        body = _OOB_TAIL.sub("", _OOB_HEAD.sub("", body, count=1))
+        notes.append("Sent while Hermes was working")
+    if "[Recent channel messages]" in body and "[New message]" in body:
+        body = body.split("[New message]", 1)[1]
+    m = _MODEL_SWITCH.match(body)
+    if m:
+        notes.append("Model switched to %s" % m.group(1).rstrip("/").rsplit("/", 1)[-1])
+        body = body[m.end():]
+    m = _REPLYING.match(body)
+    if m:
+        notes.append("Replying to “%s”" % _clip(m.group(1), 60))
+        body = body[m.end():]
+    m = _PASTED.match(body)
+    if m:
+        notes.append("Pasted %s lines" % m.group(1))
+        body = body[m.end():]
+    if body.lstrip().startswith("[The user sent an image"):
+        cut = body.find("\n\n")
+        notes.append("Sent an image")
+        body = body[cut + 2:] if cut >= 0 else ""
+    body = _SPEAKER.sub("", body, count=1)
+    body = _TRAILING_SYSTEM.sub("", body).strip()
+    if notes and body != (text or "").strip():
+        # A model-switch or reply note can sit in front of harness text: classify what is left.
+        verdict, inner, _ = classify_user_text(body)
+        if verdict == "notice" or _is_wall(body):
+            return "notice", inner if verdict == "notice" else "Background work finished", ""
+    return "user", body, " · ".join(notes)
+
+
 def _is_wall(text):
     opened = text.lstrip()
     return (opened.startswith(("[ASYNC DELEGATION", "[BACKGROUND PROCESS", "[PROCESS COMPLETE", "[SUBAGENT"))
@@ -451,11 +516,17 @@ def project_timeline_message(message, roots=None, assistant_roots=()):
         row["ok"] = not _failed_result(shown)
         return row
     if role == "user":
+        verdict, shown, note = classify_user_text(shown, kind)
+        if verdict == "notice":
+            row.update(role="system", display_kind="system_note", notice=shown, content="", ok=True)
+            return row
         if not shown and not media:
             return None
         row["role"] = "user"
         if shown:
             row["content"] = shown
+        if note:
+            row["note"] = note
         return row
     return None
 
@@ -483,42 +554,93 @@ def _skill_name_ok(name):
             and "/" not in name and "\\" not in name and "\x00" not in name and not name.startswith("."))
 
 
-def skill_names(home, limit=24):
-    """Skill directory names under this profile, then the shared Hermes home. One or two levels deep."""
-    found, seen = [], set()
-    roots = [Path(home) / "skills"]
-    shared = hermes_home() / "skills"
-    if shared not in roots:
-        roots.append(shared)
-
-    def add(name):
-        if _skill_name_ok(name) and name not in seen and len(found) < limit:
-            seen.add(name)
-            found.append(name)
-
+def _skill_roots(home):
+    """Every place Hermes finds skills: this profile, the shared home, then Hermes's own configured
+    roots (create_dir and skills.external_dirs). A fixed two-folder scan missed most of them."""
+    roots = [Path(home) / "skills", hermes_home() / "skills"]
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+        roots += [Path(d) for d in get_all_skills_dirs()]
+    except Exception:
+        pass
+    out, seen = [], set()
     for root in roots:
-        if not root.is_dir():
-            continue
         try:
-            children = sorted(root.iterdir(), key=lambda p: p.name)
+            key = root.expanduser().resolve()
         except OSError:
             continue
-        for child in children:
-            if not child.is_dir() or child.name.startswith("."):
+        if key not in seen and key.is_dir():
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+_SKILL_CACHE = {}
+_SKILL_TTL = 60.0
+_DESC = re.compile(r"(?m)^description:\s*(.+?)\s*$")
+
+
+def _skill_description(skill_md):
+    """The frontmatter one-liner, read from the first few KB only."""
+    try:
+        with open(skill_md, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(4096)
+    except OSError:
+        return ""
+    if not head.startswith("---"):
+        return ""
+    end = head.find("\n---", 3)
+    m = _DESC.search(head[:end if end > 0 else len(head)])
+    if not m:
+        return ""
+    text = m.group(1).strip().strip("'\"")
+    if text in (">", "|", ">-", "|-"):
+        return ""
+    return _clip(text, 160)
+
+
+def skill_catalog(home, limit=2000, depth=4):
+    """Every skill Hermes can load: name, category folder and description. Cached for a minute, so a
+    chat open does not walk 600 skill folders, and a new skill shows up within the minute."""
+    import time
+    key = (str(home), limit, depth)
+    hit = _SKILL_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _SKILL_TTL:
+        return [dict(x) for x in hit[1]]
+    rows = _walk_skills(home, limit, depth)
+    _SKILL_CACHE[key] = (time.monotonic(), rows)
+    return [dict(x) for x in rows]
+
+
+def skill_names(home, limit=2000, depth=4):
+    return [row["name"] for row in skill_catalog(home, limit, depth)]
+
+
+def _walk_skills(home, limit, depth):
+    """Category folders nest (skills/<category>/<name>), so the walk goes a few levels deep and stops
+    descending once it finds a SKILL.md. The first root that has a name wins, like Hermes's own lookup."""
+    found, seen = [], set()
+    for root in _skill_roots(home):
+        stack = [(root, 0, "")]
+        while stack:
+            folder, level, category = stack.pop()
+            try:
+                children = sorted((c for c in folder.iterdir() if c.is_dir() and not c.name.startswith(".")),
+                                  key=lambda p: p.name, reverse=True)
+            except OSError:
                 continue
-            if (child / "SKILL.md").is_file():
-                add(child.name)
-            else:
-                try:
-                    nested = sorted(child.iterdir(), key=lambda p: p.name)
-                except OSError:
-                    continue
-                for item in nested:
-                    if item.is_dir() and not item.name.startswith(".") and (item / "SKILL.md").is_file():
-                        add(item.name)
-            if len(found) >= limit:
-                return found
-    return found
+            for child in children:
+                skill_md = child / "SKILL.md"
+                if skill_md.is_file():
+                    if _skill_name_ok(child.name) and child.name not in seen:
+                        seen.add(child.name)
+                        found.append({"name": child.name, "category": category,
+                                      "description": _skill_description(skill_md)})
+                        if len(found) >= limit:
+                            return sorted(found, key=lambda r: r["name"])
+                elif level + 1 < depth:
+                    stack.append((child, level + 1, category or child.name))
+    return sorted(found, key=lambda r: r["name"])
 
 
 def _inside(root, path):
