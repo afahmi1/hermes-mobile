@@ -7,7 +7,16 @@ struct BotsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                if let e = app.loadError { Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary) }
+                if let e = app.loadError {
+                    VStack(alignment: .leading, spacing: HMDesign.small) {
+                        Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
+                        Button("Try again") { Task { await app.refreshBots() } }.hmTouchTarget()
+                    }
+                } else if !app.botsLoaded {
+                    HStack { Spacer(); ProgressView("Loading bots…"); Spacer() }.listRowBackground(Color.clear)
+                } else if app.bots.isEmpty {
+                    Text("No bots reported. Pull to refresh.").foregroundStyle(.secondary)
+                }
                 ForEach(app.bots) { bot in
                     NavigationLink(value: bot) { BotRow(bot: bot) }
                         .disabled(!bot.reachable)
@@ -26,24 +35,30 @@ struct BotsView: View {
 struct BotRow: View {
     let bot: Bot
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .top, spacing: HMDesign.medium) {
             BotAvatar(id: bot.id, name: bot.name, size: 44)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack {
-                    Text(bot.name).font(.body.weight(.semibold))
-                    if bot.front { Text("Front door").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(.tint.opacity(0.18), in: Capsule()) }
+            VStack(alignment: .leading, spacing: HMDesign.micro) {
+                AdaptiveTitleRow {
+                    Text(bot.name).font(HMDesign.rowTitle)
+                } trailing: {
+                    if bot.front {
+                        Text("Front door").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(.tint.opacity(0.18), in: Capsule())
+                    }
                 }
                 if !bot.blurb.isEmpty { Text(bot.blurb).font(.subheadline).foregroundStyle(.secondary).lineLimit(2) }
-                Text("\(bot.model) · \(bot.provider)").font(.caption).foregroundStyle(.tertiary)
+                Text("\(bot.model) · \(bot.provider)").font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
                 if !bot.skills.isEmpty {
                     Text(bot.skills.prefix(4).joined(separator: ", ") + (bot.skills.count > 4 ? " +\(bot.skills.count - 4)" : ""))
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
                 }
-                if !bot.reachable { Text("No API key — not reachable").font(.caption).foregroundStyle(.red) }
+                if !bot.reachable {
+                    Label("No API key. Not reachable.", systemImage: "exclamationmark.triangle.fill")
+                        .font(HMDesign.metadata).foregroundStyle(.red)
+                }
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, HMDesign.micro)
         .contentShape(Rectangle())
     }
 }
@@ -94,7 +109,7 @@ struct BotDetailView: View {
                 if cursor != nil {
                     HStack { Spacer(); ProgressView(); Spacer() }.task(id: cursor) { await more() }
                 } else if sessions.isEmpty {
-                    Text("No sessions yet").foregroundStyle(.secondary)
+                    Text("No sessions yet. Start a chat above.").foregroundStyle(.secondary)
                 }
             }
         }
@@ -171,7 +186,7 @@ private struct SkillEditorSheet: View {
                             .lineLimit(5...12)
                     }
                 }
-                if let error { Text(error).font(.footnote).foregroundStyle(.red) }
+                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red) }
             }
             .navigationTitle(editor.appending ? "Add a note" : "New skill")
             .navigationBarTitleDisplayMode(.inline)

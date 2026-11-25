@@ -45,7 +45,7 @@ struct SettingsView: View {
                         }
                     }
                     Button("Add Gateway", systemImage: "plus") { addingGateway = true }
-                    if let gatewayError { Text(gatewayError).foregroundStyle(.red) }
+                    if let gatewayError { Label(gatewayError, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
                 } header: {
                     Text("Gateways")
                 } footer: {
@@ -72,7 +72,7 @@ struct SettingsView: View {
                 } footer: { Text("Owner only. Each Mac has its own PIN; there is no default.") }
                 ProviderUsageSection()
                 Section {
-                    Text("Chats, bots and model choices live in Hermes on your server, so this phone and the desktop app always show the same thing. Away from home, keep Tailscale connected on this phone.")
+                    Text("Chats, bots and model choices live in Hermes on your server, so this phone and the desktop app show the same thing. Away from home, keep Tailscale on.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section {
@@ -141,20 +141,23 @@ private struct GatewayRow: View {
     let isCurrent: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .top, spacing: HMDesign.medium) {
             Image(systemName: "server.rack")
                 .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
                 .frame(width: 28)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(name).font(.body).foregroundStyle(.primary)
-                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer(minLength: 8)
-            if isCurrent {
-                Label("Current", systemImage: "checkmark.circle.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.green)
-                    .labelStyle(.titleAndIcon)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: HMDesign.micro) {
+                Text(name).font(HMDesign.rowTitle).foregroundStyle(.primary)
+                Text(detail).font(HMDesign.metadata).foregroundStyle(.secondary)
+                    .lineLimit(2).truncationMode(.middle)
+                if isCurrent {
+                    Label {
+                        Text("Current")
+                    } icon: {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                    .font(HMDesign.metadata.weight(.semibold)).foregroundStyle(.primary)
+                }
             }
         }
         .contentShape(Rectangle())
@@ -166,11 +169,16 @@ private struct SettingsBotsList: View {
     @Environment(AppModel.self) private var app
     var body: some View {
         List {
-            if let e = app.loadError { Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary) }
+            if let e = app.loadError {
+                VStack(alignment: .leading, spacing: HMDesign.small) {
+                    Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
+                    Button("Try again") { Task { await app.refreshBots() } }.hmTouchTarget()
+                }
+            }
             if app.botsLoaded && app.bots.isEmpty && app.loadError == nil {
-                Text("This gateway reported no bots.").foregroundStyle(.secondary)
+                Text("This gateway reported no bots. Pull to refresh.").foregroundStyle(.secondary)
             } else if !app.botsLoaded && app.loadError == nil {
-                HStack { Spacer(); ProgressView(); Spacer() }.listRowBackground(Color.clear)
+                HStack { Spacer(); ProgressView("Loading bots…"); Spacer() }.listRowBackground(Color.clear)
             }
             ForEach(app.bots) { bot in
                 NavigationLink { BotDetailView(bot: bot) } label: { BotRow(bot: bot) }
@@ -193,22 +201,22 @@ private struct DeviceAccessView: View {
 
     var body: some View {
         Form {
-            if let error { Text(error).foregroundStyle(.red) }
+            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
             if capabilities.manageDevices {
                 Section("Signed-in devices") {
                     ForEach(devices) { device in
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(device.name)
+                        AdaptiveTitleRow {
+                            VStack(alignment: .leading, spacing: HMDesign.micro) {
+                                Text(device.name).font(HMDesign.rowTitle)
                                 Text("Expires " + Date(timeIntervalSince1970: device.expires).formatted(date: .abbreviated, time: .omitted))
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(HMDesign.metadata).foregroundStyle(.secondary)
                             }
-                            Spacer()
+                        } trailing: {
                             if device.id == capabilities.deviceID {
-                                Text("This phone").font(.caption)
+                                Text("This phone").font(HMDesign.metadata).foregroundStyle(.secondary)
                             } else {
                                 Button("Revoke", role: .destructive) { selected = device }
-                                    .buttonStyle(.borderless).disabled(busy)
+                                    .buttonStyle(.borderless).disabled(busy).hmTouchTarget()
                             }
                         }
                     }
@@ -225,7 +233,7 @@ private struct DeviceAccessView: View {
                     if let offer {
                         Text(offer.code).font(.body.monospaced()).textSelection(.enabled)
                         Text("Expires at " + Date(timeIntervalSince1970: offer.expires).formatted(date: .omitted, time: .shortened))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(HMDesign.metadata).foregroundStyle(.secondary)
                     }
                 } footer: { Text("A paired phone can access chats, tools and approvals on this bridge.") }
             } else {
@@ -290,9 +298,9 @@ struct GatewayDestinationsView: View {
                             } catch { self.error = error.localizedDescription }
                         } label: {
                             HStack {
-                                VStack(alignment: .leading) {
-                                    Text(SavedGateways.displayName(url)).font(.headline)
-                                    Text(url.absoluteString).font(.caption).foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: HMDesign.micro) {
+                                    Text(SavedGateways.displayName(url)).font(HMDesign.rowTitle)
+                                    Text(url.absoluteString).font(HMDesign.metadata).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 if url == API.shared.baseURL {
@@ -330,7 +338,7 @@ struct GatewayDestinationsView: View {
                                         } label: {
                                             VStack(alignment: .leading) {
                                                 Text(row.displayTitle).lineLimit(2)
-                                                Text(row.profile + " · " + row.sourceLabel).font(.caption).foregroundStyle(.secondary)
+                                                Text(row.profile + " · " + row.sourceLabel).font(HMDesign.metadata).foregroundStyle(.secondary)
                                             }
                                         }
                                     }
@@ -342,7 +350,7 @@ struct GatewayDestinationsView: View {
                         }
                     }
                 }
-                if let error { Text(error).foregroundStyle(.red) }
+                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
             }
             .navigationTitle("Gateways")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }

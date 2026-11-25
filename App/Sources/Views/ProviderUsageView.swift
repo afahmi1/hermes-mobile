@@ -20,13 +20,13 @@ struct ProviderUsageSection: View {
         let historical = providers.filter { $0.data["historical_only"].bool }
         Section {
             if let error = data?["error"].string ?? app.status.error {
-                Label(error, systemImage: "exclamationmark.triangle").font(.footnote)
+                Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote)
             }
             if providers.isEmpty {
                 if data == nil || data?["loading"].bool == true {
                     if app.status.error == nil { ProgressView("Reading providers…") }
                 } else {
-                    Text("No providers reported").foregroundStyle(.secondary)
+                    Text("No providers reported. Pull to refresh.").foregroundStyle(.secondary)
                 }
             }
             ForEach(providers.filter { !$0.data["historical_only"].bool }) { row($0.data) }
@@ -67,18 +67,19 @@ struct ProviderUsageSection: View {
         return NavigationLink {
             ProviderUsageDetail(name: name)
         } label: {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack {
-                    Text(Self.displayName(name)).font(.body.weight(.medium))
-                    if provider["is_default"].bool { Text("Default").font(.caption).foregroundStyle(.secondary) }
-                }
+            VStack(alignment: .leading, spacing: HMDesign.micro) {
+                Text(Self.displayName(name)).font(HMDesign.rowTitle)
                 if let calls = local["calls"].int {
-                    Text("\(calls.formatted()) recorded calls\(modelSuffix(name))").font(.caption).foregroundStyle(.secondary)
+                    Text("\(calls.formatted()) recorded calls\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
                 } else {
                     let count = provider["credentials"].array.count
-                    Text("\(count) configured credential\(count == 1 ? "" : "s")\(modelSuffix(name))").font(.caption).foregroundStyle(.secondary)
+                    Text("\(count) configured credential\(count == 1 ? "" : "s")\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
+                }
+                if provider["is_default"].bool {
+                    Label("Default provider", systemImage: "checkmark.circle").font(HMDesign.metadata).foregroundStyle(.secondary)
                 }
             }
+            .accessibilityElement(children: .combine)
         }
     }
 }
@@ -109,7 +110,7 @@ private struct ProviderUsageDetail: View {
                 } else if state.isRefreshing || state.fetchedAt == nil && state.lastError == nil {
                     ProgressView("Loading models…")
                 }
-                if state.catalog == nil, let error = state.lastError { Text(error).font(.footnote).foregroundStyle(.secondary) }
+                if state.catalog == nil, let error = state.lastError { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.secondary) }
                 Button("Refresh models") {
                     if let scope { Task { await app.catalogStore.refresh(scope) } }
                 }
@@ -190,8 +191,8 @@ private struct ProviderUsageDetail: View {
                         if let at = usage["checked_at"].date { LabeledContent("Last check", value: at.formatted()) }
                     }
                 }
-            } else { Text("This provider is no longer in the latest inventory.") }
-            if let error = app.status.error { Text(error).foregroundStyle(.secondary) }
+            } else { Text("This provider is no longer in the latest inventory. Pull to refresh.").foregroundStyle(.secondary) }
+            if let error = app.status.error { Label(error, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary) }
         }
         .navigationTitle(ProviderUsageSection.displayName(name))
         .navigationBarTitleDisplayMode(.inline)

@@ -53,12 +53,16 @@ struct ProjectsView: View {
             ProgressView("Loading projects…").frame(maxWidth: .infinity, maxHeight: .infinity)
         case .notConfigured:
             panel("Projects aren't set up", "folder.badge.questionmark",
-                  "Projects are turned off on your Mac's Hermes bridge. Turn them on there, then pull to refresh.")
+                  "Projects are turned off on your Mac's Hermes bridge. Turn them on there, then check again.") {
+                Button("Check again") { Task { await model.load() } }.buttonStyle(.bordered)
+            }
         case .empty:
-            panel("No projects yet", "folder", "The catalog on your Mac is empty. Pull to refresh after it changes.")
+            panel("No projects yet", "folder", "The catalog on your Mac is empty. Add a project there, then check again.") {
+                Button("Check again") { Task { await model.load() } }.buttonStyle(.bordered)
+            }
         case .failed(let failure):
             panel(failure.title, failure.isUpgrade ? "arrow.down.app" : "exclamationmark.triangle", failure.message) {
-                Button("Try again") { Task { await model.load() } }.buttonStyle(.borderedProminent)
+                Button("Try again") { Task { await model.load() } }.buttonStyle(.bordered)
             }
         case .loaded(let snapshot):
             let shown = snapshot.filtered(model.query)
@@ -100,14 +104,15 @@ private struct ProjectRow: View {
     let bots: [Bot]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(project.title).font(.body.weight(.semibold))
+        VStack(alignment: .leading, spacing: HMDesign.micro) {
+            Text(project.title).font(HMDesign.rowTitle)
             if let summary = project.summary, !summary.isEmpty {
                 Text(summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
             }
-            Text(botLine).font(.caption).foregroundStyle(.tertiary)
+            Label(botLine, systemImage: project.botIds.isEmpty ? "person.crop.circle.badge.questionmark" : "person.2")
+                .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, HMDesign.micro)
         .accessibilityElement(children: .combine)
     }
 
@@ -144,11 +149,11 @@ struct ProjectDetailView: View {
                     .accessibilityIdentifier("ws.open")
                     .accessibilityHint("Opens instructions, files, chats and artifacts")
                     NavigationLink { BotAssignmentView(model: assignment) } label: {
-                        HStack {
-                            Label("Assigned bots", systemImage: "person.2")
-                            Spacer()
+                        LabeledContent {
                             Text(assignment.summary(name: { app.botName($0) }))
-                                .font(.subheadline).foregroundStyle(.secondary).lineLimit(2).multilineTextAlignment(.trailing)
+                                .foregroundStyle(.secondary).multilineTextAlignment(.trailing)
+                        } label: {
+                            Label("Assigned bots", systemImage: "person.2")
                         }
                         .accessibilityElement(children: .combine)
                     }
@@ -175,9 +180,9 @@ struct ProjectDetailView: View {
             Section("Sources") {
                 if project.sources.isEmpty { Text("No sources listed.").foregroundStyle(.secondary) }
                 ForEach(Array(project.sources.enumerated()), id: \.offset) { _, s in
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: HMDesign.micro) {
                         Text(s.source)
-                        Text(s.provider).font(.caption).foregroundStyle(.secondary)
+                        Text(s.provider).font(HMDesign.metadata).foregroundStyle(.secondary)
                     }
                     .accessibilityElement(children: .combine)
                 }
@@ -188,10 +193,10 @@ struct ProjectDetailView: View {
                     NavigationLink {
                         ReferenceDetailView(reference: ref, workspaceProject: hasWorkspace ? project.id : nil)
                     } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(ref.path).font(.body.monospaced()).foregroundStyle(.primary)
+                        VStack(alignment: .leading, spacing: HMDesign.micro) {
+                            Text(ref.path).font(.callout.monospaced()).foregroundStyle(.primary)
                             Text(ref.rootName + (ref.kind == .vault ? " · vault" : ref.kind == .repo ? " · repo" : ""))
-                                .font(.caption).foregroundStyle(.secondary)
+                                .font(HMDesign.metadata).foregroundStyle(.secondary)
                         }
                     }
                     .accessibilityLabel("\(ref.path) in \(ref.rootName)")
@@ -200,7 +205,7 @@ struct ProjectDetailView: View {
             } header: {
                 Text("Related files")
             } footer: {
-                if refs.hidden > 0 { Text("\(refs.hidden) reference(s) hidden because they weren't a safe relative path in a known root.") }
+                if refs.hidden > 0 { Text("\(refs.hidden) \(refs.hidden == 1 ? "reference is" : "references are") hidden because \(refs.hidden == 1 ? "it isn't" : "they aren't") a safe relative path in a known root.") }
             }
         }
         .navigationTitle(project.title)

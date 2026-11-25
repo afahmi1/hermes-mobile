@@ -26,3 +26,23 @@ extension View {
             .contentShape(Rectangle())
     }
 }
+
+/// Title on the left, state or time on the right. Falls back to a stack when the two do not fit,
+/// so identifying text keeps its width at large text sizes.
+struct AdaptiveTitleRow<Leading: View, Trailing: View>: View {
+    @ViewBuilder let leading: Leading
+    @ViewBuilder let trailing: Trailing
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: HMDesign.small) {
+                leading
+                Spacer(minLength: HMDesign.small)
+                trailing
+            }
+            VStack(alignment: .leading, spacing: HMDesign.micro) {
+                leading
+                trailing
+            }
+        }
+    }
+}
