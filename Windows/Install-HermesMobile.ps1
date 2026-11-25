@@ -3,7 +3,7 @@ $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $hermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA 'hermes' }
 & (Join-Path $PSScriptRoot 'Protect-HermesMobileStore.ps1') -Path (Join-Path $hermesHome 'mobile')
 $admissions = [Environment]::GetEnvironmentVariable('HERMES_MOBILE_ADMISSIONS_DIR', 'User')
-if ($admissions -and -not [IO.Directory]::Exists($admissions)) {
+if ($admissions) {  # an existing directory keeps its volume's default ACL unless protected here
     & (Join-Path $PSScriptRoot 'Protect-HermesMobileStore.ps1') -Path $admissions
 }
 $launcher = Join-Path $PSScriptRoot 'Start-HermesMobile.ps1'

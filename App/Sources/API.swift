@@ -72,9 +72,7 @@ final class API: @unchecked Sendable {
     private let transport = BridgeTransport()
     private init(_ login: GatewayLogin?) {
         self.login = login
-        self.accountID = login.map {
-            SHA256.hash(data: Data(($0.server.absoluteString + "|" + $0.token).utf8)).map { String(format: "%02x", $0) }.joined()
-        }
+        self.accountID = login.map(Self.accountID(for:))
         self.session = Self.makeSession(stream: false, transport: transport)
         self.streamSession = Self.makeSession(stream: true, transport: transport)
     }
@@ -193,6 +191,19 @@ final class API: @unchecked Sendable {
 
     func revokeDevice(_ id: String) async throws {
         _ = try await send(request("/m/devices/\(Self.esc(id))", method: "DELETE"))
+    }
+
+    /// Revoke the grant a saved, non-active gateway issued to this phone. Best effort: the host may be
+    /// asleep, and the caller removes the local credential either way.
+    func revokeSavedDevice(_ login: GatewayLogin) async throws {
+        var r = try request("/m/devices/current", method: "DELETE", auth: false, server: login.server)
+        r.setValue("Bearer " + login.token, forHTTPHeaderField: "Authorization")
+        r.timeoutInterval = 6
+        _ = try await send(r)
+    }
+
+    static func accountID(for login: GatewayLogin) -> String {
+        SHA256.hash(data: Data((login.server.absoluteString + "|" + login.token).utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: reads
@@ -471,6 +482,31 @@ final class API: @unchecked Sendable {
 
     /// Create a chat the way the desktop app does (canonical `session.create`, source `gui`),
     /// so it lands in the desktop's Recents and model/effort switches persist on it.
+    func commandPalette(profile: String) async throws -> CommandPalette {
+        try await get("/m/commands?profile=\(Self.esc(profile))", as: CommandPalette.self)
+    }
+
+    func slash(profile: String, session: String, command: String) async throws -> SlashResult {
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/slash", method: "POST", body: ["command": command])
+        return SlashResult(output: obj["output"] as? String, warning: obj["warning"] as? String,
+                           type: obj["type"] as? String, message: obj["message"] as? String,
+                           display: obj["display"] as? String, notice: obj["notice"] as? String)
+    }
+
+    func chatMedia(profile: String, session: String, digest: String) async throws -> Data {
+        try await send(try request("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/media/\(Self.esc(digest))"))
+    }
+
+    /// Create a skill file, or append a note to one this bot already has. Returns the names Hermes now lists.
+    func saveSkill(profile: String, action: String, name: String, description: String = "", body: String = "", note: String = "") async throws -> [String] {
+        var payload: [String: Any] = ["profile": profile, "action": action, "name": name]
+        if !description.isEmpty { payload["description"] = description }
+        if !body.isEmpty { payload["body"] = body }
+        if !note.isEmpty { payload["note"] = note }
+        let obj = try await json("/m/skills", method: "POST", body: payload)
+        return obj["skills"] as? [String] ?? []
+    }
+
     func createSession(profile: String, draftID: UUID) async throws -> String {
         let obj = try await json("/m/chat/\(Self.esc(profile))/new", method: "POST", body: ["request_id": draftID.uuidString])
         guard let id = obj["session_id"] as? String else { throw APIError.badResponse }

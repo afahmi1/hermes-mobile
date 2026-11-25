@@ -1,3 +1,7 @@
+#if canImport(UIKit)
+import UIKit
+#endif
+import SQLite3
 import CryptoKit
 import Foundation
 
@@ -32,6 +36,7 @@ struct SendAttachment: Codable, Hashable {
     let mime: String
     let filename: String
     let base64: String
+    var sourceFormat: String? = nil
     var byteCount: Int { base64.utf8.count / 4 * 3 - (base64.hasSuffix("==") ? 2 : base64.hasSuffix("=") ? 1 : 0) }
 }
 
@@ -41,10 +46,19 @@ struct PendingSend: Codable {
     let choice: RuntimeChoice
     let project: String?
     let attachments: [SendAttachment]?
+    var composerText: String?
+    var composerPastes: [PastedText]?
+    var returningToComposer: Bool?
 }
 
 actor InboxDisk {
     static let shared = InboxDisk()
+    #if os(macOS)
+    // Standalone macOS model tests cannot request iOS Data Protection classes.
+    private static let protectedWrite: Data.WritingOptions = .atomic
+    #else
+    private static let protectedWrite: Data.WritingOptions = [.atomic, .completeFileProtection]
+    #endif
 
     private var forgotten = Set<String>()
     private var root: URL {
@@ -94,7 +108,7 @@ actor InboxDisk {
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try directory.setResourceValues(values)
-        try JSONEncoder().encode(send).write(to: url, options: [.atomic, .completeFileProtection])
+        try JSONEncoder().encode(send).write(to: url, options: Self.protectedWrite)
     }
 
     func acknowledge(_ id: UUID, key: String) throws {
@@ -127,7 +141,7 @@ actor InboxDisk {
                 let snapshot = TranscriptSnapshot(messages: Array(rows), savedAt: date, hasOlder: hasOlder || rows.count < messages.count)
                 let data = try JSONEncoder().encode(snapshot)
                 if data.count <= 1024 * 1024 {
-                    try data.write(to: url, options: [.atomic, .completeFileProtection])
+                    try data.write(to: url, options: Self.protectedWrite)
                     break
                 }
                 guard rows.count > 1 else {
@@ -154,7 +168,7 @@ actor InboxDisk {
         let url = location(key)
         let rows = receipts(key).filter { $0.id != receipt.id } + [receipt]
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(Array(rows.suffix(80))).write(to: url, options: [.atomic, .completeFileProtection])
+        try JSONEncoder().encode(Array(rows.suffix(80))).write(to: url, options: Self.protectedWrite)
     }
 
     func save(_ page: InboxSnapshot, key: String) {
@@ -164,7 +178,167 @@ actor InboxDisk {
             if let previous = read(key), previous.savedAt > page.savedAt { return }
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try JSONEncoder().encode(page)
-            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            try data.write(to: url, options: Self.protectedWrite)
         } catch { /* An evicted or locked cache is recoverable from the bridge. */ }
+    }
+}
+
+// Drafts are user-authored data. Each committed edit replaces one protected row;
+// typing never re-encodes or rewrites the files attached to the same draft.
+@MainActor
+final class ComposerDisk {
+    static let shared = ComposerDisk()
+    enum Part: String { case text, pastes, media }
+    struct Snapshot {
+        var id: UUID?
+        var text = ""
+        var pastes: [PastedText] = []
+        var media: [SendAttachment] = []
+    }
+    private var databases: [String: OpaquePointer] = [:]
+    private let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("HermesComposer")
+    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    private func open(_ account: String, create: Bool) throws -> OpaquePointer? {
+        #if os(iOS)
+        guard UIApplication.shared.isProtectedDataAvailable else { throw CocoaError(.fileReadNoPermission) }
+        #endif
+        if let db = databases[account] { return db }
+        var folder = root.appendingPathComponent(account)
+        let file = folder.appendingPathComponent("drafts.sqlite")
+        if !create && !FileManager.default.fileExists(atPath: file.path) { return nil }
+        #if os(macOS)
+        let attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+        #else
+        let attributes: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.complete]
+        #endif
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: attributes)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try folder.setResourceValues(values)
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(file.path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK,
+              let db = handle else { sqlite3_close(handle); throw CocoaError(.fileWriteUnknown) }
+        let schema = """
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA secure_delete=ON;
+            CREATE TABLE IF NOT EXISTS returned_sends(scope TEXT PRIMARY KEY, submission TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS drafts(scope TEXT, part TEXT, id TEXT NOT NULL, value BLOB NOT NULL,
+                PRIMARY KEY(scope, part)) WITHOUT ROWID;
+            """
+        guard sqlite3_exec(db, schema, nil, nil, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            throw CocoaError(.fileWriteUnknown)
+        }
+        databases[account] = db
+        return db
+    }
+
+    private func withStatement<T>(_ db: OpaquePointer, _ sql: String, _ strings: [String],
+                                  _ body: (OpaquePointer) throws -> T) throws -> T {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw CocoaError(.fileWriteUnknown) }
+        defer { sqlite3_finalize(stmt) }
+        for (i, value) in strings.enumerated() {
+            guard sqlite3_bind_text(stmt, Int32(i + 1), value, -1, transient) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+        }
+        return try body(stmt)
+    }
+
+    func read(_ account: String, scope: String) throws -> Snapshot {
+        var snapshot = Snapshot()
+        guard let db = try open(account, create: false) else { return snapshot }
+        return try withStatement(db, "SELECT part,id,value FROM drafts WHERE scope=?", [scope]) { stmt in
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+                let part = String(cString: sqlite3_column_text(stmt, 0))
+                snapshot.id = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 1)))
+                let data = Data(bytes: sqlite3_column_blob(stmt, 2), count: Int(sqlite3_column_bytes(stmt, 2)))
+                switch Part(rawValue: part) {
+                case .text: snapshot.text = String(decoding: data, as: UTF8.self)
+                case .pastes: snapshot.pastes = try JSONDecoder().decode([PastedText].self, from: data)
+                case .media: snapshot.media = try JSONDecoder().decode([SendAttachment].self, from: data)
+                case nil: break
+                }
+                status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw CocoaError(.fileReadUnknown) }
+            return snapshot
+        }
+    }
+
+    func write(_ data: Data?, part: Part, account: String, scope: String, id: UUID) throws {
+        guard let db = try open(account, create: data != nil) else { return }
+        let sql = data == nil ? "DELETE FROM drafts WHERE scope=? AND part=?" :
+            "INSERT OR REPLACE INTO drafts(scope,part,id,value) VALUES(?,?,?,?)"
+        try withStatement(db, sql, [scope, part.rawValue] + (data == nil ? [] : [id.uuidString])) { stmt in
+            if let data {
+                let status = data.withUnsafeBytes { sqlite3_bind_blob(stmt, 4, $0.baseAddress, Int32($0.count), transient) }
+                guard status == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+            }
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw CocoaError(.fileWriteUnknown) }
+        }
+    }
+
+    /// The return receipt commits in the same transaction as the restored draft. If the phone
+    /// quits before it removes the outbox record, replay preserves any newer composer edits.
+    func restoreSend(_ send: PendingSend, account: String, scope: String, id: UUID) throws -> Snapshot {
+        guard let db = try open(account, create: true),
+              sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+        defer { if sqlite3_get_autocommit(db) == 0 { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) } }
+        var snapshot = try read(account, scope: scope)
+        let duplicate = try withStatement(db, "SELECT 1 FROM returned_sends WHERE scope=? AND submission=?",
+                                          [scope, send.id.uuidString]) { stmt in
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW: return true
+            case SQLITE_DONE: return false
+            default: throw CocoaError(.fileReadUnknown)
+            }
+        }
+        if !duplicate {
+            let text = send.composerText ?? send.text
+            let pastes = send.composerPastes ?? []
+            if snapshot.text.isEmpty { snapshot.text = text }
+            else if snapshot.text != text, !text.isEmpty { snapshot.pastes.insert(PastedText(id: send.id, text: text), at: 0) }
+            let existingIDs = Set(snapshot.pastes.map(\.id))
+            snapshot.pastes += pastes.filter { !existingIDs.contains($0.id) }
+            if let files = send.attachments {
+                snapshot.media = files + snapshot.media.filter { !files.contains($0) }
+            }
+            let draft = snapshot.id ?? id
+            try write(snapshot.text.isEmpty ? nil : Data(snapshot.text.utf8), part: .text, account: account, scope: scope, id: draft)
+            try write(snapshot.pastes.isEmpty ? nil : JSONEncoder().encode(snapshot.pastes), part: .pastes, account: account, scope: scope, id: draft)
+            try write(snapshot.media.isEmpty ? nil : JSONEncoder().encode(snapshot.media), part: .media, account: account, scope: scope, id: draft)
+            try withStatement(db, "INSERT OR REPLACE INTO returned_sends(scope,submission) VALUES(?,?)", [scope, send.id.uuidString]) {
+                guard sqlite3_step($0) == SQLITE_DONE else { throw CocoaError(.fileWriteUnknown) }
+            }
+        }
+        guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else { throw CocoaError(.fileWriteUnknown) }
+        return snapshot
+    }
+
+    /// Every scope ("bot|session/id") holding unsent text, pastes or files, for the inbox marker.
+    func scopes(_ account: String) -> Set<String> {
+        guard let db = try? open(account, create: false) else { return [] }
+        let found = try? withStatement(db, "SELECT DISTINCT scope FROM drafts", []) { stmt -> Set<String> in
+            var scopes = Set<String>()
+            while sqlite3_step(stmt) == SQLITE_ROW { scopes.insert(String(cString: sqlite3_column_text(stmt, 0))) }
+            return scopes
+        }
+        return found ?? []
+    }
+
+    func move(_ account: String, from: String, to: String, id: UUID) throws {
+        guard let db = try open(account, create: false) else { return }
+        try withStatement(db, "UPDATE drafts SET scope=? WHERE scope=? AND id=?", [to, from, id.uuidString]) { stmt in
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw CocoaError(.fileWriteUnknown) }
+        }
+    }
+
+    func forget(_ account: String) {
+        if let db = databases.removeValue(forKey: account) { sqlite3_close(db) }
+        try? FileManager.default.removeItem(at: root.appendingPathComponent(account))
     }
 }

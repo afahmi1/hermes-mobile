@@ -22,6 +22,7 @@ import functools
 import bridge_receipts
 import bridge_media
 import json
+import sys
 from collections import OrderedDict
 import threading
 import time
@@ -613,7 +614,16 @@ async def _drive_connection(turn: Turn):
             elif t in ("tool.start", "tool.started"):
                 turn.push("tool.started", tool_name=_tool_name(pl), preview=str(pl.get("preview") or "")[:200])
             elif t in ("tool.complete", "tool.completed"):
-                turn.push("tool.completed", tool_name=_tool_name(pl))
+                preview = pl.get("preview") if isinstance(pl.get("preview"), str) else ""
+                turn.push("tool.completed", tool_name=_tool_name(pl),
+                          ok=not pl.get("is_error") and not pl.get("error"),
+                          preview=" ".join(preview.split())[:160])
+            elif isinstance(t, str) and t.startswith("subagent."):
+                title = pl.get("title") or pl.get("goal") or pl.get("name") or "Background task"
+                detail = pl.get("error") or pl.get("status") or ""
+                turn.push("subagent", title=str(title)[:120],
+                          state="done" if t.endswith("complete") else "running",
+                          detail=" ".join(str(detail).split())[:160])
             elif t == "approval.request":
                 pid, gen = pl.get("prompt_id"), pl.get("execution_generation", turn.generation)
                 if pid:
@@ -823,18 +833,27 @@ def start_primary(profile, home, sid, text, choice, submission, project, directo
 
 def recover_primary(directory, profile_home, restore_workspace):
     journal = primary_journal(directory)
+    # A phone can restore a staged send after months offline. Its UUID must still resolve to
+    # the original outcome; terminal() already removes the prompt, workspace and media.
     for row in journal.pending():
         with _admission_lock(row["id"]), _admission_lock((row["profile"], row["sid"])):
             if get_turn(row["id"]) is not None:
                 continue
             try:
                 restored_turn(row, profile_home(row["profile"]), journal, restore_workspace)
-            except TurnError:
-                # A project grant or identity was withdrawn. Never revive its context.
-                turn = Turn(row["profile"], profile_home(row["profile"]), row["sid"], "", {})
-                turn.id = row["id"]
-                bridge_media.discard(json.loads(row["media"] or "[]"))
-                journal.terminal(turn, {"event": "run.failed"})
+            except Exception as error:
+                # TurnError: a project grant or identity was withdrawn, so never revive its context.
+                # Anything else (workspace storage offline, a damaged row) fails this one send. Letting
+                # it escape would stop the bridge at startup and loop under its supervisor.
+                if not isinstance(error, TurnError):
+                    print("Could not recover send %s: %s" % (row["id"], type(error).__name__), file=sys.stderr, flush=True)
+                try:
+                    turn = Turn(row["profile"], profile_home(row["profile"]), row["sid"], "", {})
+                    turn.id = row["id"]
+                    bridge_media.discard(json.loads(row["media"] or "[]"))
+                    journal.terminal(turn, {"event": "run.failed"})
+                except Exception as nested:
+                    print("Could not close send %s: %s" % (row["id"], type(nested).__name__), file=sys.stderr, flush=True)
 
 
 def completed_primary(turn_id, directory, profile_home):
@@ -948,6 +967,30 @@ async def _follow_up(turn, mode, text, submission, choice=None):
         TURNS[queued.id] = queued
     asyncio.create_task(_drive(queued))
     return {"status": "queued", "turn_id": queued.id}
+
+
+async def _slash(home, sid, command):
+    async with connect(home) as client:
+        snapshot = await _resume(client, sid)
+        canonical = snapshot.get("session_id") or sid
+        return await _rpc(client, "slash.exec", session_id=canonical, command=command)
+
+
+def run_slash(home, sid, command):
+    """Run a Hermes slash command on this chat. The phone displays the result; it does not interpret it."""
+    if not isinstance(command, str) or not command.startswith("/") or len(command) > 4000:
+        raise TurnError("Type one slash command, like /learn or /status.")
+    try:
+        return run(_slash(home, sid, command.strip()), timeout=180)
+    except TimeoutError:
+        raise TurnError("That command is still running on your Mac. Check the chat in a moment.", 504)
+
+
+def reload_skills(home, profile):
+    async def go():
+        async with connect(home) as client:
+            return await _rpc(client, "skills.reload", profile=profile)
+    return run(go(), timeout=30)
 
 
 def follow_up(turn, mode, text, submission=None, choice=None):

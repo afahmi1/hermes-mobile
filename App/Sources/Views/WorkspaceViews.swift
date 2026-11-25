@@ -54,7 +54,7 @@ struct WorkspaceView: View {
             NewFileSheet(project: scope.projectID, existingCount: model.detail.files.count) { Task { await model.load() } }
         }
         .task { await model.load() }
-        .onChange(of: model.phase) { _, p in if p == .failed(.signedOut), API.shared === originClient { app.signOut() } }
+        .onChange(of: model.phase) { _, p in if p == .failed(.signedOut), API.shared === originClient { app.sessionExpired() } }
         .alert("Workspace", isPresented: Binding(get: { model.notice != nil }, set: { if !$0 { model.notice = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(model.notice ?? "") }
@@ -270,7 +270,7 @@ struct ArtifactListView: View {
             if Task.isCancelled { return }
             let f = error as? WorkspacesFailure ?? .network
             failure = f
-            if f == .signedOut, account == app.inboxAccount { app.signOut() }
+            if f == .signedOut, account == app.inboxAccount { app.sessionExpired() }
         }
     }
 }
@@ -335,7 +335,7 @@ struct ArtifactDetailView: View {
             if Task.isCancelled { return }
             let f = error as? WorkspacesFailure ?? .network
             failure = f
-            if f == .signedOut, account == app.inboxAccount { app.signOut() }
+            if f == .signedOut, account == app.inboxAccount { app.sessionExpired() }
         }
     }
 }

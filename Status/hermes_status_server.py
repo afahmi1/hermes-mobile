@@ -99,6 +99,19 @@ def profile_homes():
 
 
 # ---------------------------------------------------------------- gateway
+def prior_platform_observation(platform, lifecycle, pid):
+    # Hermes preserves old adapter rows across runs, including platforms since disabled.
+    # Require this process's lifecycle record and leave a minute for startup ordering.
+    if not pid or lifecycle.get("pid") != pid or lifecycle.get("phase") != "running":
+        return False
+    try:
+        observed = datetime.fromisoformat(platform["updated_at"])
+        started = datetime.fromisoformat(lifecycle["started_at"])
+        return (started - observed).total_seconds() > 60
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def gateway_status():
     st = read_json(HOME / "gateway_state.json", {}) or {}
     hb = read_json(HOME / "state" / "gateway.heartbeat", {}) or {}
@@ -123,6 +136,8 @@ def gateway_status():
 
     platforms = []
     for name, p in (st.get("platforms") or {}).items():
+        if prior_platform_observation(p, life, pid):
+            continue
         platforms.append({
             "name": name,
             "state": p.get("state"),

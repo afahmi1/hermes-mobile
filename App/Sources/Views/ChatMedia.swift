@@ -84,7 +84,7 @@ enum FileImport {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             let header = try handle.read(upToCount: 12) ?? Data()
-            let attachment = try ChatMedia.jpeg(UIImage(cgImage: preview), name: "Photo", sourceType: ChatMedia.originalTypeName(header))
+            let attachment = try ChatMedia.jpeg(UIImage(cgImage: preview), name: "Photo", sourceType: ChatMedia.originalTypeName(header), originalName: try safeName(url))
             guard attachment.byteCount <= maxBytes else { throw Failure.tooLarge(maxBytes) }
             return attachment
         }
@@ -113,6 +113,20 @@ enum FileImport {
     }
 }
 
+/// Shared by all import sources and the final Send check, including drafts restored from disk.
+enum AttachmentSelection {
+    static func issue(_ assets: [SendAttachment], fileLimit: Int, videoLimit: Int) -> String? {
+        if assets.count > 4 { return "Choose up to four attachments for one message." }
+        let hasVideo = assets.contains { $0.mime == "video/mp4" }
+        if hasVideo && assets.count != 1 { return "Send a video on its own, or choose still frames." }
+        let limit = hasVideo ? videoLimit : fileLimit
+        if assets.reduce(0, { $0 + $1.byteCount }) > limit {
+            return "The attachments exceed this bot’s limit. Remove an attachment and try again."
+        }
+        return nil
+    }
+}
+
 enum ChatMedia {
     enum Failure: LocalizedError {
         case unreadable, tooLarge, noFrames, downloadFailed
@@ -134,6 +148,12 @@ enum ChatMedia {
         return try jpeg(UIImage(cgImage: thumbnail), name: "Photo", sourceType: originalTypeName(data))
     }
 
+    /// An image pasted into the composer (already decoded by UIKit) rides as a JPEG under a
+    /// "Pasted image" filename. The caller downsamples first; this only encodes within the 1 MiB budget.
+    static func pasted(_ image: UIImage) throws -> SendAttachment {
+        try jpeg(image, name: "Pasted image")
+    }
+
     /// The original format behind picked bytes, for an honest badge on the chip. nil = plain JPEG.
     /// The bytes sent are always JPEG (first frame); the badge says where they came from.
     static func originalTypeName(_ data: Data) -> String? {
@@ -152,13 +172,14 @@ enum ChatMedia {
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
-    /// JPEG bytes within the 1 MiB send budget; the filename keeps the source type's extension.
-    static func jpeg(_ image: UIImage, name: String, sourceType: String? = nil) throws -> SendAttachment {
-        let ext = sourceType.map { $0.lowercased() } ?? "jpg"
+    /// JPEG bytes within the 1 MiB send budget; the uploaded filename matches its bytes.
+    static func jpeg(_ image: UIImage, name: String, sourceType: String? = nil, originalName: String? = nil) throws -> SendAttachment {
+        let stem = originalName.map { String(($0 as NSString).deletingPathExtension.prefix(115)) } ?? (name + "-" + UUID().uuidString.prefix(6))
+        let filename = stem + ".jpg"
         for quality in [0.82, 0.62, 0.45, 0.3, 0.18] {
             if let bytes = image.jpegData(compressionQuality: quality), bytes.count <= 1024 * 1024 {
-                return SendAttachment(mime: "image/jpeg", filename: name + "-" + UUID().uuidString.prefix(6) + "." + ext,
-                                      base64: bytes.base64EncodedString())
+                return SendAttachment(mime: "image/jpeg", filename: filename,
+                                      base64: bytes.base64EncodedString(), sourceFormat: sourceType)
             }
         }
         throw Failure.tooLarge
@@ -228,21 +249,7 @@ enum ChatMedia {
 /// T3-style long pastes: a paste this big leaves the composer and rides as a removable chip,
 /// sent with the next message instead of flooding the text field.
 enum PasteSplit {
-    static let threshold = 2_000
-
-    /// The single inserted run that turned `old` into `new`, when at least `threshold` characters.
-    static func insertion(old: String, new: String) -> String? {
-        guard new.count - old.count >= threshold else { return nil }
-        let a = Array(old), b = Array(new)
-        let m = min(a.count, b.count)
-        var p = 0
-        while p < m, a[p] == b[p] { p += 1 }
-        var s = 0
-        while s < m - p, a[a.count - 1 - s] == b[b.count - 1 - s] { s += 1 }
-        let run = b[p ..< b.count - s]
-        guard run.count >= threshold else { return nil }
-        return String(run)
-    }
+    static func collapse(_ pasted: String) -> Bool { pasted.count >= 2_000 }
 }
 
 struct CameraPhoto: UIViewControllerRepresentable {
@@ -268,6 +275,8 @@ struct CameraPhoto: UIViewControllerRepresentable {
 
 struct AttachmentChip: View {
     let attachment: SendAttachment
+    /// Opens the full image for review. Only images get a preview; other types ignore it.
+    let preview: () -> Void
     let remove: () -> Void
     @State private var thumbnail: UIImage?
 
@@ -279,18 +288,13 @@ struct AttachmentChip: View {
         if isVideo { return "Video" }
         if isAudio { return "Audio" }
         if !isImage { return "File" }
+        if attachment.filename.hasPrefix("Pasted image") { return "Pasted image" }
         let pieces = attachment.filename.split(separator: "-")
         return pieces.count >= 3 && pieces[0] == "Frame" ? "Frame at " + pieces[1] : "Photo"
     }
 
-    /// Non-image chips show what was picked and roughly how big it is, so an MP3 is not
-    /// presented as an anonymous "file".
-    private var detail: String? {
-        guard !isImage else { return nil }
-        let name = attachment.filename
-        let shown = name.count > 26 ? String(name.prefix(24)) + "…" : name
-        let bytes = attachment.base64.count / 4 * 3
-        return shown + " · " + ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    private var detail: String {
+        attachment.filename + " · " + ByteCountFormatter.string(fromByteCount: Int64(attachment.byteCount), countStyle: .file)
     }
 
     private var icon: String {
@@ -303,7 +307,7 @@ struct AttachmentChip: View {
     /// original): named in the corner of the preview so the type is never a surprise.
     private var typeBadge: String? {
         guard attachment.mime == "image/jpeg" else { return nil }
-        switch (attachment.filename as NSString).pathExtension.lowercased() {
+        switch (attachment.sourceFormat ?? (attachment.filename as NSString).pathExtension).lowercased() {
         case "gif": return "GIF · 1st frame"
         case "png": return "PNG"
         case "webp": return "WebP"
@@ -313,32 +317,23 @@ struct AttachmentChip: View {
     }
 
     var body: some View {
-        Button(action: remove) {
-            HStack(spacing: 5) {
-                if let thumbnail {
-                    Image(uiImage: thumbnail).resizable().scaledToFill().frame(width: 46, height: 38).clipped()
-                        .overlay(alignment: .bottomLeading) {
-                            if let typeBadge {
-                                Text(typeBadge).font(.system(size: 8, weight: .semibold))
-                                    .padding(.horizontal, 3).padding(.vertical, 1)
-                                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 4))
-                            }
-                        }
-                } else {
-                    Image(systemName: icon).frame(width: 46, height: 38)
-                }
-                if let detail {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(label).font(.caption2.weight(.semibold))
-                        Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                } else if label != "Photo" {
-                    Text(label).font(.caption2)
-                }
+        HStack(spacing: 0) {
+            if isImage {
+                Button(action: preview) { content }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Preview " + attachment.filename)
+            } else {
+                content.accessibilityElement(children: .combine)
+            }
+            Button(action: remove) {
                 Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-            }.padding(4).background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove " + attachment.filename)
         }
-        .buttonStyle(.plain).accessibilityLabel("Remove " + label + (detail.map { ", " + $0 } ?? ""))
+        .padding(.horizontal, 4).padding(.vertical, 4)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
         .task(id: attachment) {
             thumbnail = nil
             guard isImage, let data = Data(base64Encoded: attachment.base64),
@@ -346,5 +341,51 @@ struct AttachmentChip: View {
                   let pixel = ChatMedia.thumbnail(source, pixels: 96) else { return }
             thumbnail = UIImage(cgImage: pixel)
         }
+    }
+
+    private var content: some View {
+        HStack(spacing: 6) {
+            if let thumbnail {
+                Image(uiImage: thumbnail).resizable().scaledToFill().frame(width: 46, height: 40).clipped()
+                    .overlay(alignment: .bottomLeading) {
+                        if let typeBadge {
+                            Text(typeBadge).font(.system(size: 8, weight: .semibold))
+                                .padding(.horizontal, 3).padding(.vertical, 1)
+                                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+            } else {
+                Image(systemName: icon).frame(width: 46, height: 40)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label).font(.caption2.weight(.semibold)).lineLimit(1)
+                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .padding(.trailing, 2)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+/// A dismissible full-screen look at one decoded image. Tap the image or the close button.
+struct FullImagePreview: View {
+    let image: UIImage
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            Image(uiImage: image).resizable().scaledToFit()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel("Attached photo")
+        }
+        .overlay(alignment: .topTrailing) {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 28)).foregroundStyle(.white.opacity(0.9)).padding(16)
+            }
+            .accessibilityLabel("Close preview")
+        }
+        .onTapGesture { dismiss() }
     }
 }

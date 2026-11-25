@@ -50,6 +50,7 @@ struct RuntimeSheet: View {
                         ForEach(catalog?.usable ?? []) { p in Text(p.name).tag(Optional(p.slug)) }
                     }
                     .pickerStyle(.menu)
+                    .disabled(loading)
                     if !loading && (catalog?.usable.isEmpty ?? true) {
                         Text("Model list unavailable. You can keep this chat’s saved selection.").foregroundStyle(.secondary)
                     }
@@ -156,12 +157,17 @@ struct RuntimeSheet: View {
             model = current.model
             provider = current.provider
             effort = current.effort
-            await app.catalog(for: profile)
+            _ = await app.catalog(for: profile)
+            guard !Task.isCancelled else { return }
             loading = false
             if let scope { Task { await app.catalogStore.openCheck(scope) } }
-            if let sid = sessionId { fresh = try? await API.shared.served(profile: profile, session: sid) }
             if let m = current.model, let p = selectedProvider, !p.models.contains(m) { modelQuery = m }  // show the custom row
             seeded = true
+        }
+        .task(id: sessionId) {
+            guard let sid = sessionId else { return }
+            let result = try? await API.shared.served(profile: profile, session: sid)
+            if !Task.isCancelled { fresh = result }
         }
     }
 

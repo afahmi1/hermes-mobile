@@ -1,12 +1,23 @@
 import Foundation
 import Observation
 
+struct ToolActivity: Hashable, Identifiable {
+    var id: String
+    var name: String
+    var preview: String
+    var result: String
+    var state: String
+}
+
 struct ChatItem: Identifiable, Hashable {
-    enum Kind: Hashable { case user, assistant, tools, notice, control }
+    enum Kind: Hashable { case user, assistant, tools, notice, control, activity }
     let id: String
     var kind: Kind
     var text: String
     var tools: [String] = []
+    var activities: [ToolActivity] = []
+    var media: [ChatMediaRef] = []
+    var detail: String = ""
     var streaming = false
     var footer: String?
     var failed = false
@@ -27,9 +38,9 @@ struct ApprovalRequest: Identifiable, Hashable {
 
 
 /// One collapsed long paste, shown as a chip in the composer and sent with the next message.
-struct PastedText: Identifiable, Equatable {
-    let id = UUID()
-    let text: String
+struct PastedText: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var text: String
 }
 /// One chat: its transcript (from Hermes), its live run, and its model/provider/effort choice.
 @MainActor @Observable
@@ -40,6 +51,9 @@ final class ChatModel {
     var title: String?
     var isLoading = false
     var isRunning = false
+    var slashBusy = false
+    var slashCommands: [SlashCommand] = SlashCommand.builtIn
+    var skillCommands: [String] = []
     var status: String?
     var error: String?
     var approval: ApprovalRequest?
@@ -57,13 +71,15 @@ final class ChatModel {
     var completedTick = 0
     var failedTick = 0
 
-    private let draftID: UUID
+    private var draftID: UUID
     private let api = API.shared
     private weak var owner: AppModel?
     // Late work must never borrow the new gateway's account, including after A → B → A.
     private var app: AppModel? { API.shared === api ? owner : nil }
     private var recovery = StreamRecovery()
     private var confirmedPrimary = false
+    private var outboxRevision = UUID()
+    private var returningSend = false
     private var pendingSend: PendingSend?
     private var sendKey: String? {
         sessionId.flatMap { app?.inboxKey(profile: profile, filter: "outbox/" + $0) }
@@ -71,6 +87,7 @@ final class ChatModel {
     private var nextReceiptAttempt = Date.distantPast
     private var receiptBackoff = 1.0
 
+    private var localNotes: [ChatItem] = []
     private var runId: String?
     private var streamTask: Task<Void, Never>?
     private var liveToolGroup: Int?
@@ -86,10 +103,71 @@ final class ChatModel {
     private var timelineValidator: String?
     private var lastSnapshotAttempt = false
     private(set) var cachedAt: Date?
-    var draft = ""
-    var draftAttachments: [SendAttachment] = []
+    private let composerAccount: String?
+    private var composerScope: String { profile + "|" + (sessionId.map { "session/" + $0 } ?? "new") }
+    @ObservationIgnored private var restoringComposer = false
+    var draft = "" { didSet { if oldValue != draft { persist(.text) } } }
+    var draftAttachments: [SendAttachment] = [] { didSet { if oldValue != draftAttachments { persist(.media) } } }
     /// Large pastes (T3-style): kept out of the composer, sent with the next message.
-    var pastedTexts: [PastedText] = []
+    var pastedTexts: [PastedText] = [] { didSet { if oldValue != pastedTexts { persist(.pastes) } } }
+
+    @ObservationIgnored private var needsDraftRestore = false
+    @ObservationIgnored private var draftProblem: String?
+    @ObservationIgnored private var failedDraftWrites = Set<ComposerDisk.Part>()
+    var canEvictDraft: Bool {
+        !needsDraftRestore && failedDraftWrites.isEmpty && (composerAccount != nil || (draft.isEmpty && pastedTexts.isEmpty && draftAttachments.isEmpty))
+    }
+
+    private func persist(_ part: ComposerDisk.Part) {
+        guard !restoringComposer, let account = composerAccount, account == app?.inboxAccount else { return }
+        if needsDraftRestore { failedDraftWrites.insert(part); return }
+        do {
+            let data: Data?
+            switch part {
+            case .text: data = draft.isEmpty ? nil : Data(draft.utf8)
+            case .pastes: data = pastedTexts.isEmpty ? nil : try JSONEncoder().encode(pastedTexts)
+            case .media: data = draftAttachments.isEmpty ? nil : try JSONEncoder().encode(draftAttachments)
+            }
+            try ComposerDisk.shared.write(data, part: part, account: account, scope: composerScope, id: draftID)
+            failedDraftWrites.remove(part)
+            clearDraftProblemIfRecovered()
+        } catch {
+            failedDraftWrites.insert(part)
+            reportDraftProblem("This draft could not be saved on this device. " + error.localizedDescription)
+        }
+    }
+
+    private func reportDraftProblem(_ message: String) {
+        draftProblem = message
+        error = message
+    }
+
+    private func clearDraftProblemIfRecovered() {
+        guard !needsDraftRestore, failedDraftWrites.isEmpty, let draftProblem else { return }
+        if error == draftProblem { error = nil }
+        self.draftProblem = nil
+    }
+
+    func retryDraftStorage() {
+        guard let account = composerAccount, account == app?.inboxAccount else { return }
+        if needsDraftRestore {
+            do {
+                let saved = try ComposerDisk.shared.read(account, scope: composerScope)
+                if let id = saved.id { draftID = id }
+                restoringComposer = true
+                if !failedDraftWrites.contains(.text) { draft = saved.text }
+                if !failedDraftWrites.contains(.pastes) { pastedTexts = saved.pastes }
+                if !failedDraftWrites.contains(.media) { draftAttachments = saved.media }
+                restoringComposer = false
+                needsDraftRestore = false
+            } catch {
+                reportDraftProblem("Couldn’t open the saved draft. " + error.localizedDescription)
+                return
+            }
+        }
+        for part in failedDraftWrites { persist(part) }
+        clearDraftProblemIfRecovered()
+    }
 
     /// What the next send actually delivers: the draft plus every pasted chunk.
     var combinedDraft: String {
@@ -112,10 +190,28 @@ final class ChatModel {
     private var resolvedApprovals = Set<String>()
 
     init(profile: String, sessionId: String?, app: AppModel, draftID: UUID = UUID()) {
-        self.draftID = draftID
+        let account = app.inboxAccount
+        self.composerAccount = account
+        let scope = profile + "|" + (sessionId.map { "session/" + $0 } ?? "new")
+        let snapshot: ComposerDisk.Snapshot?
+        var restoreError: Error?
+        do { snapshot = try account.map { try ComposerDisk.shared.read($0, scope: scope) } }
+        catch { snapshot = nil; restoreError = error }
+        self.draftID = snapshot?.id ?? draftID
         self.profile = profile
         self.sessionId = sessionId
         self.owner = app
+        restoringComposer = true
+        if let snapshot {
+            draft = snapshot.text
+            pastedTexts = snapshot.pastes
+            draftAttachments = snapshot.media
+        }
+        restoringComposer = false
+        if let restoreError {
+            needsDraftRestore = true
+            reportDraftProblem("Couldn’t open the saved draft. " + restoreError.localizedDescription)
+        }
         if let sid = sessionId, let saved = app.savedChoice(profile: profile, session: sid) {
             choice = saved
             picked = !saved.isDefault
@@ -177,8 +273,15 @@ final class ChatModel {
         }
         if resumeLive, let key = sendKey {
             do {
+                let revision = outboxRevision
                 if let pending = try await InboxDisk.shared.pending(key) {
-                    guard !isRunning, !Task.isCancelled, key == sendKey else { return }
+                    guard revision == outboxRevision, !returningSend, !isRunning, !Task.isCancelled, key == sendKey else { return }
+                    if pending.returningToComposer == true || pendingSend?.returningToComposer == true {
+                        pendingSend = pending
+                        await returnSend(pending, key: key)
+                        return
+                    }
+                    if pendingSend?.id != pending.id { clearStagedComposer(pending) }
                     pendingSend = pending
                     if Date() >= nextReceiptAttempt {
                         isRunning = true
@@ -229,7 +332,7 @@ final class ChatModel {
     }
 
     func refreshServed() async {
-        guard let sid = sessionId, let s = try? await api.served(profile: profile, session: sid) else { return }
+        guard let sid = sessionId, let s = try? await api.served(profile: profile, session: sid), app != nil else { return }
         lastRuntimeRead = Date()
         served = s
         // Hermes's session setting is the truth. Adopt it unless the user just picked something here,
@@ -239,19 +342,6 @@ final class ChatModel {
             if changedElsewhere || !picked { choice = pc; picked = false }
             lastPolicy = pc
         }
-        if let i = items.lastIndex(where: { $0.kind == .assistant }), items[i].footer == nil {
-            items[i].footer = servedCaption
-        }
-    }
-
-    var servedCaption: String? {
-        guard let s = served else { return nil }
-        let last = s.modelsUsed?.first
-        guard let m = last?.model ?? s.model, !m.isEmpty else { return nil }
-        var parts = [m]
-        if let p = last?.provider ?? s.provider, !p.isEmpty { parts.append(p) }
-        if s.fallbackActive == true { parts.append("fallback") }
-        return parts.joined(separator: " · ")
     }
 
     private func transcriptWithReceipts() -> [ChatItem] {
@@ -261,6 +351,7 @@ final class ChatModel {
             let next = rows.firstIndex { ($0.timestamp ?? 0) > t } ?? rows.endIndex
             rows.insert(receipt.item, at: next)
         }
+        rows += localNotes.filter { note in !rows.contains { $0.kind == note.kind && $0.text == note.text } }
         return rows
     }
 
@@ -268,28 +359,68 @@ final class ChatModel {
         var out: [ChatItem] = []
         var toolGroup: Int?
         for (i, m) in msgs.enumerated() {
+            if m.displayKind == "hidden" { continue }
             let key = m.id.map(String.init) ?? "i\(i)"
             let text = (m.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if isActivity(m, text: text) {
+                toolGroup = nil
+                let trimmedNotice = m.notice?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let title = trimmedNotice.isEmpty ? activityTitle(text) : trimmedNotice
+                let failed = m.ok == false || text.localizedCaseInsensitiveContains("status=failed") || text.contains("✗")
+                out.append(ChatItem(id: key, kind: .activity, text: title, detail: text == title ? "" : text,
+                                    failed: failed, timestamp: m.timestamp))
+                continue
+            }
             switch m.role {
             case "user":
                 toolGroup = nil
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .user, text: text, timestamp: m.timestamp)) }
+                if !text.isEmpty || !(m.media ?? []).isEmpty {
+                    out.append(ChatItem(id: key, kind: .user, text: text, media: m.media ?? [], timestamp: m.timestamp))
+                }
             case "assistant":
-                let names = (m.toolCalls ?? []).compactMap { $0.function?.name }
-                if !names.isEmpty {
+                let calls = m.toolCalls ?? []
+                if !calls.isEmpty {
+                    let activities = calls.enumerated().map { offset, call in
+                        ToolActivity(id: key + "-\(offset)", name: call.function?.name ?? "tool",
+                                     preview: call.preview ?? "", result: "", state: "done")
+                    }
                     if let toolGroup {
-                        out[toolGroup].tools += names
+                        out[toolGroup].activities += activities
+                        out[toolGroup].tools += activities.map(\.name)
                     } else {
                         toolGroup = out.count
-                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: names, timestamp: m.timestamp))
+                        out.append(ChatItem(id: key + "t", kind: .tools, text: "", tools: activities.map(\.name),
+                                            activities: activities, timestamp: m.timestamp))
                     }
                 }
-                if !text.isEmpty { out.append(ChatItem(id: key, kind: .assistant, text: text, timestamp: m.timestamp)) }
+                if !text.isEmpty || !(m.media ?? []).isEmpty {
+                    out.append(ChatItem(id: key, kind: .assistant, text: text, media: m.media ?? [], timestamp: m.timestamp))
+                }
+            case "tool":
+                guard let toolGroup, let idx = out[toolGroup].activities.firstIndex(where: {
+                    $0.result.isEmpty && (m.toolName == nil || m.toolName == $0.name || m.toolName?.isEmpty == true)
+                }) else { continue }
+                if m.ok == false { out[toolGroup].activities[idx].state = "failed" }
+                if let preview = m.preview, !preview.isEmpty { out[toolGroup].activities[idx].result = preview }
             default:
                 continue
             }
         }
         return out
+    }
+
+    private static func isActivity(_ m: StoredMessage, text: String) -> Bool {
+        if m.displayKind == "async_delegation_complete" || m.displayKind == "process_complete" { return true }
+        if m.role == "system" { return !text.isEmpty || m.notice?.isEmpty == false }
+        let opened = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return opened.hasPrefix("[ASYNC DELEGATION") || opened.hasPrefix("[BACKGROUND PROCESS")
+            || opened.hasPrefix("[PROCESS COMPLETE") || opened.hasPrefix("[SUBAGENT")
+    }
+
+    private static func activityTitle(_ text: String) -> String {
+        if text.hasPrefix("[") { return "Background work finished" }
+        let line = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? "Background work finished"
+        return line.count > 180 ? String(line.prefix(180)) : line
     }
 
     // MARK: runtime choice
@@ -302,6 +433,7 @@ final class ChatModel {
         let previous = lastPolicy ?? choice
         do {
             let deferred = try await api.lockRuntime(profile: profile, session: sid, choice: new, previous: previous)
+            guard app != nil else { return }
             choice = new
             picked = !new.isDefault
             app?.saveChoice(new, profile: profile, session: sid)
@@ -321,16 +453,79 @@ final class ChatModel {
 
     /// `projectContext` is a project ID only when the person switched context on for this send from a
     /// project scope; follow-ups (queue / steer) never carry it.
-    func send(_ raw: String, projectContext: String? = nil, attachments: [SendAttachment] = []) async {
+    func loadPalette() async {
+        guard let page = try? await api.commandPalette(profile: profile), app != nil else { return }
+        if !page.commands.isEmpty { slashCommands = page.commands }
+        skillCommands = page.skills
+    }
+
+    func acceptsSlash(_ raw: String) -> Bool {
+        guard draftAttachments.isEmpty, let name = SlashCommand.name(in: raw) else { return false }
+        return slashCommands.contains { $0.name == name } || skillCommands.contains(name)
+    }
+
+    /// Hermes runs the command. A `send` result becomes the next turn, with the short label in the bubble.
+    func runSlash(_ raw: String) async {
+        let command = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isRunning, !slashBusy, acceptsSlash(command) else { return }
+        let account = app?.inboxAccount
+        let authored = draft
+        let authoredPastes = pastedTexts
+        slashBusy = true
+        error = nil
+        status = "Running /\(SlashCommand.name(in: command) ?? "command")…"
+        do {
+            guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
+            if sessionId == nil {
+                let sid = try await api.createSession(profile: profile, draftID: draftID)
+                guard account == app?.inboxAccount else { throw APIError.notSignedIn }
+                try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
+                sessionId = sid
+                if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
+            }
+            guard let sid = sessionId else { throw APIError.notSignedIn }
+            draft = ""
+            pastedTexts = []
+            let result = try await api.slash(profile: profile, session: sid, command: command)
+            guard account == app?.inboxAccount else { throw APIError.notSignedIn }
+            let title = result.display ?? result.notice ?? command
+            if let output = result.output ?? result.warning, !output.isEmpty {
+                let note = ChatItem(id: "slash-\(UUID().uuidString)", kind: .activity, text: title, detail: output)
+                items.append(note)
+                localNotes.append(note)
+            } else if result.message == nil {
+                items.append(ChatItem(id: "slash-\(UUID().uuidString)", kind: .notice, text: title))
+            }
+            slashBusy = false
+            status = nil
+            if let message = result.message, ["send", "skill", "prefill"].contains(result.type ?? "") {
+                await send(message, shown: result.display ?? title)
+            }
+        } catch {
+            draft = authored
+            pastedTexts = authoredPastes
+            slashBusy = false
+            status = nil
+            self.error = error.localizedDescription
+        }
+    }
+
+    func send(_ raw: String, projectContext: String? = nil, attachments: [SendAttachment] = [], shown: String? = nil) async {
+        if needsDraftRestore {
+            retryDraftStorage()
+            // A restore can merge a previously hidden paste or attachment. Review before sending.
+            if needsDraftRestore || raw != combinedDraft || attachments != draftAttachments { return }
+        }
         let message = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isRunning, !message.isEmpty || !attachments.isEmpty else { return }
+        guard !isRunning, !slashBusy, !message.isEmpty || !attachments.isEmpty else { return }
         let text = message.isEmpty ? "Describe the attached media." : message
         if pendingSend != nil {
-            draft = raw
             error = "Reconnecting the previous send. Your next message is saved in the composer."
             return
         }
         let account = app?.inboxAccount
+        let authoredText = draft
+        let authoredPastes = pastedTexts
         isRunning = true
         error = nil
         status = "Sending…"
@@ -340,25 +535,76 @@ final class ChatModel {
             if sessionId == nil {
                 let sid = try await api.createSession(profile: profile, draftID: draftID)
                 guard account == app?.inboxAccount else { throw APIError.notSignedIn }
+                try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
                 sessionId = sid
                 if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
             }
             guard let sid = sessionId, let key = sendKey else { throw APIError.notSignedIn }
-            let send = PendingSend(id: UUID(), text: text, choice: picked ? choice : .botDefault, project: projectContext, attachments: attachments.isEmpty ? nil : attachments)
+            let send = PendingSend(id: UUID(), text: text, choice: picked ? choice : .botDefault, project: projectContext, attachments: attachments.isEmpty ? nil : attachments, composerText: authoredText, composerPastes: authoredPastes)
             try await InboxDisk.shared.stage(send, key: key)
             guard key == sendKey else { throw APIError.notSignedIn }
             pendingSend = send
-            if draftAttachments == attachments { draftAttachments.removeAll() }
-            var local = ChatItem(id: send.id.uuidString, kind: .user, text: text)
+            ReplyNotifier.shared.askOnce()
+            clearStagedComposer(send)
+            var local = ChatItem(id: send.id.uuidString, kind: .user, text: shown ?? text)
             if projectContext != nil { local.contextNote = "Project instructions + reference files sent with this message" }
             items.append(local)
             await deliver(send, session: sid, key: key, allowLegacy: true)
         } catch {
             isRunning = false
             status = nil
-            if draft.isEmpty { draft = raw }
             fail(error.localizedDescription)
         }
+    }
+
+    /// True while a staged send is still waiting for the bridge to confirm it.
+    var hasUnconfirmedSend: Bool { pendingSend != nil && !isRunning && !returningSend }
+
+    /// Give up on a send the bridge never confirmed and return its text and files to the composer.
+    /// The bridge may still have accepted it, so the person is told to check the chat first.
+    func cancelUnconfirmedSend() async {
+        guard hasUnconfirmedSend, let send = pendingSend, let key = sendKey else { return }
+        await returnSend(send, key: key)
+    }
+
+    private func returnSend(_ send: PendingSend, key: String, reason: String? = nil) async {
+        guard !returningSend, key == sendKey, let account = composerAccount else { return }
+        returningSend = true
+        outboxRevision = UUID()
+        defer { returningSend = false; outboxRevision = UUID() }
+        var returning = send
+        returning.returningToComposer = true
+        pendingSend = returning
+        do {
+            // Persist the decision before any await that could let the process suspend. Subsequent
+            // launches must finish the return instead of attempting delivery again.
+            try await InboxDisk.shared.stage(returning, key: key)
+            guard key == sendKey else { return }
+            retryDraftStorage()
+            guard canEvictDraft else { throw CocoaError(.fileWriteUnknown) }
+            let snapshot = try ComposerDisk.shared.restoreSend(returning, account: account, scope: composerScope, id: draftID)
+            restoringComposer = true
+            draft = snapshot.text
+            pastedTexts = snapshot.pastes
+            draftAttachments = snapshot.media
+            restoringComposer = false
+            try await InboxDisk.shared.acknowledge(send.id, key: key)
+            guard key == sendKey else { return }
+            pendingSend = nil
+            items.removeAll { $0.id == send.id.uuidString }
+            receiptBackoff = 1
+            nextReceiptAttempt = .distantPast
+            if let reason { fail(reason) }
+            else { error = "Moved back to the composer. Refresh the chat to check whether Hermes already received it." }
+        } catch {
+            self.error = "Couldn’t finish returning this send. Reopen the chat to try again. " + error.localizedDescription
+        }
+    }
+
+    private func clearStagedComposer(_ send: PendingSend) {
+        if let original = send.composerText, draft == original { draft = "" }
+        if let pastes = send.composerPastes, pastedTexts == pastes { pastedTexts = [] }
+        if draftAttachments == (send.attachments ?? []) { draftAttachments = [] }
     }
 
     private func deliver(_ send: PendingSend, session: String, key: String, allowLegacy: Bool) async {
@@ -369,11 +615,13 @@ final class ChatModel {
                                                     choice: send.choice, projectContext: send.project, submission: send.id,
                                                     attachments: send.attachments ?? [], recovering: !allowLegacy)
             } catch APIError.http(404, _) where allowLegacy && send.attachments == nil {
-                // An old bridge does not implement send-once. Drop the retry record BEFORE the
-                // one legacy POST; a lost legacy acknowledgment cannot cause an automatic replay.
-                try await InboxDisk.shared.acknowledge(send.id, key: key)
+                // Legacy sends cannot be repeated safely. Keep the authored data recoverable
+                // across a crash, but turn off automatic delivery before the single legacy POST.
+                var legacy = send
+                legacy.returningToComposer = true
+                try await InboxDisk.shared.stage(legacy, key: key)
                 guard sendKey == key else { throw APIError.notSignedIn }
-                pendingSend = nil
+                pendingSend = legacy
                 run = try await api.startRun(profile: profile, session: session, text: send.text,
                                                     choice: send.choice, projectContext: send.project)
             }
@@ -394,18 +642,16 @@ final class ChatModel {
             // after delivery. Keep that original UUID until the bridge can confirm it.
             if case APIError.http(let code, _) = error,
                [400, 409, 413, 415, 422].contains(code) || (allowLegacy && [403, 404].contains(code)) {
-                try? await InboxDisk.shared.acknowledge(send.id, key: key)
-                pendingSend = nil
-                if draft.isEmpty { draft = send.text }
-                if draftAttachments.isEmpty, let attachments = send.attachments { draftAttachments = attachments }
-                items.removeAll { $0.id == send.id.uuidString }
-                fail(error.localizedDescription)
-            } else if pendingSend != nil {
+                await returnSend(send, key: key, reason: error.localizedDescription)
+            } else if pendingSend?.returningToComposer != true {
                 nextReceiptAttempt = Date().addingTimeInterval(receiptBackoff)
+                // The first failure is news. Later silent retries must not buzz the phone once a minute.
+                let first = receiptBackoff <= 1
                 receiptBackoff = min(60, receiptBackoff * 2)
-                fail("Waiting to confirm your send. Reopening this chat will check the same submission.")
+                let waiting = "Waiting to confirm your send. Reopening this chat will check the same submission."
+                if first { fail(waiting) } else { self.error = waiting }
             } else {
-                fail("The previous bridge could not confirm delivery. Check the saved chat before sending again.")
+                await returnSend(send, key: key, reason: "The bridge could not confirm delivery. Check the saved chat before sending again.")
             }
         }
     }
@@ -562,6 +808,7 @@ final class ChatModel {
                 do {
                     for try await ev in api.events(profile: profile, run: run, after: recovery.lastSequence,
                                                           epoch: recovery.epoch, routeRevision: network.revision) {
+                        guard !Task.isCancelled, runId == run, account == app?.inboxAccount else { break }
                         if ev.name == "stream.checkpoint" {
                             finished = try await restoreCheckpoint(ev, run: run)
                             if finished { break }
@@ -583,7 +830,7 @@ final class ChatModel {
                     // The turn is gone from the Mac (finished long ago, or the bridge restarted): Hermes's
                     // transcript has the outcome, so reload it instead of retrying.
                     finished = true
-                    if code == 401, let account, app?.inboxAccount == account { app?.signOut() }
+                    if code == 401, let account, app?.inboxAccount == account { app?.sessionExpired() }
                 } catch {
                     if Task.isCancelled { break }
                 }
@@ -625,14 +872,35 @@ final class ChatModel {
             if status != nil { status = nil }
         case "tool.started", "tool.start":
             let name = ev.string("tool_name") ?? ev.string("tool") ?? ev.string("name") ?? "tool"
+            let activity = ToolActivity(id: "live-\(UUID().uuidString)", name: name, preview: ev.string("preview") ?? "",
+                                        result: "", state: "running")
             closeStreamingBubble()
             if let i = liveToolGroup, items.indices.contains(i), items[i].kind == .tools {
                 items[i].tools.append(name)
+                items[i].activities.append(activity)
             } else {
                 liveToolGroup = items.count
-                items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name]))
+                items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name], activities: [activity]))
             }
             status = "Using \(name.replacingOccurrences(of: "_", with: " "))…"
+        case "tool.completed":
+            let name = ev.string("tool_name") ?? ev.string("name") ?? ""
+            let ok = ev.raw["ok"] as? Bool ?? true
+            if let i = liveToolGroup, items.indices.contains(i),
+               let idx = items[i].activities.lastIndex(where: { $0.state == "running" && (name.isEmpty || $0.name == name) }) {
+                items[i].activities[idx].state = ok ? "done" : "failed"
+                if let preview = ev.string("preview"), !preview.isEmpty, items[i].activities[idx].result.isEmpty {
+                    items[i].activities[idx].result = preview
+                }
+                if items[i].activities.contains(where: { $0.state == "running" }) {
+                    status = "Using \(items[i].activities.last { $0.state == "running" }?.name.replacingOccurrences(of: "_", with: " ") ?? "a tool")…"
+                } else {
+                    status = ok ? nil : "A tool failed"
+                }
+            }
+        case "subagent":
+            let title = ev.string("title") ?? "Background task"
+            status = ev.string("state") == "done" ? "Background task finished · \(title)" : "Waiting on \(title)…"
         case "run.started":
             // The bridge says what context it accepted; replace the optimistic badge with it.
             if let summary = ProjectContext.summary(from: ev.raw),
@@ -647,19 +915,22 @@ final class ChatModel {
             items.append(ChatItem(id: "n-\(UUID().uuidString)", kind: .notice, text: ev.string("text") ?? ""))
         case "approval.request":
             let id = ev.string("request_id") ?? UUID().uuidString
-            guard !resolvedApprovals.contains(id) else { break }
+            guard !resolvedApprovals.contains(id), approval?.id != id, !waitingApprovals.contains(where: { $0.id == id }) else { break }
             enqueueApproval(ApprovalRequest(
                 id: id, runId: runId ?? "", generation: ev.raw["execution_generation"] as? Int,
                 command: ev.string("command") ?? "", description: ev.string("description") ?? "Hermes wants to run a command.",
                 choices: (ev.raw["choices"] as? [String]) ?? ["once", "deny"], requestId: ev.string("request_id")))
             status = "Waiting for your approval"
+            notify(.approval)
         case "run.completed":
             confirmedPrimary = true
+            var answeredItem = streamingIndex
             if let out = ev.string("output"), !out.isEmpty, streamingIndex == nil {
                 items.append(ChatItem(id: "final-\(UUID().uuidString)", kind: .assistant, text: out))
+                answeredItem = items.indices.last
             }
             if let rt = ev.raw["runtime"] as? [String: Any], let m = rt["model"] as? String, !m.isEmpty,
-               let i = items.lastIndex(where: { $0.kind == .assistant }) {
+               let i = answeredItem, items.indices.contains(i) {
                 var parts = [m, rt["provider"] as? String].compactMap { $0 }.filter { !$0.isEmpty }
                 if let requested = ev.string("requested_model"), requested != m {
                     parts = ["Requested " + requested, "Hermes reported " + parts.joined(separator: " · ")]
@@ -669,10 +940,12 @@ final class ChatModel {
             }
             runtimeNotice = nil
             completedTick += 1
+            notify(.reply)
             return true
         case "run.failed", "error":
             confirmedPrimary = true
             fail(ev.string("error") ?? ev.string("message") ?? "The run failed.")
+            notify(.failure)
             return true
         case "run.cancelled", "run.interrupted":
             confirmedPrimary = true
@@ -716,7 +989,7 @@ final class ChatModel {
         if gaveUp { failedTick += 1 }
         lastPage = nil
         await load(quiet: true, resumeLive: !gaveUp)
-        if gaveUp { error = "The live connection was lost. Pull down to reconnect." }
+        if gaveUp { error = "The live connection was lost. Tap Reload chat to reconnect." }
     }
 
     func absorbPaste(_ text: String) {
@@ -728,6 +1001,17 @@ final class ChatModel {
     }
 
 
+
+    private func notify(_ event: ReplyNotifier.Event) {
+        guard let app else { return }
+        ReplyNotifier.shared.post(event, bot: app.botName(profile),
+                                  account: app.inboxAccount, profile: profile, session: sessionId)
+        if event != .approval {
+            // This run is over; if it was the last one, hand the background time back.
+            let others = app.hasLiveRuns(excluding: self)
+            ReplyNotifier.shared.settled(liveRuns: others)
+        }
+    }
 
     private func fail(_ message: String) {
         error = message

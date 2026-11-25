@@ -16,7 +16,7 @@ chat state. It does three things the gateway API server cannot do for a phone on
 
 Binds to loopback only; reach it through `tailscale serve`. Stdlib only (system python3).
 """
-import base64, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
+import base64, gzip, hashlib, hmac, http.client, json, os, re, secrets, sqlite3, sys, threading, time
 from tempfile import NamedTemporaryFile
 from functools import lru_cache
 from collections import deque
@@ -26,6 +26,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
+
+import bridge_transcript as transcript
 
 # The bridge embeds Hermes libraries. A library import must never relaunch the
 # HTTP service under a different interpreter or update the host installation.
@@ -44,12 +46,14 @@ PASS = re.compile(r"^/(api/sessions(/[^/]+(/(messages|model|fork))?)?|v1/runs(/[
 MAX_BODY = 12 * 1024 * 1024
 WS_MAX_BODY = 64 * 1024  # Fits an 8 KiB file JSON-escaped (\u00XX per control byte) or 4 KiB instructions.
 WS_BODY_TIMEOUT = 10
+BODY_TIMEOUT = 120             # an 8 MiB attachment on a weak cellular link still fits; a stalled peer does not
 WS_SETTING = "HERMES_MOBILE_WORKSPACES"
 WS_BOTS_SETTING = "HERMES_MOBILE_WORKSPACE_BOTS"
 POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
 import bridge_devices
+import bridge_receipts
 from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 try:
@@ -121,7 +125,10 @@ def env_value(path, key):
 
 
 def basic_auth():
-    text = (HERMES / "config.yaml").read_text()
+    try:
+        text = (HERMES / "config.yaml").read_text()
+    except (OSError, UnicodeError):
+        text = ""  # no readable config means no password login, not a dropped connection
     m = re.search(r"^dashboard:\n(?:[ \t]+.*\n)*?[ \t]+basic_auth:\n((?:[ \t]{4,}.*\n)+)", text, re.M)
     block = m.group(1) if m else ""
 
@@ -229,7 +236,8 @@ def bots():
             name = nm or pid.replace("-", " ").replace("_", " ").title().replace("Captains", "Captain's")
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
                     "reachable": bool(key_for(pid)), "served": pid in served,
-                    "front": pid == "default", "managed": False})
+                    "front": pid == "default", "managed": False,
+                    "skills": transcript.skill_names(profile_home(pid))})
     return out
 
 
@@ -578,8 +586,20 @@ def _ro(pid):
 
 def _cursor_decode(raw):
     try:
-        return json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))) if raw else {}
-    except Exception:
+        value = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))) if raw else {}
+        if not isinstance(value, dict):
+            return {}
+        done, pin_runs = value.get("_done", []), value.get("_pin_runs", {})
+        missing_pins = value.get("_awaiting_pins", [])
+        if (not isinstance(done, list) or not all(isinstance(pid, str) for pid in done)
+                or not isinstance(pin_runs, dict) or not isinstance(missing_pins, list)
+                or not all(isinstance(pid, str) for pid in missing_pins)):
+            return {}
+        counts = [v for k, v in value.items() if k not in ("_done", "_pin_runs", "_awaiting_pins")]
+        if any(type(n) is not int or not 0 <= n < 2**63 for n in [*counts, *pin_runs.values()]):
+            return {}
+        return value
+    except (ValueError, TypeError, RecursionError):
         return {}
 
 
@@ -634,6 +654,7 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
     """One fetch round across profiles. Returns (rows, pins, new_offsets, done, errors, more_left)."""
     exhausted = set(offsets.get("_done", []))
     live = [p for p in pids if p not in exhausted]
+    awaiting_pins = set(live if first_page else offsets.get("_awaiting_pins", []))
     batch = min(100, limit * (3 if exclude else 1))
     eligible_profiles = served_profiles() if native else set()
 
@@ -643,7 +664,7 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
             try:
                 if pid not in eligible_profiles:
                     return pid, None, "Profile unavailable"
-                return pid, native_inbox_window(pid, off, limit, exclude, first_page), None
+                return pid, native_inbox_window(pid, off, limit, exclude, pid in awaiting_pins), None
             except Exception as error:
                 return pid, None, type(error).__name__
         if sources or archived:
@@ -674,7 +695,9 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
         # missed are back-filled after it. The window therefore ends at the last unpinned row.
         last_unpinned = max((i for i, r in enumerate(data) if not r.get("pinned")), default=-1)
         window, backfill = data[:last_unpinned + 1], data[last_unpinned + 1:]
-        more = len(window) >= batch  # the gateway's own has_more ignores in-window pins
+        # An all-pin window can sit between two ordinary chats. At end-of-list the gateway
+        # also returns every pin again, even for offsets beyond the last row.
+        more = len(data) >= batch
         return pid, (window, backfill, more), None
 
     fetched, errors = {}, {}
@@ -688,7 +711,10 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
     keep = lambda r: r.get("source") not in exclude
     # A profile that still has rows may hold unseen rows as new as its last fetched one: nothing
     # older than that may be emitted yet, or those rows would land on a later page out of order.
-    safe = max((_ts(w[-1]) for w, _, more in fetched.values() if more and w), default=None)
+    # For a gateway window made entirely of pins, the first batch entries still bound
+    # how recent its next unseen ordinary chat can be. Hold older rows from other bots.
+    safe = max((_ts(w[-1] if w else pins[batch - 1]) for w, pins, more in fetched.values()
+                if more and (w or len(pins) >= batch)), default=None)
     candidates = sorted((r for w, _, _ in fetched.values() for r in w if keep(r) and (sources or archived or not r.get("pinned"))),
                         key=_ts, reverse=True)
     eligible = [r for r in candidates if safe is None or _ts(r) >= safe]
@@ -698,21 +724,52 @@ def _page_round(offsets, pids, limit, exclude, first_page, sources=(), native=Fa
         cutoff = safe  # None: every profile is exhausted, so everything fetched is final
     page = [r for r in eligible if cutoff is None or _ts(r) >= cutoff]  # ties stay together
     new_off, done = {}, set(exhausted)
+    pin_runs = dict(offsets.get("_pin_runs", {}))
     for pid in pids:
         off = int(offsets.get(pid, 0))
         if pid not in fetched:
             new_off[pid] = off
             continue
-        window, _, more = fetched[pid]
+        window, backfill, more = fetched[pid]
+        if not native and not sources and not archived and not window and backfill and more:
+            # No unpinned row can be skipped here. At most len(backfill) distinct pins
+            # can occupy consecutive real window positions before the next ordinary row.
+            traversed = pin_runs.get(pid, 0)
+            if traversed >= len(backfill):
+                done.add(pid)
+                pin_runs.pop(pid, None)
+                new_off[pid] = off
+            else:
+                new_off[pid] = off + batch
+                pin_runs[pid] = traversed + batch
+            continue
+        pin_runs.pop(pid, None)
         used = len(window) if cutoff is None else sum(1 for r in window if _ts(r) >= cutoff)
         new_off[pid] = off + used
         if not more and used >= len(window):
             done.add(pid)
-    pins = [r for w, bf, _ in fetched.values() for r in w + bf if r.get("pinned") and keep(r)] if first_page and not sources and not archived else []
+    pins = [r for pid, (w, bf, _) in fetched.items() if pid in awaiting_pins
+            for r in w + bf if r.get("pinned") and keep(r)] if not sources and not archived else []
+    # A failed profile still owes its pins on its first successful fetch.
+    missing = awaiting_pins.intersection(errors)
+    if missing and not sources and not archived:
+        new_off["_awaiting_pins"] = sorted(missing)
+    if pin_runs:
+        new_off["_pin_runs"] = pin_runs
     new_off["_done"] = sorted(done)
     # A profile that errored keeps its offset and is retried by the next cursor.
     more_left = any(p not in done for p in pids)
     return page, pins, new_off, done, errors, more_left
+
+
+def with_mobile_origins(rows):
+    # A missing optional ledger must never make otherwise available chats disappear.
+    if rows:
+        try:
+            bridge_receipts.annotate_origins(admissions_dir() / "send-receipts.sqlite3", rows)
+        except (OSError, sqlite3.Error) as exc:
+            log("Mobile origins unavailable: %s" % type(exc).__name__)
+    return rows
 
 
 def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=False, source=None):
@@ -722,7 +779,7 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
     consumed. Rows are only emitted down to the newest point every unfinished profile has reached, so
     paging stays exact while the lists interleave; a round that yields nothing fetches again."""
     offsets = _cursor_decode(cursor)
-    reset = bool(offsets.get("_native")) and not NATIVE_INBOX
+    reset = bool(cursor and not offsets) or (bool(offsets.get("_native")) and not NATIVE_INBOX)
     if reset:
         offsets = {}
     first_page = not offsets
@@ -752,7 +809,7 @@ def all_sessions(limit, cursor, only=None, exclude=(), telegram=False, compact=F
             uniq.append(r)
     if native:
         offsets["_native"] = 1
-    return {"data": uniq, "reset": reset, "next": _cursor_encode(offsets) if more_left else None, "errors": errors}
+    return {"data": with_mobile_origins(uniq), "reset": reset, "next": _cursor_encode(offsets) if more_left else None, "errors": errors}
 
 
 SESSION_COLS = ("id, source, model, title, started_at, ended_at, message_count, archived, "
@@ -866,7 +923,7 @@ def search_sessions(q, archived=False, limit=40, profile=None, source=None, pref
         finally:
             con.close()
     out.sort(key=lambda s: s.get("last_active") or 0, reverse=True)
-    return out[:limit]
+    return with_mobile_origins(out[:limit])
 
 def set_session_flags(pid, ids, fields):
     """Apply one flag patch to many sessions of one profile, bounded and parallel.
@@ -1308,29 +1365,36 @@ def admissions_dir():
 
 
 def project_timeline_message(message):
-    """One mobile timeline row: visible text and tool names, never tool output or reasoning."""
-    row = {k: message[k] for k in ("id", "role", "timestamp") if k in message}
-    if message.get("role") in ("user", "assistant"):
-        body = message.get("content")
-        if isinstance(body, list):
-            body = "\n".join(p["text"] for p in body if isinstance(p, dict) and isinstance(p.get("text"), str))
-        if isinstance(body, str):
-            row["content"] = body
-        calls = message.get("tool_calls")
-        if isinstance(calls, list):
-            row["tool_calls"] = [{"function": {"name": f["name"]}} for c in calls if isinstance(c, dict)
-                                 and isinstance(f := c.get("function"), dict) and isinstance(f.get("name"), str)]
-    return row
+    """One mobile timeline row. Reasoning and unbounded tool bodies stay on the Mac."""
+    return transcript.project_timeline_message(message, [HERMES])
 
 
 def timeline_bytes(messages):
-    return json.dumps({"data": [project_timeline_message(m) for m in messages]},
-                      ensure_ascii=False, separators=(",", ":")).encode()
+    rows = [row for row in (project_timeline_message(m) for m in messages) if row]
+    return json.dumps({"data": rows}, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def timeline_page(raw):
     """Return exactly the rows consumed by the mobile timeline, retaining pagination positions."""
     return timeline_bytes(json.loads(raw)["data"])
+
+
+def session_bodies(pid, session_id):
+    """Raw transcript text for one chat, so a media digest can be re-derived instead of trusted."""
+    if not NATIVE_INBOX or not session_id or any(c in session_id for c in "/\\\x00") or len(session_id) > 200:
+        return []
+    from hermes_state import SessionDB
+    from gateway.platforms.api_server import APIServerAdapter
+    path = profile_home(pid) / "state.db"
+    if not path.is_file():
+        return []
+    with closing(SessionDB(path, read_only=True)) as db:
+        if not db.get_session(session_id):
+            return []
+        active = db.resolve_resume_session_id(session_id)
+        rows = db.get_messages(active, limit=1000, offset=0, latest=True,
+                               include_compacted=False, include_ancestors=True)
+        return [transcript.content_text(APIServerAdapter._message_response(row).get("content")) for row in rows]
 
 
 def native_timeline_page(pid, session_id, limit, offset, latest):
@@ -1351,6 +1415,18 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
 
 
 # ---------- HTTP ----------
+def _bounded_int(raw, default, low, high):
+    try:
+        return max(low, min(int(raw or default), high))
+    except (TypeError, ValueError):
+        return default
+
+
+GZIP_MIN_BYTES = 1024          # below one packet the header and CPU cost more than they save
+GZIP_LEVEL = 5                 # measured in Benchmarks/response_bytes.py: most of level 9's saving at a fraction of its CPU
+GZIP_TYPES = ("application/json", "text/")
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "HermesMobile/1"
     protocol_version = "HTTP/1.1"
@@ -1365,13 +1441,22 @@ class H(BaseHTTPRequestHandler):
             invalidate_pages()
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
+        encoded = code != 304 and self._compressible(len(body), ctype)
+        if encoded:
+            # mtime=0 keeps identical bodies byte-identical, so the bytes on the wire stay cacheable.
+            body = gzip.compress(body, compresslevel=GZIP_LEVEL, mtime=0)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if encoded:
+            self.send_header("Content-Encoding", "gzip")
         if code != 304:
             self.send_header("Content-Length", str(len(body)))
         if validator:
             self.send_header("ETag", validator)
-            self.send_header("Vary", "X-Hermes-Transcript, Authorization")
+        vary = (["X-Hermes-Transcript", "Authorization"] if validator else []) + (
+            ["Accept-Encoding"] if ctype.startswith(GZIP_TYPES) else [])
+        if vary:
+            self.send_header("Vary", ", ".join(vary))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         if close:
@@ -1379,6 +1464,25 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _compressible(self, size, ctype):
+        """JSON and text replies of a useful size, for a client that asked for gzip. Tailscale Serve
+        forwards bytes as they are, so without this a transcript page crosses cellular uncompressed."""
+        if size < GZIP_MIN_BYTES or not ctype.startswith(GZIP_TYPES):
+            return False
+        wildcard = False
+        for part in (self.headers.get("Accept-Encoding") or "").lower().split(","):
+            name, _, params = part.strip().partition(";")
+            name = name.strip()
+            if name not in ("gzip", "*"):
+                continue
+            quality = params.strip().replace(" ", "")
+            weight = re.fullmatch(r"q=(0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)", quality)
+            accepted = not quality or (weight is not None and float(weight[1]) > 0)
+            if name == "gzip":
+                return accepted
+            wildcard = accepted
+        return wildcard
 
     def body(self):
         return getattr(self, "_body", b"")
@@ -1405,16 +1509,21 @@ class H(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send(413 if n > cap else 400, {"error": "Bad request body."}, close=True)
             return False
-        if scoped:
-            self.connection.settimeout(WS_BODY_TIMEOUT)
+        # A declared body that never arrives must not hold a handler thread for the life of the socket.
+        if n:
+            self.connection.settimeout(WS_BODY_TIMEOUT if scoped else BODY_TIMEOUT)
         try:
             self._body = self.rfile.read(n) if n else b""
+            if len(self._body) != n:
+                self.close_connection = True
+                self.send(400, {"error": "Request body ended early."}, close=True)
+                return False
         except OSError:
             self.close_connection = True
             self.send(408, {"error": "Request timed out."}, close=True)
             return False
         finally:
-            if scoped:
+            if n:
                 self.connection.settimeout(None)
         return True
 
@@ -1495,6 +1604,12 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, health())
             if path == "/m/bots":
                 return self.send(200, {"bots": bots()})
+            if path == "/m/commands":
+                pid = q.get("profile") or "default"
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                return self.send(200, {"commands": transcript.phone_commands(),
+                                       "skills": transcript.skill_names(profile_home(pid))})
             if path == "/m/status":
                 why = "it answered with an error"
                 try:
@@ -1506,7 +1621,7 @@ class H(BaseHTTPRequestHandler):
                                                     % (STATUS_URL, why)})
                 return self.send(200, d)
             if path in ("/m/sessions", "/m/telegram", "/m/desktop", "/m/archived"):
-                limit = max(1, min(int(q.get("limit", "40") or 40), 100))
+                limit = _bounded_int(q.get("limit"), 40, 1, 100)
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
                 return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact", {"/m/desktop": "desktop", "/m/archived": "archived"}.get(path)))
@@ -1518,6 +1633,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200 if d else 404, d or {"error": "not found"})
         if path.startswith("/m/p/"):
             return self.proxy(path, u.query)
+        if path == "/m/skills" and self.command == "POST":
+            return self.skill_route()
         if path.startswith("/m/chat/") or path.startswith("/m/turns"):
             return self.chat_route(path, q)
         self.send(404, {"error": "not found"})
@@ -1933,6 +2050,36 @@ class H(BaseHTTPRequestHandler):
             return self.send(502, {"error": "Hermes didn't return a canonical chat id."})
         return self.send(201, store.link_chat(project, profile, stored, (title or "").strip()[:120] or "New chat"))
 
+    def skill_route(self):
+        """Create a skill file, or append a note to one this bot already has, then rescan."""
+        if turns is None:
+            return self.send(503, {"error": "Turn engine unavailable: %s" % TURNS_ERROR})
+        d = self.json_body()
+        pid = str(d.get("profile") or "")
+        if pid not in profile_ids():
+            return self.send(404, {"error": "unknown bot"})
+        home = profile_home(pid)
+        action = d.get("action")
+        try:
+            if action == "create":
+                saved = transcript.create_skill(home, str(d.get("name") or ""), str(d.get("description") or ""),
+                                                str(d.get("body") or ""))
+            elif action == "append":
+                saved = transcript.append_skill(home, str(d.get("name") or ""), str(d.get("note") or ""))
+            else:
+                return self.send(400, {"error": "Say whether to create a skill or append a note."})
+        except ValueError as e:
+            return self.send(400, {"error": str(e)})
+        except OSError:
+            return self.send(500, {"error": "Could not write that skill."})
+        reloaded = False
+        try:
+            turns.reload_skills(home, pid)
+            reloaded = True
+        except Exception:
+            log("skill reload failed")
+        return self.send(200, {**saved, "reloaded": reloaded, "skills": transcript.skill_names(home)})
+
     # ---- chats through the gateway's canonical session protocol (the desktop app's) ----
     def chat_route(self, path, q):
         if turns is None:
@@ -1965,6 +2112,33 @@ class H(BaseHTTPRequestHandler):
                 if not action and self.command == "GET":
                     return self.send(200, turn.summary())
                 return self.send(405, {"error": "method not allowed"})
+            preview = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/media/([0-9a-f]{64})", path)
+            if preview:
+                if self.command != "GET":
+                    return self.send(405, {"error": "method not allowed"})
+                pid, sid, digest = preview.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                found = transcript.file_for_digest(session_bodies(pid, sid), digest, [HERMES])
+                if found is None:
+                    return self.send(404, {"error": "That file is not in this chat."})
+                types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                         ".webp": "image/webp", ".heic": "image/heic", ".pdf": "application/pdf",
+                         ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
+                         ".json": "application/json", ".csv": "text/plain; charset=utf-8"}
+                try:
+                    data = found.read_bytes()
+                except OSError:
+                    return self.send(404, {"error": "That file is not in this chat."})
+                return self.send(200, data, types.get(found.suffix.lower(), "application/octet-stream"))
+            slash = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/slash", path)
+            if slash and self.command == "POST":
+                pid, sid = slash.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                command = str(self.json_body().get("command") or "").strip()
+                result = turns.run_slash(profile_home(pid), sid, command)
+                return self.send(200, transcript.public_slash(result))
             media = re.fullmatch(r"/m/chat/([^/]+)/media-capabilities", path)
             if media and self.command == "GET":
                 pid = media.group(1)
@@ -1984,7 +2158,18 @@ class H(BaseHTTPRequestHandler):
             home = profile_home(pid)
             d = self.json_body()
             if m.group(2) == "new":
-                return self.send(201, turns.create_session(home, pid, d.get("title"), d.get("request_id")))
+                created = turns.create_session(home, pid, d.get("title"), d.get("request_id"))
+                # A titled create can reopen an existing desktop chat by name.
+                # Only an untitled create through the mobile endpoint proves origin.
+                if not d.get("title") and created.get("session_id"):
+                    try:
+                        journal = turns.primary_journal(admissions_dir())
+                        # Inbox rows carry the stored id, which differs once Hermes resumes a lineage.
+                        for sid in {created["session_id"], created.get("stored_session_id") or created["session_id"]}:
+                            journal.record_mobile_origin(pid, sid)
+                    except (OSError, sqlite3.Error) as exc:
+                        log("Could not record mobile origin: %s" % type(exc).__name__)
+                return self.send(201, created)
             sid, action = m.group(2).rsplit("/", 1)
             if action == "runtime":
                 applied = turns.set_runtime(home, sid, d)
@@ -2079,7 +2264,28 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = lambda self: self.route()
+    def _guarded(self):
+        """A handler that raises would close the socket with no reply; the phone then sees a transport
+        failure and Tailscale Serve reports 502. Answer once instead, unless a reply already started."""
+        self._replied = False
+        try:
+            return self.route()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as error:
+            log("Unhandled %s on %s %s" % (type(error).__name__, self.command, urlsplit(self.path).path))
+            self.close_connection = True
+            if not self._replied:
+                try:
+                    self.send(500, {"error": "The bridge could not handle this request."}, close=True)
+                except OSError:
+                    pass
+
+    def send_response(self, code, message=None):
+        self._replied = True
+        super().send_response(code, message)
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = lambda self: self._guarded()
 
     def login(self):
         who = (self.headers.get("Tailscale-User-Login") or "local").strip().lower()[:120]
@@ -2173,16 +2379,21 @@ class H(BaseHTTPRequestHandler):
                 if self.headers.get("If-None-Match") == tag:
                     return self.send(304, validator=tag)
                 return self.send(200, compact, validator=tag)
+        c = http.client.HTTPConnection(*UPSTREAM, timeout=900 if stream else 120)
         try:
-            c = http.client.HTTPConnection(*UPSTREAM, timeout=900 if stream else 120)
             c.request(self.command, up, body=data, headers=headers)
             upstream_socket = c.sock
             r = c.getresponse()
         except Exception as e:
+            c.close()
             return self.send(502, {"error": "Hermes gateway is not answering (%s)." % type(e).__name__})
         try:
             if not stream:
-                raw = r.read()
+                try:
+                    raw = r.read()
+                except (OSError, http.client.HTTPException):
+                    # A reset here is upstream. The phone is still connected and needs a reply.
+                    return self.send(502, {"error": "Hermes gateway disconnected before finishing its response."})
                 if (r.status == 200 and self.command == "GET" and self.headers.get("X-Hermes-Transcript") == "timeline-v1"
                         and re.fullmatch(r"/api/sessions/[^/]+/messages", tail)):
                     try:

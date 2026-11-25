@@ -7,23 +7,49 @@ struct SettingsView: View {
     @State private var addingGateway = false
     @State private var gatewayError: String?
     @State private var capabilities: BridgeCapabilities?
+    @State private var forgetting: URL?
+
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (\(build))"
+    }
+
+    /// Reachability is a count only once the bot list has loaded; before then it is unknown, not zero.
+    private var botsSummary: String {
+        if app.loadError != nil { return "Unavailable" }
+        guard app.botsLoaded else { return "Checking…" }
+        if app.bots.isEmpty { return "No bots reported" }
+        return "\(app.bots.filter(\.reachable).count) of \(app.bots.count) reachable"
+    }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Gateways") {
-                    ForEach(app.savedGateways, id: \.self) { url in
-                        if url == API.shared.baseURL {
-                            Label(url.absoluteString, systemImage: "checkmark")
-                                .accessibilityLabel("Active gateway, " + url.absoluteString)
-                        } else {
-                            Button(url.absoluteString) {
-                                do { try app.switchGateway(url) } catch { gatewayError = error.localizedDescription }
-                            }
+                Section {
+                    if let current = API.shared.baseURL {
+                        GatewayRow(name: SavedGateways.displayName(current), detail: current.absoluteString, isCurrent: true)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Current gateway, \(SavedGateways.displayName(current))")
+                    }
+                    ForEach(app.savedGateways.filter { $0 != API.shared.baseURL }, id: \.self) { url in
+                        Button {
+                            do { try app.switchGateway(url) } catch { gatewayError = error.localizedDescription }
+                        } label: {
+                            GatewayRow(name: SavedGateways.displayName(url), detail: url.absoluteString, isCurrent: false)
+                        }
+                        .accessibilityLabel("Switch to gateway \(SavedGateways.displayName(url))")
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button("Remove", systemImage: "trash", role: .destructive) { forgetting = url }
                         }
                     }
                     Button("Add Gateway", systemImage: "plus") { addingGateway = true }
                     if let gatewayError { Text(gatewayError).foregroundStyle(.red) }
+                } header: {
+                    Text("Gateways")
+                } footer: {
+                    Text("Chats, files and approvals stay on the gateway you choose.")
                 }
                 Section("Hermes server") {
                     if let caps = capabilities, caps.features.contains("device_grants") {
@@ -34,7 +60,7 @@ struct SettingsView: View {
                     LabeledContent("Gateway") { ConnectionBadge() }
                     if let v = app.health?.version { LabeledContent("Hermes", value: v) }
                     NavigationLink { SettingsBotsList() } label: {
-                        LabeledContent("Bots", value: "\(app.bots.filter(\.reachable).count) of \(app.bots.count) reachable")
+                        LabeledContent("Bots", value: botsSummary)
                     }
                     .accessibilityIdentifier("settings.bots")
                     .accessibilityHint("Shows every bot and whether it is reachable")
@@ -51,6 +77,11 @@ struct SettingsView: View {
                 }
                 Section {
                     Button("Sign Out", role: .destructive) { confirmSignOut = true }
+                } footer: {
+                    Text("Hermes Mobile \(appVersion)")
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 8)
+                        .accessibilityLabel("App version \(appVersion)")
                 }
             }
             .navigationTitle("Settings")
@@ -66,6 +97,15 @@ struct SettingsView: View {
                 async let bots: Void = app.refreshBots()
                 await app.status.refresh(force: true, app: app)
                 _ = await (health, bots)
+            }
+            .confirmationDialog("Remove this gateway from the phone?", isPresented: Binding(
+                get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }
+            ), titleVisibility: .visible, presenting: forgetting) { url in
+                Button("Remove " + SavedGateways.displayName(url), role: .destructive) {
+                    Task { await app.forgetGateway(url) }
+                }
+            } message: { _ in
+                Text("Its saved sign-in, cached chats and drafts are deleted from this phone. Chats stay on the gateway.")
             }
             .confirmationDialog("Sign out of this server?", isPresented: $confirmSignOut, titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) {
@@ -93,13 +133,45 @@ struct SettingsView: View {
     }
 }
 
+/// One saved gateway. `isCurrent` marks the origin this phone is signed in to now; the rest are
+/// switchable rows, so chats, files and approvals move as a unit and never bleed between Macs.
+private struct GatewayRow: View {
+    let name: String
+    let detail: String
+    let isCurrent: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "server.rack")
+                .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name).font(.body).foregroundStyle(.primary)
+                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if isCurrent {
+                Label("Current", systemImage: "checkmark.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
+                    .labelStyle(.titleAndIcon)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+}
+
 /// Read-only list of the bots Hermes knows. Nothing here changes server settings.
 private struct SettingsBotsList: View {
     @Environment(AppModel.self) private var app
     var body: some View {
         List {
             if let e = app.loadError { Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary) }
-            if app.bots.isEmpty { Text("No bots found.").foregroundStyle(.secondary) }
+            if app.botsLoaded && app.bots.isEmpty && app.loadError == nil {
+                Text("This gateway reported no bots.").foregroundStyle(.secondary)
+            } else if !app.botsLoaded && app.loadError == nil {
+                HStack { Spacer(); ProgressView(); Spacer() }.listRowBackground(Color.clear)
+            }
             ForEach(app.bots) { bot in
                 NavigationLink { BotDetailView(bot: bot) } label: { BotRow(bot: bot) }
                     .disabled(!bot.reachable)

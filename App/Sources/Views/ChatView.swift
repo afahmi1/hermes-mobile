@@ -27,7 +27,8 @@ struct ChatScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showRuntime = false
     @State private var sendTick = 0
-    @FocusState private var composerFocused: Bool
+    @State private var showFullComposer = false
+    @State private var previewedImage: UIImage?
     @State private var pickerItem: PhotosPickerItem?
     @State private var showPicker = false
     @State private var showFilePicker = false
@@ -62,7 +63,23 @@ struct ChatScreen: View {
                         emptyState.padding(.top, 60)
                     }
                     ForEach(chat.items) { item in
-                        MessageRow(item: item).id(item.id)
+                        MessageRow(item: item, profile: chat.profile, session: chat.sessionId).id(item.id)
+                    }
+                    if !chat.isRunning, !backgroundTasks.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(backgroundTasks.count == 1
+                                 ? "Will resume when 1 background task finishes"
+                                 : "Will resume when \(backgroundTasks.count) background tasks finish")
+                                .font(.subheadline.weight(.semibold))
+                            ForEach(Array(backgroundTasks.enumerated()), id: \.offset) { _, task in
+                                Text(task.model.isEmpty ? task.title : "\(task.title) · \(task.model)")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+                        .padding(.horizontal, 12)
                     }
                     if let s = chat.status {
                         HStack(spacing: 8) {
@@ -92,8 +109,15 @@ struct ChatScreen: View {
                     Button {
                         followLatest = true
                         proxy.scrollTo("bottom", anchor: .bottom)
-                    } label: { Label("Latest", systemImage: "arrow.down") }
-                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                    } label: {
+                        Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityLabel("Jump to latest message")
                     .padding(.trailing, 12).padding(.bottom, 6)
                 }
             }
@@ -110,7 +134,12 @@ struct ChatScreen: View {
                     .disabled(chat.savingRuntime)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                ConnectionBadge()
+                HStack(spacing: 12) {
+                    Button { Task { await chat.load() } } label: { Image(systemName: "arrow.clockwise") }
+                        .disabled(chat.isLoading || chat.isRunning)
+                        .accessibilityLabel("Reload chat")
+                    ConnectionBadge()
+                }
             }
         }
         .sheet(isPresented: $showRuntime) {
@@ -122,14 +151,24 @@ struct ChatScreen: View {
         .sheet(item: $chat.approval) { req in
             ApprovalSheet(req: req, busy: chat.answeringApproval, error: chat.approvalError) { answer in Task { await chat.answer(req, choice: answer) } }
         }
-        .onChange(of: chat.draft) { old, new in
-            // A huge paste leaves the composer and rides as a removable chip (T3-style).
-            if let paste = PasteSplit.insertion(old: old, new: new) {
-                chat.absorbPaste(paste)
-                chat.draft = old
+        .fullScreenCover(isPresented: $showFullComposer) {
+            NavigationStack {
+                VStack(alignment: .leading, spacing: 8) {
+                    draftShelf
+                    composerField(expanded: true).padding(.horizontal, 16)
+                    if let error = chat.error { Text(error).font(.footnote).foregroundStyle(.orange).padding(.horizontal) }
+                }
+                .navigationTitle("Message")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) { Button("Done") { showFullComposer = false } }
+                }
+                .fullScreenCover(isPresented: previewPresented) { imagePreview }
             }
         }
-        .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: .any(of: [.images, .videos]))
+        .fullScreenCover(isPresented: Binding(get: { !showFullComposer && previewedImage != nil },
+                                             set: { if !$0 { previewedImage = nil } })) { imagePreview }
+        .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: imagesAvailable ? .any(of: [.images, .videos]) : .videos)
         .task(id: pickerItem) { if let pickerItem { await importMedia(pickerItem) } }
         .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             importFiles(result)
@@ -144,7 +183,7 @@ struct ChatScreen: View {
                     defer { preparingMedia = false }
                     do {
                         guard let preview = await image.byPreparingThumbnail(ofSize: CGSize(width: 1600, height: 1600)) else { throw ChatMedia.Failure.unreadable }
-                        if account == app.inboxAccount { chat.draftAttachments.append(try ChatMedia.jpeg(preview, name: "Camera")) }
+                        try appendMedia([ChatMedia.jpeg(preview, name: "Camera")], account: account)
                     } catch { chat.error = error.localizedDescription }
                 }
             }.ignoresSafeArea()
@@ -153,7 +192,7 @@ struct ChatScreen: View {
             if mediaCapabilities?.video == true, chat.draftAttachments.isEmpty {
                 Button("Send clip for Hermes video analysis") { prepareClip() }
             }
-            Button("Choose from up to 3 frames") { prepareFrames() }
+            if imagesAvailable { Button("Choose from up to 3 frames") { prepareFrames() } }
             Button("Cancel", role: .cancel) { discardVideo() }
         } message: { Text(mediaCapabilities?.video == true ? "A clip includes audio and may be processed by the gateway’s video provider. Frames are still images you can review before sending." : "This gateway accepts still images. Review and remove frames before sending. Frames contain no audio.") }
         .onDisappear { discardVideo() }
@@ -161,9 +200,14 @@ struct ChatScreen: View {
         .sensoryFeedback(.success, trigger: chat.completedTick)
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
-        .task(id: chat.profile) { mediaCapabilities = try? await API.shared.mediaCapabilities(profile: chat.profile) }
+        .task { await chat.loadPalette() }
+        // Re-ask when the gateway comes back: one failed probe must not hide attachments for the visit.
+        .task(id: [chat.profile, app.health?.ok == true ? "up" : "down"]) {
+            if let latest = try? await API.shared.mediaCapabilities(profile: chat.profile), !Task.isCancelled {
+                mediaCapabilities = latest
+            }
+        }
         .task(id: scenePhase) { if scenePhase == .active { await poll() } }
-        .refreshable { await chat.load() }
     }
 
     private var titleBlock: some View {
@@ -180,10 +224,20 @@ struct ChatScreen: View {
     private var runtimeLabel: String {
         if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
-        if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + (c.model ?? bot?.model ?? "Bot default") }
         let model = c.model ?? bot?.model ?? "default"
+        let provider = c.provider ?? bot?.provider ?? ""
+        let who = provider.isEmpty ? model : "\(model) · \(provider)"
+        if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
         let effort = c.effort.flatMap { Effort(rawValue: $0)?.label } ?? "default effort"
-        return c.isDefault ? "\(model) · bot default" : "\(model) · \(effort)"
+        return c.isDefault ? "\(who) · bot default" : "\(who) · \(effort)"
+    }
+
+    private var backgroundTasks: [(title: String, model: String)] {
+        guard let session = chat.sessionId else { return [] }
+        return (app.status.payload?["agents"].array ?? []).compactMap { row in
+            guard row["kind"].string == "subagent", row["parent_session_id"].string == session else { return nil }
+            return (row["title"].string ?? row["name"].string ?? "Background task", row["model"].string ?? "")
+        }
     }
 
     private var emptyState: some View {
@@ -205,11 +259,56 @@ struct ChatScreen: View {
     private var filesAvailable: Bool { mediaCapabilities?.files == true }
 
     private var canAttach: Bool {
-        !chat.isRunning && (imagesAvailable || filesAvailable)
+        !chat.isRunning && (imagesAvailable || filesAvailable || mediaCapabilities?.video == true)
     }
 
     private var attachmentLimitReached: Bool {
         chat.draftAttachments.count >= 4 || chat.draftAttachments.contains { $0.mime == "video/mp4" }
+    }
+
+    private var previewPresented: Binding<Bool> {
+        Binding(get: { previewedImage != nil }, set: { if !$0 { previewedImage = nil } })
+    }
+
+    @ViewBuilder private var imagePreview: some View {
+        if let previewedImage { FullImagePreview(image: previewedImage) }
+    }
+
+    private func composerField(expanded: Bool) -> some View {
+        ComposerField(text: $chat.draft, placeholder: "Message \(bot?.name ?? "Hermes")",
+                      expanded: expanded, onPasteText: chat.absorbPaste, onPasteImage: importPastedImage)
+    }
+
+    @ViewBuilder private var draftShelf: some View {
+        if !chat.pastedTexts.isEmpty {
+            ScrollView(.horizontal) {
+                HStack {
+                    ForEach(chat.pastedTexts) { chunk in
+                        PasteChip(text: Binding(get: { chat.pastedTexts.first { $0.id == chunk.id }?.text ?? "" },
+                                               set: { value in
+                                if let index = chat.pastedTexts.firstIndex(where: { $0.id == chunk.id }) { chat.pastedTexts[index].text = value }
+                            })) {
+                            chat.removePastedText(chunk.id)
+                        }
+                    }
+                }.padding(.horizontal, 12)
+            }.scrollIndicators(.hidden)
+        }
+        if !chat.draftAttachments.isEmpty {
+            ScrollView(.horizontal) {
+                HStack {
+                    ForEach(Array(chat.draftAttachments.enumerated()), id: \.offset) { index, asset in
+                        AttachmentChip(attachment: asset, preview: {
+                            if let data = Data(base64Encoded: asset.base64), let image = UIImage(data: data) {
+                                previewedImage = image
+                            }
+                        }) {
+                            if chat.draftAttachments.indices.contains(index) { chat.draftAttachments.remove(at: index) }
+                        }
+                    }
+                }.padding(.horizontal, 12)
+            }.scrollIndicators(.hidden)
+        }
     }
 
     private var composer: some View {
@@ -217,7 +316,15 @@ struct ChatScreen: View {
             if let e = chat.error {
                 HStack(alignment: .top) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text(e).font(.footnote)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(e).font(.footnote)
+                        if chat.hasUnconfirmedSend {
+                            Button("Move back to composer") { Task { await chat.cancelUnconfirmedSend() } }
+                                .font(.footnote.weight(.semibold))
+                                .frame(minHeight: 44, alignment: .leading)
+                                .accessibilityHint("Stops waiting for confirmation and returns the message for editing")
+                        }
+                    }
                     Spacer()
                     Button { chat.error = nil } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
                         .accessibilityLabel("Dismiss error")
@@ -234,31 +341,19 @@ struct ChatScreen: View {
                 }
                 .padding(.horizontal, 16)
             }
-            if !chat.pastedTexts.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack {
-                        ForEach(chat.pastedTexts) { chunk in
-                            PasteChip(text: chunk.text) { chat.removePastedText(chunk.id) }
-                        }
-                    }.padding(.horizontal, 12)
-                }.scrollIndicators(.hidden)
+            if let filter = SlashCommand.filter(in: chat.draft), chat.draftAttachments.isEmpty, !chat.isRunning {
+                SlashMenu(commands: chat.slashCommands, skills: chat.skillCommands, filter: filter) { name in
+                    chat.draft = "/" + name + " "
+                }
             }
-            if !chat.draftAttachments.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack {
-                        ForEach(Array(chat.draftAttachments.enumerated()), id: \.offset) { index, asset in
-                            AttachmentChip(attachment: asset) {
-                                if chat.draftAttachments.indices.contains(index) { chat.draftAttachments.remove(at: index) }
-                            }
-                        }
-                    }.padding(.horizontal, 12)
-                }.scrollIndicators(.hidden)
-            }
+            draftShelf
             HStack(alignment: .bottom, spacing: 8) {
                 if canAttach {
                     Menu {
+                        if imagesAvailable || mediaCapabilities?.video == true {
+                            Button { showPicker = true } label: { Label(imagesAvailable ? "Photo or video" : "Video", systemImage: "photo.on.rectangle") }
+                        }
                         if imagesAvailable {
-                            Button { showPicker = true } label: { Label("Photo or video", systemImage: "photo.on.rectangle") }
                             if UIImagePickerController.isSourceTypeAvailable(.camera) {
                                 Button { openCamera() } label: { Label("Take photo", systemImage: "camera") }
                             }
@@ -274,21 +369,38 @@ struct ChatScreen: View {
                     .disabled(attachmentLimitReached || preparingMedia)
                     .accessibilityLabel("Add photo, video or file")
                 }
-                TextField("Message \(bot?.name ?? "Hermes")", text: $chat.draft, axis: .vertical)
-                    .lineLimit(1...8)
-                    .focused($composerFocused)
-                    .padding(.horizontal, 14).padding(.vertical, 9)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20))
+                if chat.draft.isEmpty || chat.draft.hasPrefix("/") {
+                    Button {
+                        if chat.draft.isEmpty { chat.draft = "/" }
+                    } label: {
+                        Text("/").font(.title2.weight(.medium)).frame(width: 36, height: 44)
+                    }
+                    .disabled(chat.isRunning || chat.slashBusy)
+                    .accessibilityLabel("Slash commands")
+                }
+                composerField(expanded: false)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20))
+                .frame(maxWidth: .infinity, alignment: .bottom)
+
+                Button { showFullComposer = true } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 15, weight: .medium)).foregroundStyle(.secondary)
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Expand composer")
                 if chat.isRunning {
                     Button { Task { await chat.stop() } } label: {
                         Image(systemName: "stop.circle.fill").font(.system(size: 32)).foregroundStyle(.red)
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
                     }
                     .accessibilityLabel("Stop")
                 } else {
                     Button { send() } label: {
                         Image(systemName: "arrow.up.circle.fill").font(.system(size: 32))
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
                     }
-                    .disabled(preparingMedia || chat.savingRuntime || (chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty && chat.pastedTexts.isEmpty))
+                    .disabled(preparingMedia || chat.savingRuntime || chat.slashBusy || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     .accessibilityLabel("Send")
                 }
             }
@@ -315,21 +427,71 @@ struct ChatScreen: View {
         }
     }
 
+    private func issue(for assets: [SendAttachment]) -> String? {
+        AttachmentSelection.issue(assets, fileLimit: mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024,
+                                   videoLimit: mediaCapabilities?.maxVideoBytes ?? 4 * 1024 * 1024)
+    }
+
+    private func appendMedia(_ assets: [SendAttachment], account: String?) {
+        guard !Task.isCancelled, let account, account == app.inboxAccount else { return }
+        let proposed = chat.draftAttachments + assets
+        if let problem = issue(for: proposed) { chat.error = problem; return }
+        chat.draftAttachments = proposed
+    }
+
     private func importMedia(_ item: PhotosPickerItem) async {
+        let account = app.inboxAccount
         preparingMedia = true
         defer { preparingMedia = false; pickerItem = nil }
         do {
             if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
                 discardVideo()
-                pickedVideo = try await MediaImport.videoFile(from: item)
+                let file = try await MediaImport.videoFile(from: item)
+                guard !Task.isCancelled, let account, account == app.inboxAccount else {
+                    try? FileManager.default.removeItem(at: file)
+                    return
+                }
+                pickedVideo = file
                 chooseVideo = true
             } else {
                 let data = try await MediaImport.imageData(from: item)
                 if Task.isCancelled { return }
                 let asset = try await Task.detached(priority: .userInitiated) { try ChatMedia.image(from: data) }.value
-                if !Task.isCancelled { chat.draftAttachments.append(asset) }
+                appendMedia([asset], account: account)
             }
         } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
+    }
+
+    /// An image pasted into the composer becomes a reviewable attachment. The pasteboard is read
+    /// only at paste time (never on load); the budget, the active account and cancellation are all
+    /// re-checked before anything is committed to the draft.
+    private func importPastedImage(_ image: UIImage) {
+        guard imagesAvailable else { chat.error = "This bot cannot receive images."; return }
+        guard !chat.isRunning else { chat.error = "You can attach images when the current reply finishes."; return }
+        guard !preparingMedia else { chat.error = "Wait for the current attachment to finish."; return }
+        if chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) {
+            chat.error = "Remove the video before pasting an image."
+            return
+        }
+        guard chat.draftAttachments.count < 4 else {
+            chat.error = "Remove an attachment before pasting another."
+            return
+        }
+        let account = app.inboxAccount
+        preparingMedia = true
+        Task {
+            defer { preparingMedia = false }
+            do {
+                guard let preview = await image.byPreparingThumbnail(ofSize: CGSize(width: 2048, height: 2048)) else {
+                    throw ChatMedia.Failure.unreadable
+                }
+                try Task.checkCancellation()
+                let asset = try ChatMedia.pasted(preview)
+                appendMedia([asset], account: account)
+            } catch {
+                if !Task.isCancelled { chat.error = error.localizedDescription }
+            }
+        }
     }
 
     /// Files keeps the original bytes and type; only images reuse the photo pipeline. The
@@ -349,9 +511,8 @@ struct ChatScreen: View {
             preparingMedia = true
             Task {
                 defer { preparingMedia = false }
-                let original = chat.draftAttachments
                 var added: [SendAttachment] = []
-                var left = cap - original.reduce(0) { $0 + $1.byteCount }
+                var left = cap - chat.draftAttachments.reduce(0) { $0 + $1.byteCount }
                 for url in urls {
                     if Task.isCancelled { return }
                     let accessed = url.startAccessingSecurityScopedResource()
@@ -361,7 +522,7 @@ struct ChatScreen: View {
                         if type?.conforms(to: .movie) == true {
                             guard urls.count == 1 else { chat.error = "Choose a video on its own to review the clip or frames."; return }
                             let snapshot = try await Task.detached { try MediaStaging.stage(url) }.value
-                            guard account == app.inboxAccount else { try? FileManager.default.removeItem(at: snapshot); return }
+                            guard !Task.isCancelled, account == app.inboxAccount else { try? FileManager.default.removeItem(at: snapshot); return }
                             discardVideo()
                             pickedVideo = snapshot
                             chooseVideo = true
@@ -382,8 +543,7 @@ struct ChatScreen: View {
                         return
                     }
                 }
-                guard chat.draftAttachments == original, account == app.inboxAccount else { return }
-                chat.draftAttachments.append(contentsOf: added)
+                appendMedia(added, account: account)
             }
         }
     }
@@ -402,7 +562,7 @@ struct ChatScreen: View {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
                 let clip = try await ChatMedia.clip(from: url, maxBytes: caps.maxVideoBytes)
-                if account == app.inboxAccount { chat.draftAttachments = [clip] }
+                appendMedia([clip], account: account)
             } catch { chat.error = error.localizedDescription }
         }
     }
@@ -416,7 +576,7 @@ struct ChatScreen: View {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
                 let frames = try await ChatMedia.frames(from: url, count: min(3, 4 - chat.draftAttachments.count))
-                if account == app.inboxAccount { chat.draftAttachments += frames }
+                appendMedia(frames, account: account)
             } catch { chat.error = error.localizedDescription }
         }
     }
@@ -434,22 +594,30 @@ struct ChatScreen: View {
     }
 
     private func send() {
-        let text = chat.combinedDraft
         let attachments = chat.draftAttachments
-        let budget = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
-        guard attachments.reduce(0, { $0 + $1.byteCount }) <= budget else {
-            chat.error = "The attachments exceed this bot’s limit. Remove an attachment and try again."
+        let text = chat.combinedDraft
+        if let problem = issue(for: attachments) {
+            chat.error = problem
             return
         }
-        chat.draft = ""
-        chat.pastedTexts = []
+        if attachments.isEmpty, chat.acceptsSlash(text) {
+            followLatest = true
+            sendTick += 1
+            Task { await chat.runSlash(text) }
+            return
+        }
+        // The draft and pasted text are cleared by ChatModel.send only after the outbox is staged,
+        // so a failed send keeps the composer intact instead of wiping it up front.
         followLatest = true
         sendTick += 1
         let context = ProjectContext.chosen(scope: projectScope?.projectID, optedIn: includeProjectContext && !chat.isRunning)
+        let opted = includeProjectContext
         includeProjectContext = false  // ask every send
         Task {
             await chat.send(text, projectContext: context, attachments: attachments)
             app.adopt(chat, draftKey: draftKey)
+            // A send that never left keeps its draft, so it keeps the context choice made for it too.
+            if opted, !chat.isRunning, !chat.hasUnconfirmedSend, chat.combinedDraft == text, chat.draftAttachments == attachments { includeProjectContext = true }
         }
     }
 
@@ -462,28 +630,218 @@ struct ChatScreen: View {
     }
 }
 
-/// A collapsed long paste, removable before send.
+/// A collapsed long paste, editable and removable before send.
 struct PasteChip: View {
-    let text: String
+    @Binding var text: String
     let remove: () -> Void
+    @State private var editing = false
+
     var body: some View {
-        Button(action: remove) {
-            HStack(spacing: 5) {
-                Image(systemName: "doc.on.clipboard").font(.caption)
-                Text("Pasted text · \(text.count.formatted()) characters").font(.caption2).lineLimit(1)
-                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+        HStack(spacing: 0) {
+            Button { editing = true } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "doc.on.clipboard").font(.caption)
+                    Text("Pasted text · \(text.count.formatted()) characters").font(.caption2).lineLimit(1)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 8).padding(.vertical, 5)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .buttonStyle(.plain)
+            .accessibilityLabel("Edit pasted text, \(text.count) characters")
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove pasted text, \(text.count) characters")
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Remove pasted text, \(text.count) characters")
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+        .sheet(isPresented: $editing) {
+            PasteEditSheet(text: $text) { remove() }
+        }
+    }
+}
+
+/// Edits one collapsed paste in place; the chip and the sendable draft stay bound to the same text.
+struct PasteEditSheet: View {
+    @Binding var text: String
+    let remove: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            TextEditor(text: $text)
+                .focused($focused)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .navigationTitle("Pasted text")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Remove", role: .destructive) { remove(); dismiss() }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+        }
+        .onAppear { focused = true }
+    }
+}
+
+/// A native, growing text field that intercepts the standard paste gesture so an image on the
+/// pasteboard becomes an attachment instead of being dropped, and long text still rides the
+/// existing PasteSplit path. The pasteboard is never read on load — only inside `paste(_:)`.
+struct ComposerField: UIViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+    var expanded: Bool
+    var onPasteText: (String) -> Void
+    var onPasteImage: (UIImage) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> PasteTextView {
+        let view = PasteTextView()
+        view.delegate = context.coordinator
+        view.font = .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.isScrollEnabled = true
+        view.isEditable = true
+        view.dataDetectorTypes = []
+        view.autocorrectionType = .default
+        view.spellCheckingType = .default
+        view.smartQuotesType = .yes
+        view.smartDashesType = .yes
+        view.smartInsertDeleteType = .yes
+        view.keyboardDismissMode = .interactive
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.onPasteText = onPasteText
+        view.onPasteImage = onPasteImage
+        view.focusOnAppearance = expanded
+        view.accessibilityLabel = placeholder
+        view.placeholder = placeholder
+        view.text = text
+        view.updatePlaceholder()
+        return view
+    }
+
+    func updateUIView(_ view: PasteTextView, context: Context) {
+        context.coordinator.parent = self
+        if view.text != text {
+            view.text = text
+        }
+        view.placeholder = placeholder
+        view.onPasteText = onPasteText
+        view.onPasteImage = onPasteImage
+        view.updatePlaceholder()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: PasteTextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
+        if expanded, let height = proposal.height, height.isFinite { return CGSize(width: width, height: height) }
+        let line = uiView.font?.lineHeight ?? 21
+        let height = min(max(uiView.textHeight(forWidth: width), line), line * 8)
+        return CGSize(width: width, height: height)
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: ComposerField
+        init(_ parent: ComposerField) { self.parent = parent }
+        func textViewDidChange(_ textView: UITextView) {
+            let view = textView as? PasteTextView
+            if textView.text != parent.text { parent.text = textView.text }
+            view?.updatePlaceholder()
+        }
+    }
+}
+
+final class PasteTextView: UITextView {
+    var onPasteText: ((String) -> Void)?
+    var onPasteImage: ((UIImage) -> Void)?
+    var focusOnAppearance = false
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if focusOnAppearance, window != nil {
+            focusOnAppearance = false
+            becomeFirstResponder()
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)), UIPasteboard.general.hasImages { return isEditable }
+        return super.canPerformAction(action, withSender: sender)
+    }
+    var placeholder: String = "" {
+        didSet { placeholderLabel.text = placeholder; updatePlaceholder() }
+    }
+
+    private let placeholderLabel = UILabel()
+
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        placeholderLabel.font = .preferredFont(forTextStyle: .body)
+        placeholderLabel.adjustsFontForContentSizeCategory = true
+        placeholderLabel.textColor = .placeholderText
+        placeholderLabel.numberOfLines = 1
+        addSubview(placeholderLabel)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func updatePlaceholder() {
+        placeholderLabel.isHidden = !text.isEmpty
+    }
+
+    /// Read the pasteboard only at the moment of an actual paste, never on load or appear.
+    override func paste(_ sender: Any?) {
+        // Spreadsheets, slides and Universal Clipboard often carry a picture of the copied text beside
+        // the text itself. Text wins when both are present; an image-only pasteboard attaches the image.
+        let board = UIPasteboard.general
+        if !board.hasStrings, board.hasImages, let image = board.image {
+            onPasteImage?(image)
+            return
+        }
+        if let pasted = UIPasteboard.general.string, PasteSplit.collapse(pasted) {
+            onPasteText?(pasted)
+            if let selection = selectedTextRange, !selection.isEmpty { replace(selection, withText: "") }
+            return
+        }
+        super.paste(sender)
+    }
+
+    func textHeight(forWidth width: CGFloat) -> CGFloat {
+        let insets = textContainerInset
+        let padding = textContainer.lineFragmentPadding
+        let maxWidth = max(0, width - insets.left - insets.right - padding * 2)
+        let rect = (text as NSString).boundingRect(
+            with: CGSize(width: maxWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font ?? .preferredFont(forTextStyle: .body)],
+            context: nil)
+        return ceil(rect.height) + insets.top + insets.bottom
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let x = textContainerInset.left + textContainer.lineFragmentPadding
+        let y = textContainerInset.top
+        placeholderLabel.sizeToFit()
+        placeholderLabel.frame.origin = CGPoint(x: x, y: y)
     }
 }
 
 struct MessageRow: View {
     @State private var toolsExpanded = false
+    @State private var activityExpanded = false
     let item: ChatItem
+    var profile: String = ""
+    var session: String?
 
     var body: some View {
         switch item.kind {
@@ -494,26 +852,32 @@ struct MessageRow: View {
                     if let note = item.contextNote {
                         Label(note, systemImage: "folder.badge.gearshape").font(.caption2).foregroundStyle(.secondary)
                     }
-                    Text(item.text)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 14).padding(.vertical, 10)
-                        .foregroundStyle(.white)
-                        .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    if !item.text.isEmpty {
+                        Text(item.text)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 14).padding(.vertical, 10)
+                            .foregroundStyle(.white)
+                            .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    }
+                    TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .trailing)
                 }
             }
             .padding(.horizontal, 12)
         case .assistant:
             VStack(alignment: .leading, spacing: 4) {
-                Group {
-                    if item.streaming { Text(verbatim: item.text).textSelection(.enabled) }
-                    else { MarkdownText(text: item.text) }
-                }
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                    .contextMenu {
-                        Button { UIPasteboard.general.string = item.text } label: { Label("Copy", systemImage: "doc.on.doc") }
-                        ShareLink(item: item.text)
+                if !item.text.isEmpty {
+                    Group {
+                        if item.streaming { Text(verbatim: item.text).textSelection(.enabled) }
+                        else { MarkdownText(text: item.text) }
                     }
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .contextMenu {
+                            Button { UIPasteboard.general.string = item.text } label: { Label("Copy", systemImage: "doc.on.doc") }
+                            ShareLink(item: item.text)
+                        }
+                }
+                TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
                 if let f = item.footer {
                     Label(f, systemImage: "cpu").font(.caption2).foregroundStyle(.secondary).padding(.leading, 10)
                         .accessibilityLabel("Answered by \(f)")
@@ -536,16 +900,46 @@ struct MessageRow: View {
             .accessibilityElement(children: .combine)
         case .tools:
             DisclosureGroup(isExpanded: $toolsExpanded) {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(item.tools.enumerated()), id: \.offset) { _, tool in
-                        Text(tool.replacingOccurrences(of: "_", with: " ")).font(.caption.monospaced())
+                VStack(alignment: .leading, spacing: 8) {
+                    if item.activities.isEmpty {
+                        ForEach(Array(item.tools.enumerated()), id: \.offset) { _, tool in
+                            Text(tool.replacingOccurrences(of: "_", with: " ")).font(.caption.monospaced())
+                        }
+                    } else {
+                        ForEach(item.activities) { row in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(ToolLanguage.title(row))
+                                    .font(.caption)
+                                    .strikethrough(row.state == "failed", color: .red)
+                                    .foregroundStyle(row.state == "failed" ? Color.red : Color.primary)
+                                if !row.result.isEmpty {
+                                    Text(row.result).font(.caption2).foregroundStyle(.secondary).lineLimit(3)
+                                }
+                            }
+                        }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             } label: {
-                Label("\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")", systemImage: "wrench.and.screwdriver")
+                Label(item.activities.isEmpty
+                      ? "\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")"
+                      : ToolLanguage.summary(item.activities),
+                      systemImage: "wrench.and.screwdriver")
                     .font(.subheadline)
             }
             .foregroundStyle(.secondary)
+            .padding(.horizontal, 18)
+        case .activity:
+            DisclosureGroup(isExpanded: $activityExpanded) {
+                if !item.detail.isEmpty {
+                    Text(item.detail).font(.caption).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } label: {
+                Label(item.text, systemImage: item.failed ? "exclamationmark.triangle" : "arrow.triangle.branch")
+                    .font(.subheadline)
+                    .foregroundStyle(item.failed ? Color.red : Color.secondary)
+                    .strikethrough(item.failed, color: .red)
+            }
             .padding(.horizontal, 18)
         case .notice:
             Text(item.text).font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
@@ -588,6 +982,159 @@ struct ApprovalSheet: View {
         case "always": "Always allow"
         case "deny": "Deny"
         default: c.capitalized
+        }
+    }
+}
+
+private enum ToolLanguage {
+    static func title(_ row: ToolActivity) -> String {
+        let preview = row.preview
+        switch row.name {
+        case "skill_view": return preview.isEmpty ? "Loaded a skill" : "Loaded skill · \(preview)"
+        case "terminal", "execute_code": return preview.isEmpty ? "Ran a command" : "Ran · \(preview)"
+        case "read_file", "search_files", "list_files": return preview.isEmpty ? "Explored files" : "Explored · \(preview)"
+        case "web_search", "web_extract": return preview.isEmpty ? "Searched" : "Searched · \(preview)"
+        case "delegate_task": return preview.isEmpty ? "Delegated a task" : "Delegated · \(preview)"
+        case "tool_search": return "Looked up tools"
+        default:
+            let spoken = row.name.replacingOccurrences(of: "_", with: " ")
+            return preview.isEmpty ? spoken : "\(spoken) · \(preview)"
+        }
+    }
+
+    static func summary(_ rows: [ToolActivity]) -> String {
+        var ran = 0, explored = 0, searched = 0, delegated = 0, skills = 0, other = 0
+        for row in rows {
+            switch row.name {
+            case "terminal", "execute_code": ran += 1
+            case "read_file", "search_files", "list_files": explored += 1
+            case "web_search", "web_extract": searched += 1
+            case "delegate_task": delegated += 1
+            case "skill_view": skills += 1
+            default: other += 1
+            }
+        }
+        var parts: [String] = []
+        if skills > 0 { parts.append(skills == 1 ? "Loaded a skill" : "Loaded \(skills) skills") }
+        if explored > 0 { parts.append(explored == 1 ? "Explored files" : "Explored \(explored) places") }
+        if ran > 0 { parts.append(ran == 1 ? "Ran 1 command" : "Ran \(ran) commands") }
+        if searched > 0 { parts.append(searched == 1 ? "Searched" : "Searched \(searched) times") }
+        if delegated > 0 { parts.append(delegated == 1 ? "Delegated a task" : "Delegated \(delegated) tasks") }
+        if other > 0 { parts.append(other == 1 ? "1 other action" : "\(other) other actions") }
+        var text = parts.isEmpty ? "\(rows.count) tool calls" : parts.joined(separator: ", ")
+        let failed = rows.filter { $0.state == "failed" }.count
+        if failed > 0 { text += failed == 1 ? " · 1 failed" : " · \(failed) failed" }
+        if rows.contains(where: { $0.state == "running" }) { text += " · still running" }
+        return text
+    }
+}
+
+private struct SlashMenu: View {
+    let commands: [SlashCommand]
+    let skills: [String]
+    let filter: String
+    let pick: (String) -> Void
+
+    var body: some View {
+        let shown = commands.filter { filter.isEmpty || $0.name.hasPrefix(filter) }.prefix(8)
+        let skillHits = skills.filter { filter.isEmpty || $0.hasPrefix(filter) }.prefix(6)
+        if !shown.isEmpty || !skillHits.isEmpty {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(shown)) { cmd in
+                        Button { pick(cmd.name) } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("/" + cmd.name).font(.subheadline.weight(.semibold))
+                                Text(cmd.hint.isEmpty ? cmd.description : "\(cmd.description) \(cmd.hint)")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if !skillHits.isEmpty {
+                        Text("Skills").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 12).padding(.top, 4)
+                        ForEach(Array(skillHits), id: \.self) { name in
+                            Button { pick(name) } label: {
+                                Text("/" + name).font(.subheadline)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 240)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .padding(.horizontal, 12)
+        }
+    }
+}
+
+private struct TranscriptImages: View {
+    let refs: [ChatMediaRef]
+    let profile: String
+    let session: String?
+    var alignment: HorizontalAlignment = .leading
+    @State private var preview: UIImage?
+
+    var body: some View {
+        if !refs.isEmpty, session != nil {
+            VStack(alignment: alignment, spacing: 6) {
+                ForEach(refs, id: \.digest) { ref in
+                    if ref.kind == "image" {
+                        TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name) {
+                            preview = $0
+                        }
+                    } else {
+                        Label(ref.name, systemImage: "doc").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .fullScreenCover(isPresented: Binding(get: { preview != nil }, set: { if !$0 { preview = nil } })) {
+                if let preview { FullImagePreview(image: preview) }
+            }
+        }
+    }
+}
+
+private struct TranscriptImage: View {
+    let profile: String
+    let session: String
+    let digest: String
+    let name: String
+    let open: (UIImage) -> Void
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Button { open(image) } label: {
+                    Image(uiImage: image).resizable().scaledToFit()
+                        .frame(maxWidth: 240, maxHeight: 220)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(name)
+            } else if failed {
+                Label(name, systemImage: "photo").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView().frame(width: 44, height: 44)
+            }
+        }
+        .task {
+            guard image == nil, !failed else { return }
+            do {
+                let data = try await API.shared.chatMedia(profile: profile, session: session, digest: digest)
+                if let decoded = UIImage(data: data) { image = decoded } else { failed = true }
+            } catch {
+                failed = true
+            }
         }
     }
 }

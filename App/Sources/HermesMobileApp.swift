@@ -1,28 +1,51 @@
 import SwiftUI
 
+private final class NotificationDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, willFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        ReplyNotifier.shared.install()
+        return true
+    }
+}
+
 @main
 struct HermesMobileApp: App {
+    @UIApplicationDelegateAdaptor(NotificationDelegate.self) private var delegate
+    @State private var selectedTab = 0
     @State private var app = AppModel()
     @Environment(\.scenePhase) private var phase
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(selectedTab: $selectedTab)
                 .environment(app)
                 .tint(Color.accentColor)
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
+                    app.retryDraftStorage()
+                }
+                .onChange(of: ReplyNotifier.shared.destination, initial: true) { _, destination in
+                    guard let destination else { return }
+                    if destination.open(in: app) { selectedTab = 0 }
+                    ReplyNotifier.shared.destination = nil
+                }
         }
         .onChange(of: phase) { _, now in
-            if now == .active { app.resumeLiveRuns() }
+            if now == .background { ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns) }
+            if now == .active {
+                ReplyNotifier.shared.returned()
+                app.retryDraftStorage()
+                app.resumeLiveRuns()
+            }
         }
     }
 }
 
 struct RootView: View {
+    @Binding var selectedTab: Int
     @Environment(AppModel.self) private var app
 
     var body: some View {
         if app.signedIn {
-            MainTabs()
+            MainTabs(selectedTab: $selectedTab)
                 .id(app.gatewaySession)
                 .task(id: app.gatewaySession) { await app.refreshBots() }
         } else {
@@ -32,22 +55,28 @@ struct RootView: View {
 }
 
 struct MainTabs: View {
+    @Binding var selectedTab: Int
     @Environment(\.scenePhase) private var phase
     @Environment(AppModel.self) private var app
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             ChatListView()
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
+                .tag(0)
             BotsView()
                 .tabItem { Label("Bots", systemImage: "person.2") }
+                .tag(1)
             ProjectsView()
                 .tabItem { Label("Projects", systemImage: "folder") }
+                .tag(2)
             StatusView()
                 .tabItem { Label("Status", systemImage: "waveform.path.ecg") }
+                .tag(3)
                 .badge(app.status.badge)
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tag(4)
         }
         .task(id: phase) {
             guard phase == .active else { return }
@@ -102,28 +131,37 @@ struct ConnectionBadge: View {
         return app.status.payload?["gateway"]
     }
 
+    private var hostName: String {
+        guard let url = API.shared.baseURL else { return "" }
+        return SavedGateways.displayName(url)
+    }
+
+    private func named(_ label: String) -> String {
+        hostName.isEmpty ? label : "\(hostName) · \(label)"
+    }
+
     private var state: (label: String, symbol: String, color: Color) {
-        guard app.checkedConnection else { return ("Checking", "clock.fill", .yellow) }
-        if app.needsLogin { return ("Sign in", "lock.fill", .yellow) }
-        if app.healthFailure != nil { return ("Unreachable", "wifi.slash", .red) }
-        guard let health = app.health else { return ("Offline", "xmark.circle.fill", .red) }
+        guard app.checkedConnection else { return (named("Checking"), "clock.fill", .yellow) }
+        if app.needsLogin { return (named("Sign in"), "lock.fill", .yellow) }
+        if app.healthFailure != nil { return (named("Unreachable"), "wifi.slash", .red) }
+        guard let health = app.health else { return (named("Offline"), "xmark.circle.fill", .red) }
         switch health.phase {
-        case "starting": return ("Starting", "clock.fill", .yellow)
-        case "restarting": return ("Restarting", "arrow.clockwise.circle.fill", .yellow)
-        case "draining": return ("Finishing work", "clock.fill", .yellow)
-        case "waiting": return ("Waiting", "clock.fill", .yellow)
-        case "stopping": return ("Stopping", "clock.fill", .yellow)
-        case "stopped", "unavailable": return ("Gateway down", "xmark.circle.fill", .red)
+        case "starting": return (named("Starting"), "clock.fill", .yellow)
+        case "restarting": return (named("Restarting"), "arrow.clockwise.circle.fill", .yellow)
+        case "draining": return (named("Finishing work"), "clock.fill", .yellow)
+        case "waiting": return (named("Waiting"), "clock.fill", .yellow)
+        case "stopping": return (named("Stopping"), "clock.fill", .yellow)
+        case "stopped", "unavailable": return (named("Gateway down"), "xmark.circle.fill", .red)
         default: break
         }
         let gateway = health.gatewayState?.lowercased() ?? ""
         if !health.ok || ["stopped", "down", "failed", "offline"].contains(gateway) {
-            return ("Gateway down", "xmark.circle.fill", .red)
+            return (named("Gateway down"), "xmark.circle.fill", .red)
         }
         if ["degraded", "down"].contains(diagnostic?["health"].string ?? "") || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
-            return ("Degraded", "exclamationmark.triangle.fill", .yellow)
+            return (named("Degraded"), "exclamationmark.triangle.fill", .yellow)
         }
-        return ("Online", "checkmark.circle.fill", .green)
+        return (named("Online"), "checkmark.circle.fill", .green)
     }
 
     var body: some View {
@@ -145,7 +183,7 @@ struct ConnectionBadge: View {
                 if !app.checkedConnection {
                     Text("Checking the bridge and gateway.")
                 } else if app.needsLogin {
-                    Button("Sign in again") { app.signOut() }
+                    Button("Sign in again") { app.sessionExpired() }
                 } else if let failure = app.healthFailure {
                     Text(failure)
                     if let last = app.health?.phase { Text("Last known gateway state: " + last).font(.caption) }
