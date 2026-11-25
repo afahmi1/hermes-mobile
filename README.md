@@ -4,6 +4,11 @@ A native SwiftUI iPhone app for [Hermes Agent](https://github.com/NousResearch/h
 (profile) on your Mac, lets you continue any of them, and switches model, provider and reasoning effort per chat. The
 switch is saved on the chat inside Hermes, so the desktop app sees the same setting.
 
+You can switch mid-chat without leaving the composer. Tap the model chip above the input to pick a recent model, the bot
+default, an effort level, or "All models". Or type `/model` to open the picker, `/model <name>` or `/model <provider>:<name>`
+to switch, `/model reset` for the bot default, and `/effort <level>` to change effort. These commands are never sent to the
+agent. If a reply is running, the change applies to the next message.
+
 The **Projects** tab shows an optional, read-only [project catalog](docs/project-catalog.md) with links to bots and named relative file references.
 
 Chats are built for lifting the useful part out of a reply. The full contract, including a style guide for agents writing to the phone, is in [docs/message-format.md](docs/message-format.md).
