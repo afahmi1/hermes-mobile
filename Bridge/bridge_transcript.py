@@ -471,6 +471,37 @@ def file_for_digest(texts, digest, roots, assistant_roots=()):
     return None
 
 
+_BARE_PATH = re.compile(r"(?<![\w.~/])((?:~|/(?:Users|tmp|private|var|opt|Volumes|home))/[^\s`'\"<>()\[\]{}|]+)")
+
+
+def mentioned_paths(text):
+    """Absolute or ~ paths written in a reply, with trailing punctuation trimmed."""
+    out = []
+    for m in _BARE_PATH.finditer(text or ""):
+        p = m.group(1).rstrip(".,:;!?")
+        if p.startswith("~"):
+            p = str(Path.home()) + p[1:]
+        out.append(p)
+    return out
+
+
+def file_for_path(texts, raw, roots, assistant_roots=()):
+    """A file a reply in this chat named by path. Only Hermes's own replies count, and the file must still pass
+    safe_file (inside an allowed root, a known file type, not a credential or dot-folder, under the size cap)."""
+    want = (raw or "").strip()
+    if want.startswith("~"):
+        want = str(Path.home()) + want[1:]
+    if not want.startswith("/") or "\x00" in want or len(want) > 1024:
+        return None
+    allowed = list(roots) + list(assistant_roots)
+    for entry in texts:
+        role, text = entry if isinstance(entry, tuple) else ("user", entry)
+        if role != "assistant" or want not in mentioned_paths(text):
+            continue
+        return safe_file(want, allowed)
+    return None
+
+
 def project_timeline_message(message, roots=None, assistant_roots=()):
     """One mobile timeline row. Hidden diagnostics disappear. Delegation walls become activity cards."""
     if not isinstance(message, dict):

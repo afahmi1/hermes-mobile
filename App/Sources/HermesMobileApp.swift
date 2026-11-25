@@ -13,6 +13,7 @@ struct HermesMobileApp: App {
     @State private var selectedTab = 0
     @State private var app = AppModel()
     @Environment(\.scenePhase) private var phase
+    @State private var backgroundedAt: Date?
     @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
     @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
 
@@ -30,6 +31,14 @@ struct HermesMobileApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
                     app.retryDraftStorage()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: .hermesNetworkChanged)) { _ in
+                    // New network path: old sockets are bound to the old interface. Reconnect and send what's waiting.
+                    Task {
+                        await API.shared.refreshConnections()
+                        app.resumeLiveRuns()
+                        NotificationCenter.default.post(name: .hermesForeground, object: nil)
+                    }
+                }
                 .onOpenURL { url in
                     if app.open(url) { selectedTab = 0 }
                 }
@@ -40,14 +49,21 @@ struct HermesMobileApp: App {
                 }
         }
         .onChange(of: phase) { old, now in
-            if now == .background { ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns) }
+            if now == .background {
+                backgroundedAt = Date()
+                // Ask iOS for a little time so a live reply or an unsent message can finish going out.
+                ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns || app.hasUnsentMessages)
+            }
             if now == .active {
                 ReplyNotifier.shared.returned()
                 app.retryDraftStorage()
                 if old == .background {
-                    // Fresh sockets first, then everything reconnects at once instead of timing out one by one.
+                    let away = backgroundedAt.map { Date().timeIntervalSince($0) } ?? .infinity
                     Task {
-                        await API.shared.refreshConnections()
+                        // A quick switch (a text, a glance at another app) leaves the sockets and the live stream
+                        // alone: iOS kept them, and tearing them down is what made "Reconnecting…" crawl. Away
+                        // longer, iOS and Tailscale have likely dropped them: start fresh, all at once.
+                        if away >= 10 { await API.shared.refreshConnections() }
                         StreamRoutes.shared.nudge()
                         app.resumeLiveRuns()
                         NotificationCenter.default.post(name: .hermesForeground, object: nil)

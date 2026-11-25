@@ -555,6 +555,16 @@ final class API: @unchecked Sendable {
                            display: obj["display"] as? String, notice: obj["notice"] as? String)
     }
 
+    /// A file Hermes named by path in a reply of this chat. The bridge re-checks the path against the chat.
+    func chatFile(profile: String, session: String, path: String) async throws -> Data {
+        var parts = URLComponents()
+        parts.path = "/m/chat/\(Self.esc(profile))/\(Self.esc(session))/file"
+        parts.queryItems = [URLQueryItem(name: "path", value: path)]
+        parts.percentEncodedQuery = parts.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        guard let rel = parts.string else { throw APIError.badResponse }
+        return try await send(try request(rel))
+    }
+
     func chatMedia(profile: String, session: String, digest: String) async throws -> Data {
         try await send(try request("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/media/\(Self.esc(digest))"))
     }
@@ -668,6 +678,43 @@ final class API: @unchecked Sendable {
         let expected = mode == "queue" ? "queued" : "steer_accepted"
         guard result["status"] as? String == expected else { throw APIError.badResponse }
         return (result["attachments"] as? NSNumber)?.intValue ?? 0
+    }
+
+    /// Same as `followUp`, plus the admission Hermes filed a queued message under (newer bridges).
+    func followUpReceipt(run: String, mode: String, text: String, submission: UUID, choice: RuntimeChoice,
+                         attachments: [SendAttachment] = []) async throws -> (files: Int, admission: String?) {
+        var body = mode == "queue" ? Self.choiceBody(choice) : [:]
+        let action = body.isEmpty ? mode : "queue-with-runtime"
+        body["text"] = text
+        body["submission_id"] = submission.uuidString
+        if !attachments.isEmpty {
+            body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
+        }
+        let result = try await json("/m/turns/\(Self.esc(run))/\(action)", method: "POST", body: body)
+        let expected = mode == "queue" ? "queued" : "steer_accepted"
+        guard result["status"] as? String == expected else { throw APIError.badResponse }
+        return ((result["attachments"] as? NSNumber)?.intValue ?? 0, result["admission_id"] as? String)
+    }
+
+    /// The chat's queue as Hermes holds it. Nil from a bridge that predates queue controls.
+    func queueState(profile: String, session: String) async throws -> QueueState? {
+        do {
+            let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/queue", method: "GET", body: nil)
+            return QueueState(obj)
+        } catch APIError.http(404, let message) where message.contains("not found") {
+            return nil
+        }
+    }
+
+    /// edit | cancel | steer | resolve one queued row. Returns the admission it now lives under.
+    func queueAction(profile: String, session: String, admission: String, action: String, text: String? = nil,
+                     submission: UUID? = nil) async throws -> (admission: String?, queue: QueueState?) {
+        var body: [String: Any] = [:]
+        if let text { body["text"] = text }
+        if let submission { body["submission_id"] = submission.uuidString }
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/queue/\(Self.esc(admission))/\(action)",
+                                 method: "POST", body: body)
+        return (obj["admission_id"] as? String, QueueState(obj["queue"]))
     }
 
     func stopRun(profile: String, run: String) async throws {

@@ -397,6 +397,7 @@ struct GatewayDestinationsView: View {
 struct AppearanceSection: View {
     @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
     @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
+    @AppStorage(HMGlass.key) private var glass = true
 
     var body: some View {
         Section("Appearance") {
@@ -437,6 +438,14 @@ struct AppearanceSection: View {
                 }
             }
             .padding(.vertical, 4)
+            if #available(iOS 26.0, *) {
+                Toggle(isOn: $glass) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Liquid Glass")
+                        Text("Glass message box and controls. Off uses the theme's flat colors.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
         }
         .sensoryFeedback(.selection, trigger: themeRaw + accentRaw)
     }

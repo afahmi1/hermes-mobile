@@ -8,6 +8,10 @@ extension Notification.Name {
     static let hermesCopied = Notification.Name("hermesCopied")
     /// Posted after the app returns from the background and its connections were reset.
     static let hermesForeground = Notification.Name("hermesForeground")
+    /// The network came back or switched paths (Wi-Fi to cellular, Tailscale reconnect).
+    static let hermesNetworkChanged = Notification.Name("hermesNetworkChanged")
+    /// A file path in a reply was tapped; the chat downloads it through the bridge and opens Quick Look.
+    static let hermesOpenPath = Notification.Name("hermesOpenPath")
 }
 
 enum Clipboard {
@@ -32,7 +36,10 @@ enum InlineMarkdown {
             let code = String(out[run.range].characters)
             var allowed = CharacterSet.urlQueryAllowed
             allowed.remove(charactersIn: "&=+#")
-            if let encoded = code.addingPercentEncoding(withAllowedCharacters: allowed),
+            let trimmed = code.trimmingCharacters(in: .whitespaces)
+            if (trimmed.hasPrefix("/") || trimmed.hasPrefix("~/")) && !trimmed.contains(" "), let open = pathLink(trimmed) {
+                out[run.range].link = open  // a path chip opens the file; Select Text still copies it
+            } else if let encoded = code.addingPercentEncoding(withAllowedCharacters: allowed),
                let url = URL(string: "\(copyScheme)://inline?t=\(encoded)") {
                 out[run.range].link = url
             }
@@ -41,7 +48,61 @@ enum InlineMarkdown {
             out[run.range].foregroundColor = codeTint
             out[run.range].underlineStyle = nil
         }
+        for run in out.runs {
+            if let link = run.link, link.scheme?.hasPrefix("http") == true { out[run.range].link = phoneURL(link) }
+        }
+        linkify(&out)
         return out
+    }
+
+    static let fileScheme = "hermes-file"
+    private static let pathPattern = try! NSRegularExpression(
+        pattern: #"(?<![\w.~/])((?:~|/(?:Users|tmp|private|var|opt|Volumes|home))/[^\s`'"<>()\[\]{}|]+)"#)
+    private static let localPattern = try! NSRegularExpression(
+        pattern: #"\bhttps?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d{2,5})?(?:/[^\s`'"<>)\]]*)?"#)
+
+    /// localhost on the Mac means nothing on a phone: point it at the Mac's tailnet name instead. Works when
+    /// the dev server listens on all interfaces (vite --host, next -H 0.0.0.0).
+    static func phoneURL(_ url: URL) -> URL {
+        guard let host = url.host?.lowercased(), ["localhost", "127.0.0.1", "0.0.0.0"].contains(host),
+              let mac = API.shared.baseURL?.host, var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return url }
+        parts.host = mac
+        return parts.url ?? url
+    }
+
+    static func pathLink(_ path: String) -> URL? {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+#")
+        return path.addingPercentEncoding(withAllowedCharacters: allowed).flatMap { URL(string: "\(fileScheme)://open?p=\($0)") }
+    }
+
+    static func openedPath(_ url: URL) -> String? {
+        guard url.scheme == fileScheme else { return nil }
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "p" }?.value
+    }
+
+    /// File paths and localhost URLs in plain text become links.
+    private static func linkify(_ out: inout AttributedString) {
+        let plain = String(out.characters)
+        let ns = plain as NSString
+        let whole = NSRange(location: 0, length: ns.length)
+        func apply(_ range: NSRange, _ url: URL) {
+            guard let r = Range(range, in: plain),
+                  let lower = AttributedString.Index(r.lowerBound, within: out),
+                  let upper = AttributedString.Index(r.upperBound, within: out) else { return }
+            if out[lower..<upper].runs.contains(where: { $0.link != nil }) { return }
+            out[lower..<upper].link = url
+            out[lower..<upper].underlineStyle = .single
+        }
+        for m in localPattern.matches(in: plain, range: whole) {
+            if let url = URL(string: ns.substring(with: m.range)) { apply(m.range, phoneURL(url)) }
+        }
+        for m in pathPattern.matches(in: plain, range: whole) {
+            var path = ns.substring(with: m.range(at: 1))
+            while let last = path.last, ".,:;!?".contains(last) { path.removeLast() }
+            if let url = pathLink(path) { apply(NSRange(location: m.range(at: 1).location, length: (path as NSString).length), url) }
+        }
     }
 
     static func copiedText(_ url: URL) -> String? {
@@ -69,6 +130,10 @@ struct MarkdownText: View {
         .environment(\.openURL, OpenURLAction { url in
             if let code = InlineMarkdown.copiedText(url) {
                 Clipboard.copy(code)
+                return .handled
+            }
+            if let path = InlineMarkdown.openedPath(url) {
+                NotificationCenter.default.post(name: .hermesOpenPath, object: path)
                 return .handled
             }
             return .systemAction

@@ -207,6 +207,10 @@ final class AppModel {
     }
 
     var hasLiveRuns: Bool { chats.values.contains { $0.isRunning } || newChats.values.contains { $0.isRunning } }
+    /// A queued or guide message that hasn't reached the Mac yet, in any open chat.
+    var hasUnsentMessages: Bool {
+        (Array(chats.values) + Array(newChats.values)).contains { $0.outgoing.contains { !$0.onMac && $0.problem == nil } }
+    }
 
     func hasLiveRuns(excluding chat: ChatModel) -> Bool {
         chats.values.contains { $0 !== chat && $0.isRunning } || newChats.values.contains { $0 !== chat && $0.isRunning }

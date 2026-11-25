@@ -75,20 +75,25 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     enum Event { case reply, approval, failure }
 
-    func post(_ event: Event, bot: String, account: String?, profile: String, session: String?) {
+    func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
+              detail: String? = nil, worked: TimeInterval? = nil) {
         guard away, let account, let session else { return }
         let content = UNMutableNotificationContent()
+        let took = worked.flatMap { $0 >= 60 ? " · \(Int($0 / 60)) min" : nil } ?? ""
         switch event {
-        case .reply: content.title = bot
+        case .reply: content.title = bot + (took.isEmpty ? "" : " finished" + took)
         case .approval: content.title = bot + " needs your approval"
         case .failure: content.title = bot + " could not finish"
         }
-        // Commands, errors and reply excerpts can hold private data on a locked device.
+        // One readable sentence of what happened. iOS hides the body on a locked phone unless the person
+        // chose "Show Previews: Always", so excerpts follow their own privacy setting.
+        let fallback: String
         switch event {
-        case .reply: content.body = "Your reply is ready."
-        case .approval: content.body = "Open the chat to review the request."
-        case .failure: content.body = "Open the chat for details."
+        case .reply: fallback = "Your reply is ready."
+        case .approval: fallback = "Open the chat to review the request."
+        case .failure: fallback = "Open the chat for details."
         }
+        content.body = detail.flatMap { $0.isEmpty ? nil : $0 } ?? fallback
         content.sound = .default
         content.threadIdentifier = ReplyDestination(account: account, profile: profile, session: session).identifier
         content.userInfo = ["account": account, "profile": profile, "session": session]
@@ -126,6 +131,21 @@ final class ReplyNotifier {
     func left(liveRuns: Bool) { away = true }
     func returned() { away = false }
     func settled(liveRuns: Bool) {}
-    func post(_ event: Event, bot: String, account: String?, profile: String, session: String?) {}
+    func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
+              detail: String? = nil, worked: TimeInterval? = nil) {}
 }
 #endif
+
+/// The first sentence of a reply as plain text, for a notification or widget line.
+enum Headline {
+    static func of(_ markdown: String, limit: Int = 160) -> String? {
+        var text = MarkdownBlock.plainText(markdown)
+        // Skip code and list noise: take the first line with real words.
+        let lines = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        text = lines.first { $0.count > 3 && !$0.hasPrefix("```") && !$0.hasPrefix("|") } ?? ""
+        guard !text.isEmpty else { return nil }
+        if let end = text.range(of: #"[.!?](\s|$)"#, options: .regularExpression) { text = String(text[..<end.upperBound]) }
+        text = text.trimmingCharacters(in: .whitespaces)
+        return text.count > limit ? String(text.prefix(limit - 1)) + "…" : text
+    }
+}

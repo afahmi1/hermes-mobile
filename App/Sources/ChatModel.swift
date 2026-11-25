@@ -56,7 +56,9 @@ final class ChatModel {
     var items: [ChatItem] = []
     var title: String?
     var isLoading = false
-    var isRunning = false
+    var isRunning = false { didSet { if isRunning && !oldValue { runStarted = Date() } } }
+    /// When this reply started, for "finished in 4 min" in the notification.
+    @ObservationIgnored private var runStarted: Date?
     var slashBusy = false
     var slashCommands: [SlashCommand] = SlashCommand.builtIn
     var skillCommands: [String] = []
@@ -230,6 +232,7 @@ final class ChatModel {
     // MARK: loading
 
     func load(quiet: Bool = false, resumeLive: Bool = true) async {
+        if outgoingLoadedFor != sendKey { Task { await loadOutgoing() } }
         guard let sid = sessionId, !isRunning, !loadingTranscript, !loadingOlder else { return }
         loadingTranscript = true
         defer { loadingTranscript = false }
@@ -347,7 +350,7 @@ final class ChatModel {
         runId = t.turnId
         isRunning = true
         status = "Hermes is still working…"
-        Task { await flushLocalQueue() }
+        Task { await pump() }
         items = items.filter { $0.kind != .assistant || !$0.streaming }
         follow()
     }
@@ -618,6 +621,8 @@ final class ChatModel {
                 try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
                 sessionId = sid
                 if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
+                // Anything queued during these first seconds can be saved to disk now that the chat has an id.
+                Task { await loadOutgoing() }
             }
             guard let sid = sessionId else { throw APIError.notSignedIn }
             draft = ""
@@ -646,8 +651,9 @@ final class ChatModel {
         }
     }
 
-    func send(_ raw: String, projectContext: String? = nil, attachments: [SendAttachment] = [], shown: String? = nil) async {
-        if needsDraftRestore {
+    func send(_ raw: String, projectContext: String? = nil, attachments: [SendAttachment] = [], shown: String? = nil,
+              id: UUID = UUID(), fromQueue: Bool = false) async {
+        if needsDraftRestore && !fromQueue {
             retryDraftStorage()
             // A restore can merge a previously hidden paste or attachment. Review before sending.
             if needsDraftRestore || raw != combinedDraft || attachments != draftAttachments { return }
@@ -660,8 +666,9 @@ final class ChatModel {
             return
         }
         let account = app?.inboxAccount
-        let authoredText = draft
-        let authoredPastes = pastedTexts
+        // A queued message never came from the composer as it is now: leave the message box alone.
+        let authoredText: String? = fromQueue ? nil : draft
+        let authoredPastes: [PastedText]? = fromQueue ? nil : pastedTexts
         isRunning = true
         error = nil
         status = "Sending…"
@@ -674,9 +681,11 @@ final class ChatModel {
                 try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
                 sessionId = sid
                 if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
+                // Anything queued during these first seconds can be saved to disk now that the chat has an id.
+                Task { await loadOutgoing() }
             }
             guard let sid = sessionId, let key = sendKey else { throw APIError.notSignedIn }
-            let send = PendingSend(id: UUID(), text: text, choice: picked ? choice : .botDefault, project: projectContext, attachments: attachments.isEmpty ? nil : attachments, composerText: authoredText, composerPastes: authoredPastes)
+            let send = PendingSend(id: id, text: text, choice: picked ? choice : .botDefault, project: projectContext, attachments: attachments.isEmpty ? nil : attachments, composerText: authoredText, composerPastes: authoredPastes)
             try await InboxDisk.shared.stage(send, key: key)
             guard key == sendKey else { throw APIError.notSignedIn }
             pendingSend = send
@@ -740,7 +749,7 @@ final class ChatModel {
     private func clearStagedComposer(_ send: PendingSend) {
         if let original = send.composerText, draft == original { draft = "" }
         if let pastes = send.composerPastes, pastedTexts == pastes { pastedTexts = [] }
-        if draftAttachments == (send.attachments ?? []) { draftAttachments = [] }
+        if send.composerText != nil, draftAttachments == (send.attachments ?? []) { draftAttachments = [] }
     }
 
     private func deliver(_ send: PendingSend, session: String, key: String, allowLegacy: Bool) async {
@@ -770,12 +779,25 @@ final class ChatModel {
             runId = run
             status = "Thinking…"
             follow()
-            Task { await flushLocalQueue() }
+            Task { await pump() }
         } catch {
             isRunning = false
             status = nil
-            cancelLocalQueue()
+            // Queued follow-ups stay saved; they go once this send is confirmed or returned.
             guard sendKey == key else { return }
+            if outgoing.contains(where: { $0.id == send.id }) {
+                // This was a queued message going out as the next message. It still lives in the outbox, so it is
+                // never thrown back into the composer (that would make a second copy). Busy: wait. Refused: mark it.
+                try? await InboxDisk.shared.acknowledge(send.id, key: key)
+                pendingSend = nil
+                if case APIError.http(let code, let message) = error, [400, 413, 415, 422].contains(code) {
+                    update(send.id) { $0.problem = message.isEmpty ? "Hermes refused this message." : message }
+                    await persistOutgoing()
+                } else {
+                    Task { await reattach(); await pump() }
+                }
+                return
+            }
             // Auth failures and a missing route on a recovered send can arrive
             // after delivery. Keep that original UUID until the bridge can confirm it.
             if case APIError.http(let code, _) = error,
@@ -796,96 +818,367 @@ final class ChatModel {
 
     var acceptsFollowUp: Bool { isRunning && runId != nil && !sendingFollowUp && !savingRuntime }
 
-    /// A message queued while a reply runs, before the bridge has confirmed the run. It goes out as
-    /// "Send next" the moment the run is known, or as an ordinary message if the run ends first.
-    struct LocalQueue: Equatable { var text: String; var attachments: [SendAttachment] }
-    private(set) var localQueue: LocalQueue?
+    // MARK: Outbox: Send next and Guide, durable on this phone until Hermes has them
 
-    /// Send while Hermes is replying: queue it. Works from the first second of a run.
+    /// Messages waiting to go, oldest first. Saved to disk before any network call.
+    private(set) var outgoing: [Outgoing] = []
+    /// The chat's queue as Hermes holds it on the Mac. Nil until read, or from an older bridge.
+    private(set) var queue: QueueState?
+    private(set) var queueControls = true
+    private var outgoingLoadedFor: String?
+    private var pumping = false
+    private var pumpAgain = false
+    private var retryTask: Task<Void, Never>?
+    private var retryDelay: Double = 2
+
+    /// Compatibility for the composer: true while anything is waiting to go.
+    var hasOutgoing: Bool { !outgoing.isEmpty }
+
+    private func loadOutgoing() async {
+        guard let key = sendKey, outgoingLoadedFor != key else { return }
+        let saved = await InboxDisk.shared.outgoing(key)
+        guard key == sendKey else { return }
+        outgoingLoadedFor = key
+        // Anything typed before the chat had an id (the first seconds of a new chat) joins the saved list.
+        let fresh = outgoing.filter { o in !saved.contains { $0.id == o.id } }
+        outgoing = saved + fresh
+        if !fresh.isEmpty { await persistOutgoing() }
+        if !outgoing.isEmpty { await pump() }
+    }
+
+    private func persistOutgoing() async {
+        guard let key = sendKey else { return }   // a brand-new chat: saved as soon as it has an id
+        do { try await InboxDisk.shared.saveOutgoing(outgoing, key: key) }
+        catch { self.error = "Couldn't save your queued message on this phone. Keep the app open until it sends." }
+    }
+
+    private func update(_ id: UUID, _ change: (inout Outgoing) -> Void) {
+        guard let i = outgoing.firstIndex(where: { $0.id == id }) else { return }
+        change(&outgoing[i])
+    }
+
+    /// Send while Hermes is replying: queue it. Works from the first second of a run and with no connection.
     func queueNext(_ raw: String, attachments: [SendAttachment]) async -> Bool {
+        await enqueue(raw, mode: "queue", attachments: attachments)
+    }
+
+    /// Queue (Send next) or steer (Guide this reply). Returns true once it is safely on disk.
+    func enqueue(_ raw: String, mode: String, attachments: [SendAttachment]) async -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isRunning, !text.isEmpty || !attachments.isEmpty, localQueue == nil else { return false }
-        if acceptsFollowUp { return await followUp(text, mode: "queue", attachments: attachments) }
-        localQueue = LocalQueue(text: text, attachments: attachments)
+        guard !text.isEmpty || !attachments.isEmpty else { return false }
+        var pick = mode == "queue" && picked ? choice : RuntimeChoice.botDefault
+        if pick.model == nil, pick.effort != nil, let bot = app?.bot(profile) { pick.model = bot.model; pick.provider = bot.provider }
+        let item = Outgoing(id: UUID(), mode: mode, text: text, attachments: attachments.isEmpty ? nil : attachments,
+                            choice: pick, created: Date(), files: attachments.count)
+        outgoing.append(item)
+        await persistOutgoing()
         if draftAttachments == attachments { draftAttachments = [] }
+        ReplyNotifier.shared.askOnce()
+        Task { await pump() }
         return true
     }
 
-    /// Puts a not-yet-sent queued message back in the composer.
-    func cancelLocalQueue() {
-        guard let q = localQueue else { return }
-        localQueue = nil
-        draft = draft.isEmpty ? q.text : q.text + "\n\n" + draft
-        draftAttachments = q.attachments + draftAttachments
+    /// Deliver what can go now, in order. Single-flight; safe to call from anywhere, any time.
+    func pump() async {
+        if pumping { pumpAgain = true; return }
+        pumping = true
+        defer { pumping = false }
+        repeat {
+            pumpAgain = false
+            await pumpOnce()
+        } while pumpAgain
+        scheduleRetry()
     }
 
-    private func flushLocalQueue() async {
-        guard let q = localQueue else { return }
-        if isRunning {
-            guard acceptsFollowUp else { return }
-            localQueue = nil
-            if !(await followUp(q.text, mode: "queue", attachments: q.attachments)) {
-                localQueue = q
-                cancelLocalQueue()
+    private func pumpOnce() async {
+        guard sendKey != nil else { return }
+        for item in outgoing {
+            guard let current = outgoing.first(where: { $0.id == item.id }) else { continue }
+            if current.problem != nil { return }          // keep order: the person decides on this one first
+            if current.onMac {
+                if let edit = current.edit { await applyEdit(current, text: edit) }
+                continue
             }
-        } else {
-            localQueue = nil
-            await send(q.text, attachments: q.attachments)
+            if isRunning, let run = runId, !savingRuntime {
+                guard await deliverFollowUp(current, run: run) else { return }
+            } else if !isRunning, pendingSend == nil, !slashBusy, !returningSend {
+                // Nothing running: a queued message is simply the next message, and a steer whose reply
+                // already ended goes the same way. Same UUID, so a copy that already landed is not repeated.
+                var next = current
+                if next.mode == "steer" { next.note = "The reply it was meant to guide had finished, so it went as a new message." }
+                if let edit = next.edit { next.text = edit }
+                await sendQueued(next)
+                return                                     // the rest wait for this new reply
+            } else {
+                return                                     // a reply is starting: wait for its run id
+            }
         }
     }
-    private(set) var sendingFollowUp = false
-    private var lastControlAttempt: (run: String, mode: String, text: String, id: UUID, choice: RuntimeChoice)?
-    private var lastControlFiles: [SendAttachment] = []
 
-    /// Send next / Guide this reply. Files staged in the composer ride along; on success they leave the draft.
-    func followUp(_ raw: String, mode: String, attachments: [SendAttachment] = []) async -> Bool {
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard acceptsFollowUp, let run = runId, !text.isEmpty || !attachments.isEmpty else { return false }
-        sendingFollowUp = true
-        defer { sendingFollowUp = false }
-        let previous = lastControlAttempt
-        let attempt: (run: String, mode: String, text: String, id: UUID, choice: RuntimeChoice)
-        if let previous, previous.run == run, previous.mode == mode, previous.text == text, lastControlFiles == attachments {
-            // A retry checks the original admission even if the picker has since changed.
-            attempt = previous
-        } else {
-            var next = mode == "queue" && picked ? choice : .botDefault
-            if next.model == nil, next.effort != nil, let bot = app?.bot(profile) {
-                next.model = bot.model
-                next.provider = bot.provider
-            }
-            attempt = (run, mode, text, UUID(), next)
-        }
-        let id = attempt.id
-        let key = receiptKey
-        lastControlAttempt = attempt
-        lastControlFiles = attachments
+    /// One follow-up to the running reply. False stops the pump (offline, or the person must decide).
+    private func deliverFollowUp(_ item: Outgoing, run: String) async -> Bool {
+        update(item.id) { $0.attempts += 1 }
+        let text = item.edit ?? item.text
         do {
-            let accepted = try await api.followUp(run: run, mode: mode, text: text, submission: id,
-                                                  choice: attempt.choice, attachments: attachments)
-            if !attachments.isEmpty, accepted < attachments.count {
-                // An older bridge delivered the words but dropped the files: keep them staged and say so.
-                error = "Hermes got the message, but this Mac's bridge is too old to take files with it. They are still in your draft."
-            } else if !attachments.isEmpty, draftAttachments == attachments {
-                draftAttachments = []
+            // The original words with the original ID: if a lost acknowledgment means the Mac already has it,
+            // Hermes answers with that same admission instead of filing a second copy. Edits apply after.
+            let (accepted, admission) = try await api.followUpReceipt(run: run, mode: item.mode, text: item.text,
+                                                                      submission: item.id, choice: item.choice ?? .botDefault,
+                                                                      attachments: item.attachments ?? [])
+            retryDelay = 2
+            if error?.hasPrefix("Waiting to send") == true { error = nil }
+            if item.mode == "steer" {
+                outgoing.removeAll { $0.id == item.id }
+                await recordReceipt(ControlReceipt(id: item.id, mode: "steer", text: item.text, at: Date(), files: accepted))
+            } else {
+                // Hermes has it now (state.db). Files are no longer needed on the phone.
+                update(item.id) { $0.admission = admission ?? "turn:" + run; $0.attachments = nil; $0.files = accepted }
+                if item.edit != nil, let now = outgoing.first(where: { $0.id == item.id }) { await applyEdit(now, text: text) }
             }
-            guard let key, receiptKey == key else { return false }
-            let receipt = ControlReceipt(id: id, mode: mode, text: text, at: Date(), files: min(accepted, attachments.count))
-            receipts.removeAll { $0.id == id }
-            receipts.append(receipt)
-            if !items.contains(where: { $0.id == id.uuidString }) { items.append(receipt.item) }
-            lastControlAttempt = nil
-            lastControlFiles = []
-            if accepted >= attachments.count { error = nil }
-            do { try await InboxDisk.shared.record(receipt, key: key) }
-            catch { self.error = "Hermes received the instruction. This phone could not save its receipt." }
+            await persistOutgoing()
+            Task { await refreshQueue() }
             return true
+        } catch APIError.http(let code, let message) where code == 404 || code == 409 {
+            // The reply ended (or this bridge restarted) between the tap and the request. Never an error to
+            // the person: the message waits for the next safe moment and goes as the next message.
+            if code == 409, !message.contains("no longer") && !message.contains("not started") && !message.contains("Refresh") {
+                return refuse(item, message)
+            }
+            update(item.id) { if $0.mode == "steer" { $0.mode = "queue"; $0.note = "The reply had finished, so this goes as the next message." } }
+            await persistOutgoing()
+            if isRunning, runId == run { runId = nil; isRunning = false; status = nil }
+            pumpAgain = true
+            return false
+        } catch APIError.http(let code, let message) where [400, 413, 415, 422].contains(code) {
+            return refuse(item, message)
         } catch {
-            self.error = error.localizedDescription
+            // Offline, timed out, the Mac asleep. It stays saved here and goes when the connection is back.
+            if (outgoing.first { $0.id == item.id }?.attempts ?? 0) <= 1 {
+                self.error = "Waiting to send. Your message is saved on this phone and goes out when \(app?.botName(profile) ?? "Hermes") is reachable."
+            }
+            await persistOutgoing()
             return false
         }
     }
 
+    private func refuse(_ item: Outgoing, _ message: String) -> Bool {
+        update(item.id) { $0.problem = message.isEmpty ? "Hermes refused this message." : message }
+        Task { await persistOutgoing() }
+        return false
+    }
+
+    private func recordReceipt(_ receipt: ControlReceipt) async {
+        guard let key = receiptKey else { return }
+        receipts.removeAll { $0.id == receipt.id }
+        receipts.append(receipt)
+        if !items.contains(where: { $0.id == receipt.id.uuidString }) { items.append(receipt.item) }
+        try? await InboxDisk.shared.record(receipt, key: key)
+    }
+
+    /// Hands a queued message to the ordinary send path (durable PendingSend) and only then drops it here.
+    private func sendQueued(_ item: Outgoing) async {
+        // The Mac may already be running something for this chat (this app was away when it started).
+        // Follow that first; the queued message goes after it.
+        if let sid = sessionId, let live = try? await api.liveTurns(),
+           live.contains(where: { $0.sessionId == sid && $0.profile == profile && !$0.done }) {
+            await reattach()
+            return
+        }
+        guard !isRunning, pendingSend == nil else { return }
+        await send(item.text, attachments: item.attachments ?? [], shown: nil, id: item.id, fromQueue: true)
+        if pendingSend?.id == item.id || isRunning {
+            outgoing.removeAll { $0.id == item.id }
+            await persistOutgoing()
+        }
+    }
+
+    /// Retries with a gentle backoff while something is waiting: 2 s, 4 s … 30 s. Silent after the first try.
+    private func scheduleRetry() {
+        retryTask?.cancel()
+        guard outgoing.contains(where: { !$0.onMac && $0.problem == nil }) || outgoing.contains(where: { $0.onMac }) else {
+            retryDelay = 2
+            return
+        }
+        let delay = outgoing.contains(where: { !$0.onMac && $0.problem == nil }) ? retryDelay : 15
+        retryDelay = min(30, retryDelay * 2)
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            if self.outgoing.contains(where: { $0.onMac }) { await self.refreshQueue() }
+            await self.pump()
+        }
+    }
+
+    /// Called when the app comes back, the connection returns, or a reply ends.
+    func outboxWake() {
+        retryDelay = 2
+        Task { await refreshQueue(); await pump() }
+    }
+
+    /// Reads Hermes's queue and drops messages that have started (they are in the transcript now).
+    func refreshQueue() async {
+        guard let sid = sessionId else { return }
+        guard queueControls else {
+            // Older bridge: a queued message has started once no reply is running.
+            if !isRunning { outgoing.removeAll { $0.onMac && $0.problem == nil }; await persistOutgoing() }
+            return
+        }
+        do {
+            guard let state = try await api.queueState(profile: profile, session: sid) else {
+                queueControls = false
+                return await refreshQueue()
+            }
+            guard sid == sessionId else { return }
+            queue = state
+            let before = outgoing.count
+            outgoing.removeAll { o in
+                guard let adm = o.admission, !adm.hasPrefix("turn:"), o.edit == nil else { return false }
+                return state.row(adm).map { $0.status != "queued" } ?? true
+            }
+            // An admission id from an older bridge ("turn:…") is reconciled once no reply runs.
+            if !isRunning, state.rows.allSatisfy({ $0.status != "queued" }) {
+                outgoing.removeAll { $0.admission?.hasPrefix("turn:") == true }
+            }
+            if outgoing.count != before {
+                await persistOutgoing()
+                if !isRunning { await load(quiet: true) }
+            }
+        } catch {}
+    }
+
+    // MARK: Changing a queued message
+
+    /// Edit a message that is still waiting. On the phone it is a local change; on the Mac it uses
+    /// Hermes's replace_queued (a new admission at the back of the queue). Too late once it started.
+    func editOutgoing(_ id: UUID, text raw: String) async {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let item = outgoing.first(where: { $0.id == id }) else { return }
+        if item.onMac {
+            await applyEdit(item, text: text)
+        } else if item.attempts == 0 || item.problem != nil {
+            update(id) { $0.text = text; $0.problem = nil; $0.edit = nil }
+            await persistOutgoing()
+            await pump()
+        } else {
+            // It may already be on the Mac (a lost acknowledgment). Confirm with the same ID, then edit there.
+            update(id) { $0.edit = text }
+            await persistOutgoing()
+            await pump()
+        }
+    }
+
+    private func applyEdit(_ item: Outgoing, text: String) async {
+        guard let sid = sessionId, let adm = item.admission, !adm.hasPrefix("turn:"), queueControls else {
+            update(item.id) { $0.edit = nil }
+            error = "This Mac's bridge can't edit queued messages yet. Update the bridge, or remove it and send again."
+            await persistOutgoing()
+            return
+        }
+        do {
+            let (newAdmission, state) = try await api.queueAction(profile: profile, session: sid, admission: adm,
+                                                                  action: "edit", text: text, submission: UUID())
+            update(item.id) { $0.text = text; $0.edit = nil; $0.admission = newAdmission ?? adm }
+            if let state { queue = state }
+            await persistOutgoing()
+        } catch APIError.http(409, let message) where message.contains("already started") {
+            outgoing.removeAll { $0.id == item.id }
+            await persistOutgoing()
+            error = "Hermes had already started that message, so the edit didn't apply. Your edit is in the message box."
+            draft = draft.isEmpty ? text : text + "\n\n" + draft
+        } catch APIError.http(404, _) {
+            outgoing.removeAll { $0.id == item.id }
+            await persistOutgoing()
+            error = "That message already left the queue. Your edit is in the message box."
+            draft = draft.isEmpty ? text : text + "\n\n" + draft
+        } catch {
+            update(item.id) { $0.edit = text }   // offline: applied when the connection is back
+            await persistOutgoing()
+        }
+    }
+
+    /// Remove a waiting message. `toComposer` puts its words back in the message box.
+    func removeOutgoing(_ id: UUID, toComposer: Bool) async {
+        guard let item = outgoing.first(where: { $0.id == id }) else { return }
+        if let adm = item.admission, !adm.hasPrefix("turn:"), let sid = sessionId {
+            do { _ = try await api.queueAction(profile: profile, session: sid, admission: adm, action: "cancel") }
+            catch APIError.http(409, let message) {
+                error = message
+                await refreshQueue()
+                return
+            } catch APIError.http(404, _) {
+            } catch {
+                self.error = "Couldn't reach your Mac to remove it. Try again when you're connected."
+                return
+            }
+        } else if item.onMac {
+            error = "This Mac's bridge can't remove queued messages yet. It will send after this reply."
+            return
+        } else if item.attempts > 0, item.mode == "queue" {
+            // It may have reached the Mac with the reply lost. Ask with the same ID; if it's there, cancel it there.
+            guard isRunning, let run = runId else {
+                // A reply is starting but has no id yet: ask again in a moment.
+                if isRunning {
+                    error = "It may already be on your Mac. Remove it again in a moment."
+                    return
+                }
+                // Nothing is running, so nothing can be waiting behind a reply on the Mac. Safe to drop here.
+                outgoing.removeAll { $0.id == id }
+                await persistOutgoing()
+                if toComposer { returnToComposer(item) }
+                return
+            }
+            do {
+                let (_, admission) = try await api.followUpReceipt(run: run, mode: "queue", text: item.text, submission: item.id,
+                                                                   choice: item.choice ?? .botDefault, attachments: item.attachments ?? [])
+                if let admission, let sid = sessionId {
+                    _ = try? await api.queueAction(profile: profile, session: sid, admission: admission, action: "cancel")
+                }
+            } catch APIError.http(let code, _) where code == 404 || code == 409 {
+            } catch {
+                self.error = "It may already be on your Mac. Remove it again once you're connected."
+                return
+            }
+        }
+        outgoing.removeAll { $0.id == id }
+        await persistOutgoing()
+        if toComposer { returnToComposer(item) }
+        await refreshQueue()
+    }
+
+    private func returnToComposer(_ item: Outgoing) {
+        let words = item.edit ?? item.text
+        draft = draft.isEmpty ? words : words + "\n\n" + draft
+        if let files = item.attachments { draftAttachments = files + draftAttachments }
+    }
+
+    /// Hand a queued message to the running reply now, as guidance (Hermes's steer_queued).
+    func guideNow(_ id: UUID) async {
+        guard let item = outgoing.first(where: { $0.id == id }) else { return }
+        if item.onMac, let adm = item.admission, !adm.hasPrefix("turn:"), let sid = sessionId {
+            do {
+                _ = try await api.queueAction(profile: profile, session: sid, admission: adm, action: "steer")
+                outgoing.removeAll { $0.id == id }
+                await persistOutgoing()
+                await recordReceipt(ControlReceipt(id: item.id, mode: "steer", text: item.text, at: Date(), files: item.files))
+            } catch { self.error = error.localizedDescription }
+        } else if !item.onMac {
+            update(id) { $0.mode = "steer"; $0.note = nil }
+            await persistOutgoing()
+            await pump()
+        }
+    }
+
+    /// After Hermes restarted mid-reply: acknowledge the cut-off reply so the queue behind it runs.
+    func continueQueue() async {
+        guard let sid = sessionId, let lost = queue?.lost else { return }
+        do {
+            let (_, state) = try await api.queueAction(profile: profile, session: sid, admission: lost.id, action: "resolve")
+            queue = state
+            await load(quiet: true)
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private(set) var sendingFollowUp = false
     func stop() async {
         guard let run = runId else { return }
         status = "Stopping…"
@@ -1111,7 +1404,7 @@ final class ChatModel {
                 command: ev.string("command") ?? "", description: ev.string("description") ?? "Hermes wants to run a command.",
                 choices: (ev.raw["choices"] as? [String]) ?? ["once", "deny"], requestId: ev.string("request_id")))
             status = "Waiting for your approval"
-            notify(.approval)
+            notify(.approval, detail: (ev.string("description")).flatMap { Headline.of($0) })
         case "run.completed":
             confirmedPrimary = true
             var answeredItem = streamingIndex
@@ -1126,16 +1419,20 @@ final class ChatModel {
                     parts = ["Requested " + requested, "Hermes reported " + parts.joined(separator: " · ")]
                 }
                 if rt["fallback"] as? Bool == true { parts.append("Fallback") }
+                parts[0] = ModelName.short(parts[0])
+                if let label = CostSummary(rt["cost"])?.replyLabel { parts.append(label) }
                 items[i].footer = parts.joined(separator: " · ")
             }
             runtimeNotice = nil
             completedTick += 1
-            notify(.reply)
+            let replyText = answeredItem.flatMap { items.indices.contains($0) ? items[$0].text : nil } ?? ""
+            notify(.reply, detail: Headline.of(replyText))
             return true
         case "run.failed", "error":
             confirmedPrimary = true
-            fail(ev.string("error") ?? ev.string("message") ?? "The run failed.")
-            notify(.failure)
+            let reason = ev.string("error") ?? ev.string("message") ?? "The run failed."
+            fail(reason)
+            notify(.failure, detail: Headline.of(reason))
             return true
         case "run.cancelled", "run.interrupted":
             confirmedPrimary = true
@@ -1180,7 +1477,8 @@ final class ChatModel {
         lastPage = nil
         await load(quiet: true, resumeLive: !gaveUp)
         if gaveUp { error = "The live connection was lost. Tap Reload chat to reconnect." }
-        if gaveUp { cancelLocalQueue() } else { await flushLocalQueue() }
+        // Queued messages are never thrown back at the person: they stay saved and go at the next safe moment.
+        outboxWake()
     }
 
     func absorbPaste(_ text: String) {
@@ -1193,10 +1491,11 @@ final class ChatModel {
 
 
 
-    private func notify(_ event: ReplyNotifier.Event) {
+    private func notify(_ event: ReplyNotifier.Event, detail: String? = nil) {
         guard let app else { return }
-        ReplyNotifier.shared.post(event, bot: app.botName(profile),
-                                  account: app.inboxAccount, profile: profile, session: sessionId)
+        let worked = runStarted.map { Date().timeIntervalSince($0) }
+        ReplyNotifier.shared.post(event, bot: app.botName(profile), account: app.inboxAccount, profile: profile,
+                                  session: sessionId, detail: detail, worked: event == .approval ? nil : worked)
         if event != .approval {
             // This run is over; if it was the last one, hand the background time back.
             let others = app.hasLiveRuns(excluding: self)

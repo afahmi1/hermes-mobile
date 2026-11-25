@@ -604,6 +604,7 @@ struct ServedRuntime: Codable, Hashable {
     let fallbackActive: Bool?
     let policy: Policy?
     let modelsUsed: [Used]?
+    let cost: CostSummary?
 
     struct Policy: Codable, Hashable { let model: String?; let provider: String?; let effort: String? }
     struct Used: Codable, Hashable {
@@ -614,7 +615,7 @@ struct ServedRuntime: Codable, Hashable {
         enum CodingKeys: String, CodingKey { case model, provider, calls, reasoningTokens = "reasoning_tokens" }
     }
     enum CodingKeys: String, CodingKey {
-        case model, provider, policy
+        case model, provider, policy, cost
         case reasoningTokens = "reasoning_tokens", fallbackActive = "fallback_active", modelsUsed = "models_used"
     }
 
@@ -1043,4 +1044,72 @@ enum ModelName {
         let name = words.joined(separator: " ")
         return context.isEmpty ? name : name + " · " + context
     }
+}
+
+/// What a chat or a reply cost, from Hermes's own ledger. `usd` is real money (API-priced routes);
+/// subscription routes are `included`, with what they would have cost at API prices kept separately.
+struct CostSummary: Codable, Hashable {
+    let usd: Double
+    let includedApiUsd: Double
+    let included: Bool
+    let unknown: Bool
+    enum CodingKeys: String, CodingKey { case usd, included, unknown, includedApiUsd = "included_api_usd" }
+
+    init(usd: Double, includedApiUsd: Double = 0, included: Bool = false, unknown: Bool = false) {
+        self.usd = usd; self.includedApiUsd = includedApiUsd; self.included = included; self.unknown = unknown
+    }
+
+    init?(_ raw: Any?) {
+        guard let d = raw as? [String: Any] else { return nil }
+        self.init(usd: (d["usd"] as? NSNumber)?.doubleValue ?? 0,
+                  includedApiUsd: (d["included_api_usd"] as? NSNumber)?.doubleValue ?? 0,
+                  included: d["included"] as? Bool ?? false, unknown: d["unknown"] as? Bool ?? false)
+    }
+
+    static func money(_ usd: Double) -> String {
+        if usd < 0.005 { return "<$0.01" }
+        return usd.formatted(.currency(code: "USD").precision(.fractionLength(usd < 1 ? 3 : 2)))
+    }
+
+    /// Under one reply: "$0.042", "Included in plan", "$0.03 + plan". Nil when nothing is priced or included.
+    var replyLabel: String? {
+        let paid = usd >= 0.0005
+        if paid && included { return Self.money(usd) + " + plan" }
+        if paid { return Self.money(usd) }
+        if included { return "Included in plan" }
+        return nil
+    }
+}
+
+/// One chat's queue on the Mac (Hermes's session_admissions), oldest first.
+struct QueueState: Equatable {
+    struct Row: Equatable, Identifiable {
+        let id: String          // admission id
+        let status: String      // queued | started | steering | unknown
+        let text: String
+        let canEdit: Bool
+        let canSteer: Bool
+        let canCancel: Bool
+    }
+    let rows: [Row]
+    /// Hermes restarted mid-reply and holds the queue until that loss is acknowledged.
+    let paused: Bool
+    let lost: Row?
+
+    init?(_ raw: Any?) {
+        guard let d = raw as? [String: Any], let list = d["pending"] as? [[String: Any]] else { return nil }
+        func row(_ r: [String: Any]) -> Row? {
+            guard let id = r["admission_id"] as? String else { return nil }
+            return Row(id: id, status: r["status"] as? String ?? "queued", text: r["text"] as? String ?? "",
+                       canEdit: r["can_edit"] as? Bool ?? false, canSteer: r["can_steer"] as? Bool ?? false,
+                       canCancel: r["can_cancel"] as? Bool ?? false)
+        }
+        rows = list.compactMap(row)
+        paused = d["paused"] as? Bool ?? false
+        lost = (d["lost"] as? [String: Any]).flatMap(row)
+    }
+
+    func row(_ admission: String) -> Row? { rows.first { $0.id == admission } }
+    /// Still waiting its turn (not started, not finished).
+    func isWaiting(_ admission: String) -> Bool { row(admission)?.status == "queued" }
 }

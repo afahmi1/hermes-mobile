@@ -32,6 +32,7 @@ struct ChatScreen: View {
     @State private var previewedImage: UIImage?
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var landTick = 0
+    @State private var pathPreview: URL?
     @State private var revealTimes = false
     @State private var showPicker = false
     @State private var showFilePicker = false
@@ -107,7 +108,7 @@ struct ChatScreen: View {
                     }
                     if let s = chat.status {
                         HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
+                            ThinkingOrb(size: 16)
                             Text(s).font(.footnote).foregroundStyle(.secondary)
                             Spacer()
                         }
@@ -238,7 +239,14 @@ struct ChatScreen: View {
         .task(id: chat.sessionId) { await chat.loadPins() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
+        .onReceive(NotificationCenter.default.publisher(for: .hermesOpenPath)) { note in
+            guard let path = note.object as? String, let sid = chat.sessionId else { return }
+            Task { await openPath(path, session: sid) }
+        }
+        .quickLookPreview($pathPreview)
         .onReceive(NotificationCenter.default.publisher(for: .hermesForeground)) { _ in
+            // Anything waiting to go tries again right away, then backs off quietly.
+            chat.outboxWake()
             // Back from the background: show what happened while away, then land on it.
             guard !chat.isRunning else { return }
             Task { await chat.load(quiet: true); landTick &+= 1 }
@@ -261,9 +269,19 @@ struct ChatScreen: View {
             Button("Keep current", role: .cancel) {}
         } message: { pending in Text(pending.message) }
         .sheet(isPresented: $showCommands) {
-            CommandsSheet(commands: chat.slashCommands, skills: chat.skillDetails) { name in
+            CommandsSheet(commands: chat.slashCommands, skills: chat.skillDetails, pick: { name in
                 chat.draft = "/" + name + " "
-            }
+            }, usePrompt: { text, now in
+                if now && !chat.isRunning && chat.draftAttachments.isEmpty && chat.draft.isEmpty {
+                    chat.draft = text
+                    send()
+                } else if now && chat.isRunning {
+                    chat.draft = text
+                    followUp("queue")
+                } else {
+                    chat.draft = chat.draft.isEmpty ? text : chat.draft + "\n\n" + text
+                }
+            })
         }
         .onChange(of: chat.pins.count) { _, _ in pinCursor = 0 }
         // Re-ask when the gateway comes back: one failed probe must not hide attachments for the visit.
@@ -333,8 +351,11 @@ struct ChatScreen: View {
         let c = chat.choice
         let who = ModelName.short(c.model ?? bot?.model ?? "Default model")
         if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
-        guard let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) else { return who }
-        return "\(who) · \(effort)"
+        var parts = [who]
+        if let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) { parts.append(effort) }
+        // Real money only: a plan-covered chat shows no price here (the model sheet has the detail).
+        if let usd = chat.served?.cost?.usd, usd >= 0.01 { parts.append(CostSummary.money(usd)) }
+        return parts.joined(separator: " · ")
     }
 
     private var backgroundTasks: [(title: String, model: String)] {
@@ -464,22 +485,8 @@ struct ChatScreen: View {
                     chat.draft = "/" + name + " "
                 }
             }
-            if let queued = chat.localQueue {
-                HStack(spacing: 8) {
-                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(.tint)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Queued for right after this reply").font(.caption.weight(.semibold))
-                        Text(queued.text.isEmpty ? "\(queued.attachments.count) attachment\(queued.attachments.count == 1 ? "" : "s")" : queued.text)
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer()
-                    Button("Edit") { chat.cancelLocalQueue() }.font(.caption.weight(.semibold))
-                }
-                .padding(10)
-                .background(HMDesign.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-                .padding(.horizontal, 12)
-                .accessibilityElement(children: .combine)
-            }
+            if chat.queue?.paused == true { QueuePausedBanner(chat: chat) }
+            if !chat.outgoing.isEmpty { OutboxTray(chat: chat) }
             draftShelf
             if chat.isRunning, let notice = chat.runtimeNotice {
                 Text(notice).font(HMDesign.metadata).foregroundStyle(.secondary)
@@ -499,7 +506,7 @@ struct ChatScreen: View {
                     .padding(.leading, HMDesign.medium).padding(.vertical, HMDesign.small)
                     .padding(.trailing, (longDraft || keyboardUp) ? 30 : HMDesign.medium)
                     .frame(maxWidth: .infinity, minHeight: HMDesign.touch)
-                    .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
+                    .hmField()
                     .overlay(alignment: .topTrailing) {
                         if longDraft {
                             Button { showFullComposer = true } label: {
@@ -539,11 +546,10 @@ struct ChatScreen: View {
                             }
                             .hmTouchTarget()
                     }
-                    .disabled(chat.localQueue != nil || preparingMedia || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
+                    .disabled(preparingMedia || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     .contextMenu {
                         Button { followUp("queue") } label: { Label("Send next (after this reply)", systemImage: "text.line.last.and.arrowtriangle.forward") }
                         Button { followUp("steer") } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
-                            .disabled(!chat.acceptsFollowUp)
                     }
                     .accessibilityLabel("Queue message")
                     .accessibilityHint("Sends it right after the current reply. Touch and hold to guide this reply instead.")
@@ -640,6 +646,25 @@ struct ChatScreen: View {
             if day != last { out[item.id] = day; last = day }
         }
         return out
+    }
+
+    /// A path Hermes wrote in a reply: fetch it through the bridge (which re-checks it) and preview it.
+    private func openPath(_ path: String, session: String) async {
+        do {
+            let data = try await API.shared.chatFile(profile: chat.profile, session: session, path: path)
+            let name = (path as NSString).lastPathComponent
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("hermes-paths", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString.prefix(8).description, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let url = folder.appendingPathComponent(name.isEmpty ? "file" : name)
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            pathPreview = url
+        } catch APIError.http(404, _) {
+            Clipboard.copy(path, what: "Path copied")
+            chat.error = "Hermes can't share that file (it's gone, private, or not a previewable type), so the path was copied."
+        } catch {
+            chat.error = "Couldn't open that file: " + error.localizedDescription
+        }
     }
 
     /// Bottom, then again once rows have measured themselves (lazy rows report estimated heights first).
@@ -928,9 +953,8 @@ struct ChatScreen: View {
         let files = chat.draftAttachments
         if let problem = issue(for: files) { chat.error = problem; return }
         Task {
-            let accepted = mode == "queue"
-                ? await chat.queueNext(text, attachments: files)
-                : await chat.followUp(text, mode: mode, attachments: files)
+            // Saved to this phone first, then sent. Closing the app or losing signal never loses it.
+            let accepted = await chat.enqueue(text, mode: mode, attachments: files)
             if accepted, chat.draft == draftAtSend, chat.pastedTexts == pastedAtSend {
                 chat.draft = ""
                 chat.pastedTexts = []
@@ -1307,6 +1331,7 @@ struct MessageRow: View {
                 }
             }
             .padding(.horizontal, 12)
+            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .assistant:
             // Replies run full width without a bubble (as in T3 and the desktop app): more of the
@@ -1360,6 +1385,7 @@ struct MessageRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
+            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .control:
             // Their words, not a gray system card. The tag says whether it was queued or used to guide the reply.
@@ -1971,12 +1997,40 @@ struct TranscriptFile: View {
 // MARK: - Commands
 
 /// Every slash command and skill this bot offers, searchable. Tapping one puts it in the composer.
+/// A prompt kept for one-tap reuse. `sendNow` sends it as is; otherwise it lands in the composer to edit.
+struct SavedPrompt: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var title: String
+    var text: String
+    var sendNow: Bool
+
+    static let key = "hm.savedPrompts"
+    static let starters = [
+        SavedPrompt(title: "Status", text: "Where are you on this? One short paragraph, then what's next.", sendNow: true),
+        SavedPrompt(title: "Continue", text: "Continue.", sendNow: true),
+        SavedPrompt(title: "Summarize", text: "Summarize this chat so far: decisions, open questions, next steps.", sendNow: true),
+        SavedPrompt(title: "Explain simply", text: "Explain that again simply, like I'm new to it.", sendNow: false),
+    ]
+    static func load() -> [SavedPrompt] {
+        guard let data = UserDefaults.standard.data(forKey: key), let list = try? JSONDecoder().decode([SavedPrompt].self, from: data)
+        else { return starters }
+        return list
+    }
+    static func save(_ list: [SavedPrompt]) {
+        if let data = try? JSONEncoder().encode(list) { UserDefaults.standard.set(data, forKey: key) }
+    }
+}
+
 struct CommandsSheet: View {
-    enum Side: String, CaseIterable { case commands = "Commands", skills = "Skills" }
+    enum Side: String, CaseIterable { case saved = "Saved", commands = "Commands", skills = "Skills" }
 
     let commands: [SlashCommand]
     let skills: [SkillInfo]
     let pick: (String) -> Void
+    /// (text, send now)
+    var usePrompt: ((String, Bool) -> Void)? = nil
+    @State private var prompts = SavedPrompt.load()
+    @State private var editing: SavedPrompt?
     var start: Side = .commands
     @State private var side: Side = .commands
     @State private var query = ""
@@ -2029,7 +2083,34 @@ struct CommandsSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                if side == .commands {
+                if side == .saved {
+                    Section {
+                        ForEach(prompts.filter { trimmed.isEmpty || ($0.title + " " + $0.text).localizedCaseInsensitiveContains(trimmed) }) { prompt in
+                            Button {
+                                usePrompt?(prompt.text, prompt.sendNow)
+                                dismiss()
+                            } label: {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: prompt.sendNow ? "paperplane.fill" : "square.and.pencil")
+                                        .foregroundStyle(HMDesign.accent).frame(width: 20)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(prompt.title).font(.body.weight(.semibold))
+                                        Text(prompt.text).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                    }
+                                }
+                            }
+                            .foregroundStyle(.primary)
+                            .swipeActions {
+                                Button(role: .destructive) { prompts.removeAll { $0.id == prompt.id }; SavedPrompt.save(prompts) } label: { Label("Delete", systemImage: "trash") }
+                                Button { editing = prompt } label: { Label("Edit", systemImage: "pencil") }.tint(HMDesign.accent)
+                            }
+                        }
+                        .onMove { from, to in prompts.move(fromOffsets: from, toOffset: to); SavedPrompt.save(prompts) }
+                        Button { editing = SavedPrompt(title: "", text: "", sendNow: true) } label: { Label("New saved prompt", systemImage: "plus") }
+                    } footer: {
+                        Text("A paper plane sends right away. A pencil puts the text in the message box to edit first. Swipe to edit or delete.")
+                    }
+                } else if side == .commands {
                     ForEach(grouped, id: \.0) { group, rows in
                         Section(group) {
                             ForEach(rows) { command in
@@ -2071,21 +2152,28 @@ struct CommandsSheet: View {
                     }
                 }
             }
+            .sheet(item: $editing) { prompt in
+                SavedPromptEditor(prompt: prompt) { saved in
+                    if let i = prompts.firstIndex(where: { $0.id == saved.id }) { prompts[i] = saved } else { prompts.append(saved) }
+                    SavedPrompt.save(prompts)
+                }
+            }
             .overlay {
                 if (side == .commands && grouped.isEmpty) || (side == .skills && skillHits.isEmpty) {
                     ContentUnavailableView.search(text: query)
                 }
             }
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
-                        prompt: side == .commands ? "Find a command" : "Search \(skills.count) skills by name or purpose")
+                        prompt: side == .saved ? "Find a saved prompt" : side == .commands ? "Find a command" : "Search \(skills.count) skills by name or purpose")
             .toolbar {
                 ToolbarItem(placement: .principal) {
                     Picker("Show", selection: $side) {
-                        Text("Commands · \(commands.count)").tag(Side.commands)
+                        Text("Saved").tag(Side.saved)
+                        Text("Commands").tag(Side.commands)
                         Text("Skills · \(skills.count)").tag(Side.skills)
                     }
                     .pickerStyle(.segmented)
-                    .frame(maxWidth: 280)
+                    .frame(maxWidth: 320)
                 }
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
@@ -2128,6 +2216,37 @@ struct CommandsSheet: View {
 }
 
 /// The small "Copied" pill that confirms any copy in the chat.
+struct SavedPromptEditor: View {
+    @State var prompt: SavedPrompt
+    let save: (SavedPrompt) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Name", text: $prompt.title)
+                TextField("What to send", text: $prompt.text, axis: .vertical).lineLimit(3...10)
+                Toggle("Send right away", isOn: $prompt.sendNow)
+            }
+            .hmCanvas()
+            .navigationTitle(prompt.title.isEmpty ? "Saved prompt" : prompt.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        var p = prompt
+                        if p.title.trimmingCharacters(in: .whitespaces).isEmpty { p.title = String(p.text.prefix(24)) }
+                        save(p); dismiss()
+                    }
+                    .disabled(prompt.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
 struct CopiedToast: View {
     let text: String
 
@@ -2191,4 +2310,146 @@ struct ActionIcon: View {
 private struct MediaInputsModifier: ViewModifier {
     let host: ChatScreen
     func body(content: Content) -> some View { host.mediaInputs(content) }
+}
+
+// MARK: - Outbox tray
+
+/// Messages written while Hermes was busy or the connection was down. Each says plainly where it is.
+/// Tap to edit; touch and hold for the rest. Nothing here is ever lost: it is on disk until it starts.
+struct OutboxTray: View {
+    @Bindable var chat: ChatModel
+    @State private var editing: Outgoing?
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 6) {
+                ForEach(Array(chat.outgoing.enumerated()), id: \.element.id) { index, item in
+                    row(item, position: index)
+                }
+            }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(maxHeight: chat.outgoing.count > 2 ? 150 : nil)
+        .fixedSize(horizontal: false, vertical: chat.outgoing.count <= 2)
+        .padding(.horizontal, 12)
+        .sheet(item: $editing) { item in
+            OutgoingEditor(item: item) { text in Task { await chat.editOutgoing(item.id, text: text) } }
+        }
+        .animation(.spring(duration: 0.3), value: chat.outgoing)
+    }
+
+    private func status(_ item: Outgoing, position: Int) -> (String, String, Color) {
+        if let problem = item.problem { return ("exclamationmark.triangle.fill", "Didn't send: \(problem). Tap to edit.", HMDesign.warning) }
+        if item.edit != nil { return ("pencil.circle", "Edit saved · applies as soon as your Mac answers", .secondary) }
+        if item.onMac {
+            let ahead = chat.outgoing.prefix(position).filter(\.onMac).count
+            return ("checkmark.circle.fill", ahead == 0 ? "On your Mac · next up" : "On your Mac · #\(ahead + 1) in line", HMDesign.success)
+        }
+        if item.attempts > 0 { return ("icloud.and.arrow.up", "Saved on this phone · sends when your Mac answers", .secondary) }
+        if item.mode == "steer" { return ("arrow.turn.up.right", "Will guide this reply", HMDesign.accent) }
+        return ("clock.arrow.circlepath", chat.isRunning ? "Sends after this reply" : "Sending…", HMDesign.accent)
+    }
+
+    @ViewBuilder private func row(_ item: Outgoing, position: Int) -> some View {
+        let (icon, caption, tint) = status(item, position: position)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon).foregroundStyle(tint).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.edit ?? item.label).font(.subheadline).lineLimit(2)
+                Text(caption).font(.caption).foregroundStyle(item.problem == nil ? Color.secondary : tint)
+                if let note = item.note { Text(note).font(.caption2).foregroundStyle(.secondary) }
+            }
+            Spacer(minLength: 0)
+            if item.files > 0 {
+                Label("\(item.files)", systemImage: "paperclip").font(.caption2).foregroundStyle(.secondary).labelStyle(.titleAndIcon)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onTapGesture { if canEdit(item) { editing = item } }
+        .contextMenu {
+            if canEdit(item) { Button { editing = item } label: { Label("Edit", systemImage: "pencil") } }
+            if item.mode == "queue", chat.isRunning, item.problem == nil {
+                Button { Task { await chat.guideNow(item.id) } } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
+            }
+            Button { Task { await chat.removeOutgoing(item.id, toComposer: true) } } label: {
+                Label("Move back to message box", systemImage: "arrow.uturn.down")
+            }
+            Button(role: .destructive) { Task { await chat.removeOutgoing(item.id, toComposer: false) } } label: {
+                Label("Remove", systemImage: "trash")
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(canEdit(item) ? "Double-tap to edit. Touch and hold for more." : "Touch and hold for more.")
+    }
+
+    /// A steer that may already have reached the running reply can't be taken back, so it can't be edited.
+    private func canEdit(_ item: Outgoing) -> Bool {
+        !(item.mode == "steer" && item.attempts > 0 && item.problem == nil)
+    }
+}
+
+/// Hermes restarted while answering, cut that reply off, and holds the queue until someone says go.
+struct QueuePausedBanner: View {
+    @Bindable var chat: ChatModel
+    @State private var working = false
+
+    var body: some View {
+        let waiting = chat.queue?.rows.filter { $0.status == "queued" }.count ?? 0
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Hermes restarted mid-reply", systemImage: "arrow.clockwise.circle.fill")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.warning)
+            Text("The reply to “\(String((chat.queue?.lost?.text ?? "your message").prefix(80)))” was cut off. "
+                 + "\(waiting) message\(waiting == 1 ? " is" : "s are") waiting behind it.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button { working = true; Task { await chat.continueQueue(); working = false } } label: {
+                    Text(working ? "Continuing…" : "Continue").font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent).disabled(working)
+                if let lost = chat.queue?.lost?.text, !lost.isEmpty {
+                    Button("Copy cut-off message") { Clipboard.copy(lost, what: "Copied") }.font(.subheadline)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.warning.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 12)
+    }
+}
+
+struct OutgoingEditor: View {
+    let item: Outgoing
+    let save: (String) -> Void
+    @State private var text = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Message", text: $text, axis: .vertical).lineLimit(3...14)
+                } footer: {
+                    Text(item.onMac
+                         ? "Your Mac swaps in the edit if Hermes hasn't started it yet. It keeps its place after the current reply."
+                         : "It hasn't left this phone yet, so the edit is instant.")
+                }
+            }
+            .hmCanvas()
+            .navigationTitle(item.mode == "steer" ? "Edit guidance" : "Edit queued message")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save(text); dismiss() }
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onAppear { text = item.edit ?? item.text }
+        }
+        .presentationDetents([.medium, .large])
+    }
 }

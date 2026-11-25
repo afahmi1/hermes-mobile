@@ -178,3 +178,99 @@ struct AdaptiveTitleRow<Leading: View, Trailing: View>: View {
         }
     }
 }
+
+// MARK: - Glass
+
+enum HMGlass {
+    static let key = "hm.glass"
+}
+
+/// iOS 26 Liquid Glass where the person wants it (Settings > Appearance), the theme's flat colors otherwise.
+private struct HMSurface<S: Shape>: ViewModifier {
+    @AppStorage(HMGlass.key) private var glass = true
+    let shape: S
+    let flat: Color
+    func body(content: Content) -> some View {
+        if glass, #available(iOS 26.0, *) {
+            content.glassEffect(.regular.tint(flat.opacity(0.25)).interactive(), in: shape)
+        } else {
+            content.background(flat, in: shape)
+        }
+    }
+}
+
+extension View {
+    /// The message box and floating chips.
+    func hmField(radius: CGFloat = HMDesign.messageRadius) -> some View {
+        modifier(HMSurface(shape: RoundedRectangle(cornerRadius: radius, style: .continuous), flat: HMDesign.panel))
+    }
+    func hmCapsule() -> some View { modifier(HMSurface(shape: Capsule(), flat: HMDesign.panel)) }
+}
+
+// MARK: - Thinking orb
+
+/// A small living orb for "Hermes is thinking": slow, soft, in the theme's accent. Respects Reduce Motion.
+struct ThinkingOrb: View {
+    var size: CGFloat = 18
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            ZStack {
+                Circle()
+                    .fill(AngularGradient(colors: [HMDesign.accent, HMDesign.accent.opacity(0.35), HMDesign.success.opacity(0.7),
+                                                   HMDesign.accent], center: .center, angle: .degrees(t * 90)))
+                    .blur(radius: size * 0.12)
+                Circle()
+                    .fill(RadialGradient(colors: [.white.opacity(0.55), .clear], center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3),
+                                                                                                   y: 0.3 + 0.1 * cos(t * 1.1)),
+                                         startRadius: 0, endRadius: size * 0.5))
+            }
+            .frame(width: size, height: size)
+            .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
+            .shadow(color: HMDesign.accent.opacity(0.45), radius: size * 0.35)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Swipe to quote
+
+/// Swipe a message right to quote it into the composer, like Telegram and iMessage. A haptic marks the
+/// point where letting go counts. Vertical scrolling is untouched: only a clearly sideways drag moves it.
+struct SwipeToQuote: ViewModifier {
+    let onQuote: () -> Void
+    @State private var offset: CGFloat = 0
+    @State private var armed = false
+    private let threshold: CGFloat = 56
+
+    func body(content: Content) -> some View {
+        content
+            .offset(x: offset)
+            .background(alignment: .leading) {
+                Image(systemName: "arrowshape.turn.up.left.fill")
+                    .font(.callout).foregroundStyle(armed ? HMDesign.accent : .secondary)
+                    .opacity(Double(min(offset / threshold, 1)))
+                    .scaleEffect(armed ? 1.15 : 0.85)
+                    .padding(.leading, 6)
+            }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 18)
+                    .onChanged { drag in
+                        let dx = drag.translation.width, dy = drag.translation.height
+                        guard dx > 0, dx > abs(dy) * 1.6 else { return }
+                        offset = min(dx * 0.55, threshold + 14)
+                        let now = offset >= threshold
+                        if now != armed {
+                            armed = now
+                            if now { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
+                        }
+                    }
+                    .onEnded { _ in
+                        if armed { onQuote() }
+                        withAnimation(.spring(duration: 0.3)) { offset = 0; armed = false }
+                    }
+            )
+    }
+}
