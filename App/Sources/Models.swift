@@ -16,6 +16,18 @@ struct Bot: Codable, Identifiable, Hashable {
         case id, name, blurb, model, provider, reachable, front, skills
     }
 
+    init(id: String, name: String, blurb: String, model: String, provider: String, reachable: Bool, front: Bool,
+         skills: [String] = []) {
+        self.id = id
+        self.name = name
+        self.blurb = blurb
+        self.model = model
+        self.provider = provider
+        self.reachable = reachable
+        self.front = front
+        self.skills = skills
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
@@ -103,11 +115,16 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     var pinned: Bool?
     var archived: Bool?
     let endedAt: Double?
+    /// Pinned messages inside this chat (bridge-side). Absent on older bridges and on chats without pins.
+    var pinCount: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, profile, source, model, title, preview, pinned, archived, createdVia = "created_via"
         case startedAt = "started_at", lastActive = "last_active", messageCount = "message_count", endedAt = "ended_at"
+        case pinCount = "pin_count"
     }
+
+    var pinnedMessages: Int { max(0, pinCount ?? 0) }
 
     var key: String { "\(profile)/\(id)" }
     var displayTitle: String {
@@ -154,6 +171,85 @@ struct SessionPage: Codable {
 struct SessionFlagResult {
     let updated: [String]
     let errors: [String: String]
+    /// Chats the bridge refused to archive because they hold pinned messages: {session id: pin count}.
+    var heldForPins: [String: Int] = [:]
+}
+
+/// One pinned message in a chat. The bridge snapshots the text from Hermes when it is pinned, so the pin
+/// still reads correctly after the live transcript is compressed or trimmed.
+struct MessagePin: Codable, Identifiable, Hashable {
+    let messageId: Int
+    let role: String
+    let text: String
+    let messageAt: Double?
+    let pinnedAt: Double
+
+    var id: Int { messageId }
+    /// The transcript row id this pin points at (`ChatItem.id` for stored messages).
+    var itemID: String { String(messageId) }
+    var isMine: Bool { role == "user" }
+    var excerpt: String {
+        let flat = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return flat.count > 140 ? String(flat.prefix(140)) + "…" : flat
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case role, text
+        case messageId = "message_id", messageAt = "message_at", pinnedAt = "pinned_at"
+    }
+
+    /// A ChatItem can be pinned only when it is a stored user/assistant message (numeric Hermes id).
+    static func messageID(for item: ChatItem) -> Int? {
+        guard item.kind == .user || item.kind == .assistant, !item.streaming,
+              !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return Int(item.id)
+    }
+}
+
+/// One background command or subagent task in an activity card.
+struct ActivityEntry: Codable, Hashable {
+    /// "process" or "task".
+    let type: String
+    /// "ok", "failed", "stopped" or "warning".
+    let status: String
+    let label: String
+    var exitCode: Int?
+    var cwd: String?
+    var command: String?
+    var output: String?
+    var duration: String?
+    var apiCalls: Int?
+    var model: String?
+    var state: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, status, label, cwd, command, output, duration, model, state
+        case exitCode = "exit_code", apiCalls = "api_calls"
+    }
+
+    var isProcess: Bool { type == "process" }
+    var failed: Bool { status == "failed" }
+
+    /// "in plate B · exit 0" or "gpt-6.2-astra · 14 calls · 7m25s".
+    var meta: String {
+        var parts: [String] = []
+        if isProcess {
+            if let cwd, !cwd.isEmpty { parts.append("in " + cwd) }
+            if status == "stopped" { parts.append("stopped") }
+            else if let exitCode, exitCode != 0 { parts.append("exit \(exitCode)") }
+        } else {
+            if let state, !state.isEmpty, state != "completed" { parts.append(state) }
+            if let model, !model.isEmpty { parts.append(model) }
+            if let apiCalls { parts.append(apiCalls == 1 ? "1 call" : "\(apiCalls) calls") }
+        }
+        if let duration, !duration.isEmpty { parts.append(duration) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+struct PinList: Decodable {
+    let pins: [MessagePin]
+    let limit: Int?
 }
 
 struct SearchPage: Codable { let data: [SessionSummary] }
@@ -172,9 +268,11 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     let preview: String?
     let ok: Bool?
     let media: [ChatMediaRef]?
+    /// Background commands and subagent tasks behind an activity card (bridge-parsed). Absent on older bridges.
+    let activity: [ActivityEntry]?
 
     enum CodingKeys: String, CodingKey {
-        case id, role, content, timestamp, reasoning, notice, preview, ok, media
+        case id, role, content, timestamp, reasoning, notice, preview, ok, media, activity
         case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind"
     }
 
@@ -192,6 +290,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         preview = try? c.decode(String.self, forKey: .preview)
         ok = try? c.decode(Bool.self, forKey: .ok)
         media = try? c.decode([ChatMediaRef].self, forKey: .media)
+        activity = try? c.decode([ActivityEntry].self, forKey: .activity)
     }
 
     /// Content may be a string or a list of OpenAI-style parts.
@@ -603,5 +702,213 @@ struct SavedGateways {
            Self.origin(active) == origin { _ = remove("token") }
         defaults.set(servers.filter { $0 != origin }.map(\.absoluteString), forKey: "savedGatewayOrigins")
         return deleted
+    }
+}
+
+// MARK: - Message format (rendered by MarkdownText)
+
+/// One block of a Markdown message, as the phone renders it. See docs/message-format.md for the contract.
+enum MarkdownBlock: Equatable {
+    case paragraph(String)
+    case heading(Int, String)
+    case list([ListItem])
+    case quote(String)
+    case code(language: String, body: String, closed: Bool, file: String? = nil)
+    /// GitHub alert syntax: `> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`.
+    case callout(kind: String, text: String)
+    case table([[String]])
+    case rule
+
+    struct ListItem: Equatable {
+        var depth: Int
+        /// "•", "1.", "☐" or "☑".
+        var marker: String
+        var text: String
+    }
+
+    static func parse(_ text: String) -> [MarkdownBlock] {
+        var out: [MarkdownBlock] = []
+        var paragraph: [String] = []
+        var list: [ListItem] = []
+        var quote: [String] = []
+        var table: [String] = []
+        let lines = text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+
+        func flush() {
+            if !paragraph.isEmpty { out.append(.paragraph(paragraph.joined(separator: "\n"))); paragraph = [] }
+            if !list.isEmpty { out.append(.list(list)); list = [] }
+            if !quote.isEmpty {
+                if let kind = calloutKind(quote[0]) {
+                    var lines = Array(quote.dropFirst())
+                    let rest = quote[0].replacingOccurrences(of: "[!\(kind.uppercased())]", with: "", options: .caseInsensitive)
+                        .trimmingCharacters(in: .whitespaces)
+                    if !rest.isEmpty { lines.insert(rest, at: 0) }
+                    out.append(.callout(kind: kind, text: lines.joined(separator: "\n")))
+                } else {
+                    out.append(.quote(quote.joined(separator: "\n")))
+                }
+                quote = []
+            }
+            if !table.isEmpty {
+                let rows = table.filter { !isTableRule($0) }.map(cells)
+                if table.count >= 2, table.contains(where: isTableRule) { out.append(.table(rows)) }
+                else { out.append(.paragraph(table.joined(separator: "\n"))) }
+                table = []
+            }
+        }
+
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // Fenced code: ``` or ~~~, with an optional language. An unclosed fence (a reply still streaming)
+            // runs to the end and is shown as code straight away.
+            if let fence = ["```", "~~~"].first(where: { trimmed.hasPrefix($0) }) {
+                flush()
+                let (language, file) = fenceInfo(String(trimmed.dropFirst(fence.count)))
+                var body: [String] = []
+                var closed = false
+                i += 1
+                while i < lines.count {
+                    if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix(fence) { closed = true; break }
+                    body.append(lines[i])
+                    i += 1
+                }
+                out.append(.code(language: language, body: body.joined(separator: "\n"), closed: closed, file: file))
+                i += 1
+                continue
+            }
+            if trimmed.isEmpty { flush(); i += 1; continue }
+            if let heading = headingLevel(trimmed) {
+                flush()
+                out.append(.heading(heading.level, heading.text))
+            } else if ["---", "***", "___"].contains(trimmed.replacingOccurrences(of: " ", with: "")) && trimmed.count >= 3 {
+                flush()
+                out.append(.rule)
+            } else if trimmed.hasPrefix(">") {
+                if !paragraph.isEmpty || !list.isEmpty || !table.isEmpty { flush() }
+                quote.append(String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces))
+            } else if trimmed.hasPrefix("|") && trimmed.dropFirst().contains("|") {
+                if !paragraph.isEmpty || !list.isEmpty || !quote.isEmpty { flush() }
+                table.append(trimmed)
+            } else if let item = listItem(line) {
+                if !paragraph.isEmpty || !quote.isEmpty || !table.isEmpty { flush() }
+                list.append(item)
+            } else if !list.isEmpty, line.hasPrefix("  ") || line.hasPrefix("\t") {
+                // A wrapped continuation of the previous list item.
+                list[list.count - 1].text += " " + trimmed
+            } else {
+                if !list.isEmpty || !quote.isEmpty || !table.isEmpty { flush() }
+                paragraph.append(line)
+            }
+            i += 1
+        }
+        flush()
+        return out
+    }
+
+    /// "python title=build.py", "ts src/app.ts" or "build.py": the language and an optional file name.
+    static func fenceInfo(_ raw: String) -> (language: String, file: String?) {
+        let tokens = raw.trimmingCharacters(in: .whitespaces).split(separator: " ").map(String.init)
+        var language = tokens.first ?? ""
+        var file: String?
+        for token in tokens {
+            for key in ["title=", "file=", "filename="] where token.lowercased().hasPrefix(key) {
+                file = String(token.dropFirst(key.count)).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            }
+        }
+        if file == nil, let first = tokens.first, first.contains("."), !first.hasPrefix("."), !first.contains("=") {
+            file = first
+            language = (first as NSString).pathExtension
+        } else if file == nil, tokens.count > 1, tokens[1].contains("."), !tokens[1].contains("=") {
+            file = tokens[1]
+        }
+        if language.contains("=") { language = "" }
+        return (language, file?.isEmpty == true ? nil : file)
+    }
+
+    /// "bash" reads "Bash", "cpp" reads "C++": the label a code block's header shows.
+    static func languageName(_ raw: String) -> String {
+        let names = ["sh": "Shell", "bash": "Bash", "zsh": "Zsh", "shell": "Shell", "console": "Console", "fish": "Fish",
+                     "js": "JavaScript", "javascript": "JavaScript", "ts": "TypeScript", "typescript": "TypeScript",
+                     "tsx": "TSX", "jsx": "JSX", "py": "Python", "python": "Python", "swift": "Swift", "rb": "Ruby",
+                     "ruby": "Ruby", "go": "Go", "rs": "Rust", "rust": "Rust", "c": "C", "h": "C", "cpp": "C++", "c++": "C++",
+                     "cs": "C#", "csharp": "C#", "java": "Java", "kt": "Kotlin", "kotlin": "Kotlin", "json": "JSON",
+                     "jsonc": "JSON", "yaml": "YAML", "yml": "YAML", "toml": "TOML", "xml": "XML", "html": "HTML",
+                     "css": "CSS", "scss": "SCSS", "sql": "SQL", "md": "Markdown", "markdown": "Markdown", "diff": "Diff",
+                     "patch": "Diff", "dockerfile": "Dockerfile", "docker": "Dockerfile", "ps1": "PowerShell",
+                     "powershell": "PowerShell", "text": "Text", "txt": "Text", "plaintext": "Text", "graphql": "GraphQL",
+                     "php": "PHP", "lua": "Lua", "r": "R", "ini": "INI", "env": "Env", "nginx": "Nginx",
+                     "makefile": "Makefile", "make": "Makefile", "proto": "Protobuf", "regex": "Regex", "applescript": "AppleScript",
+                     "gcode": "G-code", "smiles": "SMILES", "fasta": "FASTA"]
+        if raw.isEmpty { return "Code" }
+        return names[raw.lowercased()] ?? raw.prefix(1).uppercased() + raw.dropFirst()
+    }
+
+    /// The message as plain text: Markdown markers gone, code kept verbatim. "Copy" uses this.
+    static func plainText(_ text: String) -> String {
+        func flat(_ s: String) -> String {
+            let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+            return (try? AttributedString(markdown: s, options: opts)).map { String($0.characters) } ?? s
+        }
+        return parse(text).map { block -> String in
+            switch block {
+            case .paragraph(let s), .quote(let s): return flat(s)
+            case .heading(_, let s): return flat(s)
+            case .callout(_, let s): return flat(s)
+            case .list(let items):
+                return items.map { String(repeating: "  ", count: $0.depth) + ($0.marker == "•" ? "-" : $0.marker) + " " + flat($0.text) }
+                    .joined(separator: "\n")
+            case .code(_, let body, _, _): return body
+            case .table(let rows): return rows.map { $0.map(flat).joined(separator: "\t") }.joined(separator: "\n")
+            case .rule: return "---"
+            }
+        }.joined(separator: "\n\n")
+    }
+
+    private static func calloutKind(_ line: String) -> String? {
+        let lower = line.lowercased()
+        return ["note", "tip", "important", "warning", "caution"].first { lower.hasPrefix("[!\($0)]") }
+    }
+
+    private static func headingLevel(_ line: String) -> (level: Int, text: String)? {
+        let hashes = line.prefix { $0 == "#" }.count
+        guard (1...6).contains(hashes), line.count > hashes, line[line.index(line.startIndex, offsetBy: hashes)] == " " else { return nil }
+        return (hashes, String(line.dropFirst(hashes + 1)).trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func listItem(_ line: String) -> ListItem? {
+        let indent = line.prefix { $0 == " " || $0 == "\t" }.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) }
+        let body = line.drop { $0 == " " || $0 == "\t" }
+        var marker: String
+        var rest: Substring
+        if let first = body.first, "-*+".contains(first), body.dropFirst().first == " " {
+            marker = "•"
+            rest = body.dropFirst(2)
+        } else {
+            let digits = body.prefix { $0.isNumber }
+            guard !digits.isEmpty, digits.count <= 4 else { return nil }
+            let after = body.dropFirst(digits.count)
+            guard let sep = after.first, sep == "." || sep == ")", after.dropFirst().first == " " else { return nil }
+            marker = digits + "."
+            rest = after.dropFirst(2)
+        }
+        if marker == "•" {
+            if rest.hasPrefix("[ ] ") { marker = "☐"; rest = rest.dropFirst(4) }
+            else if rest.lowercased().hasPrefix("[x] ") { marker = "☑"; rest = rest.dropFirst(4) }
+        }
+        return ListItem(depth: min(indent / 2, 4), marker: marker, text: String(rest))
+    }
+
+    private static func isTableRule(_ line: String) -> Bool {
+        let core = line.replacingOccurrences(of: " ", with: "")
+        return !core.isEmpty && core.allSatisfy { "|-:".contains($0) } && core.contains("-")
+    }
+
+    private static func cells(_ line: String) -> [String] {
+        var core = line.trimmingCharacters(in: .whitespaces)
+        if core.hasPrefix("|") { core.removeFirst() }
+        if core.hasSuffix("|") { core.removeLast() }
+        return core.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
     }
 }

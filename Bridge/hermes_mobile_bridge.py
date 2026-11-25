@@ -56,6 +56,7 @@ import bridge_devices
 import bridge_receipts
 from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
+import bridge_pins  # pinned messages (own SQLite file, stdlib only)
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
     TURNS_ERROR = None
@@ -471,6 +472,34 @@ def manage_overlay():
         if key not in _MANAGE:
             _MANAGE[key] = bridge_manage.Manage(STATE_DIR)
         return _MANAGE[key]
+
+
+_PINS = {}
+
+
+def pin_store():
+    """The pinned-message store, or None when it cannot open (pins then simply do not show)."""
+    key = str(STATE_DIR)
+    with _MANAGE_LOCK:
+        if key not in _PINS:
+            try:
+                _PINS[key] = bridge_pins.Pins(STATE_DIR)
+            except (OSError, sqlite3.Error) as exc:
+                log("Pinned messages unavailable: %s" % type(exc).__name__)
+                return None
+        return _PINS[key]
+
+
+def pin_message(pid, sid, mid):
+    store = pin_store()
+    if store is None:
+        raise bridge_pins.PinError("Pinned messages are unavailable on this Mac.", 503, "unavailable")
+    con = _ro(pid)
+    if con is None:
+        raise bridge_pins.PinError("This bot has no saved chats.", 404, "not_found")
+    with closing(con):
+        role, excerpt, ts = bridge_pins.read_message(con, sid, mid)
+    return store.add(pid, sid, mid, role, excerpt, ts)
 
 
 def archived_live_bots():
@@ -1364,9 +1393,17 @@ def admissions_dir():
     return Path(override) if override else STATE_DIR / "admissions"
 
 
+def assistant_media_roots():
+    """Where Hermes's own replies may point a phone at files: the Mac user's home (secrets excluded by
+    bridge_transcript). HERMES_MOBILE_REPLY_FILES=hermes keeps replies inside the Hermes home only."""
+    if os.environ.get("HERMES_MOBILE_REPLY_FILES", "").strip().lower() == "hermes":
+        return []
+    return [HOME]
+
+
 def project_timeline_message(message):
     """One mobile timeline row. Reasoning and unbounded tool bodies stay on the Mac."""
-    return transcript.project_timeline_message(message, [HERMES])
+    return transcript.project_timeline_message(message, [HERMES], assistant_media_roots())
 
 
 def timeline_bytes(messages):
@@ -1394,7 +1431,11 @@ def session_bodies(pid, session_id):
         active = db.resolve_resume_session_id(session_id)
         rows = db.get_messages(active, limit=1000, offset=0, latest=True,
                                include_compacted=False, include_ancestors=True)
-        return [transcript.content_text(APIServerAdapter._message_response(row).get("content")) for row in rows]
+        out = []
+        for row in rows:
+            shaped = APIServerAdapter._message_response(row)
+            out.append((shaped.get("role") or row.get("role") or "user", transcript.content_text(shaped.get("content"))))
+        return out
 
 
 def native_timeline_page(pid, session_id, limit, offset, latest):
@@ -1599,6 +1640,8 @@ class H(BaseHTTPRequestHandler):
             return self.workspace_route(path, q)
         if path == "/m/sessions/flags" and self.command == "POST":
             return self.session_flags()
+        if path.startswith("/m/pins/"):
+            return self.pins_route(path)
         if self.command == "GET":
             if path == "/m/health":
                 return self.send(200, health())
@@ -1624,9 +1667,11 @@ class H(BaseHTTPRequestHandler):
                 limit = _bounded_int(q.get("limit"), 40, 1, 100)
                 only = set(q["profile"].split(",")) if q.get("profile") else None
                 exclude = tuple(x for x in q.get("exclude", "").split(",") if x)
-                return self.send(200, session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact", {"/m/desktop": "desktop", "/m/archived": "archived"}.get(path)))
+                page = session_page(limit, q.get("cursor"), only, exclude, path == "/m/telegram", q.get("view") == "compact", {"/m/desktop": "desktop", "/m/archived": "archived"}.get(path))
+                return self.send(200, bridge_pins.with_pin_counts(page, pin_store()))
             if path == "/m/search":
-                return self.send(200, {"data": search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"), scope=q.get("scope"))})
+                found = search_sessions(q.get("q", "").strip(), archived=q.get("archived") == "1", profile=q.get("profile"), source=q.get("source"), scope=q.get("scope"))
+                return self.send(200, bridge_pins.with_pin_counts({"data": found}, pin_store()))
             m = re.match(r"^/m/runtime/([^/]+)/([^/]+)$", path)
             if m:
                 d = session_runtime(m.group(1), m.group(2)) if (m.group(1) == "default" or PROFILE_RE.match(m.group(1))) else None
@@ -1673,12 +1718,61 @@ class H(BaseHTTPRequestHandler):
         if not key_for(pid):
             return self.send(404, {"error": "unknown or unreachable bot"})
         unique = list(dict.fromkeys(ids))
+        # A chat with pinned messages is protected: archiving it needs an explicit confirmation
+        # (`confirm_pins: true`) that the person saw how many pins it holds. Pins are kept either way.
+        held = {}
+        if fields.get("archived") is True and d.get("confirm_pins") is not True:
+            store = pin_store()
+            held = store.counts(pid, unique) if store is not None else {}
+        if held:
+            unique = [sid for sid in unique if sid not in held]
+            if not unique:
+                return self.send(409, {"error": "Those chats have pinned messages.", "code": "has_pins",
+                                       "pins": held, "updated": [],
+                                       "errors": {sid: "has %d pinned message%s" % (n, "" if n == 1 else "s")
+                                                  for sid, n in held.items()}})
         try:
             updated, errors = set_session_flags(pid, unique, fields)
         except Exception as e:
             log("session flags failed: %s: %s" % (type(e).__name__, e))
             return self.send(502, {"error": "Hermes could not update those chats."})
-        return self.send(200, {"updated": updated, "errors": errors})
+        for sid, n in held.items():
+            errors[sid] = "has %d pinned message%s" % (n, "" if n == 1 else "s")
+        return self.send(200, {"updated": updated, "errors": errors, **({"pins": held} if held else {})})
+
+    def pins_route(self, path):
+        """GET/DELETE /m/pins/<bot>/<chat>, POST it with {message_id}, DELETE /m/pins/<bot>/<chat>/<message id>."""
+        m = re.fullmatch(r"/m/pins/([^/]+)/([^/]+)(?:/([0-9]{1,18}))?", path)
+        if not m:
+            return self.send(404, {"error": "not found"})
+        pid, sid, mid = m.group(1), m.group(2), m.group(3)
+        if pid not in profile_ids():
+            return self.send(404, {"error": "unknown bot"})
+        if not _WS_SID.fullmatch(sid):
+            return self.send(400, {"error": "Bad chat id."})
+        store = pin_store()
+        if store is None:
+            return self.send(503, {"error": "Pinned messages are unavailable on this Mac.", "code": "unavailable"})
+        try:
+            if mid is None and self.command == "GET":
+                return self.send(200, {"pins": store.list(pid, sid), "limit": bridge_pins.MAX_PINS_PER_CHAT})
+            if mid is None and self.command == "POST":
+                raw = self.json_body().get("message_id")
+                if type(raw) is not int or not 0 < raw < 2**63:
+                    return self.send(400, {"error": "Bad message id."})
+                pin, created = pin_message(pid, sid, raw)
+                return self.send(201 if created else 200, {"pin": pin, "pins": store.list(pid, sid)})
+            if mid is None and self.command == "DELETE":
+                return self.send(200, {"removed": store.clear(pid, sid), "pins": []})
+            if mid is not None and self.command == "DELETE":
+                removed = store.remove(pid, sid, int(mid))
+                return self.send(200, {"removed": 1 if removed else 0, "pins": store.list(pid, sid)})
+            return self.send(405, {"error": "Method not allowed."})
+        except bridge_pins.PinError as e:
+            return self.send(e.status, {"error": str(e), "code": e.code})
+        except sqlite3.Error as e:
+            log("pins failed: %s" % type(e).__name__)
+            return self.send(503, {"error": "Pinned messages are unavailable right now.", "code": "unavailable"})
 
     def projects_route(self, u):
         if self.command != "GET":
@@ -2101,7 +2195,8 @@ class H(BaseHTTPRequestHandler):
                 if action in ("/queue", "/queue-with-runtime", "/steer") and self.command == "POST":
                     body = self.json_body()
                     mode = "steer" if action == "/steer" else "queue"
-                    return self.send(200, turns.follow_up(turn, mode, body.get("text"), body.get("submission_id"), body))
+                    return self.send(200, turns.follow_up(turn, mode, body.get("text"), body.get("submission_id"), body,
+                                                          body.get("attachments")))
                 if action == "/stop" and self.command == "POST":
                     turns.stop(turn)
                     return self.send(200, {"ok": True})
@@ -2119,18 +2214,24 @@ class H(BaseHTTPRequestHandler):
                 pid, sid, digest = preview.groups()
                 if pid not in profile_ids():
                     return self.send(404, {"error": "unknown bot"})
-                found = transcript.file_for_digest(session_bodies(pid, sid), digest, [HERMES])
+                found = transcript.file_for_digest(session_bodies(pid, sid), digest, [HERMES], assistant_media_roots())
                 if found is None:
                     return self.send(404, {"error": "That file is not in this chat."})
                 types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
                          ".webp": "image/webp", ".heic": "image/heic", ".pdf": "application/pdf",
-                         ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
-                         ".json": "application/json", ".csv": "text/plain; charset=utf-8"}
+                         ".json": "application/json"}
+                suffix = found.suffix.lower()
+                ctype = types.get(suffix)
+                if ctype is None:
+                    import mimetypes
+                    guessed = mimetypes.guess_type(found.name)[0] or "application/octet-stream"
+                    # Markup is served as text: the phone previews files, it never renders them as pages.
+                    ctype = "text/plain; charset=utf-8" if guessed.startswith("text/") or suffix in (".svg", ".xml") else guessed
                 try:
                     data = found.read_bytes()
                 except OSError:
                     return self.send(404, {"error": "That file is not in this chat."})
-                return self.send(200, data, types.get(found.suffix.lower(), "application/octet-stream"))
+                return self.send(200, data, ctype)
             slash = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/slash", path)
             if slash and self.command == "POST":
                 pid, sid = slash.groups()

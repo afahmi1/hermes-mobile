@@ -417,11 +417,47 @@ final class API: @unchecked Sendable {
     }
     /// Archive or pin many sessions in one request. The bridge fans the gateway's
     /// per-session PATCH out in parallel and returns the rows it could not change.
-    func updateSessions(profile: String, ids: [String], fields: [String: Bool]) async throws -> SessionFlagResult {
-        let d = try await json("/m/sessions/flags", method: "POST",
-                               body: ["profile": profile, "ids": ids, "fields": fields])
+    /// Archiving a chat with pinned messages is refused by the bridge unless `confirmPins` says the person
+    /// saw how many pins it holds. Refused chats come back in `heldForPins`; the pins are never deleted.
+    func updateSessions(profile: String, ids: [String], fields: [String: Bool], confirmPins: Bool = false) async throws -> SessionFlagResult {
+        var body: [String: Any] = ["profile": profile, "ids": ids, "fields": fields]
+        if confirmPins { body["confirm_pins"] = true }
+        let r = try request("/m/sessions/flags", method: "POST", body: body)
+        let (data, resp) = try await session.data(for: r)
+        guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+        let d = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        let held = (d["pins"] as? [String: Any] ?? [:]).compactMapValues { ($0 as? NSNumber)?.intValue }
+        if http.statusCode == 409, !held.isEmpty {
+            return SessionFlagResult(updated: [], errors: d["errors"] as? [String: String] ?? [:], heldForPins: held)
+        }
+        guard (200..<300).contains(http.statusCode) else { throw APIError.http(http.statusCode, Self.errorText(data)) }
         return SessionFlagResult(updated: d["updated"] as? [String] ?? [],
-                                 errors: d["errors"] as? [String: String] ?? [:])
+                                 errors: d["errors"] as? [String: String] ?? [:], heldForPins: held)
+    }
+
+    // MARK: pinned messages
+
+    private func pinPath(_ profile: String, _ session: String, _ message: Int? = nil) -> String {
+        "/m/pins/\(Self.esc(profile))/\(Self.esc(session))" + (message.map { "/\($0)" } ?? "")
+    }
+
+    func pins(profile: String, session: String) async throws -> [MessagePin] {
+        try await get(pinPath(profile, session), as: PinList.self).pins
+    }
+
+    /// Pins one stored message and returns the chat's full pin list.
+    func pin(profile: String, session: String, message: Int) async throws -> [MessagePin] {
+        let data = try await send(try request(pinPath(profile, session), method: "POST", body: ["message_id": message]))
+        return try JSONDecoder().decode(PinList.self, from: data).pins
+    }
+
+    func unpin(profile: String, session: String, message: Int) async throws -> [MessagePin] {
+        let data = try await send(try request(pinPath(profile, session, message), method: "DELETE"))
+        return try JSONDecoder().decode(PinList.self, from: data).pins
+    }
+
+    func unpinAll(profile: String, session: String) async throws {
+        _ = try await send(try request(pinPath(profile, session), method: "DELETE"))
     }
 
     func search(_ text: String, archived: Bool = false, profile: String? = nil, source: String? = nil, scope: String? = nil) async throws -> [SessionSummary] {
@@ -575,16 +611,24 @@ final class API: @unchecked Sendable {
         return id
     }
 
-    func followUp(run: String, mode: String, text: String, submission: UUID, choice: RuntimeChoice) async throws {
+    /// Queue the next message or steer the running reply, optionally with the files staged in the composer.
+    /// Returns how many attachments the bridge accepted: an older bridge ignores them and reports none.
+    @discardableResult
+    func followUp(run: String, mode: String, text: String, submission: UUID, choice: RuntimeChoice,
+                  attachments: [SendAttachment] = []) async throws -> Int {
         var body = mode == "queue" ? Self.choiceBody(choice) : [:]
         // Older bridges ignore unknown JSON fields. A distinct route refuses an unsupported
         // override before it can submit the message with the wrong model.
         let action = body.isEmpty ? mode : "queue-with-runtime"
         body["text"] = text
         body["submission_id"] = submission.uuidString
+        if !attachments.isEmpty {
+            body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
+        }
         let result = try await json("/m/turns/\(Self.esc(run))/\(action)", method: "POST", body: body)
         let expected = mode == "queue" ? "queued" : "steer_accepted"
         guard result["status"] as? String == expected else { throw APIError.badResponse }
+        return (result["attachments"] as? NSNumber)?.intValue ?? 0
     }
 
     func stopRun(profile: String, run: String) async throws {

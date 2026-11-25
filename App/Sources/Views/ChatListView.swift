@@ -29,6 +29,23 @@ struct ChatListView: View {
     @State private var showGateways = false
     @State private var showSourceGuide = false
     @State private var draftScopes = Set<String>()
+    /// Archiving chats that hold pinned messages asks twice: a dialog naming the pins, then an alert.
+    @State private var pinGuard: PinGuard?
+    @State private var pinGuardConfirm: PinGuard?
+
+    /// Chats about to be archived that still hold pinned messages.
+    struct PinGuard: Identifiable {
+        let id = UUID()
+        let targets: [SessionSummary]
+        let batch: Bool
+        var held: [SessionSummary] { targets.filter { $0.pinnedMessages > 0 } }
+        var pinTotal: Int { held.reduce(0) { $0 + $1.pinnedMessages } }
+        var title: String {
+            let pins = pinTotal == 1 ? "1 pinned message" : "\(pinTotal) pinned messages"
+            if !batch || targets.count == 1 { return "This chat has \(pins)" }
+            return held.count == 1 ? "1 selected chat has \(pins)" : "\(held.count) selected chats have \(pins)"
+        }
+    }
     private let fixedProfile: String?
     @State private var selectedBot: String?
     private var profile: String? { fixedProfile ?? selectedBot }
@@ -82,6 +99,36 @@ struct ChatListView: View {
                 .task(id: [String(navigation.wrappedValue.count), app.inboxAccount ?? ""]) {
                     draftScopes = app.inboxAccount.map(ComposerDisk.shared.scopes) ?? []
                 }
+                .confirmationDialog(pinGuard?.title ?? "", isPresented: Binding(get: { pinGuard != nil }, set: { if !$0 { pinGuard = nil } }),
+                                    titleVisibility: .visible, presenting: pinGuard) { guarded in
+                    Button(guarded.batch && guarded.targets.count > 1 ? "Archive all, keep pins" : "Archive, keep pins", role: .destructive) {
+                        pinGuardConfirm = guarded
+                    }
+                    if guarded.batch, guarded.held.count < guarded.targets.count {
+                        Button("Archive only chats without pins") {
+                            let keep = Set(guarded.held.map(\.key))
+                            Task { await batch(["archived": true], only: guarded.targets.filter { !keep.contains($0.key) }) }
+                        }
+                    }
+                    if !guarded.batch, let first = guarded.held.first {
+                        Button("Open chat to review pins") {
+                            navigation.wrappedValue.append(ChatRef(profile: first.profile, sessionId: first.id))
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: { _ in
+                    Text("Pins mark what matters in a chat. Archiving keeps them, and they come back when you unarchive.")
+                }
+                .alert("Archive with pins?", isPresented: Binding(get: { pinGuardConfirm != nil }, set: { if !$0 { pinGuardConfirm = nil } }),
+                       presenting: pinGuardConfirm) { guarded in
+                    Button("Archive", role: .destructive) {
+                        if guarded.batch { Task { await batch(["archived": true], only: guarded.targets, confirmPins: true) } }
+                        else if let s = guarded.targets.first { Task { await archive(s, confirmPins: true) } }
+                    }
+                    Button("Keep in inbox", role: .cancel) {}
+                } message: { guarded in
+                    Text("Are you sure? \(guarded.pinTotal == 1 ? "1 pinned message" : "\(guarded.pinTotal) pinned messages") will be out of sight until you unarchive.")
+                }
 
         }
     }
@@ -121,7 +168,7 @@ struct ChatListView: View {
 
     private var selectionActions: some View {
         HStack {
-            Button { Task { await batch(["archived": filter != .archived]) } } label: {
+            Button { requestBatchArchive() } label: {
                 Label(filter == .archived ? "Unarchive" : "Archive", systemImage: "archivebox")
             }
             Spacer()
@@ -283,7 +330,7 @@ struct ChatListView: View {
             }
             .swipeActions(edge: .trailing) {
                 Button {
-                    Task { await setFlag(s, "archived", !(s.archived ?? false)) }
+                    requestArchive(s)
                 } label: {
                     Label(s.archived == true ? "Unarchive" : "Archive", systemImage: "archivebox")
                 }.tint(.indigo)
@@ -315,7 +362,7 @@ struct ChatListView: View {
                 }
                 Divider()
                 Button {
-                    Task { await setFlag(s, "archived", !(s.archived ?? false)) }
+                    requestArchive(s)
                 } label: {
                     Label(s.archived == true ? "Unarchive" : "Archive",
                           systemImage: s.archived == true ? "tray.and.arrow.up" : "archivebox")
@@ -341,10 +388,57 @@ struct ChatListView: View {
     }
 
     /// One request per profile; the bridge fans the gateway's per-session PATCH out in parallel.
-    private func batch(_ fields: [String: Bool]) async {
-        guard !batchBusy, !selection.isEmpty else { return }
+    /// Archive (or unarchive) the selection, asking first when any selected chat holds pinned messages.
+    private func requestBatchArchive() {
+        let archiving = filter != .archived
         let targets = visibleSessions.filter { selection.contains($0.key) }
+        if archiving, targets.contains(where: { $0.pinnedMessages > 0 }) {
+            pinGuard = PinGuard(targets: targets, batch: true)
+        } else {
+            Task { await batch(["archived": archiving]) }
+        }
+    }
+
+    /// Swipe/menu archive for one chat. Unarchiving never asks; archiving a chat with pins does.
+    private func requestArchive(_ s: SessionSummary) {
+        if s.archived == true { Task { await setFlag(s, "archived", false) } }
+        else if s.pinnedMessages > 0 { pinGuard = PinGuard(targets: [s], batch: false) }
+        else { Task { await archive(s, confirmPins: false) } }
+    }
+
+    /// Archives through the bridge's flag endpoint, which refuses chats with pins unless confirmed. An older
+    /// bridge without that endpoint falls back to the gateway's per-session PATCH.
+    private func archive(_ s: SessionSummary, confirmPins: Bool) async {
+        let destination = app.gatewaySession
+        do {
+            let result = try await API.shared.updateSessions(profile: s.profile, ids: [s.id], fields: ["archived": true],
+                                                             confirmPins: confirmPins)
+            guard destination == app.gatewaySession else { return }
+            if let held = result.heldForPins[s.id] {
+                // Pinned from another device since this list loaded: show the count and ask.
+                var fresh = s
+                fresh.pinCount = held
+                if let index = sessions.firstIndex(where: { $0.key == s.key }) { sessions[index].pinCount = held }
+                pinGuard = PinGuard(targets: [fresh], batch: false)
+                return
+            }
+            if let problem = result.errors[s.id] { self.error = problem; return }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            apply("archived", true, to: s.key)
+            if !query.isEmpty { await runSearch() }
+        } catch APIError.http(404, _) {
+            await setFlag(s, "archived", true)
+        } catch {
+            guard destination == app.gatewaySession else { return }
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func batch(_ fields: [String: Bool], only: [SessionSummary]? = nil, confirmPins: Bool = false) async {
+        guard !batchBusy, only != nil || !selection.isEmpty else { return }
+        let targets = only ?? visibleSessions.filter { selection.contains($0.key) }
         guard !targets.isEmpty else { endSelection(); return }
+        var heldForPins = 0
         batchBusy = true
         defer { batchBusy = false }
         let api = API.shared
@@ -356,7 +450,9 @@ struct ChatListView: View {
                 guard gateway == app.gatewaySession else { return }
                 let chunk = rows[start..<min(start + 200, rows.count)]
                 do {
-                    let response = try await api.updateSessions(profile: pid, ids: chunk.map(\.id), fields: fields)
+                    let response = try await api.updateSessions(profile: pid, ids: chunk.map(\.id), fields: fields,
+                                                                confirmPins: confirmPins)
+                    heldForPins += response.heldForPins.count
                     let updated = Set(response.updated)
                     failures.formUnion(chunk.filter { !updated.contains($0.id) }.map(\.key))
                 } catch APIError.http(404, _) {
@@ -373,6 +469,9 @@ struct ChatListView: View {
         await reload()
         if !query.isEmpty { await runSearch() }
         if failures.isEmpty { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+        else if heldForPins > 0 {
+            error = "Archived \(targets.count - failures.count) of \(targets.count) chats. \(heldForPins == 1 ? "1 chat has" : "\(heldForPins) chats have") pinned messages and stayed; they are selected. Tap Archive again to confirm."
+        }
         else { error = "Updated \(targets.count - failures.count) of \(targets.count) chats. The others are selected for retry." }
     }
 
@@ -583,6 +682,11 @@ struct SessionRow: View {
                     if !session.sourceLabel.isEmpty { Text("·"); Text(session.sourceLabel) }
                     if let m = session.model, !m.isEmpty { Text("·"); Text(Self.shortModel(m)).lineLimit(1).truncationMode(.middle).foregroundStyle(.tertiary) }
                     if session.pinned == true { Image(systemName: "pin.fill").font(.caption2) }
+                    if session.pinnedMessages > 0 {
+                        Label("\(session.pinnedMessages)", systemImage: "pin.circle.fill")
+                            .labelStyle(.titleAndIcon).font(.caption2.weight(.semibold)).foregroundStyle(.orange)
+                            .accessibilityLabel("\(session.pinnedMessages) pinned messages")
+                    }
                 }
                 .font(.caption).foregroundStyle(.secondary)
             }

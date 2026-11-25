@@ -17,6 +17,8 @@ struct ChatItem: Identifiable, Hashable {
     var tools: [String] = []
     var activities: [ToolActivity] = []
     var media: [ChatMediaRef] = []
+    /// Structured background work behind an activity card (empty on older bridges: `detail` is shown).
+    var entries: [ActivityEntry] = []
     var detail: String = ""
     var streaming = false
     var footer: String?
@@ -367,8 +369,10 @@ final class ChatModel {
                 let trimmedNotice = m.notice?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let title = trimmedNotice.isEmpty ? activityTitle(text) : trimmedNotice
                 let failed = m.ok == false || text.localizedCaseInsensitiveContains("status=failed") || text.contains("✗")
-                out.append(ChatItem(id: key, kind: .activity, text: title, detail: text == title ? "" : text,
-                                    failed: failed, timestamp: m.timestamp))
+                var row = ChatItem(id: key, kind: .activity, text: title, detail: text == title ? "" : text,
+                                   failed: failed, timestamp: m.timestamp)
+                row.entries = m.activity ?? []
+                out.append(row)
                 continue
             }
             switch m.role {
@@ -457,6 +461,78 @@ final class ChatModel {
         guard let page = try? await api.commandPalette(profile: profile), app != nil else { return }
         if !page.commands.isEmpty { slashCommands = page.commands }
         skillCommands = page.skills
+    }
+
+    // MARK: pinned messages
+
+    /// Newest pin first. Lives on the bridge, so every device signed in to this gateway sees the same stack.
+    private(set) var pins: [MessagePin] = []
+    private(set) var pinsAvailable = true
+    @ObservationIgnored private var pinWork: Set<Int> = []
+
+    func isPinned(_ item: ChatItem) -> Bool {
+        guard let id = MessagePin.messageID(for: item) else { return false }
+        return pins.contains { $0.messageId == id }
+    }
+
+    func loadPins() async {
+        guard let sid = sessionId else { pins = []; return }
+        do {
+            let latest = try await api.pins(profile: profile, session: sid)
+            guard !Task.isCancelled, sessionId == sid else { return }
+            pins = latest
+            pinsAvailable = true
+        } catch APIError.http(404, _) {
+            // A bridge from before pinned messages: hide the feature instead of reporting an error.
+            pinsAvailable = false
+        } catch {
+            // Pins are an overlay; a failed refresh keeps what is already shown.
+        }
+    }
+
+    func togglePin(_ item: ChatItem) async {
+        guard let sid = sessionId, let mid = MessagePin.messageID(for: item), !pinWork.contains(mid) else { return }
+        pinWork.insert(mid)
+        defer { pinWork.remove(mid) }
+        do {
+            let latest = isPinned(item)
+                ? try await api.unpin(profile: profile, session: sid, message: mid)
+                : try await api.pin(profile: profile, session: sid, message: mid)
+            guard sessionId == sid else { return }
+            pins = latest
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    func unpin(_ pin: MessagePin) async {
+        guard let sid = sessionId else { return }
+        do {
+            let latest = try await api.unpin(profile: profile, session: sid, message: pin.messageId)
+            if sessionId == sid { pins = latest }
+        } catch { self.error = error.localizedDescription }
+    }
+
+    func unpinAll() async {
+        guard let sid = sessionId else { return }
+        do {
+            try await api.unpinAll(profile: profile, session: sid)
+            if sessionId == sid { pins = [] }
+        } catch { self.error = error.localizedDescription }
+    }
+
+    /// Loads earlier pages until the pinned message is in the transcript. Returns false when Hermes no
+    /// longer has it (compressed or deleted); the pin's own snapshot still shows the text.
+    func reveal(_ pin: MessagePin) async -> Bool {
+        var pages = 0
+        while !items.contains(where: { $0.id == pin.itemID }) {
+            guard hasOlder, !isRunning, pages < 20 else { return false }
+            let before = stored.count
+            await loadOlder()
+            pages += 1
+            if stored.count == before { return false }
+        }
+        return true
     }
 
     func acceptsSlash(_ raw: String) -> Bool {
@@ -659,15 +735,17 @@ final class ChatModel {
     var acceptsFollowUp: Bool { isRunning && runId != nil && !sendingFollowUp && !savingRuntime }
     private(set) var sendingFollowUp = false
     private var lastControlAttempt: (run: String, mode: String, text: String, id: UUID, choice: RuntimeChoice)?
+    private var lastControlFiles: [SendAttachment] = []
 
-    func followUp(_ raw: String, mode: String) async -> Bool {
+    /// Send next / Guide this reply. Files staged in the composer ride along; on success they leave the draft.
+    func followUp(_ raw: String, mode: String, attachments: [SendAttachment] = []) async -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard acceptsFollowUp, let run = runId, !text.isEmpty else { return false }
+        guard acceptsFollowUp, let run = runId, !text.isEmpty || !attachments.isEmpty else { return false }
         sendingFollowUp = true
         defer { sendingFollowUp = false }
         let previous = lastControlAttempt
         let attempt: (run: String, mode: String, text: String, id: UUID, choice: RuntimeChoice)
-        if let previous, previous.run == run, previous.mode == mode, previous.text == text {
+        if let previous, previous.run == run, previous.mode == mode, previous.text == text, lastControlFiles == attachments {
             // A retry checks the original admission even if the picker has since changed.
             attempt = previous
         } else {
@@ -681,15 +759,24 @@ final class ChatModel {
         let id = attempt.id
         let key = receiptKey
         lastControlAttempt = attempt
+        lastControlFiles = attachments
         do {
-            try await api.followUp(run: run, mode: mode, text: text, submission: id, choice: attempt.choice)
+            let accepted = try await api.followUp(run: run, mode: mode, text: text, submission: id,
+                                                  choice: attempt.choice, attachments: attachments)
+            if !attachments.isEmpty, accepted < attachments.count {
+                // An older bridge delivered the words but dropped the files: keep them staged and say so.
+                error = "Hermes got the message, but this Mac's bridge is too old to take files with it. They are still in your draft."
+            } else if !attachments.isEmpty, draftAttachments == attachments {
+                draftAttachments = []
+            }
             guard let key, receiptKey == key else { return false }
-            let receipt = ControlReceipt(id: id, mode: mode, text: text, at: Date())
+            let receipt = ControlReceipt(id: id, mode: mode, text: text, at: Date(), files: min(accepted, attachments.count))
             receipts.removeAll { $0.id == id }
             receipts.append(receipt)
             if !items.contains(where: { $0.id == id.uuidString }) { items.append(receipt.item) }
             lastControlAttempt = nil
-            error = nil
+            lastControlFiles = []
+            if accepted >= attachments.count { error = nil }
             do { try await InboxDisk.shared.record(receipt, key: key) }
             catch { self.error = "Hermes received the instruction. This phone could not save its receipt." }
             return true

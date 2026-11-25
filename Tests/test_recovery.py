@@ -112,7 +112,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         queued.submission = uuid4().hex
         with patch.dict(engine.TURNS, {queued.id: queued}, clear=True), patch.object(engine, "_rpc", AsyncMock()) as rpc:
             result = await engine._follow_up(turn, "queue", "next", queued.submission)
-            self.assertEqual(result, {"status": "queued", "turn_id": queued.id})
+            self.assertEqual(result, {"status": "queued", "turn_id": queued.id, "attachments": 0})
             rpc.assert_not_awaited()
             with self.assertRaises(engine.TurnError):
                 await engine._follow_up(turn, "queue", "different", queued.submission)

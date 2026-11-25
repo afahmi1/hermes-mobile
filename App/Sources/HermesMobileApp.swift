@@ -122,6 +122,9 @@ private struct Announcement: View {
 
 /// An authenticated health probe checks both the bridge and the Hermes gateway.
 struct ConnectionBadge: View {
+    /// Icon only (details on tap). Inside a chat the full "frostbyte · Online" label pushed the chat title
+    /// and its model picker out of the navigation bar.
+    var compact = false
     @State private var detail = false
     @Environment(AppModel.self) private var app
 
@@ -168,7 +171,9 @@ struct ConnectionBadge: View {
         Button { detail.toggle() } label: {
             HStack(spacing: 5) {
                 Image(systemName: state.symbol).foregroundStyle(state.color)
-                Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+                if !compact {
+                    Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+                }
             }
             .fixedSize(horizontal: true, vertical: false)
         }
