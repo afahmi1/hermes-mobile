@@ -59,7 +59,7 @@ struct MarkdownText: View {
     let text: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: HMDesign.medium) {
             ForEach(Array(MarkdownBlock.parse(text).enumerated()), id: \.offset) { _, block in
                 view(for: block)
             }
@@ -124,6 +124,8 @@ struct CodeBlockView: View {
     @State private var copied = false
     @State private var expanded = false
     @State private var wrap = false
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var lines: [Substring] { code.split(separator: "\n", omittingEmptySubsequences: false) }
     private var label: String { file ?? title ?? MarkdownBlock.languageName(language) }
@@ -133,34 +135,38 @@ struct CodeBlockView: View {
         let folded = !expanded && lines.count > foldAfter + 4
         let shown = folded ? lines.prefix(foldAfter).joined(separator: "\n") : code
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: file != nil ? "doc.text" : "chevron.left.forwardslash.chevron.right")
-                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-                Text(label)
-                    .font(.caption.weight(.medium)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                if streaming { ProgressView().controlSize(.mini) }
-                Spacer(minLength: 8)
-                Button { withAnimation(.snappy) { wrap.toggle() } } label: {
-                    Image(systemName: "text.alignleft").font(.system(size: 13, weight: .medium))
-                        .frame(width: 32, height: 30).contentShape(Rectangle())
+            let layout = typeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
+                : AnyLayout(HStackLayout(spacing: HMDesign.micro))
+            layout {
+                HStack(spacing: HMDesign.micro) {
+                    Label(label, systemImage: file != nil ? "doc.text" : "chevron.left.forwardslash.chevron.right")
+                        .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        .lineLimit(typeSize.isAccessibilitySize ? 2 : 1).truncationMode(.middle)
+                    if streaming { ProgressView().controlSize(.mini).accessibilityLabel("Receiving code") }
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(wrap ? Color.accentColor : Color.secondary)
-                .accessibilityLabel(wrap ? "Stop wrapping lines" : "Wrap lines")
-                Button(action: copy) {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .font(.caption.weight(.semibold))
-                        .contentTransition(.symbolEffect(.replace))
-                        .padding(.horizontal, 8).frame(height: 30)
-                        .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, HMDesign.medium)
+                HStack(spacing: 0) {
+                    Button { withAnimation(reduceMotion ? nil : .snappy) { wrap.toggle() } } label: {
+                        Image(systemName: "text.alignleft").font(.footnote).hmTouchTarget()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(wrap ? Color.accentColor : Color.secondary)
+                    .accessibilityLabel(wrap ? "Stop wrapping lines" : "Wrap lines")
+                    Button(action: copy) {
+                        Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, HMDesign.small).hmTouchTarget()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(copied ? Color.primary : Color.accentColor)
+                    .disabled(streaming)
+                    .accessibilityLabel(copied ? "Copied" : "Copy \(label)")
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(copied ? Color.green : Color.accentColor)
-                .disabled(streaming)
-                .accessibilityLabel(copied ? "Copied" : "Copy \(label)")
             }
-            .padding(.leading, 10).padding(.trailing, 2)
-            .background(Color(.tertiarySystemFill))
+            .padding(.top, typeSize.isAccessibilitySize ? HMDesign.small : 0)
+            .background(Color(uiColor: .tertiarySystemFill))
             Group {
                 if wrap {
                     Text(shown).font(.system(.footnote, design: .monospaced))
@@ -187,13 +193,13 @@ struct CodeBlockView: View {
                     withAnimation(.snappy) { expanded.toggle() }
                 }
                 .font(.caption.weight(.semibold))
-                .frame(maxWidth: .infinity, minHeight: 34)
+                .frame(maxWidth: .infinity, minHeight: HMDesign.touch)
                 .background(Color(.tertiarySystemFill).opacity(0.6))
             }
         }
-        .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color(.separator).opacity(0.5), lineWidth: 0.5))
+        .background(HMDesign.panel)
+        .clipShape(RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+        .overlay(RoundedRectangle(cornerRadius: HMDesign.panelRadius).strokeBorder(Color(.separator).opacity(0.5), lineWidth: 0.5))
     }
 
     private func copy() {
@@ -227,16 +233,27 @@ struct CalloutView: View {
     var body: some View {
         let s = style
         VStack(alignment: .leading, spacing: 4) {
-            Label(s.title, systemImage: s.icon).font(.subheadline.weight(.semibold)).foregroundStyle(s.color)
+            Label(s.title, systemImage: s.icon)
+                .font(.subheadline.weight(.semibold))
+                .labelStyle(CalloutLabelStyle(color: s.color))
             if !text.isEmpty {
                 Text(InlineMarkdown.attributed(text)).fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(10)
+        .padding(HMDesign.medium)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(s.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(alignment: .leading) { Rectangle().fill(s.color).frame(width: 3).clipShape(RoundedRectangle(cornerRadius: 1.5)) }
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(s.color.opacity(0.08), in: RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+    }
+
+    private struct CalloutLabelStyle: LabelStyle {
+        let color: Color
+
+        func makeBody(configuration: Configuration) -> some View {
+            HStack(alignment: .firstTextBaseline, spacing: HMDesign.small) {
+                configuration.icon.foregroundStyle(color)
+                configuration.title.foregroundStyle(.primary)
+            }
+        }
     }
 }
 
@@ -265,7 +282,7 @@ struct TableBlockView: View {
             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
             Button {
                 Clipboard.copy(rows.map { "| " + $0.joined(separator: " | ") + " |" }.joined(separator: "\n"), what: "Copied table")
-            } label: { Label("Copy table", systemImage: "doc.on.doc").font(.caption2) }
+            } label: { Label("Copy table", systemImage: "doc.on.doc").font(.caption).hmTouchTarget() }
             .buttonStyle(.plain).foregroundStyle(.secondary)
         }
     }

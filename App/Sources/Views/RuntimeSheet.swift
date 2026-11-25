@@ -209,8 +209,10 @@ struct RuntimeSheet: View {
         } label: {
             Text(label).font(.subheadline.weight(on ? .semibold : .regular))
                 .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color(.tertiarySystemFill)), in: Capsule())
-                .foregroundStyle(on ? .white : .primary)
+                .background(on ? HMDesign.selectedFill : Color(uiColor: .tertiarySystemFill), in: Capsule())
+                .foregroundStyle(.primary)
+                .overlay { if on { Capsule().strokeBorder(Color.accentColor, lineWidth: 1) } }
+                .hmTouchTarget()
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(on ? .isSelected : [])

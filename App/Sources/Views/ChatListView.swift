@@ -136,9 +136,10 @@ struct ChatListView: View {
     private var inboxNavigation: some View {
         content
             .navigationTitle(selecting ? "\(selection.count) selected" : (profile.map { app.botName($0) } ?? "Chats"))
-            .navigationBarTitleDisplayMode(.inline)
+            // Large title only on the real top-level inbox, not a bot's inbox or while selecting.
+            .navigationBarTitleDisplayMode(fixedProfile == nil && !selecting ? .large : .inline)
             .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
-            .searchable(text: $query, prompt: "Search this gateway")
+            .searchable(text: $query, prompt: "Search chats")
             .task(id: [query] + inboxScope) { await runSearch() }
             .toolbar { inboxToolbar }
             .onChange(of: inboxScope) { _, _ in endSelection() }
@@ -170,15 +171,16 @@ struct ChatListView: View {
         HStack {
             Button { requestBatchArchive() } label: {
                 Label(filter == .archived ? "Unarchive" : "Archive", systemImage: "archivebox")
+                    .hmTouchTarget()
             }
             Spacer()
             if batchBusy { ProgressView().controlSize(.small); Spacer() }
             Menu {
                 Button("Pin", systemImage: "pin") { Task { await batch(["pinned": true]) } }
                 Button("Unpin", systemImage: "pin.slash") { Task { await batch(["pinned": false]) } }
-            } label: { Label("Pin options", systemImage: "pin") }
+            } label: { Label("Pin options", systemImage: "pin").hmTouchTarget() }
         }
-        .padding(.horizontal, 20).frame(minHeight: 48).background(.bar)
+        .padding(.horizontal, HMDesign.gutter).frame(minHeight: HMDesign.touch).background(.bar)
         .disabled(batchBusy || selection.isEmpty)
     }
 
@@ -212,24 +214,24 @@ struct ChatListView: View {
         List {
             Section {
                 // One quiet strip above the list: where you are, how it is doing, and what is shown.
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
+                VStack(alignment: .leading, spacing: HMDesign.micro) {
+                    let header = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout())
+                    header {
                         if let url = API.shared.baseURL {
                             Button { showGateways = true } label: {
                                 HStack(spacing: 6) {
                                     Image(systemName: "server.rack").imageScale(.small)
-                                    Text(SavedGateways.displayName(url)).lineLimit(1)
+                                    Text(SavedGateways.displayName(url)).lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
                                     Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold))
                                 }
-                                .font(.subheadline.weight(.semibold))
-                                .frame(minHeight: 44)
-                                .contentShape(Rectangle())
+                                .font(.subheadline.weight(.medium))
+                                .hmTouchTarget()
                             }
                             .buttonStyle(.borderless)
                             .disabled(selecting || fixedProfile != nil)
                             .accessibilityLabel("Choose gateway, current gateway " + SavedGateways.displayName(url))
                         }
-                        Spacer(minLength: 6)
+                        if !typeSize.isAccessibilitySize { Spacer(minLength: 6) }
                         ConnectionBadge().buttonStyle(.borderless)
                     }
                     let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 8))
@@ -240,32 +242,64 @@ struct ChatListView: View {
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
             }
             .listSectionSpacing(.compact)
-            if let error {
-                VStack(alignment: .leading, spacing: 4) {
+            if let error, !(sessions.isEmpty && results == nil) {
+                // Cached or partial rows stay visible; say what failed and offer the existing refresh.
+                VStack(alignment: .leading, spacing: HMDesign.micro) {
                     Label(error, systemImage: "wifi.exclamationmark")
                     if let lastSync { Text("Last synced \(lastSync, style: .relative) ago").font(.footnote) }
+                    Button("Try again") { Task { await reload() } }
+                        .buttonStyle(.borderless)
+                        .hmTouchTarget()
+                        .disabled(loading)
                 }.foregroundStyle(.secondary)
             }
             if let results {
-                if results.isEmpty { Text("No matches").foregroundStyle(.secondary) }
+                if results.isEmpty { ContentUnavailableView.search(text: query.trimmingCharacters(in: .whitespaces)) }
                 ForEach(results, id: \.key) { row($0) }
             } else {
                 ForEach(grouped, id: \.0) { section in
                     Section(section.0) { ForEach(section.1, id: \.key) { row($0) } }
                 }
                 if cursor != nil {
-                    HStack { Spacer(); ProgressView(); Spacer() }
+                    HStack { Spacer(); ProgressView().accessibilityLabel("Loading more chats"); Spacer() }
                         .task(id: cursor) { await loadMore() }  // re-runs for every new page, even an empty one
-                } else if sessions.isEmpty && !loading && error == nil {
-                    ContentUnavailableView("No chats yet", systemImage: "bubble.left",
-                                           description: Text(filter == .telegram ? "Telegram chats appear here after this bot saves them in Hermes." : "Choose another source or start a chat with the compose button."))
+                } else if sessions.isEmpty && !loading {
+                    if let error { failureState(error) } else { emptyState }
                 }
             }
         }
         .listStyle(.insetGrouped)
         .safeAreaInset(edge: .bottom, spacing: 0) { if selecting { selectionActions } }
         .overlay {
-            if loading && sessions.isEmpty { ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)) }
+            if loading && sessions.isEmpty { ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius)) }
+        }
+    }
+
+    private var emptyState: some View {
+        let title: String, detail: String, symbol: String
+        switch filter {
+        case .archived: (title, detail, symbol) = ("No archived chats", "Chats you archive show up here. You can unarchive them any time.", "archivebox")
+        case .telegram: (title, detail, symbol) = ("No Telegram chats", "Telegram chats appear here after this bot saves them in Hermes.", "bubble.left")
+        case .desktop: (title, detail, symbol) = ("No Hermes app chats", "Chats started in the Hermes app on your Mac show up here.", "bubble.left")
+        case .all: (title, detail, symbol) = ("Nothing here yet", "Chats and automated runs show up here once Hermes records them.", "tray")
+        case .chats: (title, detail, symbol) = ("No chats yet", "Start a chat, or choose another source from the filter above.", "bubble.left")
+        }
+        return ContentUnavailableView {
+            Label(title, systemImage: symbol)
+        } description: {
+            Text(detail)
+        } actions: {
+            if filter != .archived { Button("New chat") { startNew() } }
+        }
+    }
+
+    private func failureState(_ message: String) -> some View {
+        ContentUnavailableView {
+            Label("Can't load chats", systemImage: "wifi.exclamationmark")
+        } description: {
+            Text(message)
+        } actions: {
+            Button("Try again") { Task { await reload() } }.disabled(loading)
         }
     }
 
@@ -299,18 +333,17 @@ struct ChatListView: View {
         }
         .font(.subheadline.weight(.medium))
         .foregroundStyle(.primary)
-        .padding(.horizontal, 12).padding(.vertical, 7)
+        .padding(.horizontal, HMDesign.medium).padding(.vertical, 7)
         .background(Color(.tertiarySystemFill), in: Capsule())
-        .frame(minHeight: 44)
-        .contentShape(Rectangle())
+        .hmTouchTarget()
     }
 
     @ViewBuilder private func row(_ s: SessionSummary) -> some View {
         if selecting {
             Button { toggle(s) } label: {
-                HStack(spacing: 10) {
+                HStack(spacing: HMDesign.medium) {
                     Image(systemName: selection.contains(s.key) ? "checkmark.circle.fill" : "circle")
-                        .frame(width: 44, height: 44)
+                        .frame(width: HMDesign.touch, height: HMDesign.touch)
                         .font(.title3)
                         .foregroundStyle(selection.contains(s.key) ? Color.accentColor : Color.secondary)
                     SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
@@ -320,10 +353,13 @@ struct ChatListView: View {
             .buttonStyle(.plain).disabled(batchBusy)
             .accessibilityAddTraits(selection.contains(s.key) ? .isSelected : [])
         } else {
-            HStack(spacing: 10) {
-                BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
-                    .frame(width: 44, height: 44)
-                    .accessibilityHidden(true)
+            HStack(spacing: HMDesign.medium) {
+                // Bot name is in the row's metadata, so give the text the width at accessibility sizes.
+                if !typeSize.isAccessibilitySize {
+                    BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
+                        .frame(width: HMDesign.touch, height: HMDesign.touch)
+                        .accessibilityHidden(true)
+                }
                 NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
                     SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
@@ -660,14 +696,28 @@ struct SessionRow: View {
     var showAvatar = true
     var hasDraft = false
 
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    private var large: Bool { typeSize.isAccessibilitySize }
+
+    private var metadata: [String] {
+        var parts = [botName]
+        if !session.sourceLabel.isEmpty { parts.append(session.sourceLabel) }
+        if let m = session.model, !m.isEmpty { parts.append(Self.shortModel(m)) }
+        return parts
+    }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            if showAvatar { BotAvatar(id: session.profile, name: botName, size: 38) }
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(session.displayTitle).font(.body.weight(.semibold)).lineLimit(1)
-                    Spacer(minLength: 6)
-                    Text(session.date, format: relative).font(.caption).foregroundStyle(.secondary)
+        HStack(alignment: .top, spacing: HMDesign.medium) {
+            if showAvatar && !large { BotAvatar(id: session.profile, name: botName, size: 38).accessibilityHidden(true) }
+            VStack(alignment: .leading, spacing: HMDesign.micro) {
+                // Title keeps the full width; the time moves below it at accessibility sizes.
+                let head = large ? AnyLayout(VStackLayout(alignment: .leading, spacing: HMDesign.micro)) : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: HMDesign.small))
+                head {
+                    Text(session.displayTitle).font(HMDesign.rowTitle).lineLimit(large ? 4 : 2)
+                    if !large { Spacer(minLength: HMDesign.micro) }
+                    Text(session.date, format: relative).font(HMDesign.metadata).foregroundStyle(.secondary)
+                        .monospacedDigit().fixedSize(horizontal: true, vertical: false)
                 }
                 if hasDraft {
                     // An unsent message is the most useful line a row can show: it is why you come back.
@@ -675,20 +725,25 @@ struct SessionRow: View {
                         .font(.subheadline.weight(.medium)).foregroundStyle(.tint)
                         .accessibilityLabel("Unsent draft")
                 } else if let p = session.preview, !p.isEmpty, p != session.displayTitle {
-                    Text(p).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                    Text(p).font(.subheadline).foregroundStyle(.secondary).lineLimit(large ? 4 : 2)
                 }
-                HStack(spacing: 6) {
-                    Text(botName)
-                    if !session.sourceLabel.isEmpty { Text("·"); Text(session.sourceLabel) }
-                    if let m = session.model, !m.isEmpty { Text("·"); Text(Self.shortModel(m)).lineLimit(1).truncationMode(.middle).foregroundStyle(.tertiary) }
-                    if session.pinned == true { Image(systemName: "pin.fill").font(.caption2) }
-                    if session.pinnedMessages > 0 {
-                        Label("\(session.pinnedMessages)", systemImage: "pin.circle.fill")
-                            .labelStyle(.titleAndIcon).font(.caption2.weight(.semibold)).foregroundStyle(.orange)
-                            .accessibilityLabel("\(session.pinnedMessages) pinned messages")
+                // One wrapping line, so a long bot or model name never squeezes the title or the pin state.
+                Text(metadata.joined(separator: " · "))
+                    .font(HMDesign.metadata).foregroundStyle(.secondary)
+                    .lineLimit(large ? 4 : 2).truncationMode(.middle)
+                    .accessibilityLabel(metadata.joined(separator: ", "))
+                if session.pinned == true || session.pinnedMessages > 0 {
+                    let pins = large ? AnyLayout(VStackLayout(alignment: .leading, spacing: HMDesign.micro)) : AnyLayout(HStackLayout(spacing: HMDesign.small))
+                    pins {
+                        if session.pinned == true {
+                            Label("Pinned", systemImage: "pin.fill")
+                        }
+                        if session.pinnedMessages > 0 {
+                            Label(session.pinnedMessages == 1 ? "1 pinned message" : "\(session.pinnedMessages) pinned messages", systemImage: "pin.circle.fill")
+                        }
                     }
+                    .font(HMDesign.metadata).foregroundStyle(.secondary)
                 }
-                .font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 2)
