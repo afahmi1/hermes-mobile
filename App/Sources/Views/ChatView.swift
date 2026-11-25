@@ -48,10 +48,13 @@ struct ChatScreen: View {
 
     private var bot: Bot? { app.bot(chat.profile) }
 
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 10) {
+                LazyVStack(spacing: HMDesign.medium) {
                     if let saved = chat.cachedAt {
                         Text("Saved on this iPhone \(saved, style: .relative) ago")
                             .font(.footnote).foregroundStyle(.secondary)
@@ -65,10 +68,10 @@ struct ChatScreen: View {
                                 if let anchor { proxy.scrollTo(anchor, anchor: .top) }
                             }
                         }
-                        .font(.footnote).disabled(chat.loadingOlder)
+                        .font(HMDesign.metadata).frame(minHeight: HMDesign.touch).disabled(chat.loadingOlder)
                     }
                     if chat.items.isEmpty && !chat.isLoading {
-                        emptyState.padding(.top, 60)
+                        emptyState.padding(.vertical, HMDesign.section)
                     }
                     let days = Self.dayStarts(chat.items)
                     let lastReply = chat.isRunning ? nil : chat.items.last(where: { $0.kind == .assistant && !$0.streaming })?.id
@@ -128,8 +131,8 @@ struct ChatScreen: View {
                         proxy.scrollTo("bottom", anchor: .bottom)
                     } label: {
                         Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
-                            .padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(.horizontal, HMDesign.medium).frame(minHeight: HMDesign.touch)
+                            .background(.regularMaterial, in: Capsule())
                             .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
@@ -138,7 +141,7 @@ struct ChatScreen: View {
                     .padding(.trailing, 12).padding(.bottom, 6)
                 }
             }
-            .overlay { if chat.isLoading { ProgressView() } }
+            .overlay { if chat.isLoading { ProgressView("Loading messages…") } }
             .safeAreaInset(edge: .top, spacing: 0) {
                 if !chat.pins.isEmpty {
                     PinnedBar(pins: chat.pins, cursor: min(pinCursor, chat.pins.count - 1)) {
@@ -155,19 +158,21 @@ struct ChatScreen: View {
                 }
             }
         }
-        .safeAreaInset(edge: .bottom) { composer }
+        .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         .toolbar(.hidden, for: .tabBar)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Button { showRuntime = true } label: { titleBlock }
+                Button { showRuntime = true } label: { titleBlock.frame(minHeight: HMDesign.touch).contentShape(Rectangle()) }
                     .buttonStyle(.plain)
                     .accessibilityHint("Change model, provider and effort")
                     .disabled(chat.savingRuntime)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 12) {
-                    Button { Task { await chat.load() } } label: { Image(systemName: "arrow.clockwise") }
+                HStack(spacing: 0) {
+                    Button { Task { await chat.load() } } label: {
+                        Image(systemName: "arrow.clockwise").hmTouchTarget()
+                    }
                         .disabled(chat.isLoading || chat.isRunning)
                         .accessibilityLabel("Reload chat")
                     ConnectionBadge(compact: true)
@@ -267,7 +272,7 @@ struct ChatScreen: View {
             Text(bot?.name ?? chat.profile).font(.headline).lineLimit(1)
             HStack(spacing: 3) {
                 Text(runtimeLabel).lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
+                Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).imageScale(.small).accessibilityHidden(true)
             }
             .font(.caption2).foregroundStyle(.secondary)
         }
@@ -293,14 +298,19 @@ struct ChatScreen: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            BotAvatar(id: chat.profile, name: bot?.name ?? chat.profile, size: 64)
-            Text(bot?.name ?? chat.profile).font(.title2.bold())
+        VStack(spacing: HMDesign.small) {
+            BotAvatar(id: chat.profile, name: bot?.name ?? chat.profile, size: 64).accessibilityHidden(true)
+            Text(bot?.name ?? chat.profile).font(.title2.bold()).accessibilityAddTraits(.isHeader)
             if let b = bot?.blurb, !b.isEmpty {
                 Text(b).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 32)
             }
-            Button { showRuntime = true } label: { Label(runtimeLabel, systemImage: "cpu").font(.footnote) }
-                .buttonStyle(.bordered).padding(.top, 6)
+            Text("Write a message to start the conversation.")
+                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Button { showRuntime = true } label: {
+                Label(runtimeLabel, systemImage: "cpu").font(HMDesign.metadata)
+                    .frame(minHeight: HMDesign.touch)
+            }
+            .buttonStyle(.borderless)
         }
     }
 
@@ -368,12 +378,12 @@ struct ChatScreen: View {
     }
 
     private var composer: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: HMDesign.micro) {
             if let e = chat.error {
                 HStack(alignment: .top) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(e).font(.footnote)
+                        Text(e).font(HMDesign.metadata)
                         if chat.hasUnconfirmedSend {
                             Button("Move back to composer") { Task { await chat.cancelUnconfirmedSend() } }
                                 .font(.footnote.weight(.semibold))
@@ -382,11 +392,12 @@ struct ChatScreen: View {
                         }
                     }
                     Spacer()
-                    Button { chat.error = nil } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
+                    Button { chat.error = nil } label: { Image(systemName: "xmark").hmTouchTarget() }
                         .accessibilityLabel("Dismiss error")
                 }
-                .padding(10).background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-                .padding(.horizontal, 12)
+                .padding(HMDesign.small)
+                .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+                .padding(.horizontal, HMDesign.medium)
             }
             if let scope = projectScope {
                 VStack(alignment: .leading, spacing: 2) {
@@ -403,95 +414,106 @@ struct ChatScreen: View {
                 }
             }
             draftShelf
-            modelChip
-            HStack(alignment: .bottom, spacing: 6) {
-                VStack(spacing: 0) {
-                    // Every command and skill, browsable. Typing "/" still filters them inline.
-                    Button { showCommands = true } label: {
-                        Image(systemName: "command")
-                            .font(.system(size: 12, weight: .semibold))
-                            .frame(width: 38, height: 22)
-                            .contentShape(Rectangle())
+            HStack(spacing: 0) {
+                modelChip
+                    .layoutPriority(1)
+                Spacer(minLength: HMDesign.micro)
+                Button { showCommands = true } label: {
+                    Image(systemName: "command").font(.subheadline).hmTouchTarget()
+                }
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Commands and skills")
+                if longDraft {
+                    Button { showFullComposer = true } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.subheadline).hmTouchTarget()
                     }
                     .foregroundStyle(.secondary)
-                    .accessibilityLabel("All commands and skills")
-                if canAttach {
-                    Menu {
-                        if imagesAvailable || mediaCapabilities?.video == true {
-                            Button { showPicker = true } label: { Label(imagesAvailable ? "Photo or video" : "Video", systemImage: "photo.on.rectangle") }
-                        }
-                        if imagesAvailable {
-                            if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                                Button { openCamera() } label: { Label("Take photo", systemImage: "camera") }
-                            }
-                        }
-                        if filesAvailable {
-                            Button { showFilePicker = true } label: { Label("Choose file", systemImage: "doc") }
-                        }
-                    } label: {
-                        if preparingMedia { ProgressView() }
-                        else { Image(systemName: "plus.circle").font(.title2) }
-                    }
-                    .frame(width: 38, height: 38)
-                    .disabled(attachmentLimitReached || preparingMedia)
-                    .accessibilityLabel("Add photo, video or file")
+                    .accessibilityLabel("Expand composer")
                 }
-                }
-                // No separate "/" button: typing "/" in the field opens the command and skill menu.
-                composerField(expanded: false)
-                .padding(.leading, 12).padding(.trailing, longDraft ? 30 : 12).padding(.vertical, 8)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 19))
-                .overlay(alignment: .topTrailing) {
-                    // Expand only when there is something long to edit; short drafts keep the width.
-                    if longDraft {
-                        Button { showFullComposer = true } label: {
-                            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-                                .frame(width: 30, height: 30).contentShape(Rectangle())
-                        }
-                        .accessibilityLabel("Expand composer")
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .bottom)
-
                 if keyboardUp {
                     Button { Self.hideKeyboard() } label: {
                         Image(systemName: "keyboard.chevron.compact.down")
-                            .font(.system(size: 16, weight: .medium)).foregroundStyle(.secondary)
-                            .frame(width: 34, height: 38).contentShape(Rectangle())
+                            .font(.subheadline).hmTouchTarget()
                     }
+                    .foregroundStyle(.secondary)
                     .accessibilityLabel("Hide keyboard")
                 }
+            }
+            .padding(.horizontal, HMDesign.medium)
+            if chat.isRunning, let notice = chat.runtimeNotice {
+                Text(notice).font(HMDesign.metadata).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, HMDesign.gutter)
+            }
+            HStack(alignment: .bottom, spacing: HMDesign.micro) {
+                if canAttach { attachmentMenu }
+                composerField(expanded: false)
+                    .padding(.horizontal, HMDesign.medium).padding(.vertical, HMDesign.small)
+                    .frame(maxWidth: .infinity, minHeight: HMDesign.touch)
+                    .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
                 if chat.isRunning {
                     Button { Task { await chat.stop() } } label: {
-                        Image(systemName: "stop.circle.fill").font(.system(size: 30)).foregroundStyle(.red)
-                            .frame(width: 40, height: 40).contentShape(Rectangle())
+                        Image(systemName: "stop.circle.fill").font(.title).foregroundStyle(.red)
+                            .hmTouchTarget()
                     }
-                    .accessibilityLabel("Stop")
+                    .accessibilityLabel("Stop reply")
                 } else {
                     Button { send() } label: {
-                        Image(systemName: "arrow.up.circle.fill").font(.system(size: 30))
-                            .frame(width: 40, height: 40).contentShape(Rectangle())
+                        Image(systemName: "arrow.up.circle.fill").font(.title).hmTouchTarget()
                     }
                     .disabled(preparingMedia || chat.savingRuntime || chat.slashBusy || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
-                    .accessibilityLabel("Send")
+                    .accessibilityLabel("Send message")
                 }
             }
-            .padding(.horizontal, 8).padding(.bottom, 4)
+            .buttonStyle(.borderless)
+            .padding(.horizontal, HMDesign.small).padding(.bottom, HMDesign.micro)
             // Send next / Guide only once there is something to send: an empty row costs a line of chat.
             if chat.isRunning, !chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !chat.draftAttachments.isEmpty {
-                HStack(spacing: 20) {
-                    Button { followUp("queue") } label: { Label("Send next", systemImage: "text.line.last.and.arrowtriangle.forward") }
-                    Button { followUp("steer") } label: { Label("Guide this reply", systemImage: "arrow.turn.up.right") }
-                    Spacer()
+                let layout = typeSize.isAccessibilitySize
+                    ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
+                    : AnyLayout(HStackLayout(spacing: HMDesign.gutter))
+                layout {
+                    Button { followUp("queue") } label: {
+                        Label("Send next", systemImage: "text.line.last.and.arrowtriangle.forward").hmTouchTarget()
+                    }
+                    Button { followUp("steer") } label: {
+                        Label("Guide this reply", systemImage: "arrow.turn.up.right").hmTouchTarget()
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .font(.subheadline.weight(.medium))
                 .disabled(!chat.acceptsFollowUp || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                 .padding(.horizontal, 16).padding(.bottom, 5)
             }
         }
-        .padding(.top, 4)
+        .padding(.top, HMDesign.micro)
         .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private var attachmentMenu: some View {
+        Menu {
+            if imagesAvailable || mediaCapabilities?.video == true {
+                Button { showPicker = true } label: {
+                    Label(imagesAvailable ? "Photo or video" : "Video", systemImage: "photo.on.rectangle")
+                }
+            }
+            if imagesAvailable, UIImagePickerController.isSourceTypeAvailable(.camera) {
+                Button { openCamera() } label: { Label("Take photo", systemImage: "camera") }
+            }
+            if filesAvailable {
+                Button { showFilePicker = true } label: { Label("Choose file", systemImage: "doc") }
+            }
+        } label: {
+            Group {
+                if preparingMedia { ProgressView() }
+                else { Image(systemName: "plus.circle").font(.title2) }
+            }
+            .hmTouchTarget()
+        }
+        .disabled(attachmentLimitReached || preparingMedia)
+        .accessibilityLabel(preparingMedia ? "Preparing attachment" : "Add attachment")
     }
 
     private var longDraft: Bool {
@@ -529,7 +551,7 @@ struct ChatScreen: View {
                 chat.error = "That pinned message is no longer in this chat's history. Its text is kept in Pinned."
                 return
             }
-            withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(pin.itemID, anchor: .center) }
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) { proxy.scrollTo(pin.itemID, anchor: .center) }
             highlighted = pin.itemID
             try? await Task.sleep(for: .seconds(1.6))
             if highlighted == pin.itemID { withAnimation { highlighted = nil } }
@@ -752,23 +774,20 @@ struct ChatScreen: View {
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "cpu").font(.caption2)
-                    Text(chat.savingRuntime ? "Saving…" : chipLabel).lineLimit(1)
-                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .bold))
+                    Text(chat.savingRuntime ? "Saving…" : chipLabel)
+                        .lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
+                        .truncationMode(.middle)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).imageScale(.small)
                 }
-                .font(.caption).foregroundStyle(.secondary)
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(Color(.secondarySystemBackground), in: Capsule())
-                .frame(minHeight: 44)
+                .font(.caption.weight(.medium)).foregroundStyle(.primary)
+                .padding(.horizontal, HMDesign.medium).padding(.vertical, HMDesign.micro)
+                .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+                .hmTouchTarget()
             }
             .disabled(chat.savingRuntime)
             .accessibilityLabel("Switch model")
             .accessibilityValue(chipLabel)
-            if chat.isRunning, let n = chat.runtimeNotice {
-                Text(n).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer()
         }
-        .padding(.horizontal, 12)
     }
 
     /// Handles `/model` and `/effort` lines. They are never sent to the agent. Returns true when
@@ -1142,7 +1161,7 @@ struct MessageRow: View {
     }
 
     private var pinMark: some View {
-        Image(systemName: "pin.fill").font(.caption2).foregroundStyle(.orange)
+        Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Color.accentColor)
             .rotationEffect(.degrees(45))
             .accessibilityLabel("Pinned")
     }
@@ -1160,17 +1179,18 @@ struct MessageRow: View {
                         HStack(alignment: .top, spacing: 4) {
                             if pinned { pinMark }
                             Text(userText)
-                                .padding(.horizontal, 14).padding(.vertical, 10)
-                                .foregroundStyle(.white)
-                                .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
-                                    .strokeBorder(Color.orange, lineWidth: highlighted ? 2.5 : 0))
+                                .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
+                                .foregroundStyle(.primary)
+                                .background(HMDesign.selectedFill, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
+                                .overlay(RoundedRectangle(cornerRadius: HMDesign.messageRadius)
+                                    .strokeBorder(Color.accentColor, lineWidth: highlighted ? 2 : 0))
                                 .contextMenu { messageMenu }
                         }
                     }
                     if userIsLong {
                         Button(showFull ? "Show less" : "Show full message") { withAnimation(.snappy) { showFull.toggle() } }
                             .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .frame(minHeight: HMDesign.touch)
                     }
                     TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .trailing)
                 }
@@ -1185,7 +1205,7 @@ struct MessageRow: View {
                     MarkdownText(text: item.text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 4).padding(.horizontal, 6)
-                        .background(highlighted ? Color.orange.opacity(0.12) : .clear,
+                        .background(highlighted ? HMDesign.selectedFill : .clear,
                                     in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
                         .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -1193,31 +1213,32 @@ struct MessageRow: View {
                 }
                 TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
                 if showActions || item.footer != nil {
-                    HStack(spacing: 2) {
+                    VStack(alignment: .leading, spacing: 0) {
                         if showActions, !item.text.isEmpty {
-                            ActionIcon(symbol: "doc.on.doc", label: "Copy reply") { Clipboard.copy(MarkdownBlock.plainText(item.text)) }
-                            if let onPin {
-                                ActionIcon(symbol: pinned ? "pin.slash" : "pin", label: pinned ? "Unpin" : "Pin", action: onPin)
+                            HStack(spacing: HMDesign.micro) {
+                                ActionIcon(symbol: "doc.on.doc", label: "Copy reply") { Clipboard.copy(MarkdownBlock.plainText(item.text)) }
+                                if let onPin {
+                                    ActionIcon(symbol: pinned ? "pin.slash" : "pin", label: pinned ? "Unpin" : "Pin", action: onPin)
+                                }
+                                if let onCompose {
+                                    ActionIcon(symbol: "text.quote", label: "Reply with quote") { onCompose(quoted, false) }
+                                }
+                                ShareLink(item: item.text) {
+                                    Image(systemName: "square.and.arrow.up").font(.footnote).hmTouchTarget()
+                                }
+                                .foregroundStyle(.secondary)
+                                .accessibilityLabel("Share reply")
                             }
-                            if let onCompose {
-                                ActionIcon(symbol: "text.quote", label: "Reply with quote") { onCompose(quoted, false) }
-                            }
-                            ShareLink(item: item.text) {
-                                Image(systemName: "square.and.arrow.up").font(.system(size: 13)).frame(width: 32, height: 28)
-                            }
-                            .foregroundStyle(.secondary)
                         }
                         if let f = item.footer {
-                            Label(f, systemImage: "cpu").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                .padding(.leading, showActions ? 6 : 0)
+                            Label(f, systemImage: "cpu").font(.caption).foregroundStyle(.secondary)
                                 .accessibilityLabel("Answered by \(f)")
                         }
                         if showActions, let ts = item.timestamp {
-                            Text(Date(timeIntervalSince1970: ts), style: .time).font(.caption2).foregroundStyle(.tertiary)
-                                .padding(.leading, 6)
+                            Text(Date(timeIntervalSince1970: ts), style: .time).font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    .padding(.leading, 2)
+                    .padding(.leading, HMDesign.micro)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1523,18 +1544,19 @@ struct PinnedBar: View {
                     PinTicks(count: pins.count, current: cursor)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(pins.count == 1 ? "Pinned message" : "Pinned message \(cursor + 1) of \(pins.count)")
-                            .font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                            .font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor)
                         Text(pin.excerpt).font(.footnote).lineLimit(1).foregroundStyle(.primary)
                     }
                     Spacer(minLength: 0)
                 }
+                .frame(minHeight: HMDesign.touch)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Pinned message \(cursor + 1) of \(pins.count): \(pin.excerpt)")
             .accessibilityHint("Jumps to it, then shows the next pin")
             Button(action: list) {
-                Image(systemName: "list.bullet").frame(width: 44, height: 36)
+                Image(systemName: "list.bullet").hmTouchTarget()
             }
             .accessibilityLabel("All pinned messages")
         }
@@ -1555,7 +1577,7 @@ private struct PinTicks: View {
         VStack(spacing: 2) {
             ForEach(0..<shown, id: \.self) { slot in
                 Capsule()
-                    .fill(window + slot == current ? Color.orange : Color.orange.opacity(0.3))
+                    .fill(window + slot == current ? Color.accentColor : Color.accentColor.opacity(0.3))
                     .frame(width: 2.5)
             }
         }
@@ -1939,7 +1961,7 @@ struct ActionIcon: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: symbol).font(.system(size: 13)).frame(width: 32, height: 28).contentShape(Rectangle())
+            Image(systemName: symbol).font(.footnote).hmTouchTarget()
         }
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)

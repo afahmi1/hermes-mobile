@@ -169,13 +169,14 @@ struct ConnectionBadge: View {
 
     var body: some View {
         Button { detail.toggle() } label: {
-            HStack(spacing: 5) {
+            HStack(spacing: HMDesign.micro) {
                 Image(systemName: state.symbol).foregroundStyle(state.color)
                 if !compact {
                     Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
                 }
             }
-            .fixedSize(horizontal: true, vertical: false)
+            .fixedSize(horizontal: false, vertical: true)
+            .hmTouchTarget()
         }
         .accessibilityLabel("Hermes connection, " + state.label)
         .popover(isPresented: $detail) {
