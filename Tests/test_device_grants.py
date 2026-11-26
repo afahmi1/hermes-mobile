@@ -1,4 +1,5 @@
 """Exercise device grants at the HTTP boundary with an isolated signing key and registry."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import base64
 import hashlib
 import hmac

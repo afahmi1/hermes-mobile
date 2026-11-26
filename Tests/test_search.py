@@ -1,4 +1,5 @@
 """Session search: the trigram path must return exactly the legacy LIKE path's rows."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import sqlite3
 import sys
 import unittest

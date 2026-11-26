@@ -2,6 +2,7 @@
 
 Synthetic HERMES_HOME, synthetic catalog, ephemeral loopback port. No network, no live bridge.
 """
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import base64
 import hashlib
 import http.client
