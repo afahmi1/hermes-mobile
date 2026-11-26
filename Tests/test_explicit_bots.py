@@ -1,6 +1,7 @@
 """An operator-named bot skips the NAME privacy heuristic; key and opt-out checks still apply.
 
 Synthetic HERMES_HOME, no network, no live bridge."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import importlib
 import json
 import os
