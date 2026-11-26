@@ -19,3 +19,7 @@ foreach ($service in 'Bridge','Status') {
     Register-ScheduledTask -Force -TaskName "HermesMobile$service" -Action $action -Trigger $trigger -Settings $settings -User $user | Out-Null
     Start-ScheduledTask -TaskName "HermesMobile$service"
 }
+Start-Sleep -Seconds 3
+Write-Host "`nChecking everything the phone needs:"
+& powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $launcher -Service Bridge --doctor
+Write-Host "`nPair the phone with a one-time code:  powershell -File `"$launcher`" -Service Bridge --pair-code"

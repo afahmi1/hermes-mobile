@@ -23,14 +23,16 @@ def _max_bytes():
     except ValueError:
         configured = 0
     if configured <= 0:
-        return 4 * 1024 * 1024
-    return max(256 * 1024, min(8 * 1024 * 1024, configured))
+        # Voice memos, screen recordings and phone videos are routinely 5 to 50 MB. The bridge is the phone's
+        # door into Hermes, so it takes what Telegram would and more. HERMES_MOBILE_MEDIA_MAX_BYTES overrides.
+        return 50 * 1024 * 1024
+    return max(256 * 1024, min(128 * 1024 * 1024, configured))
 
 
 MAX_BYTES = _max_bytes()
 JPEG = "image/jpeg"
 MP4 = "video/mp4"
-MAX_ITEMS = 4
+MAX_ITEMS = 20  # twice a Telegram album
 MIME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$")
 EXT = re.compile(r"^[A-Za-z0-9]{1,10}$")
 
@@ -178,7 +180,7 @@ def decode(items):
     if items is None or items == []:
         return []
     if not isinstance(items, list) or not 1 <= len(items) <= MAX_ITEMS:
-        raise MediaError("Attach up to four files, or one MP4 clip.")
+        raise MediaError("Attach up to %d files, or one MP4 clip." % MAX_ITEMS)
     frames = []
     remaining = MAX_BYTES
     for item in items:
@@ -188,7 +190,7 @@ def decode(items):
         if not isinstance(mime, str) or not MIME.match(mime) or mime.startswith("image/") and mime != JPEG:
             raise MediaError("Attach images as JPEG and other files with a valid media type.")
         if mime == MP4 and len(items) != 1:
-            raise MediaError("Attach one MP4 clip, or up to four other files.")
+            raise MediaError("Attach one MP4 clip, or up to %d other files." % MAX_ITEMS)
         if (not isinstance(name, str) or not 0 < len(name) <= 140 or not name.isprintable()
                 or any(c in name for c in "/\\:") or name in (".", "..")):
             raise MediaError("Invalid attachment name.")

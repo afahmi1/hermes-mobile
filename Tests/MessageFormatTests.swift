@@ -82,6 +82,46 @@ func run() async {
     check(items2.count == 1 && items2[0].kind == .activity && items2[0].entries.count == 1, "activity item: \(items2)")
     check(items2[0].text == "build.py --mesh failed (exit 2)" && items2[0].failed, "activity title and failure")
 
+    let first = HistoryPaging.first(count: 100, hasMore: nil, nextOffset: nil)
+    check(first.offset == 100 && first.hasOlder, "a full first page can continue")
+    let short = HistoryPaging.first(count: 40, hasMore: nil, nextOffset: nil)
+    check(short.offset == 100 && !short.hasOlder, "a short first page with no bridge flag is the end")
+    let probed = HistoryPaging.first(count: 40, hasMore: true, nextOffset: 100)
+    check(probed.hasOlder && probed.offset == 100, "bridge has_more beats the projected count")
+    let cont = HistoryPaging.advance(offset: 100, added: 37, hasMore: nil, nextOffset: nil)
+    check(cont.offset == 200 && cont.hasOlder, "a short later page is not the end")
+    let done = HistoryPaging.advance(offset: 200, added: 0, hasMore: nil, nextOffset: nil)
+    check(!done.hasOlder, "nothing new means history is exhausted")
+    let flagged = HistoryPaging.advance(offset: 100, added: 10, hasMore: false, nextOffset: 200)
+    check(flagged.offset == 200 && !flagged.hasOlder, "bridge has_more false stops")
+
+    // Harness text never shows as something the person said (fallback for older bridges).
+    check(HarnessText.classify("You've reached the maximum number of tool-calling iterations allowed. Please…")
+          == .notice("Hermes hit its tool-call limit for this turn and wrapped up"), "max iterations")
+    check(HarnessText.classify("[OUT-OF-BAND USER MESSAGE — a direct message]\nqueue this\n[/OUT-OF-BAND USER MESSAGE]")
+          == .user("queue this", note: "Sent while Hermes was working"), "out-of-band wrapper")
+    check(HarnessText.classify("[CONTEXT COMPACTION — REFERENCE ONLY] summary") == .notice("Earlier turns were compacted into a summary"), "compaction")
+    check(HarnessText.classify("just a normal [bracketed] message") == .user("just a normal [bracketed] message", note: nil), "plain text kept")
+    let harness = try! JSONDecoder().decode([StoredMessage].self, from: Data(#"""
+    [{"id":1,"role":"user","content":"You've reached the maximum number of tool-calling iterations allowed."},
+     {"id":2,"role":"user","content":"real words","note":"Sent while Hermes was working · Pasted 6 lines"},
+     {"id":3,"role":"system","display_kind":"system_note","notice":"Loaded the last30days skill","content":""}]
+    """#.utf8))
+    let shaped = ChatModel.transcript(harness)
+    check(shaped.map(\.kind) == [.notice, .user, .notice], "kinds: \(shaped.map(\.kind))")
+    check(shaped[1].annotation == "Sent while Hermes was working · Pasted 6 lines" && shaped[2].text == "Loaded the last30days skill", "notes")
+
+    check(ModelName.short("claude-opus-5-5[1m]") == "Opus 5.5 · 1M", "opus: \(ModelName.short("claude-opus-5-5[1m]"))")
+    check(ModelName.short("deepseek-v4-pro") == "DeepSeek V4 Pro", "deepseek: \(ModelName.short("deepseek-v4-pro"))")
+    check(ModelName.short("accounts/fireworks/models/glm-5p1") == "GLM 5.1", "glm: \(ModelName.short("accounts/fireworks/models/glm-5p1"))")
+    check(ModelName.short("gpt-5.5") == "GPT 5.5", "gpt: \(ModelName.short("gpt-5.5"))")
+    check(ModelName.short("claude-sonnet-4-5-20250929") == "Sonnet 4.5", "dated: \(ModelName.short("claude-sonnet-4-5-20250929"))")
+    check(SkillInfo.search([SkillInfo(name: "web-pentest", category: "security", description: "Authorized web pentest"),
+                            SkillInfo(name: "pentest-checklist", description: "checklist")], "pentest").first?.name == "pentest-checklist",
+          "prefix match ranks first")
+    check(SkillInfo.search([SkillInfo(name: "zayds-security-toolkit", description: "security research")], "security").count == 1,
+          "contains match found")
+
     print("Message format parsing, activity entries and transcript activity tests passed")
 }
 

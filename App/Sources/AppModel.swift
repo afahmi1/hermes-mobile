@@ -86,6 +86,36 @@ final class AppModel {
         DevicePreferences.migrate(account: inboxAccount)
     }
 
+    /// `prometheus://` links, so dictation keyboards (Hex, Zone) can bounce back here after recording and
+    /// Shortcuts / the Action Button can start a chat:
+    /// - `prometheus://` (or `/open`) only brings the app forward, keeping the chat and draft you were in.
+    /// - `prometheus://chat/<bot>/<session>` opens that chat.
+    /// - `prometheus://new/<bot>?text=…` opens a new chat with the text in its draft (nothing is sent).
+    func open(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "prometheus", signedIn else { return false }
+        let parts = ([url.host ?? ""] + url.pathComponents.filter { $0 != "/" }).filter { !$0.isEmpty }
+        switch parts.first?.lowercased() {
+        case nil, "open":
+            return true
+        case "chat" where parts.count >= 3:
+            inboxPath = [ChatRef(profile: parts[1], sessionId: parts[2...].joined(separator: "/"))]
+            return true
+        case "new":
+            let profile = parts.count >= 2 ? parts[1] : (bots.first?.id ?? "default")
+            let ref = ChatRef(profile: profile, sessionId: nil)
+            let text = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "text" }?.value ?? ""
+            if !text.isEmpty {
+                let chat = chat(for: ref)
+                chat.draft = chat.draft.isEmpty ? text : chat.draft + "\n\n" + text
+            }
+            inboxPath = [ref]
+            return true
+        default:
+            return false
+        }
+    }
+
     func bot(_ id: String) -> Bot? { bots.first { $0.id == id } }
     func botName(_ id: String) -> String { bot(id)?.name ?? id }
 
@@ -177,6 +207,10 @@ final class AppModel {
     }
 
     var hasLiveRuns: Bool { chats.values.contains { $0.isRunning } || newChats.values.contains { $0.isRunning } }
+    /// A queued or guide message that hasn't reached the Mac yet, in any open chat.
+    var hasUnsentMessages: Bool {
+        (Array(chats.values) + Array(newChats.values)).contains { $0.outgoing.contains { !$0.onMac && $0.problem == nil } }
+    }
 
     func hasLiveRuns(excluding chat: ChatModel) -> Bool {
         chats.values.contains { $0 !== chat && $0.isRunning } || newChats.values.contains { $0 !== chat && $0.isRunning }

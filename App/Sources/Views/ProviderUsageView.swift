@@ -10,6 +10,45 @@ private struct ProviderEntry: Identifiable {
     }
 }
 
+/// Usage in words a person reads at a glance: what limit, how much is left, when it resets.
+enum UsageWords {
+    static func compact(_ n: Int) -> String { n.formatted(.number.notation(.compactName).precision(.significantDigits(2))) }
+
+    /// "Weekly limit", "5-hour limit". The provider's own label, with "limit" added once.
+    static func windowTitle(_ raw: String?) -> String {
+        let label = (raw ?? "Usage").trimmingCharacters(in: .whitespaces)
+        return label.lowercased().contains("limit") ? label : label + " limit"
+    }
+
+    /// "1% left · resets Sunday 1:49 AM (in 4 days)"
+    static func windowDetail(used: Double, resets: Date?, now: Date = Date()) -> String {
+        let left = max(0, 100 - Int(used.rounded()))
+        var text = left == 0 ? "None left" : "\(left)% left"
+        if let resets {
+            let day = Calendar.current.isDateInToday(resets) ? "today" : Calendar.current.isDateInTomorrow(resets) ? "tomorrow"
+                : resets.formatted(.dateTime.weekday(.wide))
+            let rel = RelativeDateTimeFormatter().localizedString(for: resets, relativeTo: now)
+            text += " · resets \(day) \(resets.formatted(date: .omitted, time: .shortened)) (\(rel))"
+        }
+        return text
+    }
+
+    static func severity(_ used: Double) -> Color {
+        used >= 95 ? .red : used >= 80 ? HMDesign.warning : HMDesign.accent
+    }
+
+    /// The one line a provider row needs: its tightest limit, or what Hermes has used.
+    static func headline(_ provider: JV) -> String? {
+        let windows = provider["usage"]["windows"].array.compactMap { w -> (String, Double)? in
+            guard let p = w["used_percent"].double else { return nil }
+            return (windowTitle(w["label"].string), p)
+        }
+        if let worst = windows.max(by: { $0.1 < $1.1 }) { return "\(worst.0) · \(Int(worst.1.rounded()))% used" }
+        if let usd = provider["usage"]["spend"]["usage_monthly"]["usd"].double { return usd.formatted(.currency(code: "USD")) + " this month" }
+        return nil
+    }
+}
+
 struct ProviderUsageSection: View {
     @Environment(AppModel.self) private var app
     @State private var showHistorical = false
@@ -41,7 +80,7 @@ struct ProviderUsageSection: View {
             if data?["refreshing"].bool == true {
                 Text("Updating provider readings…")
             } else if let date = data?["fetched_at"].date {
-                Text("Inventory checked \(date, style: .relative) ago")
+                Text("Updated \(date, style: .relative) ago")
             }
         }
     }
@@ -69,11 +108,15 @@ struct ProviderUsageSection: View {
         } label: {
             VStack(alignment: .leading, spacing: HMDesign.micro) {
                 Text(Self.displayName(name)).font(HMDesign.rowTitle)
+                if let headline = UsageWords.headline(provider) {
+                    Text(headline).font(HMDesign.metadata.weight(.medium))
+                        .foregroundStyle(provider["usage"]["windows"].array.contains { ($0["used_percent"].double ?? 0) >= 80 } ? HMDesign.warning : .secondary)
+                }
                 if let calls = local["calls"].int {
-                    Text("\(calls.formatted()) recorded calls\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
+                    Text("\(UsageWords.compact(calls)) requests from Hermes\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
                 } else {
                     let count = provider["credentials"].array.count
-                    Text("\(count) configured credential\(count == 1 ? "" : "s")\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
+                    Text("\(count) key\(count == 1 ? "" : "s") set up\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
                 }
                 if provider["is_default"].bool {
                     Label("Default provider", systemImage: "checkmark.circle").font(HMDesign.metadata).foregroundStyle(.secondary)
@@ -131,27 +174,28 @@ private struct ProviderUsageDetail: View {
             if let provider {
                 let local = provider["local_usage"]
                 let usage = provider["usage"]
-                Section("Hermes activity") {
+                Section {
                     if let calls = local["calls"].int {
-                        LabeledContent("Calls", value: calls.formatted())
-                        LabeledContent("Sessions", value: (local["sessions"].int ?? 0).formatted())
-                        LabeledContent("Input tokens", value: (local["input_tokens"].int ?? 0).formatted())
-                        LabeledContent("Output tokens", value: (local["output_tokens"].int ?? 0).formatted())
+                        LabeledContent("Requests", value: calls.formatted())
+                        LabeledContent("Chats", value: (local["sessions"].int ?? 0).formatted())
+                        LabeledContent("Tokens sent", value: UsageWords.compact(local["input_tokens"].int ?? 0))
+                        LabeledContent("Tokens received", value: UsageWords.compact(local["output_tokens"].int ?? 0))
                         if let epoch = local["last_seen"].double {
-                            LabeledContent("Last activity", value: Date(timeIntervalSince1970: epoch).formatted())
+                            LabeledContent("Last used") { Text(Date(timeIntervalSince1970: epoch), style: .relative) + Text(" ago") }
                         }
                     } else {
-                        Text("No activity attributed to this provider in the available Hermes ledgers.")
+                        Text("Hermes hasn't used this provider yet.")
                     }
+                } header: { Text("What Hermes used") } footer: {
                     if let coverage = inventory?["ledger"], let read = coverage["profiles_read"].int {
-                        Text("Lifetime totals across \(read) profile ledgers. Unavailable ledgers: \(coverage["profiles_unavailable"].int ?? 0).")
-                            .font(.footnote).foregroundStyle(.secondary)
+                        let missing = coverage["profiles_unavailable"].int ?? 0
+                        Text("All time, across \(read) bot\(read == 1 ? "" : "s")" + (missing > 0 ? ". \(missing) couldn't be read." : "."))
                     }
                 }
                 modelsSection(historicalOnly: provider["historical_only"].bool)
                 if !provider["historical_only"].bool {
-                    Section("Provider account") {
-                        LabeledContent("Configured credentials", value: provider["credentials"].array.count.formatted())
+                    Section("Your account") {
+                        LabeledContent("Keys set up", value: provider["credentials"].array.count.formatted())
                         if let plan = usage["plan"].string { LabeledContent("Plan", value: plan) }
                         if let count = usage["key_count"].int {
                             LabeledContent("Keys reporting", value: "\(usage["keys_reporting"].int ?? 0) of \(count)")
@@ -163,7 +207,7 @@ private struct ProviderUsageDetail: View {
                                 let label = ["usage_daily": "Spent today", "usage_monthly": "This month", "usage": "All-time spend"][period]!
                                 LabeledContent(label, value: usd.formatted(.currency(code: "USD").precision(.fractionLength(2...4))))
                                 if reading["reporting"].int != usage["key_count"].int {
-                                    Text("\(reading["reporting"].int ?? 0) keys included").font(.caption).foregroundStyle(.secondary)
+                                    Text("Counts \(reading["reporting"].int ?? 0) of your keys").font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                         }
@@ -175,10 +219,21 @@ private struct ProviderUsageDetail: View {
                         ForEach(Array(usage["windows"].array.enumerated()), id: \.offset) { _, w in
                             if let percent = w["used_percent"].double {
                                 let used = max(0, min(100, percent))
-                                LabeledContent(w["label"].string ?? "Quota", value: "\(Int(used.rounded()))% used")
-                                ProgressView(value: used, total: 100).accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack {
+                                        Text(UsageWords.windowTitle(w["label"].string))
+                                        Spacer()
+                                        Text("\(Int(used.rounded()))% used").monospacedDigit().foregroundStyle(UsageWords.severity(used))
+                                    }
+                                    ProgressView(value: used, total: 100).tint(UsageWords.severity(used)).accessibilityHidden(true)
+                                    Text(UsageWords.windowDetail(used: used, resets: w["resets_at"].date))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 2)
+                                .accessibilityElement(children: .combine)
+                            } else if let reset = w["resets_at"].date {
+                                LabeledContent(UsageWords.windowTitle(w["label"].string)) { Text("resets ") + Text(reset, style: .relative) }
                             }
-                            if let reset = w["resets_at"].date { LabeledContent("Resets", value: reset.formatted()) }
                             if let detail = w["detail"].string { Text(detail).font(.footnote) }
                         }
                         ForEach(Array(usage["details"].array.enumerated()), id: \.offset) { _, d in
@@ -186,14 +241,15 @@ private struct ProviderUsageDetail: View {
                         }
                         if let why = usage["unavailable_reason"].string { Text(why).foregroundStyle(.secondary) }
                         if usage["stale"].bool, let at = usage["stale_since"].date {
-                            Label("Last successful reading \(at.formatted())", systemImage: "clock").font(.footnote)
+                            Label("Couldn't refresh. Showing the reading from \(at.formatted(date: .abbreviated, time: .shortened)).", systemImage: "clock").font(.footnote)
                         }
-                        if let at = usage["checked_at"].date { LabeledContent("Last check", value: at.formatted()) }
+                        if let at = usage["checked_at"].date { LabeledContent("Checked") { Text(at, style: .relative) + Text(" ago") } }
                     }
                 }
             } else { Text("This provider is no longer in the latest inventory. Pull to refresh.").foregroundStyle(.secondary) }
             if let error = app.status.error { Label(error, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary) }
         }
+        .hmCanvas()
         .navigationTitle(ProviderUsageSection.displayName(name))
         .navigationBarTitleDisplayMode(.inline)
         .refreshable {

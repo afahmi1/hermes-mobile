@@ -135,6 +135,7 @@ struct ChatListView: View {
 
     private var inboxNavigation: some View {
         content
+            .hmCanvas()
             .navigationTitle(selecting ? "\(selection.count) selected" : (profile.map { app.botName($0) } ?? "Chats"))
             // Large title only on the real top-level inbox, not a bot's inbox or while selecting.
             .navigationBarTitleDisplayMode(fixedProfile == nil && !selecting ? .large : .inline)
@@ -180,7 +181,7 @@ struct ChatListView: View {
                 Button("Unpin", systemImage: "pin.slash") { Task { await batch(["pinned": false]) } }
             } label: { Label("Pin options", systemImage: "pin").hmTouchTarget() }
         }
-        .padding(.horizontal, HMDesign.gutter).frame(minHeight: HMDesign.touch).background(.bar)
+        .padding(.horizontal, HMDesign.gutter).frame(minHeight: HMDesign.touch).background(HMDesign.bar)
         .disabled(batchBusy || selection.isEmpty)
     }
 
@@ -345,7 +346,7 @@ struct ChatListView: View {
                     Image(systemName: selection.contains(s.key) ? "checkmark.circle.fill" : "circle")
                         .frame(width: HMDesign.touch, height: HMDesign.touch)
                         .font(.title3)
-                        .foregroundStyle(selection.contains(s.key) ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(selection.contains(s.key) ? HMDesign.accent : Color.secondary)
                     SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
                 .contentShape(Rectangle())
@@ -775,6 +776,7 @@ struct NewChatSheet: View {
                 Button { onPick(bot) } label: { BotRow(bot: bot) }
                     .buttonStyle(.plain)
             }
+            .hmCanvas()
             .navigationTitle("New chat with…")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
@@ -830,6 +832,7 @@ private struct SourceGuideView: View {
                         .font(.footnote)
                 }
             }
+            .hmCanvas()
             .navigationTitle("Chats, explained")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }

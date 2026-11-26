@@ -83,6 +83,46 @@ struct SlashCommand: Codable, Identifiable, Hashable {
 struct CommandPalette: Decodable {
     let commands: [SlashCommand]
     let skills: [String]
+    /// Name, category folder and one-line description. Absent on older bridges (names only).
+    let skillDetails: [SkillInfo]?
+
+    enum CodingKeys: String, CodingKey { case commands, skills, skillDetails = "skill_details" }
+}
+
+struct SkillInfo: Codable, Hashable, Identifiable {
+    let name: String
+    let category: String
+    let description: String
+    var id: String { name }
+
+    init(name: String, category: String = "", description: String = "") {
+        self.name = name; self.category = category; self.description = description
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        category = (try? c.decode(String.self, forKey: .category)) ?? ""
+        description = (try? c.decode(String.self, forKey: .description)) ?? ""
+    }
+
+    /// Ranked search: name prefix, then name contains, then category or description contains. Each word
+    /// of the query must match somewhere, so "web pentest" finds "web-pentest" and "authorized web pentest".
+    static func search(_ skills: [SkillInfo], _ raw: String) -> [SkillInfo] {
+        let words = raw.lowercased().split { $0 == " " || $0 == "/" }.map(String.init)
+        guard !words.isEmpty else { return skills }
+        let joined = words.joined(separator: "-")
+        var scored: [(Int, SkillInfo)] = []
+        for skill in skills {
+            let name = skill.name.lowercased()
+            let hay = name + " " + skill.category.lowercased() + " " + skill.description.lowercased()
+            guard words.allSatisfy({ hay.contains($0) }) else { continue }
+            let score = name.hasPrefix(joined) ? 0 : name.contains(joined) ? 1
+                : words.allSatisfy({ name.contains($0) }) ? 2 : skill.category.lowercased().contains(words[0]) ? 3 : 4
+            scored.append((score, skill))
+        }
+        return scored.sorted { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1.name < $1.1.name }.map(\.1)
+    }
 }
 
 struct SlashResult {
@@ -206,6 +246,34 @@ struct MessagePin: Codable, Identifiable, Hashable {
     }
 }
 
+/// Harness text that lands in user-role rows. The bridge classifies it (bridge_transcript.classify_user_text);
+/// this is the phone's fallback for older bridges, so a system nudge never shows as something the person said.
+enum HarnessText {
+    enum Verdict: Equatable { case user(String, note: String?), notice(String) }
+
+    static func classify(_ raw: String) -> Verdict {
+        var body = raw
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notices: [(String, String)] = [
+            ("You've reached the maximum number of tool-calling iterations", "Hermes hit its tool-call limit for this turn and wrapped up"),
+            ("[CONTEXT COMPACTION", "Earlier turns were compacted into a summary"),
+            ("[Your active task list was preserved", "Task list carried over after compaction"),
+            ("[STILL IN PROGRESS", "Your earlier request carried over after compaction"),
+            ("[System note: Your previous turn was interrupted", "Resumed after an interruption"),
+            ("[IMPORTANT: MCP servers have been reloaded", "Tool servers reloaded"),
+            ("[System:", "System note for Hermes"), ("[SYSTEM:", "System note for Hermes"), ("[System note:", "System note for Hermes"),
+        ]
+        if let hit = notices.first(where: { trimmed.hasPrefix($0.0) }) { return .notice(hit.1) }
+        var note: String?
+        if trimmed.hasPrefix("[OUT-OF-BAND USER MESSAGE") {
+            if let close = body.range(of: "]") { body = String(body[close.upperBound...]) }
+            body = body.replacingOccurrences(of: "[/OUT-OF-BAND USER MESSAGE]", with: "")
+            note = "Sent while Hermes was working"
+        }
+        return .user(body.trimmingCharacters(in: .whitespacesAndNewlines), note: note)
+    }
+}
+
 /// One background command or subagent task in an activity card.
 struct ActivityEntry: Codable, Hashable {
     /// "process" or "task".
@@ -270,9 +338,11 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     let media: [ChatMediaRef]?
     /// Background commands and subagent tasks behind an activity card (bridge-parsed). Absent on older bridges.
     let activity: [ActivityEntry]?
+    /// A short tag under a user bubble ("Sent while Hermes was working · Pasted 6 lines").
+    let note: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, role, content, timestamp, reasoning, notice, preview, ok, media, activity
+        case id, role, content, timestamp, reasoning, notice, preview, ok, media, activity, note
         case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind"
     }
 
@@ -291,6 +361,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         ok = try? c.decode(Bool.self, forKey: .ok)
         media = try? c.decode([ChatMediaRef].self, forKey: .media)
         activity = try? c.decode([ActivityEntry].self, forKey: .activity)
+        note = try? c.decode(String.self, forKey: .note)
     }
 
     /// Content may be a string or a list of OpenAI-style parts.
@@ -311,7 +382,32 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     }
 }
 
-struct MessagesPage: Codable { let data: [StoredMessage] }
+struct MessagesPage: Codable {
+    let data: [StoredMessage]
+    /// Present when the bridge knows whether another raw page exists. Absent on older bridges.
+    let hasMore: Bool?
+    let nextOffset: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case data
+        case hasMore = "has_more"
+        case nextOffset = "next_offset"
+    }
+}
+
+/// How far back the transcript can still go. A projected page is often shorter than the 100 raw
+/// rows the bridge fetched (hidden tool rows are dropped), so a short page is not the end.
+enum HistoryPaging {
+    static func first(count: Int, limit: Int = 100, hasMore: Bool?, nextOffset: Int?) -> (offset: Int, hasOlder: Bool) {
+        if let hasMore { return (nextOffset ?? limit, hasMore) }
+        return (limit, count == limit)
+    }
+
+    static func advance(offset: Int, limit: Int = 100, added: Int, hasMore: Bool?, nextOffset: Int?) -> (offset: Int, hasOlder: Bool) {
+        if let hasMore { return (nextOffset ?? offset + limit, hasMore) }
+        return (offset + limit, added > 0)
+    }
+}
 
 // MARK: - Model catalog
 
@@ -508,6 +604,7 @@ struct ServedRuntime: Codable, Hashable {
     let fallbackActive: Bool?
     let policy: Policy?
     let modelsUsed: [Used]?
+    let cost: CostSummary?
 
     struct Policy: Codable, Hashable { let model: String?; let provider: String?; let effort: String? }
     struct Used: Codable, Hashable {
@@ -518,7 +615,7 @@ struct ServedRuntime: Codable, Hashable {
         enum CodingKeys: String, CodingKey { case model, provider, calls, reasoningTokens = "reasoning_tokens" }
     }
     enum CodingKeys: String, CodingKey {
-        case model, provider, policy
+        case model, provider, policy, cost
         case reasoningTokens = "reasoning_tokens", fallbackActive = "fallback_active", modelsUsed = "models_used"
     }
 
@@ -911,4 +1008,108 @@ enum MarkdownBlock: Equatable {
         if core.hasSuffix("|") { core.removeLast() }
         return core.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
     }
+}
+
+/// Model ids as people say them: "claude-opus-5-5[1m]" reads "Opus 5.5 · 1M", "deepseek-v4-pro" reads
+/// "DeepSeek V4 Pro", "accounts/fireworks/models/glm-5p1" reads "GLM 5.1". Display only; the id is kept everywhere else.
+enum ModelName {
+    private static let upper: Set<String> = ["gpt", "glm", "llm", "ai", "oss", "vl", "moe", "r1", "o1", "o3", "o4"]
+    private static let brands: [String: String] = ["deepseek": "DeepSeek", "openai": "OpenAI", "xai": "xAI",
+                                                   "qwen": "Qwen", "kimi": "Kimi", "minimax": "MiniMax", "grok": "Grok"]
+
+    static func short(_ raw: String) -> String {
+        var id = raw.split(separator: "/").last.map(String.init) ?? raw
+        var context = ""
+        if let open = id.firstIndex(of: "["), id.hasSuffix("]") {
+            context = String(id[id.index(after: open)..<id.index(before: id.endIndex)]).uppercased()
+            id = String(id[..<open])
+        }
+        if id.hasPrefix("claude-") { id.removeFirst("claude-".count) }
+        // Dated snapshots ("-20250514") say nothing a person needs.
+        id = id.replacingOccurrences(of: #"-20\d{6}$"#, with: "", options: .regularExpression)
+        var words: [String] = []
+        for token in id.split(whereSeparator: { $0 == "-" || $0 == "_" || $0 == ":" }).map(String.init) {
+            let fixed = token.replacingOccurrences(of: #"^(\d+)p(\d+)$"#, with: "$1.$2", options: .regularExpression)
+            if let last = words.last, fixed.allSatisfy(\.isNumber), last.allSatisfy({ $0.isNumber || $0 == "." }), !last.contains(".") {
+                words[words.count - 1] = last + "." + fixed
+                continue
+            }
+            let lower = fixed.lowercased()
+            if let brand = brands[lower] { words.append(brand) }
+            else if upper.contains(lower) { words.append(lower.uppercased()) }
+            else if lower.first?.isLetter == true, lower.count > 1, lower.dropFirst().allSatisfy({ $0.isNumber || $0 == "." }) {
+                words.append(lower.uppercased())  // v4, k2
+            } else { words.append(fixed.prefix(1).uppercased() + fixed.dropFirst()) }
+        }
+        let name = words.joined(separator: " ")
+        return context.isEmpty ? name : name + " · " + context
+    }
+}
+
+/// What a chat or a reply cost, from Hermes's own ledger. `usd` is real money (API-priced routes);
+/// subscription routes are `included`, with what they would have cost at API prices kept separately.
+struct CostSummary: Codable, Hashable {
+    let usd: Double
+    let includedApiUsd: Double
+    let included: Bool
+    let unknown: Bool
+    enum CodingKeys: String, CodingKey { case usd, included, unknown, includedApiUsd = "included_api_usd" }
+
+    init(usd: Double, includedApiUsd: Double = 0, included: Bool = false, unknown: Bool = false) {
+        self.usd = usd; self.includedApiUsd = includedApiUsd; self.included = included; self.unknown = unknown
+    }
+
+    init?(_ raw: Any?) {
+        guard let d = raw as? [String: Any] else { return nil }
+        self.init(usd: (d["usd"] as? NSNumber)?.doubleValue ?? 0,
+                  includedApiUsd: (d["included_api_usd"] as? NSNumber)?.doubleValue ?? 0,
+                  included: d["included"] as? Bool ?? false, unknown: d["unknown"] as? Bool ?? false)
+    }
+
+    static func money(_ usd: Double) -> String {
+        if usd < 0.005 { return "<$0.01" }
+        return usd.formatted(.currency(code: "USD").precision(.fractionLength(usd < 1 ? 3 : 2)))
+    }
+
+    /// Under one reply: "$0.042", "Included in plan", "$0.03 + plan". Nil when nothing is priced or included.
+    var replyLabel: String? {
+        let paid = usd >= 0.0005
+        if paid && included { return Self.money(usd) + " + plan" }
+        if paid { return Self.money(usd) }
+        if included { return "Included in plan" }
+        return nil
+    }
+}
+
+/// One chat's queue on the Mac (Hermes's session_admissions), oldest first.
+struct QueueState: Equatable {
+    struct Row: Equatable, Identifiable {
+        let id: String          // admission id
+        let status: String      // queued | started | steering | unknown
+        let text: String
+        let canEdit: Bool
+        let canSteer: Bool
+        let canCancel: Bool
+    }
+    let rows: [Row]
+    /// Hermes restarted mid-reply and holds the queue until that loss is acknowledged.
+    let paused: Bool
+    let lost: Row?
+
+    init?(_ raw: Any?) {
+        guard let d = raw as? [String: Any], let list = d["pending"] as? [[String: Any]] else { return nil }
+        func row(_ r: [String: Any]) -> Row? {
+            guard let id = r["admission_id"] as? String else { return nil }
+            return Row(id: id, status: r["status"] as? String ?? "queued", text: r["text"] as? String ?? "",
+                       canEdit: r["can_edit"] as? Bool ?? false, canSteer: r["can_steer"] as? Bool ?? false,
+                       canCancel: r["can_cancel"] as? Bool ?? false)
+        }
+        rows = list.compactMap(row)
+        paused = d["paused"] as? Bool ?? false
+        lost = (d["lost"] as? [String: Any]).flatMap(row)
+    }
+
+    func row(_ admission: String) -> Row? { rows.first { $0.id == admission } }
+    /// Still waiting its turn (not started, not finished).
+    func isWaiting(_ admission: String) -> Bool { row(admission)?.status == "queued" }
 }

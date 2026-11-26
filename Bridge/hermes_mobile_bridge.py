@@ -43,10 +43,21 @@ PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 # Gateway paths the phone may reach (relative to /p/<profile>/).
 PASS = re.compile(r"^/(api/sessions(/[^/]+(/(messages|model|fork))?)?|v1/runs(/[^/]+(/(events|stop|approval|steer))?)?"
                   r"|api/model/options|v1/models|health)$")
-MAX_BODY = 12 * 1024 * 1024
+def _media_body_cap():
+    """Attachments arrive base64 in JSON (4/3 the bytes) plus the message text: size the request cap from
+    the same setting bridge_media uses, so raising one never silently 413s the other."""
+    try:
+        media = int(os.environ.get("HERMES_MOBILE_MEDIA_MAX_BYTES", "") or 0)
+    except ValueError:
+        media = 0
+    media = 50 * 1024 * 1024 if media <= 0 else max(256 * 1024, min(128 * 1024 * 1024, media))
+    return media * 4 // 3 + 2 * 1024 * 1024
+
+
+MAX_BODY = _media_body_cap()
 WS_MAX_BODY = 64 * 1024  # Fits an 8 KiB file JSON-escaped (\u00XX per control byte) or 4 KiB instructions.
 WS_BODY_TIMEOUT = 10
-BODY_TIMEOUT = 120             # an 8 MiB attachment on a weak cellular link still fits; a stalled peer does not
+BODY_TIMEOUT = 600             # a 50 MiB attachment on a weak cellular link still fits; a stalled peer does not
 WS_SETTING = "HERMES_MOBILE_WORKSPACES"
 WS_BOTS_SETTING = "HERMES_MOBILE_WORKSPACE_BOTS"
 POOL = ThreadPoolExecutor(max_workers=16)
@@ -1001,6 +1012,77 @@ def set_session_flags(pid, ids, fields):
     return updated, errors
 
 
+_INCLUDED_PROVIDERS = {"openai-codex", "copilot", "github-copilot", "claude-code"}
+
+
+def billing_kind(provider, mode="", status=None, est=0.0, act=0.0):
+    """included: a subscription or OAuth route (Hermes may still estimate an API-rate price for it, which
+    nobody pays). priced: Hermes has a real or estimated price. unknown: local or custom routes with no price."""
+    p = (provider or "").lower()
+    if mode == "subscription_included" or status == "included" or "subscription" in p or p.endswith("-oauth") \
+            or p in _INCLUDED_PROVIDERS:
+        return "included"
+    if (act or 0) > 0 or (est or 0) > 0 or status in ("estimated", "actual", "exact"):
+        return "priced"
+    return "unknown"
+
+
+def cost_ledger(pid, sid):
+    """Hermes's own per-model ledger for one chat: {(model, provider): {usd, api_usd, calls, kind}}."""
+    con = _ro(pid)
+    if con is None:
+        return {}
+    try:
+        rows = con.execute(
+            "SELECT model, billing_provider AS provider, MAX(billing_mode) AS mode, MAX(cost_status) AS status, "
+            "SUM(api_call_count) AS calls, SUM(estimated_cost_usd) AS est, SUM(actual_cost_usd) AS act, "
+            "SUM(input_tokens) AS input, SUM(output_tokens) AS output, SUM(cache_read_tokens) AS cached "
+            "FROM session_model_usage WHERE session_id=? GROUP BY model, billing_provider", (sid,)).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        con.close()
+    out = {}
+    for r in rows:
+        est, act = float(r["est"] or 0), float(r["act"] or 0)
+        kind = billing_kind(r["provider"], r["mode"] or "", r["status"], est, act)
+        api = act if act > 0 else est
+        out[(r["model"], r["provider"] or "")] = {
+            "model": r["model"], "provider": r["provider"] or "", "kind": kind, "calls": int(r["calls"] or 0),
+            "usd": api if kind == "priced" else 0.0, "api_usd": api,
+            "input": int(r["input"] or 0), "output": int(r["output"] or 0), "cached": int(r["cached"] or 0)}
+    return out
+
+
+def cost_summary(entries):
+    """What a person needs: what this cost, what was included in a plan, and whether anything is unpriced."""
+    entries = list(entries)
+    return {"usd": round(sum(e["usd"] for e in entries), 6),
+            "included_api_usd": round(sum(e["api_usd"] for e in entries if e["kind"] == "included"), 6),
+            "included": any(e["kind"] == "included" for e in entries),
+            "unknown": any(e["kind"] == "unknown" for e in entries),
+            "input": sum(e["input"] for e in entries), "output": sum(e["output"] for e in entries)}
+
+
+def cost_delta(before, after):
+    """The ledger rows a single turn added."""
+    out = []
+    for key, now in after.items():
+        was = before.get(key)
+        if was is None:
+            out.append(now)
+            continue
+        d = {k: now[k] - was[k] for k in ("usd", "api_usd", "calls", "input", "output", "cached")}
+        if d["calls"] > 0 or d["api_usd"] > 1e-9:
+            out.append({**now, **d})
+    return out
+
+
+if turns is not None:
+    # A reply's cost = Hermes's ledger after the turn minus before it (see bridge_turns.LEDGER).
+    turns.LEDGER, turns.COST_SUMMARY, turns.COST_DELTA = (lambda pid, sid: cost_ledger(pid, sid)), cost_summary, cost_delta
+
+
 def session_runtime(pid, sid):
     """What actually served the session's latest turn, from state.db — the proof the app shows."""
     con = _ro(pid)
@@ -1047,9 +1129,13 @@ def session_runtime(pid, sid):
                 "ORDER BY MAX(last_seen) DESC LIMIT 8", (sid,))]
         except sqlite3.Error:
             d["models_used"] = []
-        return d
     finally:
         con.close()
+    try:
+        d["cost"] = cost_summary(cost_ledger(pid, sid).values())
+    except Exception:
+        log("cost ledger read failed")
+    return d
 
 
 _health_history = deque(maxlen=8)
@@ -1425,9 +1511,13 @@ def project_timeline_message(message):
     return transcript.project_timeline_message(message, [HERMES], assistant_media_roots())
 
 
-def timeline_bytes(messages):
+def timeline_bytes(messages, has_more=None, next_offset=None):
     rows = [row for row in (project_timeline_message(m) for m in messages) if row]
-    return json.dumps({"data": rows}, ensure_ascii=False, separators=(",", ":")).encode()
+    doc = {"data": rows}
+    if has_more is not None:
+        doc["has_more"] = bool(has_more)
+        doc["next_offset"] = next_offset
+    return json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def timeline_page(raw):
@@ -1469,9 +1559,17 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
         if not db.get_session(session_id):
             return None
         active = db.resolve_resume_session_id(session_id)
-        rows = db.get_messages(active, limit=limit, offset=offset, latest=latest,
+        # One extra raw row tells the phone whether another page exists. Projected pages are shorter
+        # (hidden tool rows are dropped), so the phone cannot infer this from the row count.
+        probe = None if limit is None else limit + 1
+        rows = db.get_messages(active, limit=probe, offset=offset, latest=latest,
                                include_compacted=False, include_ancestors=True)
-        return timeline_bytes(APIServerAdapter._message_response(row) for row in rows)
+        if limit is not None and len(rows) > limit:
+            page, has_more = rows[-limit:], True
+        else:
+            page, has_more = rows, False
+        return timeline_bytes([APIServerAdapter._message_response(row) for row in page],
+                              has_more=has_more, next_offset=offset + (limit or 0))
 
 
 # ---------- HTTP ----------
@@ -1647,6 +1745,8 @@ class H(BaseHTTPRequestHandler):
                 features.append("image_attachments_v1")
             if turns:
                 features.append("file_attachments_v1")
+            if turns:
+                features.append("queue_controls_v1")  # GET/POST /m/chat/<bot>/<chat>/queue
             return self.send(200, {"protocol": 2, "features": features,
                                    "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
         if path == "/m/devices" or path.startswith("/m/devices/"):
@@ -1672,8 +1772,10 @@ class H(BaseHTTPRequestHandler):
                 pid = q.get("profile") or "default"
                 if pid not in profile_ids():
                     return self.send(404, {"error": "unknown bot"})
+                catalog = transcript.skill_catalog(profile_home(pid))
                 return self.send(200, {"commands": transcript.phone_commands(),
-                                       "skills": transcript.skill_names(profile_home(pid))})
+                                       "skills": [row["name"] for row in catalog],
+                                       "skill_details": catalog})
             if path == "/m/status":
                 why = "it answered with an error"
                 try:
@@ -2251,13 +2353,18 @@ class H(BaseHTTPRequestHandler):
                     return self.send(200, turn.summary())
                 return self.send(405, {"error": "method not allowed"})
             preview = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/media/([0-9a-f]{64})", path)
-            if preview:
+            by_path = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/file", path)
+            if preview or by_path:
                 if self.command != "GET":
                     return self.send(405, {"error": "method not allowed"})
-                pid, sid, digest = preview.groups()
+                pid, sid = (preview or by_path).groups()[:2]
                 if pid not in profile_ids():
                     return self.send(404, {"error": "unknown bot"})
-                found = transcript.file_for_digest(session_bodies(pid, sid), digest, [HERMES], assistant_media_roots())
+                if by_path:
+                    # A path Hermes wrote in a reply, tapped on the phone. Same guards as attachments.
+                    found = transcript.file_for_path(session_bodies(pid, sid), q.get("path") or "", [HERMES], assistant_media_roots())
+                else:
+                    found = transcript.file_for_digest(session_bodies(pid, sid), preview.group(3), [HERMES], assistant_media_roots())
                 if found is None:
                     return self.send(404, {"error": "That file is not in this chat."})
                 types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
@@ -2275,6 +2382,18 @@ class H(BaseHTTPRequestHandler):
                 except OSError:
                     return self.send(404, {"error": "That file is not in this chat."})
                 return self.send(200, data, ctype)
+            queue = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/queue(?:/([A-Za-z0-9_.:-]{1,128})/(edit|cancel|steer|resolve))?", path)
+            if queue:
+                pid, sid, admission, action = queue.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                if not admission and self.command == "GET":
+                    return self.send(200, turns.queue_state(profile_home(pid), sid))
+                if admission and self.command == "POST":
+                    d = self.json_body()
+                    return self.send(200, turns.queue_action(profile_home(pid), pid, sid, admission, action,
+                                                             d.get("text"), d.get("submission_id")))
+                return self.send(405, {"error": "method not allowed"})
             slash = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/slash", path)
             if slash and self.command == "POST":
                 pid, sid = slash.groups()
@@ -2317,6 +2436,9 @@ class H(BaseHTTPRequestHandler):
             sid, action = m.group(2).rsplit("/", 1)
             if action == "runtime":
                 applied = turns.set_runtime(home, sid, d)
+                guard = next((row for row in applied.values() if row.get("status") == "confirmation_required"), None)
+                if guard:
+                    return self.send(200, {"applied": {}, "timing": "confirm", "confirm": guard})
                 # A deferred pick lands at the next claim; polling here delays the picker and
                 # still reads the old policy throughout a long-running turn.
                 deferred = any(row.get("status") == "deferred" for row in applied.values())
@@ -2582,6 +2704,9 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if "--doctor" in sys.argv[1:]:
+        import bridge_doctor
+        sys.exit(bridge_doctor.report(bridge_doctor.run(HERMES, PORT, profile_ids, profile_home), "--json" in sys.argv))
     if sys.argv[1:] == ["--pair-code"]:
         print(devices().offer()["code"])
         sys.exit(0)

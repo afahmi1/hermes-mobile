@@ -124,11 +124,36 @@ final class API: @unchecked Sendable {
             r.httpBody = try JSONSerialization.data(withJSONObject: body)
             r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
+        // Reads are small: fail fast and retry rather than staring at a spinner for a minute. A body can be
+        // 30 MB of attachments on a cellular link, so writes get room.
+        r.timeoutInterval = method == "GET" ? 20 : ((r.httpBody?.count ?? 0) > 512 * 1024 ? 600 : 60)
         return r
     }
 
+    /// A read that died on a connection left over from before the app was suspended is retried once on a
+    /// fresh one. The person never sees "cancelled" or a minute-long hang after coming back to the app.
+    private func load(_ r: URLRequest) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(for: r)
+        } catch let error as URLError where !Task.isCancelled && (r.httpMethod ?? "GET") == "GET"
+                    && [.cancelled, .networkConnectionLost, .timedOut, .notConnectedToInternet].contains(error.code) {
+            try await Task.sleep(for: .milliseconds(250))
+            return try await session.data(for: r)
+        }
+    }
+
+    /// Called when the app comes back to the foreground. iOS (and Tailscale's tunnel) drop sockets while the
+    /// app is suspended, but URLSession keeps the dead ones pooled: the next request waits out its whole
+    /// timeout before failing. Cancel stale reads and the live stream, and force new connections.
+    func refreshConnections() async {
+        for s in [session, streamSession] {
+            for task in await s.allTasks where (task.originalRequest?.httpMethod ?? "GET") == "GET" { task.cancel() }
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in s.flush { done.resume() } }
+        }
+    }
+
     private func send(_ r: URLRequest) async throws -> Data {
-        let (data, resp) = try await session.data(for: r)
+        let (data, resp) = try await load(r)
         guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
         guard (200..<300).contains(http.statusCode) else { throw APIError.http(http.statusCode, Self.errorText(data)) }
         return data
@@ -226,7 +251,7 @@ final class API: @unchecked Sendable {
 
     func health() async throws -> HealthInfo {
         var probe = try request("/m/health")
-        probe.timeoutInterval = 8
+        probe.timeoutInterval = 5
         return try JSONDecoder().decode(HealthInfo.self, from: try await send(probe))
     }
 
@@ -501,23 +526,24 @@ final class API: @unchecked Sendable {
         guard let path = components.string else { throw APIError.badResponse }
         return path
     }
-    func messages(profile: String, session: String, limit: Int = 100, offset: Int = 0) async throws -> [StoredMessage] {
+    func messages(profile: String, session: String, limit: Int = 100, offset: Int = 0) async throws -> MessagesPage {
         let page = try await timeline(profile: profile, session: session, limit: limit, offset: offset)
         guard let rows = page.rows else { throw APIError.badResponse }
-        return rows
+        return MessagesPage(data: rows, hasMore: page.hasMore, nextOffset: page.nextOffset)
     }
 
     func timeline(profile: String, session id: String, limit: Int = 100, offset: Int = 0,
-                  validator: String? = nil) async throws -> (rows: [StoredMessage]?, validator: String?) {
+                  validator: String? = nil) async throws -> (rows: [StoredMessage]?, validator: String?, hasMore: Bool?, nextOffset: Int?) {
         var r = try request(p(profile, "/api/sessions/\(Self.esc(id))/messages?limit=\(limit)&offset=\(offset)&order=latest"))
         r.cachePolicy = .reloadIgnoringLocalCacheData
         r.setValue("timeline-v1", forHTTPHeaderField: "X-Hermes-Transcript")
         r.setValue(validator, forHTTPHeaderField: "If-None-Match")
-        let (data, response) = try await session.data(for: r)
+        let (data, response) = try await load(r)
         guard let http = response as? HTTPURLResponse else { throw APIError.badResponse }
-        if http.statusCode == 304, let validator { return (nil, validator) }
+        if http.statusCode == 304, let validator { return (nil, validator, nil, nil) }
         guard http.statusCode == 200 else { throw APIError.http(http.statusCode, Self.errorText(data)) }
-        return (try JSONDecoder().decode(MessagesPage.self, from: data).data, http.value(forHTTPHeaderField: "ETag"))
+        let page = try JSONDecoder().decode(MessagesPage.self, from: data)
+        return (page.data, http.value(forHTTPHeaderField: "ETag"), page.hasMore, page.nextOffset)
     }
     func catalog(profile: String, fetch: CatalogFetch = .cached) async throws -> ModelCatalog {
         try await get(fetch.path(escapedProfile: Self.esc(profile)), as: ModelCatalog.self)
@@ -539,6 +565,16 @@ final class API: @unchecked Sendable {
         return SlashResult(output: obj["output"] as? String, warning: obj["warning"] as? String,
                            type: obj["type"] as? String, message: obj["message"] as? String,
                            display: obj["display"] as? String, notice: obj["notice"] as? String)
+    }
+
+    /// A file Hermes named by path in a reply of this chat. The bridge re-checks the path against the chat.
+    func chatFile(profile: String, session: String, path: String) async throws -> Data {
+        var parts = URLComponents()
+        parts.path = "/m/chat/\(Self.esc(profile))/\(Self.esc(session))/file"
+        parts.queryItems = [URLQueryItem(name: "path", value: path)]
+        parts.percentEncodedQuery = parts.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        guard let rel = parts.string else { throw APIError.badResponse }
+        return try await send(try request(rel))
     }
 
     func chatMedia(profile: String, session: String, digest: String) async throws -> Data {
@@ -581,11 +617,24 @@ final class API: @unchecked Sendable {
     /// Persist the chat's model/provider/effort on the session in Hermes (`session.mutate`), exactly
     /// what the desktop's picker does, so every device sees it and the next turn runs on it.
     /// `previous` is what the chat had; fields cleared since then are reset to the bot's own setting.
-    func lockRuntime(profile: String, session: String, choice: RuntimeChoice, previous: RuntimeChoice? = nil) async throws -> Bool {
-        let body = Self.choiceBody(choice, previous: previous)
-        guard !body.isEmpty else { return false }
+    enum RuntimeLock: Equatable { case saved, nextTurn, needsConfirmation(title: String, message: String) }
+
+    /// Save a model/effort pick on the chat. A guarded model (Hermes's cost or capability warning) comes back
+    /// as needsConfirmation with Hermes's own text; send it again with `confirm` once the person agrees.
+    func lockRuntime(profile: String, session: String, choice: RuntimeChoice, previous: RuntimeChoice? = nil,
+                     confirm: Bool = false) async throws -> RuntimeLock {
+        var body = Self.choiceBody(choice, previous: previous)
+        guard !body.isEmpty else { return .saved }
+        if confirm { body["confirm"] = true }
         let result = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/runtime", method: "POST", body: body)
-        return result["timing"] as? String == "next_turn"
+        switch result["timing"] as? String {
+        case "next_turn": return .nextTurn
+        case "confirm":
+            let guardInfo = result["confirm"] as? [String: Any] ?? [:]
+            return .needsConfirmation(title: guardInfo["title"] as? String ?? "Model selection warning",
+                                      message: guardInfo["message"] as? String ?? "This model needs a confirmation.")
+        default: return .saved
+        }
     }
 
     /// Start a turn. The Mac holds it; it keeps running if the phone locks or loses signal.
@@ -641,6 +690,43 @@ final class API: @unchecked Sendable {
         let expected = mode == "queue" ? "queued" : "steer_accepted"
         guard result["status"] as? String == expected else { throw APIError.badResponse }
         return (result["attachments"] as? NSNumber)?.intValue ?? 0
+    }
+
+    /// Same as `followUp`, plus the admission Hermes filed a queued message under (newer bridges).
+    func followUpReceipt(run: String, mode: String, text: String, submission: UUID, choice: RuntimeChoice,
+                         attachments: [SendAttachment] = []) async throws -> (files: Int, admission: String?) {
+        var body = mode == "queue" ? Self.choiceBody(choice) : [:]
+        let action = body.isEmpty ? mode : "queue-with-runtime"
+        body["text"] = text
+        body["submission_id"] = submission.uuidString
+        if !attachments.isEmpty {
+            body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
+        }
+        let result = try await json("/m/turns/\(Self.esc(run))/\(action)", method: "POST", body: body)
+        let expected = mode == "queue" ? "queued" : "steer_accepted"
+        guard result["status"] as? String == expected else { throw APIError.badResponse }
+        return ((result["attachments"] as? NSNumber)?.intValue ?? 0, result["admission_id"] as? String)
+    }
+
+    /// The chat's queue as Hermes holds it. Nil from a bridge that predates queue controls.
+    func queueState(profile: String, session: String) async throws -> QueueState? {
+        do {
+            let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/queue", method: "GET", body: nil)
+            return QueueState(obj)
+        } catch APIError.http(404, let message) where message.contains("not found") {
+            return nil
+        }
+    }
+
+    /// edit | cancel | steer | resolve one queued row. Returns the admission it now lives under.
+    func queueAction(profile: String, session: String, admission: String, action: String, text: String? = nil,
+                     submission: UUID? = nil) async throws -> (admission: String?, queue: QueueState?) {
+        var body: [String: Any] = [:]
+        if let text { body["text"] = text }
+        if let submission { body["submission_id"] = submission.uuidString }
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/queue/\(Self.esc(admission))/\(action)",
+                                 method: "POST", body: body)
+        return (obj["admission_id"] as? String, QueueState(obj["queue"]))
     }
 
     func stopRun(profile: String, run: String) async throws {

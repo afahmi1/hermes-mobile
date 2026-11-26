@@ -69,11 +69,24 @@ class TimelineTest(unittest.TestCase):
                 db.append_message("chat", "assistant", "diagnostic text", display_kind="hidden",
                                   display_metadata={"notification_category": "diagnostic"})
                 rows = db.get_messages("chat", include_ancestors=True, latest=True, limit=100)
-                expected = bridge.timeline_bytes(APIServerAdapter._message_response(row) for row in rows)
-                self.assertNotIn(b"diagnostic text", expected)
+                expected = json.loads(bridge.timeline_bytes(APIServerAdapter._message_response(row) for row in rows))
             with patch.object(bridge, "profile_home", return_value=home):
-                self.assertEqual(bridge.native_timeline_page("default", "chat", 100, 0, True), expected)
+                actual = json.loads(bridge.native_timeline_page("default", "chat", 100, 0, True))
+                self.assertEqual(actual["data"], expected["data"])
+                self.assertFalse(actual["has_more"])
+                self.assertEqual(actual["next_offset"], 100)
                 self.assertIsNone(bridge.native_timeline_page("default", "missing", 100, 0, True))
+            with closing(SessionDB(home / "state.db")) as db:
+                for n in range(3):
+                    db.append_message("chat", "user", "page %d" % n)
+            with patch.object(bridge, "profile_home", return_value=home):
+                paged = json.loads(bridge.native_timeline_page("default", "chat", 2, 0, True))
+                self.assertTrue(paged["has_more"])
+                self.assertEqual(paged["next_offset"], 2)
+                self.assertEqual([row["content"] for row in paged["data"]], ["page 1", "page 2"])
+                older = json.loads(bridge.native_timeline_page("default", "chat", 2, 2, True))
+                self.assertTrue(older["has_more"])
+                self.assertEqual(older["next_offset"], 4)
 
 
 if __name__ == "__main__":

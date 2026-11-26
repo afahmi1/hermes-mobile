@@ -27,6 +27,7 @@ struct BotAssignmentView: View {
                 loaded
             }
         }
+        .hmCanvas()
         .navigationTitle("Assigned bots")
         .navigationBarTitleDisplayMode(.inline)
         .task { await model.load() }
@@ -68,7 +69,7 @@ struct BotAssignmentView: View {
                             Text(app.botName(id)).foregroundStyle(.primary)
                             Spacer()
                             Image(systemName: on ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(on ? Color.accentColor : .secondary)
+                                .foregroundStyle(on ? HMDesign.accent : .secondary)
                         }
                         .contentShape(Rectangle())
                     }
@@ -173,6 +174,7 @@ struct InstructionsView: View {
             }
         }
         .padding()
+        .hmCanvas()
         .navigationTitle("Instructions")
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(model.instructionsEditing)
@@ -257,6 +259,7 @@ struct WorkspaceFileView: View {
                 .padding()
             }
         }
+        .hmCanvas()
         .navigationTitle(editor.name)
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(editor.isEditing)
@@ -325,6 +328,7 @@ struct NewFileSheet: View {
                     else if let c = editor.conflict, c == .stale { Text(WorkspacesFailure.conflict.message).foregroundStyle(.red) }
                 }
             }
+            .hmCanvas()
             .navigationTitle("New text file")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -399,6 +403,7 @@ struct ReferenceDetailView: View {
                 }
             }
         }
+        .hmCanvas()
         .navigationTitle(basename)
         .navigationBarTitleDisplayMode(.inline)
     }

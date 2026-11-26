@@ -35,6 +35,7 @@ struct StatusView: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .hmCanvas()
             .navigationTitle("Status")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { ConnectionBadge() }
@@ -126,7 +127,7 @@ struct StatusView: View {
             LabeledContent(gatewayName) {
                 stateLabel(health.capitalized,
                            health == "healthy" ? "checkmark.circle.fill" : health == "down" ? "xmark.octagon.fill" : "exclamationmark.triangle.fill",
-                           health == "healthy" ? .green : health == "down" ? .red : .orange)
+                           health == "healthy" ? HMDesign.success : health == "down" ? .red : .orange)
             }
             if let hb = g["heartbeat_age_s"].double {
                 let age = max(0, Int(hb.rounded()))
@@ -136,12 +137,12 @@ struct StatusView: View {
             }
             LabeledContent("Incidents") {
                 stateLabel(incidents == 0 ? "None" : "\(incidents) open",
-                           incidents == 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill", incidents == 0 ? .green : .red)
+                           incidents == 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill", incidents == 0 ? HMDesign.success : .red)
             }
             if !failing.isEmpty {
                 LabeledContent("Failing jobs") { stateLabel("\(failing.count)", "exclamationmark.triangle.fill", .red) }
             }
-            LabeledContent("Running now") { stateLabel("\(running)", running == 0 ? "moon.zzz" : "play.circle.fill", running == 0 ? nil : .green) }
+            LabeledContent("Running now") { stateLabel("\(running)", running == 0 ? "moon.zzz" : "play.circle.fill", running == 0 ? nil : HMDesign.success) }
             LabeledContent("Scheduled jobs") { Text("\(jobs.count - paused.count)").monospacedDigit() }
             LabeledContent("Bots") {
                 HStack(spacing: HMDesign.small) {
@@ -362,7 +363,7 @@ struct StatusPill: View {
     var body: some View {
         let t = text ?? "Unknown"
         let color: Color = switch t {
-        case "ok", "completed", "delivered", "connected", "healthy": .green
+        case "ok", "completed", "delivered", "connected", "healthy": HMDesign.success
         case "running", "claimed": .blue
         case "failed", "error", "disconnected", "down": .red
         case "missed", "paused", "unknown", "degraded", "starting", "restarting", "draining", "waiting", "stopping": .orange

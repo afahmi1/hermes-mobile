@@ -30,7 +30,10 @@ struct ChatScreen: View {
     @State private var sendTick = 0
     @State private var showFullComposer = false
     @State private var previewedImage: UIImage?
-    @State private var pickerItem: PhotosPickerItem?
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var landTick = 0
+    @State private var pathPreview: URL?
+    @State private var revealTimes = false
     @State private var showPicker = false
     @State private var showFilePicker = false
     @State private var showCamera = false
@@ -59,7 +62,7 @@ struct ChatScreen: View {
                         Text("Saved on this iPhone \(saved, style: .relative) ago")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    if chat.hasOlder && !chat.isRunning {
+                    if chat.hasOlder {
                         Button(chat.loadingOlder ? "Loading earlier messages…" : "Load earlier messages") {
                             followLatest = false
                             let anchor = chat.items.first?.id
@@ -74,6 +77,7 @@ struct ChatScreen: View {
                         emptyState.padding(.vertical, HMDesign.section)
                     }
                     let days = Self.dayStarts(chat.items)
+                    let timeMarks = Self.timeMarks(chat.items)
                     let lastReply = chat.isRunning ? nil : chat.items.last(where: { $0.kind == .assistant && !$0.streaming })?.id
                     ForEach(chat.items) { item in
                         if let day = days[item.id] { DaySeparator(date: day) }
@@ -82,7 +86,8 @@ struct ChatScreen: View {
                                    onPin: chat.pinsAvailable && chat.sessionId != nil && MessagePin.messageID(for: item) != nil
                                         ? { Task { await chat.togglePin(item) } } : nil,
                                    onCompose: { text, replace in compose(text, replace: replace) },
-                                   showActions: item.id == lastReply)
+                                   showActions: item.id == lastReply,
+                                   showTime: revealTimes || timeMarks.contains(item.id))
                             .id(item.id)
                     }
                     if !chat.isRunning, !backgroundTasks.isEmpty {
@@ -98,12 +103,12 @@ struct ChatScreen: View {
                         }
                         .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+                        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14))
                         .padding(.horizontal, 12)
                     }
                     if let s = chat.status {
                         HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
+                            ThinkingOrb(size: 16)
                             Text(s).font(.footnote).foregroundStyle(.secondary)
                             Spacer()
                         }
@@ -117,11 +122,32 @@ struct ChatScreen: View {
             .defaultScrollAnchor(.bottom)
             .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { drag in
                 if drag.translation.height > 12 { followLatest = false }
+                // Swipe left, like iMessage, to see every message's time.
+                let sideways = drag.translation.width < -40 && abs(drag.translation.width) > abs(drag.translation.height) * 1.5
+                if sideways != revealTimes { withAnimation(.snappy) { revealTimes = sideways } }
+            }.onEnded { _ in
+                if revealTimes { withAnimation(.snappy) { revealTimes = false } }
             })
             .onChange(of: chat.textRevision) { _, _ in
                 if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             .onChange(of: chat.items.last?.id) { _, _ in
+                if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            // Land on the newest message after a reload, and when coming back to the chat. A lazy list that
+            // gets a whole transcript at once can otherwise sit past its content: a blank screen until you scroll.
+            .onChange(of: landTick) { _, _ in land(proxy) }
+            .onAppear { if followLatest { land(proxy) } }
+            .task(id: chat.items.isEmpty) { if !chat.items.isEmpty, followLatest { land(proxy) } }
+            // A long transcript arriving all at once can leave a lazy list parked below its content (a blank
+            // screen until you scroll). Land on the newest message once the first page is in, then again after
+            // the rows have measured themselves.
+            .task(id: chat.items.isEmpty) {
+                guard !chat.items.isEmpty, followLatest else { return }
+                proxy.scrollTo("bottom", anchor: .bottom)
+                try? await Task.sleep(for: .milliseconds(150))
+                proxy.scrollTo("bottom", anchor: .bottom)
+                try? await Task.sleep(for: .milliseconds(450))
                 if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             .overlay(alignment: .bottomTrailing) {
@@ -136,7 +162,7 @@ struct ChatScreen: View {
                             .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(HMDesign.accent)
                     .accessibilityLabel("Jump to latest message")
                     .padding(.trailing, 12).padding(.bottom, 6)
                 }
@@ -159,6 +185,7 @@ struct ChatScreen: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { composer }
+        .hmCanvas()
         .toolbar(.hidden, for: .tabBar)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -169,13 +196,10 @@ struct ChatScreen: View {
                     .disabled(chat.savingRuntime)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 0) {
-                    Button { Task { await chat.load() } } label: {
-                        Image(systemName: "arrow.clockwise").hmTouchTarget()
-                    }
-                        .disabled(chat.isLoading || chat.isRunning)
-                        .accessibilityLabel("Reload chat")
-                    ConnectionBadge(compact: true)
+                // One dot. Tap it for the gateway's state, Reload chat and Check again.
+                ConnectionBadge(compact: true, reloadDisabled: chat.isLoading || chat.isRunning) {
+                    await chat.load(quiet: true)
+                    landTick &+= 1
                 }
             }
         }
@@ -195,6 +219,7 @@ struct ChatScreen: View {
                     composerField(expanded: true).padding(.horizontal, 16)
                     if let error = chat.error { Text(error).font(.footnote).foregroundStyle(.orange).padding(.horizontal) }
                 }
+                .hmCanvas()
                 .navigationTitle("Message")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -205,12 +230,82 @@ struct ChatScreen: View {
         }
         .fullScreenCover(isPresented: Binding(get: { !showFullComposer && previewedImage != nil },
                                              set: { if !$0 { previewedImage = nil } })) { imagePreview }
-        .photosPicker(isPresented: $showPicker, selection: $pickerItem, matching: imagesAvailable ? .any(of: [.images, .videos]) : .videos)
-        .task(id: pickerItem) { if let pickerItem { await importMedia(pickerItem) } }
-        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
+        .modifier(MediaInputsModifier(host: self))
+        .sensoryFeedback(.impact(weight: .light), trigger: sendTick)
+        .sensoryFeedback(.success, trigger: chat.completedTick)
+        .sensoryFeedback(.error, trigger: chat.failedTick)
+        .task { await chat.load() }
+        .task { await chat.loadPalette() }
+        .task(id: chat.sessionId) { await chat.loadPins() }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
+        .onReceive(NotificationCenter.default.publisher(for: .hermesOpenPath)) { note in
+            guard let path = note.object as? String, let sid = chat.sessionId else { return }
+            Task { await openPath(path, session: sid) }
+        }
+        .quickLookPreview($pathPreview)
+        .onReceive(NotificationCenter.default.publisher(for: .hermesForeground)) { _ in
+            // Anything waiting to go tries again right away, then backs off quietly.
+            chat.outboxWake()
+            // Back from the background: show what happened while away, then land on it.
+            guard !chat.isRunning else { return }
+            Task { await chat.load(quiet: true); landTick &+= 1 }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .hermesCopied)) { note in
+            let text = note.object as? String ?? "Copied"
+            withAnimation(.snappy) { toast = text }
+            Task {
+                try? await Task.sleep(for: .seconds(1.3))
+                if toast == text { withAnimation(.snappy) { toast = nil } }
+            }
+        }
+        .overlay(alignment: .top) {
+            if let toast { CopiedToast(text: toast).padding(.top, 8).allowsHitTesting(false) }
+        }
+        .alert(chat.runtimeConfirmation?.title ?? "Model selection warning",
+               isPresented: Binding(get: { chat.runtimeConfirmation != nil }, set: { if !$0 { chat.runtimeConfirmation = nil } }),
+               presenting: chat.runtimeConfirmation) { pending in
+            Button("Use this model") { Task { await chat.apply(pending.choice, confirm: true) } }
+            Button("Keep current", role: .cancel) {}
+        } message: { pending in Text(pending.message) }
+        .sheet(isPresented: $showCommands) {
+            CommandsSheet(commands: chat.slashCommands, skills: chat.skillDetails, pick: { name in
+                chat.draft = "/" + name + " "
+            }, usePrompt: { text, now in
+                if now && !chat.isRunning && chat.draftAttachments.isEmpty && chat.draft.isEmpty {
+                    chat.draft = text
+                    send()
+                } else if now && chat.isRunning {
+                    chat.draft = text
+                    followUp("queue")
+                } else {
+                    chat.draft = chat.draft.isEmpty ? text : chat.draft + "\n\n" + text
+                }
+            })
+        }
+        .onChange(of: chat.pins.count) { _, _ in pinCursor = 0 }
+        // Re-ask when the gateway comes back: one failed probe must not hide attachments for the visit.
+        .task(id: [chat.profile, app.health?.ok == true ? "up" : "down"]) {
+            if let latest = try? await API.shared.mediaCapabilities(profile: chat.profile), !Task.isCancelled {
+                mediaCapabilities = latest
+            }
+        }
+        .task(id: scenePhase) { if scenePhase == .active { await poll() } }
+    }
+
+    /// The pickers, camera and video consent dialog. Kept out of `body`: one long modifier chain is more
+    /// than the Swift type checker will solve in reasonable time.
+    fileprivate func mediaInputs<Content: View>(_ content: Content) -> some View {
+        content
+            .photosPicker(isPresented: $showPicker, selection: $pickerItems,
+                      maxSelectionCount: max(1, ChatMedia.maxAttachments - chat.draftAttachments.count),
+                      selectionBehavior: .ordered,
+                      matching: imagesAvailable ? .any(of: [.images, .videos]) : .videos)
+            .task(id: pickerItems) { if !pickerItems.isEmpty { await importPicked(pickerItems) } }
+            .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             importFiles(result)
         }
-        .sheet(isPresented: $showCamera) {
+            .sheet(isPresented: $showCamera) {
             CameraPhoto { image in
                 showCamera = false
                 guard let image else { return }
@@ -225,52 +320,24 @@ struct ChatScreen: View {
                 }
             }.ignoresSafeArea()
         }
-        .confirmationDialog("How should Hermes receive this video?", isPresented: $chooseVideo) {
+            .confirmationDialog("How should Hermes receive this video?", isPresented: $chooseVideo) {
             if mediaCapabilities?.video == true, chat.draftAttachments.isEmpty {
                 Button("Send clip for Hermes video analysis") { prepareClip() }
             }
             if imagesAvailable { Button("Choose from up to 3 frames") { prepareFrames() } }
             Button("Cancel", role: .cancel) { discardVideo() }
         } message: { Text(mediaCapabilities?.video == true ? "A clip includes audio and may be processed by the gateway’s video provider. Frames are still images you can review before sending." : "This gateway accepts still images. Review and remove frames before sending. Frames contain no audio.") }
-        .onDisappear { discardVideo() }
-        .sensoryFeedback(.impact(weight: .light), trigger: sendTick)
-        .sensoryFeedback(.success, trigger: chat.completedTick)
-        .sensoryFeedback(.error, trigger: chat.failedTick)
-        .task { await chat.load() }
-        .task { await chat.loadPalette() }
-        .task(id: chat.sessionId) { await chat.loadPins() }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
-        .onReceive(NotificationCenter.default.publisher(for: .hermesCopied)) { note in
-            let text = note.object as? String ?? "Copied"
-            withAnimation(.snappy) { toast = text }
-            Task {
-                try? await Task.sleep(for: .seconds(1.3))
-                if toast == text { withAnimation(.snappy) { toast = nil } }
-            }
-        }
-        .overlay(alignment: .top) {
-            if let toast { CopiedToast(text: toast).padding(.top, 8).allowsHitTesting(false) }
-        }
-        .sheet(isPresented: $showCommands) {
-            CommandsSheet(commands: chat.slashCommands, skills: chat.skillCommands) { name in
-                chat.draft = "/" + name + " "
-            }
-        }
-        .onChange(of: chat.pins.count) { _, _ in pinCursor = 0 }
-        // Re-ask when the gateway comes back: one failed probe must not hide attachments for the visit.
-        .task(id: [chat.profile, app.health?.ok == true ? "up" : "down"]) {
-            if let latest = try? await API.shared.mediaCapabilities(profile: chat.profile), !Task.isCancelled {
-                mediaCapabilities = latest
-            }
-        }
-        .task(id: scenePhase) { if scenePhase == .active { await poll() } }
+            .onDisappear { discardVideo() }
     }
 
     private var titleBlock: some View {
         VStack(spacing: 1) {
             Text(bot?.name ?? chat.profile).font(.headline).lineLimit(1)
             HStack(spacing: 3) {
+                if chat.served?.fallbackActive == true {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        .accessibilityLabel("Answered by a fallback model")
+                }
                 Text(runtimeLabel).lineLimit(1)
                 Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).imageScale(.small).accessibilityHidden(true)
             }
@@ -278,15 +345,17 @@ struct ChatScreen: View {
         }
     }
 
+    /// "Opus 5.5 · High". The provider and raw id live in the model sheet, one tap away.
     private var runtimeLabel: String {
         if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
-        let model = c.model ?? bot?.model ?? "default"
-        let provider = c.provider ?? bot?.provider ?? ""
-        let who = provider.isEmpty ? model : "\(model) · \(provider)"
+        let who = ModelName.short(c.model ?? bot?.model ?? "Default model")
         if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
-        let effort = c.effort.flatMap { Effort(rawValue: $0)?.label } ?? "default effort"
-        return c.isDefault ? "\(who) · bot default" : "\(who) · \(effort)"
+        var parts = [who]
+        if let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) { parts.append(effort) }
+        // Real money only: a plan-covered chat shows no price here (the model sheet has the detail).
+        if let usd = chat.served?.cost?.usd, usd >= 0.01 { parts.append(CostSummary.money(usd)) }
+        return parts.joined(separator: " · ")
     }
 
     private var backgroundTasks: [(title: String, model: String)] {
@@ -307,8 +376,11 @@ struct ChatScreen: View {
             Text("Write a message to start the conversation.")
                 .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             Button { showRuntime = true } label: {
-                Label(runtimeLabel, systemImage: "cpu").font(HMDesign.metadata)
-                    .frame(minHeight: HMDesign.touch)
+                VStack(spacing: 2) {
+                    Label(runtimeLabel, systemImage: "cpu").font(HMDesign.metadata)
+                    Text("Tap to pick the model and effort").font(.caption2).foregroundStyle(.secondary)
+                }
+                .frame(minHeight: HMDesign.touch)
             }
             .buttonStyle(.borderless)
         }
@@ -329,7 +401,7 @@ struct ChatScreen: View {
     }
 
     private var attachmentLimitReached: Bool {
-        chat.draftAttachments.count >= 4 || chat.draftAttachments.contains { $0.mime == "video/mp4" }
+        chat.draftAttachments.count >= ChatMedia.maxAttachments || chat.draftAttachments.contains { $0.mime == "video/mp4" }
     }
 
     private var previewPresented: Binding<Bool> {
@@ -409,55 +481,78 @@ struct ChatScreen: View {
                 .padding(.horizontal, 16)
             }
             if let filter = SlashCommand.filter(in: chat.draft), chat.draftAttachments.isEmpty, !chat.isRunning {
-                SlashMenu(commands: chat.slashCommands, skills: chat.skillCommands, filter: filter) { name in
+                SlashMenu(commands: chat.slashCommands, skills: chat.skillDetails, filter: filter) { name in
                     chat.draft = "/" + name + " "
                 }
             }
+            if chat.queue?.paused == true { QueuePausedBanner(chat: chat) }
+            if !chat.outgoing.isEmpty { OutboxTray(chat: chat) }
             draftShelf
-            HStack(spacing: 0) {
-                modelChip
-                    .layoutPriority(1)
-                Spacer(minLength: HMDesign.micro)
-                Button { showCommands = true } label: {
-                    Image(systemName: "command").font(.subheadline).hmTouchTarget()
-                }
-                .foregroundStyle(.secondary)
-                .accessibilityLabel("Commands and skills")
-                if longDraft {
-                    Button { showFullComposer = true } label: {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.subheadline).hmTouchTarget()
-                    }
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("Expand composer")
-                }
-                if keyboardUp {
-                    Button { Self.hideKeyboard() } label: {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                            .font(.subheadline).hmTouchTarget()
-                    }
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("Hide keyboard")
-                }
-            }
-            .padding(.horizontal, HMDesign.medium)
             if chat.isRunning, let notice = chat.runtimeNotice {
                 Text(notice).font(HMDesign.metadata).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, HMDesign.gutter)
             }
-            HStack(alignment: .bottom, spacing: HMDesign.micro) {
+            // One row: tools left, the field, send right. The model lives in the title, so no pill here,
+            // and every line the composer does not take is a line of conversation.
+            HStack(alignment: .bottom, spacing: 0) {
                 if canAttach { attachmentMenu }
+                Button { showCommands = true } label: {
+                    Image(systemName: "command").font(.body).frame(width: 34, height: HMDesign.touch).contentShape(Rectangle())
+                }
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Commands and skills")
                 composerField(expanded: false)
-                    .padding(.horizontal, HMDesign.medium).padding(.vertical, HMDesign.small)
+                    .padding(.leading, HMDesign.medium).padding(.vertical, HMDesign.small)
+                    .padding(.trailing, (longDraft || keyboardUp) ? 30 : HMDesign.medium)
                     .frame(maxWidth: .infinity, minHeight: HMDesign.touch)
-                    .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
+                    .hmField()
+                    .overlay(alignment: .topTrailing) {
+                        if longDraft {
+                            Button { showFullComposer = true } label: {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right").font(.caption)
+                                    .frame(width: 30, height: 30).contentShape(Rectangle())
+                            }
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Expand composer")
+                        }
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if keyboardUp {
+                            Button { Self.hideKeyboard() } label: {
+                                Image(systemName: "keyboard.chevron.compact.down").font(.caption)
+                                    .frame(width: 30, height: 30).contentShape(Rectangle())
+                            }
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Hide keyboard")
+                        }
+                    }
+                    .padding(.horizontal, HMDesign.micro)
                 if chat.isRunning {
                     Button { Task { await chat.stop() } } label: {
-                        Image(systemName: "stop.circle.fill").font(.title).foregroundStyle(.red)
+                        Image(systemName: "stop.circle.fill").font(.title2).foregroundStyle(.red)
                             .hmTouchTarget()
                     }
                     .accessibilityLabel("Stop reply")
+                    // While Hermes replies, Send queues the message for right after this reply.
+                    // Touch and hold to guide the current reply instead.
+                    Button { followUp("queue") } label: {
+                        Image(systemName: "arrow.up.circle.fill").font(.title)
+                            .overlay(alignment: .bottomTrailing) {
+                                Image(systemName: "clock.fill").font(.system(size: 11, weight: .bold))
+                                    .foregroundStyle(.white, HMDesign.accent)
+                                    .background(Circle().fill(HMDesign.canvas).padding(-1))
+                                    .offset(x: 2, y: 2)
+                            }
+                            .hmTouchTarget()
+                    }
+                    .disabled(preparingMedia || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
+                    .contextMenu {
+                        Button { followUp("queue") } label: { Label("Send next (after this reply)", systemImage: "text.line.last.and.arrowtriangle.forward") }
+                        Button { followUp("steer") } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
+                    }
+                    .accessibilityLabel("Queue message")
+                    .accessibilityHint("Sends it right after the current reply. Touch and hold to guide this reply instead.")
                 } else {
                     Button { send() } label: {
                         Image(systemName: "arrow.up.circle.fill").font(.title).hmTouchTarget()
@@ -468,18 +563,14 @@ struct ChatScreen: View {
             }
             .buttonStyle(.borderless)
             .padding(.horizontal, HMDesign.small).padding(.bottom, HMDesign.micro)
-            // Send next / Guide only once there is something to send: an empty row costs a line of chat.
+            // Send already queues. Guide only shows once there is something to say: an empty row costs a line of chat.
             if chat.isRunning, !chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !chat.draftAttachments.isEmpty {
-                let layout = typeSize.isAccessibilitySize
-                    ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
-                    : AnyLayout(HStackLayout(spacing: HMDesign.gutter))
-                layout {
-                    Button { followUp("queue") } label: {
-                        Label("Send next", systemImage: "text.line.last.and.arrowtriangle.forward").hmTouchTarget()
-                    }
+                HStack(spacing: HMDesign.gutter) {
                     Button { followUp("steer") } label: {
-                        Label("Guide this reply", systemImage: "arrow.turn.up.right").hmTouchTarget()
+                        Label("Guide this reply instead", systemImage: "arrow.turn.up.right").hmTouchTarget()
                     }
+                    Spacer()
+                    Text("Send queues it").font(.caption).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .font(.subheadline.weight(.medium))
@@ -488,7 +579,7 @@ struct ChatScreen: View {
             }
         }
         .padding(.top, HMDesign.micro)
-        .background(.bar)
+        .background(HMDesign.bar)
         .overlay(alignment: .top) { Divider() }
     }
 
@@ -530,6 +621,20 @@ struct ChatScreen: View {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
+    /// Which rows show a time: the last row before a pause of five minutes or more, and the newest row.
+    /// Like iMessage, a burst of messages carries one time, not one each. Swipe left shows them all.
+    static func timeMarks(_ items: [ChatItem]) -> Set<String> {
+        let stamped = items.filter { $0.timestamp != nil && $0.kind != .tools && $0.kind != .notice }
+        var marks = Set<String>()
+        for (index, item) in stamped.enumerated() {
+            guard let t = item.timestamp else { continue }
+            if index == stamped.count - 1 { marks.insert(item.id); continue }
+            let next = stamped[index + 1]
+            if (next.timestamp ?? t) - t >= 300 || (next.kind == .user) != (item.kind == .user) { marks.insert(item.id) }
+        }
+        return marks
+    }
+
     /// The first item of each calendar day, so the transcript can say "Today", "Yesterday" or the date.
     static func dayStarts(_ items: [ChatItem]) -> [String: Date] {
         var out: [String: Date] = [:]
@@ -541,6 +646,37 @@ struct ChatScreen: View {
             if day != last { out[item.id] = day; last = day }
         }
         return out
+    }
+
+    /// A path Hermes wrote in a reply: fetch it through the bridge (which re-checks it) and preview it.
+    private func openPath(_ path: String, session: String) async {
+        do {
+            let data = try await API.shared.chatFile(profile: chat.profile, session: session, path: path)
+            let name = (path as NSString).lastPathComponent
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("hermes-paths", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString.prefix(8).description, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let url = folder.appendingPathComponent(name.isEmpty ? "file" : name)
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            pathPreview = url
+        } catch APIError.http(404, _) {
+            Clipboard.copy(path, what: "Path copied")
+            chat.error = "Hermes can't share that file (it's gone, private, or not a previewable type), so the path was copied."
+        } catch {
+            chat.error = "Couldn't open that file: " + error.localizedDescription
+        }
+    }
+
+    /// Bottom, then again once rows have measured themselves (lazy rows report estimated heights first).
+    private func land(_ proxy: ScrollViewProxy) {
+        followLatest = true
+        proxy.scrollTo("bottom", anchor: .bottom)
+        Task {
+            try? await Task.sleep(for: .milliseconds(120))
+            proxy.scrollTo("bottom", anchor: .bottom)
+            try? await Task.sleep(for: .milliseconds(380))
+            if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
+        }
     }
 
     /// Scrolls to a pinned message, loading earlier pages if needed, and flashes it.
@@ -578,10 +714,33 @@ struct ChatScreen: View {
         chat.draftAttachments = proposed
     }
 
+    /// Several photos at once, like a Telegram album. A video still goes on its own (it has its own
+    /// consent choice), so a mixed pick keeps the photos and says what it skipped.
+    private func importPicked(_ items: [PhotosPickerItem]) async {
+        defer { pickerItems = [] }
+        if items.count == 1, let only = items.first { await importMedia(only); return }
+        let isVideo: (PhotosPickerItem) -> Bool = { $0.supportedContentTypes.contains { $0.conforms(to: .movie) } }
+        let photos = items.filter { !isVideo($0) }
+        let skipped = items.count - photos.count
+        let account = app.inboxAccount
+        preparingMedia = true
+        defer { preparingMedia = false }
+        var assets: [SendAttachment] = []
+        for item in photos {
+            do {
+                let data = try await MediaImport.imageData(from: item)
+                if Task.isCancelled { return }
+                assets.append(try await Task.detached(priority: .userInitiated) { try ChatMedia.image(from: data) }.value)
+            } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
+        }
+        appendMedia(assets, account: account)
+        if skipped > 0 { chat.error = "Videos go one per message, so \(skipped == 1 ? "the video was" : "\(skipped) videos were") left out." }
+    }
+
     private func importMedia(_ item: PhotosPickerItem) async {
         let account = app.inboxAccount
         preparingMedia = true
-        defer { preparingMedia = false; pickerItem = nil }
+        defer { preparingMedia = false }
         do {
             if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
                 discardVideo()
@@ -611,7 +770,7 @@ struct ChatScreen: View {
             chat.error = "Remove the video before pasting an image."
             return
         }
-        guard chat.draftAttachments.count < 4 else {
+        guard chat.draftAttachments.count < ChatMedia.maxAttachments else {
             chat.error = "Remove an attachment before pasting another."
             return
         }
@@ -670,7 +829,7 @@ struct ChatScreen: View {
                             try FileImport.attachment(from: url, maxBytes: cap)
                         }.value
                         guard account == app.inboxAccount else { return }
-                        guard chat.draftAttachments.count < 4,
+                        guard chat.draftAttachments.count < ChatMedia.maxAttachments,
                               !chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) else { return }
                         guard asset.mime != "image/jpeg" || imagesAvailable else { chat.error = "This bot cannot receive images."; return }
                         guard asset.byteCount <= left else { throw FileImport.Failure.tooLarge(cap) }
@@ -742,56 +901,6 @@ struct ChatScreen: View {
 
     /// One-tap model switch above the input. Everything goes through `chat.apply`, so it is saved on
     /// the session and waits for the next message while a reply is running.
-    private var modelChip: some View {
-        HStack {
-            Menu {
-                ForEach(menuModels, id: \.self) { c in
-                    Button {
-                        var next = c
-                        next.effort = chat.choice.effort
-                        Task { await chat.apply(next) }
-                    } label: {
-                        if isCurrent(c) { Label(shortModel(c.model ?? ""), systemImage: "checkmark") } else { Text(shortModel(c.model ?? "")) }
-                    }
-                }
-                Button { Task { await chat.apply(.botDefault) } } label: {
-                    if chat.choice.isDefault { Label("Bot default", systemImage: "checkmark") } else { Text("Bot default") }
-                }
-                if !chat.choice.isDefault, chat.choice.model != nil {
-                    Menu("Effort") {
-                        ForEach(Effort.allCases) { e in
-                            Button {
-                                var next = chat.choice
-                                next.effort = e.rawValue
-                                Task { await chat.apply(next) }
-                            } label: {
-                                if chat.choice.effort == e.rawValue { Label(e.label, systemImage: "checkmark") } else { Text(e.label) }
-                            }
-                        }
-                    }
-                }
-                Button { showRuntime = true } label: { Label("All models…", systemImage: "ellipsis.circle") }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "cpu").font(.caption2)
-                    Text(chat.savingRuntime ? "Saving…" : chipLabel)
-                        .lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
-                        .truncationMode(.middle)
-                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold)).imageScale(.small)
-                }
-                .font(.caption.weight(.medium)).foregroundStyle(.primary)
-                .padding(.horizontal, HMDesign.medium).padding(.vertical, HMDesign.micro)
-                .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
-                .hmTouchTarget()
-            }
-            .disabled(chat.savingRuntime)
-            .accessibilityLabel("Switch model")
-            .accessibilityValue(chipLabel)
-        }
-    }
-
-    /// Handles `/model` and `/effort` lines. They are never sent to the agent. Returns true when
-    /// the draft is such a command (the draft is cleared once it has been applied).
     private func runModelCommand() -> Bool {
         guard chat.pastedTexts.isEmpty, chat.draftAttachments.isEmpty,
               let cmd = ModelCommand.parse(chat.draft) else { return false }
@@ -844,7 +953,9 @@ struct ChatScreen: View {
         let files = chat.draftAttachments
         if let problem = issue(for: files) { chat.error = problem; return }
         Task {
-            if await chat.followUp(text, mode: mode, attachments: files), chat.draft == draftAtSend, chat.pastedTexts == pastedAtSend {
+            // Saved to this phone first, then sent. Closing the app or losing signal never loses it.
+            let accepted = await chat.enqueue(text, mode: mode, attachments: files)
+            if accepted, chat.draft == draftAtSend, chat.pastedTexts == pastedAtSend {
                 chat.draft = ""
                 chat.pastedTexts = []
             }
@@ -934,6 +1045,7 @@ struct PasteEditSheet: View {
                 .focused($focused)
                 .scrollContentBackground(.hidden)
                 .padding(8)
+                .hmCanvas()
                 .navigationTitle("Pasted text")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -1112,8 +1224,22 @@ struct MessageRow: View {
     var onCompose: ((String, Bool) -> Void)?
     /// The last reply of a finished turn shows a small row of actions under it, like T3.
     var showActions = false
+    /// Times show where the conversation pauses (or everywhere while the transcript is swiped left).
+    var showTime = true
     @State private var showFull = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static func toolLabel(_ item: ChatItem) -> String {
+        let base = item.activities.isEmpty
+            ? "\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")"
+            : ToolLanguage.summary(item.activities)
+        guard let start = item.timestamp, let end = item.ended, end > start else { return base }
+        let seconds = Int(end - start)
+        guard seconds >= 1 else { return base }
+        let span = seconds < 60 ? "\(seconds)s" : seconds < 3600 ? "\(seconds / 60)m" + (seconds % 60 >= 10 ? " \(seconds % 60)s" : "")
+            : "\(seconds / 3600)h \(seconds % 3600 / 60)m"
+        return "Worked \(span) · " + base
+    }
 
     private var quoted: String {
         let clipped = item.text.count > 600 ? String(item.text.prefix(600)) + "…" : item.text
@@ -1161,7 +1287,7 @@ struct MessageRow: View {
     }
 
     private var pinMark: some View {
-        Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Color.accentColor)
+        Image(systemName: "pin.fill").font(.caption2).foregroundStyle(HMDesign.accent)
             .rotationEffect(.degrees(45))
             .accessibilityLabel("Pinned")
     }
@@ -1183,7 +1309,7 @@ struct MessageRow: View {
                                 .foregroundStyle(.primary)
                                 .background(HMDesign.selectedFill, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
                                 .overlay(RoundedRectangle(cornerRadius: HMDesign.messageRadius)
-                                    .strokeBorder(Color.accentColor, lineWidth: highlighted ? 2 : 0))
+                                    .strokeBorder(HMDesign.accent, lineWidth: highlighted ? 2 : 0))
                                 .contextMenu { messageMenu }
                         }
                     }
@@ -1193,9 +1319,19 @@ struct MessageRow: View {
                             .frame(minHeight: HMDesign.touch)
                     }
                     TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .trailing)
+                    let note = item.annotation.flatMap { $0.isEmpty ? nil : $0 }
+                    if note != nil || (showTime && item.timestamp != nil) {
+                        HStack(spacing: 4) {
+                            if let note { Text(note) }
+                            if note != nil, showTime, item.timestamp != nil { Text("·") }
+                            if showTime, let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
+                        }
+                        .font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
             }
             .padding(.horizontal, 12)
+            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .assistant:
             // Replies run full width without a bubble (as in T3 and the desktop app): more of the
@@ -1228,34 +1364,49 @@ struct MessageRow: View {
                                 }
                                 .foregroundStyle(.secondary)
                                 .accessibilityLabel("Share reply")
+                                Spacer(minLength: 0)
+                                if let ts = item.timestamp {
+                                    Text(Date(timeIntervalSince1970: ts), style: .time).font(.caption2).foregroundStyle(.tertiary)
+                                }
                             }
                         }
                         if let f = item.footer {
                             Label(f, systemImage: "cpu").font(.caption).foregroundStyle(.secondary)
                                 .accessibilityLabel("Answered by \(f)")
                         }
-                        if showActions, let ts = item.timestamp {
-                            Text(Date(timeIntervalSince1970: ts), style: .time).font(.caption).foregroundStyle(.secondary)
-                        }
                     }
                     .padding(.leading, HMDesign.micro)
+                }
+                if showTime, !(showActions && !item.text.isEmpty), let ts = item.timestamp {
+                    Text(Date(timeIntervalSince1970: ts), style: .time)
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
+            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .control:
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(item.text).textSelection(.enabled)
-                HStack(spacing: 5) {
-                    Image(systemName: "arrow.turn.up.right")
-                    Text(item.footer ?? "Received")
-                    if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
-                }.font(.caption).foregroundStyle(.secondary)
+            // Their words, not a gray system card. The tag says whether it was queued or used to guide the reply.
+            HStack {
+                Spacer(minLength: 48)
+                VStack(alignment: .trailing, spacing: 4) {
+                    if !item.text.isEmpty {
+                        Text(item.text).textSelection(.enabled)
+                            .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
+                            .foregroundStyle(.primary)
+                            .background(HMDesign.selectedFill, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
+                    }
+                    HStack(spacing: 4) {
+                        Image(systemName: (item.footer ?? "").hasPrefix("Guided") ? "arrow.turn.up.right" : "clock")
+                        Text(item.footer ?? "Sent")
+                        if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
+                    }
+                    .font(.caption2).foregroundStyle(.secondary)
+                }
             }
-            .padding(.horizontal, 14).padding(.vertical, 10)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
-            .frame(maxWidth: .infinity, alignment: .trailing).padding(.horizontal, 14)
+            .padding(.horizontal, 12)
             .accessibilityElement(children: .combine)
         case .tools:
             DisclosureGroup(isExpanded: $toolsExpanded) {
@@ -1286,10 +1437,7 @@ struct MessageRow: View {
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             } label: {
-                Label(item.activities.isEmpty
-                      ? "\(item.tools.count) tool call\(item.tools.count == 1 ? "" : "s")"
-                      : ToolLanguage.summary(item.activities),
-                      systemImage: "wrench.and.screwdriver")
+                Label(Self.toolLabel(item), systemImage: "wrench.and.screwdriver")
                     .font(.subheadline)
             }
             .foregroundStyle(.secondary)
@@ -1311,7 +1459,12 @@ struct MessageRow: View {
             }
             .padding(.horizontal, 18)
         case .notice:
-            Text(item.text).font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
+            Label(item.text, systemImage: "info.circle")
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(Color(.tertiarySystemFill).opacity(0.6), in: Capsule())
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
         }
     }
 }
@@ -1337,6 +1490,7 @@ struct ApprovalSheet: View {
                 }
             }
             .disabled(busy)
+            .hmCanvas()
             .navigationTitle("Approve?")
             .navigationBarTitleDisplayMode(.inline)
         }
@@ -1388,43 +1542,42 @@ private enum ToolLanguage {
         }
     }
 
+    /// One line: the two biggest kinds of work, then how many other steps. The full list is one tap away.
     static func summary(_ rows: [ToolActivity]) -> String {
-        var ran = 0, explored = 0, searched = 0, delegated = 0, skills = 0, other = 0
-        for row in rows {
-            switch row.name {
-            case "terminal", "execute_code": ran += 1
-            case "read_file", "search_files", "list_files": explored += 1
-            case "web_search", "web_extract": searched += 1
-            case "delegate_task": delegated += 1
-            case "skill_view": skills += 1
-            default: other += 1
-            }
-        }
-        var parts: [String] = []
-        if skills > 0 { parts.append(skills == 1 ? "Loaded a skill" : "Loaded \(skills) skills") }
-        if explored > 0 { parts.append(explored == 1 ? "Explored files" : "Explored \(explored) places") }
-        if ran > 0 { parts.append(ran == 1 ? "Ran 1 command" : "Ran \(ran) commands") }
-        if searched > 0 { parts.append(searched == 1 ? "Searched" : "Searched \(searched) times") }
-        if delegated > 0 { parts.append(delegated == 1 ? "Delegated a task" : "Delegated \(delegated) tasks") }
-        if other > 0 { parts.append(other == 1 ? "1 other action" : "\(other) other actions") }
-        var text = parts.isEmpty ? "\(rows.count) tool calls" : parts.joined(separator: ", ")
+        var counts: [(String, String, Int)] = []  // (singular, plural, n)
+        func add(_ one: String, _ many: String, _ n: Int) { if n > 0 { counts.append((one, many, n)) } }
+        let names = rows.map(\.name)
+        func n(_ set: Set<String>) -> Int { names.filter(set.contains).count }
+        add("command", "commands", n(["terminal", "execute_code"]))
+        add("file read", "files read", n(["read_file", "search_files", "list_files"]))
+        add("edit", "edits", n(["patch", "write_file"]))
+        add("search", "searches", n(["web_search", "web_extract", "x_search"]))
+        add("subagent", "subagents", n(["delegate_task"]))
+        add("skill", "skills", n(["skill_view"]))
+        let shown = counts.sorted { $0.2 > $1.2 }.prefix(2)
+        var parts = shown.map { "\($0.2) \($0.2 == 1 ? $0.0 : $0.1)" }
+        let rest = rows.count - shown.reduce(0) { $0 + $1.2 }
+        if rest > 0 { parts.append(parts.isEmpty ? (rest == 1 ? "1 step" : "\(rest) steps") : "\(rest) more") }
+        var text = parts.joined(separator: " · ")
         let failed = rows.filter { $0.state == "failed" }.count
-        if failed > 0 { text += failed == 1 ? " · 1 failed" : " · \(failed) failed" }
-        if rows.contains(where: { $0.state == "running" }) { text += " · still running" }
+        if failed > 0 { text += " · \(failed) failed" }
+        if rows.contains(where: { $0.state == "running" }) { text += " · working" }
         return text
     }
 }
 
 private struct SlashMenu: View {
     let commands: [SlashCommand]
-    let skills: [String]
+    let skills: [SkillInfo]
     let filter: String
     let pick: (String) -> Void
 
     var body: some View {
         // Every match, not the first eight: the list scrolls. (A cap hid /learn behind the alphabet.)
         let shown = commands.filter { filter.isEmpty || $0.name.hasPrefix(filter) }
-        let skillHits = skills.filter { filter.isEmpty || $0.hasPrefix(filter) }.prefix(filter.isEmpty ? 12 : 40)
+        // Hundreds of skills: ranked by name, then category and description, so "/pentest" finds them by
+        // purpose. A bare "/" shows a handful; typing narrows it. The ⌘ sheet browses them all.
+        let skillHits = filter.isEmpty ? [] : Array(SkillInfo.search(skills, filter).prefix(60))
         if !shown.isEmpty || !skillHits.isEmpty {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -1444,11 +1597,17 @@ private struct SlashMenu: View {
                     if !skillHits.isEmpty {
                         Text("Skills").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                             .padding(.horizontal, 12).padding(.top, 4)
-                        ForEach(Array(skillHits), id: \.self) { name in
-                            Button { pick(name) } label: {
-                                Text("/" + name).font(.subheadline)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                        ForEach(skillHits) { skill in
+                            Button { pick(skill.name) } label: {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("/" + skill.name).font(.subheadline)
+                                    if !skill.description.isEmpty {
+                                        Text(skill.description).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .padding(.horizontal, 12).padding(.vertical, 6)
                             }
                             .buttonStyle(.plain)
                         }
@@ -1544,7 +1703,7 @@ struct PinnedBar: View {
                     PinTicks(count: pins.count, current: cursor)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(pins.count == 1 ? "Pinned message" : "Pinned message \(cursor + 1) of \(pins.count)")
-                            .font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor)
+                            .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
                         Text(pin.excerpt).font(.footnote).lineLimit(1).foregroundStyle(.primary)
                     }
                     Spacer(minLength: 0)
@@ -1561,7 +1720,7 @@ struct PinnedBar: View {
             .accessibilityLabel("All pinned messages")
         }
         .padding(.leading, 14).padding(.vertical, 6)
-        .background(.bar)
+        .background(HMDesign.bar)
         .overlay(alignment: .bottom) { Divider() }
     }
 }
@@ -1577,7 +1736,7 @@ private struct PinTicks: View {
         VStack(spacing: 2) {
             ForEach(0..<shown, id: \.self) { slot in
                 Capsule()
-                    .fill(window + slot == current ? Color.accentColor : Color.accentColor.opacity(0.3))
+                    .fill(window + slot == current ? HMDesign.accent : HMDesign.accent.opacity(0.3))
                     .frame(width: 2.5)
             }
         }
@@ -1628,6 +1787,7 @@ struct PinsSheet: View {
                 }
             }
             .overlay { if chat.pins.isEmpty { ContentUnavailableView("No pinned messages", systemImage: "pin", description: Text("Touch and hold a message, then choose Pin.")) } }
+            .hmCanvas()
             .navigationTitle(chat.pins.isEmpty ? "Pinned" : "Pinned · \(chat.pins.count)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1700,7 +1860,7 @@ struct ActivityCard: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
             .strokeBorder(worst == "failed" ? Color.red.opacity(0.35) : Color(.separator).opacity(0.4), lineWidth: 0.5))
         .accessibilityElement(children: .contain)
@@ -1744,7 +1904,7 @@ private struct StatusGlyph: View {
 
     var body: some View {
         let (name, color): (String, Color) = switch status {
-        case "ok": ("checkmark.circle.fill", .green)
+        case "ok": ("checkmark.circle.fill", HMDesign.success)
         case "failed": ("xmark.octagon.fill", .red)
         case "stopped", "warning": ("stop.circle.fill", .orange)
         default: ("clock.fill", .secondary)
@@ -1770,7 +1930,7 @@ struct TranscriptFile: View {
         Button { Task { await open() } } label: {
             HStack(spacing: 10) {
                 Image(systemName: Self.symbol(for: ref.name))
-                    .font(.title3).foregroundStyle(Color.accentColor).frame(width: 28)
+                    .font(.title3).foregroundStyle(HMDesign.accent).frame(width: 28)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(ref.name).font(.subheadline.weight(.medium)).lineLimit(1).truncationMode(.middle)
                     Text(failed ?? Self.kind(for: ref.name)).font(.caption2)
@@ -1782,7 +1942,7 @@ struct TranscriptFile: View {
             }
             .padding(.horizontal, 12).padding(.vertical, 9)
             .frame(maxWidth: 300, alignment: .leading)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1837,15 +1997,51 @@ struct TranscriptFile: View {
 // MARK: - Commands
 
 /// Every slash command and skill this bot offers, searchable. Tapping one puts it in the composer.
+/// A prompt kept for one-tap reuse. `sendNow` sends it as is; otherwise it lands in the composer to edit.
+struct SavedPrompt: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var title: String
+    var text: String
+    var sendNow: Bool
+
+    static let key = "hm.savedPrompts"
+    static let starters = [
+        SavedPrompt(title: "Status", text: "Where are you on this? One short paragraph, then what's next.", sendNow: true),
+        SavedPrompt(title: "Continue", text: "Continue.", sendNow: true),
+        SavedPrompt(title: "Summarize", text: "Summarize this chat so far: decisions, open questions, next steps.", sendNow: true),
+        SavedPrompt(title: "Explain simply", text: "Explain that again simply, like I'm new to it.", sendNow: false),
+    ]
+    static func load() -> [SavedPrompt] {
+        guard let data = UserDefaults.standard.data(forKey: key), let list = try? JSONDecoder().decode([SavedPrompt].self, from: data)
+        else { return starters }
+        return list
+    }
+    static func save(_ list: [SavedPrompt]) {
+        if let data = try? JSONEncoder().encode(list) { UserDefaults.standard.set(data, forKey: key) }
+    }
+}
+
 struct CommandsSheet: View {
+    enum Side: String, CaseIterable { case saved = "Saved", commands = "Commands", skills = "Skills" }
+
     let commands: [SlashCommand]
-    let skills: [String]
+    let skills: [SkillInfo]
     let pick: (String) -> Void
+    /// (text, send now)
+    var usePrompt: ((String, Bool) -> Void)? = nil
+    @State private var prompts = SavedPrompt.load()
+    @State private var editing: SavedPrompt?
+    var start: Side = .commands
+    @State private var side: Side = .commands
     @State private var query = ""
+    @State private var category: String?
+    @AppStorage("hm.recentSkills") private var recentRaw = ""
     @Environment(\.dismiss) private var dismiss
 
+    private var trimmed: String { query.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")) }
+
     private var grouped: [(String, [SlashCommand])] {
-        let q = query.lowercased().trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let q = trimmed.lowercased()
         let hits = commands.filter { q.isEmpty || $0.name.lowercased().contains(q) || $0.description.lowercased().contains(q) }
         var order: [String] = []
         var buckets: [String: [SlashCommand]] = [:]
@@ -1857,58 +2053,200 @@ struct CommandsSheet: View {
         return order.map { ($0, buckets[$0] ?? []) }
     }
 
-    private var skillHits: [String] {
-        let q = query.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        return skills.filter { q.isEmpty || $0.lowercased().contains(q) }
+    private var recent: [SkillInfo] {
+        let names = recentRaw.split(separator: ",").map(String.init)
+        return names.compactMap { name in skills.first { $0.name == name } }
+    }
+
+    private var categories: [(String, Int)] {
+        var counts: [String: Int] = [:]
+        for skill in skills { counts[skill.category.isEmpty ? "General" : skill.category, default: 0] += 1 }
+        return counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }.map { ($0.key, $0.value) }
+    }
+
+    private var skillHits: [SkillInfo] {
+        var pool = skills
+        if let category { pool = pool.filter { ($0.category.isEmpty ? "General" : $0.category) == category } }
+        return SkillInfo.search(pool, trimmed)
+    }
+
+    private func choose(_ name: String, skill: Bool) {
+        if skill {
+            var names = recentRaw.split(separator: ",").map(String.init).filter { $0 != name }
+            names.insert(name, at: 0)
+            recentRaw = names.prefix(8).joined(separator: ",")
+        }
+        pick(name)
+        dismiss()
     }
 
     var body: some View {
         NavigationStack {
             List {
-                ForEach(grouped, id: \.0) { category, rows in
-                    Section(category) {
-                        ForEach(rows) { command in
-                            Button { pick(command.name); dismiss() } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 6) {
-                                        Text("/" + command.name).font(.body.monospaced().weight(.semibold))
-                                        if !command.hint.isEmpty {
-                                            Text(command.hint).font(.caption.monospaced()).foregroundStyle(.secondary)
-                                        }
+                if side == .saved {
+                    Section {
+                        ForEach(prompts.filter { trimmed.isEmpty || ($0.title + " " + $0.text).localizedCaseInsensitiveContains(trimmed) }) { prompt in
+                            Button {
+                                usePrompt?(prompt.text, prompt.sendNow)
+                                dismiss()
+                            } label: {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: prompt.sendNow ? "paperplane.fill" : "square.and.pencil")
+                                        .foregroundStyle(HMDesign.accent).frame(width: 20)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(prompt.title).font(.body.weight(.semibold))
+                                        Text(prompt.text).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                                     }
-                                    Text(command.description).font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                             .foregroundStyle(.primary)
+                            .swipeActions {
+                                Button(role: .destructive) { prompts.removeAll { $0.id == prompt.id }; SavedPrompt.save(prompts) } label: { Label("Delete", systemImage: "trash") }
+                                Button { editing = prompt } label: { Label("Edit", systemImage: "pencil") }.tint(HMDesign.accent)
+                            }
                         }
+                        .onMove { from, to in prompts.move(fromOffsets: from, toOffset: to); SavedPrompt.save(prompts) }
+                        Button { editing = SavedPrompt(title: "", text: "", sendNow: true) } label: { Label("New saved prompt", systemImage: "plus") }
+                    } footer: {
+                        Text("A paper plane sends right away. A pencil puts the text in the message box to edit first. Swipe to edit or delete.")
+                    }
+                } else if side == .commands {
+                    ForEach(grouped, id: \.0) { group, rows in
+                        Section(group) {
+                            ForEach(rows) { command in
+                                Button { choose(command.name, skill: false) } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack(spacing: 6) {
+                                            Text("/" + command.name).font(.body.monospaced().weight(.semibold))
+                                            if !command.hint.isEmpty {
+                                                Text(command.hint).font(.caption.monospaced()).foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        Text(command.description).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                .foregroundStyle(.primary)
+                            }
+                        }
+                    }
+                } else {
+                    if trimmed.isEmpty, category == nil, !recent.isEmpty {
+                        Section("Recent") { ForEach(recent) { skillRow($0) } }
+                    }
+                    if trimmed.isEmpty {
+                        Section {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    chip("All", count: skills.count, on: category == nil) { category = nil }
+                                    ForEach(categories, id: \.0) { name, count in
+                                        chip(name, count: count, on: category == name) { category = category == name ? nil : name }
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
+                            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                        }
+                    }
+                    Section(category.map { "\($0) · \(skillHits.count)" } ?? "\(skillHits.count) skills") {
+                        ForEach(skillHits) { skillRow($0) }
                     }
                 }
-                if !skillHits.isEmpty {
-                    Section("Skills · \(skillHits.count)") {
-                        ForEach(skillHits, id: \.self) { name in
-                            Button { pick(name); dismiss() } label: {
-                                Text("/" + name).font(.callout.monospaced())
-                            }
-                            .foregroundStyle(.primary)
-                        }
-                    }
+            }
+            .sheet(item: $editing) { prompt in
+                SavedPromptEditor(prompt: prompt) { saved in
+                    if let i = prompts.firstIndex(where: { $0.id == saved.id }) { prompts[i] = saved } else { prompts.append(saved) }
+                    SavedPrompt.save(prompts)
                 }
             }
             .overlay {
-                if grouped.isEmpty && skillHits.isEmpty {
+                if (side == .commands && grouped.isEmpty) || (side == .skills && skillHits.isEmpty) {
                     ContentUnavailableView.search(text: query)
                 }
             }
-            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Find a command or skill")
-            .navigationTitle("Commands · \(commands.count + skills.count)")
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: side == .saved ? "Find a saved prompt" : side == .commands ? "Find a command" : "Search \(skills.count) skills by name or purpose")
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Picker("Show", selection: $side) {
+                        Text("Saved").tag(Side.saved)
+                        Text("Commands").tag(Side.commands)
+                        Text("Skills · \(skills.count)").tag(Side.skills)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 320)
+                }
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .onChange(of: side) { _, _ in category = nil }
+            .onAppear { side = start }
+            .sensoryFeedback(.selection, trigger: side)
         }
         .presentationDetents([.medium, .large])
+    }
+
+    private func skillRow(_ skill: SkillInfo) -> some View {
+        Button { choose(skill.name, skill: true) } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("/" + skill.name).font(.callout.monospaced().weight(.medium))
+                    if !skill.category.isEmpty, category == nil {
+                        Text(skill.category).font(.caption2).foregroundStyle(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color(.tertiarySystemFill), in: Capsule())
+                    }
+                }
+                if !skill.description.isEmpty {
+                    Text(skill.description).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+            }
+        }
+        .foregroundStyle(.primary)
+    }
+
+    private func chip(_ title: String, count: Int, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text("\(title) \(count)").font(.caption.weight(on ? .semibold : .regular))
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(on ? HMDesign.accent.opacity(0.18) : Color(.tertiarySystemFill), in: Capsule())
+                .foregroundStyle(on ? HMDesign.accent : .primary)
+        }
+        .buttonStyle(.plain)
     }
 }
 
 /// The small "Copied" pill that confirms any copy in the chat.
+struct SavedPromptEditor: View {
+    @State var prompt: SavedPrompt
+    let save: (SavedPrompt) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Name", text: $prompt.title)
+                TextField("What to send", text: $prompt.text, axis: .vertical).lineLimit(3...10)
+                Toggle("Send right away", isOn: $prompt.sendNow)
+            }
+            .hmCanvas()
+            .navigationTitle(prompt.title.isEmpty ? "Saved prompt" : prompt.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        var p = prompt
+                        if p.title.trimmingCharacters(in: .whitespaces).isEmpty { p.title = String(p.text.prefix(24)) }
+                        save(p); dismiss()
+                    }
+                    .disabled(prompt.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
 struct CopiedToast: View {
     let text: String
 
@@ -1966,5 +2304,152 @@ struct ActionIcon: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .accessibilityLabel(label)
+    }
+}
+
+private struct MediaInputsModifier: ViewModifier {
+    let host: ChatScreen
+    func body(content: Content) -> some View { host.mediaInputs(content) }
+}
+
+// MARK: - Outbox tray
+
+/// Messages written while Hermes was busy or the connection was down. Each says plainly where it is.
+/// Tap to edit; touch and hold for the rest. Nothing here is ever lost: it is on disk until it starts.
+struct OutboxTray: View {
+    @Bindable var chat: ChatModel
+    @State private var editing: Outgoing?
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 6) {
+                ForEach(Array(chat.outgoing.enumerated()), id: \.element.id) { index, item in
+                    row(item, position: index)
+                }
+            }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(maxHeight: chat.outgoing.count > 2 ? 150 : nil)
+        .fixedSize(horizontal: false, vertical: chat.outgoing.count <= 2)
+        .padding(.horizontal, 12)
+        .sheet(item: $editing) { item in
+            OutgoingEditor(item: item) { text in Task { await chat.editOutgoing(item.id, text: text) } }
+        }
+        .animation(.spring(duration: 0.3), value: chat.outgoing)
+    }
+
+    private func status(_ item: Outgoing, position: Int) -> (String, String, Color) {
+        if let problem = item.problem { return ("exclamationmark.triangle.fill", "Didn't send: \(problem). Tap to edit.", HMDesign.warning) }
+        if item.edit != nil { return ("pencil.circle", "Edit saved · applies as soon as your Mac answers", .secondary) }
+        if item.onMac {
+            let ahead = chat.outgoing.prefix(position).filter(\.onMac).count
+            return ("checkmark.circle.fill", ahead == 0 ? "On your Mac · next up" : "On your Mac · #\(ahead + 1) in line", HMDesign.success)
+        }
+        if item.attempts > 0 { return ("icloud.and.arrow.up", "Saved on this phone · sends when your Mac answers", .secondary) }
+        if item.mode == "steer" { return ("arrow.turn.up.right", "Will guide this reply", HMDesign.accent) }
+        return ("clock.arrow.circlepath", chat.isRunning ? "Sends after this reply" : "Sending…", HMDesign.accent)
+    }
+
+    @ViewBuilder private func row(_ item: Outgoing, position: Int) -> some View {
+        let (icon, caption, tint) = status(item, position: position)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon).foregroundStyle(tint).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.edit ?? item.label).font(.subheadline).lineLimit(2)
+                Text(caption).font(.caption).foregroundStyle(item.problem == nil ? Color.secondary : tint)
+                if let note = item.note { Text(note).font(.caption2).foregroundStyle(.secondary) }
+            }
+            Spacer(minLength: 0)
+            if item.files > 0 {
+                Label("\(item.files)", systemImage: "paperclip").font(.caption2).foregroundStyle(.secondary).labelStyle(.titleAndIcon)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onTapGesture { if canEdit(item) { editing = item } }
+        .contextMenu {
+            if canEdit(item) { Button { editing = item } label: { Label("Edit", systemImage: "pencil") } }
+            if item.mode == "queue", chat.isRunning, item.problem == nil {
+                Button { Task { await chat.guideNow(item.id) } } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
+            }
+            Button { Task { await chat.removeOutgoing(item.id, toComposer: true) } } label: {
+                Label("Move back to message box", systemImage: "arrow.uturn.down")
+            }
+            Button(role: .destructive) { Task { await chat.removeOutgoing(item.id, toComposer: false) } } label: {
+                Label("Remove", systemImage: "trash")
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(canEdit(item) ? "Double-tap to edit. Touch and hold for more." : "Touch and hold for more.")
+    }
+
+    /// A steer that may already have reached the running reply can't be taken back, so it can't be edited.
+    private func canEdit(_ item: Outgoing) -> Bool {
+        !(item.mode == "steer" && item.attempts > 0 && item.problem == nil)
+    }
+}
+
+/// Hermes restarted while answering, cut that reply off, and holds the queue until someone says go.
+struct QueuePausedBanner: View {
+    @Bindable var chat: ChatModel
+    @State private var working = false
+
+    var body: some View {
+        let waiting = chat.queue?.rows.filter { $0.status == "queued" }.count ?? 0
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Hermes restarted mid-reply", systemImage: "arrow.clockwise.circle.fill")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.warning)
+            Text("The reply to “\(String((chat.queue?.lost?.text ?? "your message").prefix(80)))” was cut off. "
+                 + "\(waiting) message\(waiting == 1 ? " is" : "s are") waiting behind it.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button { working = true; Task { await chat.continueQueue(); working = false } } label: {
+                    Text(working ? "Continuing…" : "Continue").font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent).disabled(working)
+                if let lost = chat.queue?.lost?.text, !lost.isEmpty {
+                    Button("Copy cut-off message") { Clipboard.copy(lost, what: "Copied") }.font(.subheadline)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.warning.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 12)
+    }
+}
+
+struct OutgoingEditor: View {
+    let item: Outgoing
+    let save: (String) -> Void
+    @State private var text = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Message", text: $text, axis: .vertical).lineLimit(3...14)
+                } footer: {
+                    Text(item.onMac
+                         ? "Your Mac swaps in the edit if Hermes hasn't started it yet. It keeps its place after the current reply."
+                         : "It hasn't left this phone yet, so the edit is instant.")
+                }
+            }
+            .hmCanvas()
+            .navigationTitle(item.mode == "steer" ? "Edit guidance" : "Edit queued message")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save(text); dismiss() }
+                        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onAppear { text = item.edit ?? item.text }
+        }
+        .presentationDetents([.medium, .large])
     }
 }

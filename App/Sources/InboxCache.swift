@@ -28,7 +28,7 @@ struct ControlReceipt: Codable, Identifiable {
     var files: Int? = nil
 
     var item: ChatItem {
-        let base = mode == "queue" ? "Queued for the next turn" : "Steer received by Hermes"
+        let base = mode == "queue" ? "Sends after this reply" : "Guided this reply"
         let attached = files.map { $0 == 1 ? " · 1 file" : " · \($0) files" } ?? ""
         return ChatItem(id: id.uuidString, kind: .control, text: text.isEmpty ? "Attachments" : text,
                         footer: base + ((files ?? 0) > 0 ? attached : ""), timestamp: at.timeIntervalSince1970)
@@ -52,6 +52,32 @@ struct PendingSend: Codable {
     var composerText: String?
     var composerPastes: [PastedText]?
     var returningToComposer: Bool?
+}
+
+/// A message written while Hermes was busy (Send next) or meant to steer the running reply. It is saved
+/// to disk before any network call, so closing the app, a crash or a dead connection never loses it, and
+/// it goes out with the same submission ID on every retry, so a lost acknowledgment never duplicates it.
+///
+/// Life of one: on this phone (`admission == nil`) → on the Mac, held in Hermes's own queue in state.db
+/// (`admission` set; survives bridge and gateway restarts) → started, at which point it leaves this list
+/// and appears in the transcript. `problem` means the bridge refused it and the person must decide.
+struct Outgoing: Codable, Identifiable, Equatable {
+    var id: UUID
+    var mode: String                 // "queue" or "steer"
+    var text: String
+    var attachments: [SendAttachment]?
+    var choice: RuntimeChoice?
+    var created: Date
+    var attempts: Int = 0
+    var admission: String? = nil
+    var files: Int = 0
+    var note: String? = nil
+    var problem: String? = nil
+    /// An edit typed after the original may already have reached the Mac: applied once that's confirmed.
+    var edit: String? = nil
+
+    var onMac: Bool { admission != nil }
+    var label: String { text.isEmpty ? "\(files) attachment\(files == 1 ? "" : "s")" : text }
 }
 
 actor InboxDisk {
@@ -112,6 +138,33 @@ actor InboxDisk {
         values.isExcludedFromBackup = true
         try directory.setResourceValues(values)
         try JSONEncoder().encode(send).write(to: url, options: Self.protectedWrite)
+    }
+
+    // Follow-ups have their own small file next to the first-send record. Files ride along only until the
+    // Mac has them; after that the record is a few hundred bytes of text and IDs.
+    private func outgoingURL(_ key: String) -> URL {
+        pendingURL(key).appendingPathExtension("followups")
+    }
+
+    func outgoing(_ key: String) -> [Outgoing] {
+        guard !forgotten.contains(account(key)), let data = try? Data(contentsOf: outgoingURL(key)) else { return [] }
+        return (try? JSONDecoder().decode([Outgoing].self, from: data)) ?? []
+    }
+
+    func saveOutgoing(_ list: [Outgoing], key: String) throws {
+        guard !forgotten.contains(account(key)) else { throw APIError.notSignedIn }
+        let url = outgoingURL(key)
+        if list.isEmpty {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var dir = directory
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try dir.setResourceValues(values)
+        try JSONEncoder().encode(list).write(to: url, options: Self.protectedWrite)
     }
 
     func acknowledge(_ id: UUID, key: String) throws {

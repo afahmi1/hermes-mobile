@@ -16,6 +16,9 @@ Chats are built for lifting the useful part out of a reply. The full contract, i
 - **Files** a reply hands over with `MEDIA:/path` open in Quick Look (documents, code, audio, video, 3D and AR). Credentials and Hermes config are never served.
 - **Background work** shows as readable cards ("build.py --mesh in plate B", "2 subagent tasks finished · 1 failed"), with the exact command and output a tap away.
 - **Pinned messages** work like Telegram: a pinned bar, a list of every pin, and a chat with pins asks before it is archived.
+- **Send next and Guide never get lost.** They're saved on the phone before they're sent, and keep one ID across retries
+  so a resend never duplicates. A tray above the composer shows where each one is. Tap to edit it while it waits in
+  Hermes's queue; touch and hold to guide the current reply now, move it back to the message box, or remove it.
 - **The composer** stays small: `+` attaches files (also while a reply runs; Send next and Guide this reply carry them), ⌘ lists every command and skill, and typing `/` filters them inline.
 
 The **Status** tab mirrors the Mac status dashboard (`Status/`, a web page on port 9230). It shows:
@@ -28,8 +31,13 @@ Both the Mac page and the phone re-discover everything on each refresh, so a bot
 seconds, with a "new" badge for a day. Removals and renames show up too. The phone refreshes every 5 s while the Status
 tab is open and every 30 s otherwise, badges the tab, and shows a banner when something is created or removed.
 
-The app has no server of its own. Each person who installs it points it at **their own Mac**, which runs Hermes, a
-small bridge (`Bridge/`) that the app talks to over Tailscale, and the status dashboard.
+The app has no server of its own. Each person who installs it points it at **their own computer** (macOS, Linux or
+Windows), which runs Hermes, a small bridge (`Bridge/`) that the app talks to over Tailscale, and the status dashboard.
+
+**Setting it up, or asking an agent to?** Follow [docs/setup.md](docs/setup.md). It's an ordered runbook for all three
+operating systems, and `Bridge/run-bridge.sh --doctor` checks every step and prints the exact fix for anything missing.
+**Wondering whether a message can get lost?** [docs/delivery.md](docs/delivery.md) says where every outgoing message
+lives and what survives an app kill, lost signal, or a bridge or gateway restart.
 
 ```
 iPhone app  ──HTTPS over your tailnet──▶  Bridge on your Mac (127.0.0.1:9131, exposed with `tailscale serve`)
@@ -128,7 +136,7 @@ Everyone needs their own Mac running Hermes. The app only ever talks to the addr
 4. Install the bridge (a per-user launch agent on port 9131 that starts at login) and the status dashboard (port 9230):
 
    ```bash
-   Bridge/install.sh          # each one takes --uninstall to remove it
+   Bridge/install.sh          # macOS or Linux; each one takes --uninstall to remove it
    Status/install.sh          # then open http://127.0.0.1:9230 on the Mac
    ```
 

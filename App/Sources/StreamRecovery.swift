@@ -82,10 +82,28 @@ final class StreamRoutes: @unchecked Sendable {
     }
 
     func update(_ next: StreamRoute) {
+        var woke = false
         let listeners: [AsyncStream<Void>.Continuation] = lock.withLock {
             let wake = next.wakesReader(after: route)
             route = next
+            woke = wake
             guard wake else { return [] }
+            revision &+= 1
+            let listeners = Array(observers.values)
+            observers.removeAll()
+            return listeners
+        }
+        for listener in listeners { listener.yield(()); listener.finish() }
+        // The network came back or moved (Wi-Fi to cellular): sockets on the old path are dead, and anything
+        // waiting in an outbox should go now rather than at its next backoff tick.
+        if woke, next.reachable {
+            DispatchQueue.main.async { NotificationCenter.default.post(name: .hermesNetworkChanged, object: nil) }
+        }
+    }
+
+    /// Wake every waiting reader now: the app just came back and its sockets were reset.
+    func nudge() {
+        let listeners: [AsyncStream<Void>.Continuation] = lock.withLock {
             revision &+= 1
             let listeners = Array(observers.values)
             observers.removeAll()
@@ -121,4 +139,9 @@ final class StreamRoutes: @unchecked Sendable {
             tasks.cancelAll()
         }
     }
+}
+
+extension Notification.Name {
+    /// The network came back or switched paths (Wi-Fi to cellular, Tailscale reconnect).
+    static let hermesNetworkChanged = Notification.Name("hermesNetworkChanged")
 }

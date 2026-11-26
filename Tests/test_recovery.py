@@ -112,7 +112,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
         queued.submission = uuid4().hex
         with patch.dict(engine.TURNS, {queued.id: queued}, clear=True), patch.object(engine, "_rpc", AsyncMock()) as rpc:
             result = await engine._follow_up(turn, "queue", "next", queued.submission)
-            self.assertEqual(result, {"status": "queued", "turn_id": queued.id, "attachments": 0})
+            self.assertEqual(result, {"status": "queued", "turn_id": queued.id, "attachments": 0, "admission_id": None})
             rpc.assert_not_awaited()
             with self.assertRaises(engine.TurnError):
                 await engine._follow_up(turn, "queue", "different", queued.submission)
@@ -138,7 +138,7 @@ class FollowUpTests(unittest.IsolatedAsyncioTestCase):
     async def test_busy_model_and_effort_share_one_native_mutation_receipt(self):
         with patch.object(engine, "_mutate", AsyncMock(return_value={"status":"deferred"})) as mutate:
             result = await engine._apply(None,"chat",{"model":"new","provider":"p","effort":"high"})
-            mutate.assert_awaited_once_with(None,"chat","model",{"model":"new","provider":"p","reasoning":"high"})
+            mutate.assert_awaited_once_with(None,"chat","model",{"model":"new","provider":"p","reasoning":"high"},ask=False)
             self.assertEqual(result["model"]["status"],"deferred")
 
     async def test_simultaneous_steers_share_the_gateway_ack(self):

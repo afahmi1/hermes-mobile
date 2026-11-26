@@ -110,14 +110,31 @@ struct RuntimeSheet: View {
                             Text("The desktop app shows and uses the same setting.")
                         }
                     }
+                    if let cost = s.cost, cost.usd >= 0.0005 || cost.included {
+                        Section {
+                            if cost.usd >= 0.0005 {
+                                LabeledContent("Spent", value: CostSummary.money(cost.usd))
+                            }
+                            if cost.included {
+                                LabeledContent("Covered by your plan") {
+                                    Text(cost.includedApiUsd >= 0.01 ? "≈ \(CostSummary.money(cost.includedApiUsd)) at API prices" : "Included")
+                                }
+                            }
+                        } header: { Text("This chat") } footer: {
+                            Text(cost.unknown ? "Some steps ran on a model with no price on record, so they aren't counted."
+                                 : "From Hermes's usage records, including background helpers like summaries and image reading.")
+                        }
+                    }
                     if let used = s.modelsUsed, !used.isEmpty {
                         Section("Models that answered this chat") {
                             ForEach(used, id: \.self) { u in
                                 LabeledContent {
-                                    Text("\(u.calls ?? 0) call\((u.calls ?? 0) == 1 ? "" : "s") · \(u.reasoningTokens ?? 0) reasoning tok")
+                                    let calls = u.calls ?? 0
+                                    Text("\(calls) step\(calls == 1 ? "" : "s")" + ((u.reasoningTokens ?? 0) > 0 ? " · \(UsageWords.compact(u.reasoningTokens ?? 0)) thinking tokens" : ""))
+                                        .font(.caption)
                                 } label: {
                                     VStack(alignment: .leading) {
-                                        Text(u.model)
+                                        Text(ModelName.short(u.model))
                                         if let p = u.provider, !p.isEmpty { Text(p).font(.caption).foregroundStyle(.secondary) }
                                     }
                                 }
@@ -126,6 +143,7 @@ struct RuntimeSheet: View {
                     }
                 }
             }
+            .hmCanvas()
             .navigationTitle("Model & Effort")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -211,7 +229,7 @@ struct RuntimeSheet: View {
                 .padding(.horizontal, 12).padding(.vertical, 7)
                 .background(on ? HMDesign.selectedFill : Color(uiColor: .tertiarySystemFill), in: Capsule())
                 .foregroundStyle(.primary)
-                .overlay { if on { Capsule().strokeBorder(Color.accentColor, lineWidth: 1) } }
+                .overlay { if on { Capsule().strokeBorder(HMDesign.accent, lineWidth: 1) } }
                 .hmTouchTarget()
         }
         .buttonStyle(.plain)
