@@ -20,6 +20,9 @@ class Devices:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, issued INTEGER NOT NULL,
                     expires INTEGER NOT NULL, method TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS pairing (digest BLOB PRIMARY KEY, expires INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS push_tokens (
+                    device_id TEXT PRIMARY KEY, token TEXT NOT NULL, env TEXT NOT NULL,
+                    account TEXT NOT NULL, updated INTEGER NOT NULL);
             """)
         if os.name == "posix":
             self.path.chmod(0o600)
@@ -37,6 +40,7 @@ class Devices:
                 if not used:
                     return False
             db.execute("DELETE FROM devices WHERE expires<=?", (time.time(),))
+            db.execute("DELETE FROM push_tokens WHERE device_id NOT IN (SELECT id FROM devices)")
             db.execute("INSERT INTO devices(id,name,issued,expires,method) VALUES(?,?,?,?,?)",
                        (claims["did"], claims["dev"], claims["issued"], claims["exp"], claims["method"]))
             return True
@@ -77,7 +81,34 @@ class Devices:
 
     def revoke(self, key):
         with closing(self.connect()) as db, db:
+            db.execute("DELETE FROM push_tokens WHERE device_id=?", (key,))
             return db.execute("UPDATE devices SET revoked=1 WHERE id=? AND revoked=0", (key,)).rowcount == 1
+
+    def set_push_token(self, key, token, env, account):
+        """One APNs token per device grant. A token that moved to another grant leaves the old one."""
+        with closing(self.connect()) as db, db:
+            db.execute("DELETE FROM push_tokens WHERE token=? AND device_id!=?", (token, key))
+            db.execute("INSERT OR REPLACE INTO push_tokens(device_id,token,env,account,updated) VALUES(?,?,?,?,?)",
+                       (key, token, env, account, int(time.time())))
+
+    def clear_push_token(self, key):
+        with closing(self.connect()) as db, db:
+            db.execute("DELETE FROM push_tokens WHERE device_id=?", (key,))
+
+    def drop_push_token(self, token):
+        with closing(self.connect()) as db, db:
+            db.execute("DELETE FROM push_tokens WHERE token=?", (token,))
+
+    def push_targets(self, key=None):
+        """Tokens of live grants only; one device, or every device when the turn's origin is unknown."""
+        with closing(self.connect()) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("DELETE FROM push_tokens WHERE device_id NOT IN "
+                       "(SELECT id FROM devices WHERE revoked=0 AND expires>?)", (time.time(),))
+            db.commit()
+            sql = "SELECT device_id,token,env,account FROM push_tokens"
+            rows = db.execute(sql + (" WHERE device_id=?" if key else ""), (key,) if key else ())
+            return [dict(row) for row in rows]
 
     def offer(self):
         code = secrets.token_urlsafe(18)

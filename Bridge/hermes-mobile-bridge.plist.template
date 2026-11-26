@@ -12,6 +12,8 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>HERMES_MOBILE_PORT</key><string>__PORT__</string>
+    <!-- Push notifications are added here by install.sh when HERMES_MOBILE_APNS_KEY_PATH, _KEY_ID, _TEAM_ID
+         (and optionally _TOPIC, the app's bundle ID) are set. Without them push stays off. -->
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

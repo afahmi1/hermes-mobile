@@ -11,6 +11,9 @@
 # opts those project/bot pairs in to Project instructions, files, chats and output files. Needs the catalog.
 # Single owner only. Paired phones can chat and approve tools, while owner grants control workspace changes.
 # Do not enable it on a shared or multi-user bridge.)
+# Push notifications (optional, see README "Push notifications"): HERMES_MOBILE_APNS_KEY_PATH (the .p8),
+# HERMES_MOBILE_APNS_KEY_ID, HERMES_MOBILE_APNS_TEAM_ID and HERMES_MOBILE_APNS_TOPIC (the app's bundle ID;
+# defaults to HERMES_BUNDLE_ID from App/Config/Signing.xcconfig). Set all three of key path, key ID and team ID or none.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -60,6 +63,20 @@ if [[ -n "${HERMES_MOBILE_PROJECTS_CATALOG:-}" ]]; then
 fi
 if [[ -n "${HERMES_MOBILE_WORKSPACES:-}" ]]; then
   plutil -insert EnvironmentVariables.HERMES_MOBILE_WORKSPACES -string "$HERMES_MOBILE_WORKSPACES" "$PLIST"
+fi
+if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
+  if [[ -z "${HERMES_MOBILE_APNS_KEY_ID:-}" || -z "${HERMES_MOBILE_APNS_TEAM_ID:-}" ]]; then
+    echo "Push needs HERMES_MOBILE_APNS_KEY_ID and HERMES_MOBILE_APNS_TEAM_ID as well as the key path." >&2
+    exit 1
+  fi
+  TOPIC="${HERMES_MOBILE_APNS_TOPIC:-}"
+  if [[ -z "$TOPIC" && -f "$HERE/../App/Config/Signing.xcconfig" ]]; then
+    TOPIC="$(sed -n 's#^[[:space:]]*HERMES_BUNDLE_ID[[:space:]]*=[[:space:]]*\([^[:space:]/]*\).*#\1#p' "$HERE/../App/Config/Signing.xcconfig" | head -1)"
+  fi
+  plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_KEY_PATH -string "$HERMES_MOBILE_APNS_KEY_PATH" "$PLIST"
+  plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_KEY_ID -string "$HERMES_MOBILE_APNS_KEY_ID" "$PLIST"
+  plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_TEAM_ID -string "$HERMES_MOBILE_APNS_TEAM_ID" "$PLIST"
+  [[ -n "$TOPIC" ]] && plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_TOPIC -string "$TOPIC" "$PLIST"
 fi
 plutil -lint "$PLIST" >/dev/null
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
