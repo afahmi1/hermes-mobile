@@ -47,6 +47,13 @@ iPhone app (App/)  ──HTTPS over Tailscale──▶  bridge (Bridge/, port 91
    Never paste a code or password into a chat log.
 5. **Done** when the doctor exits 0 and the phone lists the person's chats.
 
+**Reinstalling keeps your settings.** `install.sh` writes every `HERMES_MOBILE_*` variable in its environment
+(`OWNER_LOGIN`, `OWNER_MANAGED`, `TRUST_TAILSCALE_SERVE`, `WORKSPACE_BOTS`, `PERSONA_HOSTS`, `MANAGEABLE_BOTS`, the push
+settings and so on) into the service, except the installer-only `HERMES_MOBILE_LABEL`. If a service with the same label
+is already installed, its `HERMES_MOBILE_*` settings are the defaults, and your environment overrides them. A variable
+set to the empty string removes that setting. The installer prints the names it kept, never the values. A systemd unit
+can't hold a newline in a value; the installer refuses it with a message.
+
 **Uninstall:** run `Bridge/install.sh --uninstall`, or remove the Windows scheduled tasks. The Tailscale route stays
 until you run `tailscale serve --https=10001 off`.
 

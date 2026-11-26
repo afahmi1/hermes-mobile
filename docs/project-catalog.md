@@ -61,7 +61,7 @@ The filename is known only to the local process. Every valid bridge bearer token
 
 - the project must exist in the current catalog;
 - if the catalog project lists `bot_ids`, the bot must also be listed there (an empty or omitted `bot_ids` adds no restriction, because the catalog is display metadata and the real catalog carries none);
-- the bot must be a live profile with an API key, not marked `# hermes-mobile: no-key`, and not a protected profile (names containing health, journal, trading, robinhood, captain, wellness, portfolio, stocks, doctor, medical, bacta, finance, bank, therapy, secrets, vault). The name list is a backstop only; do not allowlist any bot you would not hand project files to.
+- the bot must be a live profile with an API key, not marked `# hermes-mobile: no-key`, and, unless you named it here, not a protected profile (names containing health, journal, trading, robinhood, captain, wellness, portfolio, stocks, doctor, medical, bacta, finance, bank, therapy, secrets, vault). Naming a bot in `HERMES_MOBILE_WORKSPACES` (or `HERMES_MOBILE_WORKSPACE_BOTS`) is your explicit decision and skips only that name check; the key and opt-out checks still apply. Do not allowlist any bot you would not hand project files to.
 
 Malformed JSON disables the feature. It never reads or writes extra paths named in the catalog.
 

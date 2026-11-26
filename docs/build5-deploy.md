@@ -18,7 +18,9 @@ Everything is off until the operator turns it on. With the new settings unset, t
 | `HERMES_MOBILE_MANAGEABLE_BOTS` | none | JSON list of live bots the owner may archive. `default` and protected names are always refused. |
 | `HERMES_MOBILE_WORKSPACES` (existing) | — | The legacy pilot allowlist. In owner mode it seeds assignments once, on first use. |
 
-The eligible, host and manageable lists are narrowed further on every request. A bot is dropped if it is no longer live, lacks an API key, is opted out with `# hermes-mobile: no-key`, matches a protected name, or isn't in the project's catalog `bot_ids` (when that list is non-empty).
+The eligible, host and manageable lists are narrowed further on every request. A bot is dropped if it is no longer live, lacks an API key, is opted out with `# hermes-mobile: no-key`, or isn't in the project's catalog `bot_ids` (when that list is non-empty).
+
+A bot you name in one of these lists (`HERMES_MOBILE_WORKSPACE_BOTS`, `_PERSONA_HOSTS`, `_MANAGEABLE_BOTS`, or a project in `HERMES_MOBILE_WORKSPACES`) skips the protected-name check, so a health or journal bot works from projects when you list it. It still needs an API key and no opt-out marker. A bot you don't name is never reachable through these paths. When `HERMES_MOBILE_WORKSPACE_BOTS` is absent, the bots named in `HERMES_MOBILE_WORKSPACES` count as named. Only list bots you would hand project files to.
 
 ## Owner authentication (required for every new mutation)
 

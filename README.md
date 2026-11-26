@@ -140,6 +140,8 @@ Everyone needs their own Mac running Hermes. The app only ever talks to the addr
    Status/install.sh          # then open http://127.0.0.1:9230 on the Mac
    ```
 
+   Re-running `Bridge/install.sh` keeps every `HERMES_MOBILE_*` setting of the installed service (your environment overrides it); see [docs/setup.md](docs/setup.md).
+
    **New bots work on the phone automatically.** Hermes's API server refuses a bot without an `API_SERVER_KEY`, so when
    a bot appears that the gateway serves but that has never had a key, the bridge backs up its `.env` to
    `~/.hermes/backups/hermes-mobile-auto/` and adds one, once the `.env` has been unchanged for 30 s. Each bot gets this

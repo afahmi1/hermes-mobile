@@ -127,8 +127,8 @@ class Base(unittest.TestCase):
         env = {"HERMES_MOBILE_PROJECTS_CATALOG": str(tmp / "cat.json"),
                "HERMES_MOBILE_WORKSPACES": json.dumps(ALLOW),
                "HERMES_MOBILE_OWNER_MANAGED": "1",
-               "HERMES_MOBILE_MANAGEABLE_BOTS": json.dumps(["bot-b", "quiet", "default", "health-coach", "ghost"]),
-               "HERMES_MOBILE_PERSONA_HOSTS": json.dumps(["bot-a", "quiet", "health-coach", "ghost"])}
+               "HERMES_MOBILE_MANAGEABLE_BOTS": json.dumps(["bot-b", "quiet", "default", "ghost"]),
+               "HERMES_MOBILE_PERSONA_HOSTS": json.dumps(["bot-a", "quiet", "ghost"])}
         self.enterContext(patch.dict(os.environ, env))
         self.enterContext(patch.object(bridge, "HERMES", HOME))
         self.enterContext(patch.object(bridge, "STATE_DIR", self.state))
