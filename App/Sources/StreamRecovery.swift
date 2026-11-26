@@ -31,6 +31,9 @@ struct StreamRecovery {
         failures = 0
     }
 
+    /// The bridge answered: the next failure starts the backoff from the shortest delay again.
+    mutating func connected() { failures = 0 }
+
     /// Equal jitter avoids a tight loop after an empty stream and spreads reconnects.
     mutating func retryDelay() -> Double? {
         failures += 1

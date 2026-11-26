@@ -1520,7 +1520,7 @@ def session_bodies(pid, session_id):
             return []
         active = db.resolve_resume_session_id(session_id)
         rows = db.get_messages(active, limit=1000, offset=0, latest=True,
-                               include_compacted=False, include_ancestors=True)
+                               include_compacted=True, include_ancestors=True)
         out = []
         for row in rows:
             shaped = APIServerAdapter._message_response(row)
@@ -1543,8 +1543,10 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
         # One extra raw row tells the phone whether another page exists. Projected pages are shorter
         # (hidden tool rows are dropped), so the phone cannot infer this from the row count.
         probe = None if limit is None else limit + 1
+        # include_compacted: the DISPLAY history, as the desktop app reads it. Without it a compacted chat
+        # shows only the person's own messages (Hermes keeps those verbatim) and none of the answers.
         rows = db.get_messages(active, limit=probe, offset=offset, latest=latest,
-                               include_compacted=False, include_ancestors=True)
+                               include_compacted=True, include_ancestors=True)
         if limit is not None and len(rows) > limit:
             page, has_more = rows[-limit:], True
         else:

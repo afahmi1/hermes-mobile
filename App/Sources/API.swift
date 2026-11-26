@@ -761,7 +761,14 @@ final class API: @unchecked Sendable {
                             guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
                             guard http.statusCode == 200 else { throw APIError.http(http.statusCode, "") }  // 404 = turn gone
                             let wireEpoch = http.value(forHTTPHeaderField: "X-Hermes-Replay-Epoch")
+                            // Liveness, not content: "connected" the moment the bridge answers, and "alive" on each
+                            // bridge heartbeat, so the chat can tell a quiet reply from a dead socket.
+                            continuation.yield(RunEvent(seq: nil, name: "stream.open", raw: [:], replayEpoch: wireEpoch))
                             for try await line in bytes.lines {
+                                if line.hasPrefix(": keepalive") {
+                                    continuation.yield(RunEvent(seq: nil, name: "stream.alive", raw: [:], replayEpoch: wireEpoch))
+                                    continue
+                                }
                                 guard line.hasPrefix("data:") else { continue }
                                 let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
                                 guard let d = payload.data(using: .utf8),

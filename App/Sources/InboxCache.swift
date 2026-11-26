@@ -78,6 +78,50 @@ struct Outgoing: Codable, Identifiable, Equatable {
 
     var onMac: Bool { admission != nil }
     var label: String { text.isEmpty ? "\(files) attachment\(files == 1 ? "" : "s")" : text }
+
+    /// The one place that says what state a waiting message is in. Every screen and decision reads this,
+    /// never the raw fields, so a new field can't create a state nobody handles.
+    enum Phase: Equatable {
+        case onPhone            // saved here, never tried
+        case retrying           // tried, no answer yet: may or may not be on the Mac
+        case needsYou(String)   // the bridge refused it; the person decides
+        case onMac(String)      // in Hermes's queue under this admission
+        case editPending(String) // an edit waits until the original's place is confirmed
+    }
+
+    var phase: Phase {
+        if let problem { return .needsYou(problem) }
+        if let edit, attempts > 0 || admission != nil { return .editPending(edit) }
+        if let admission { return .onMac(admission) }
+        return attempts > 0 ? .retrying : .onPhone
+    }
+
+    /// Transitions. Each returns the next value; nothing else mutates these fields.
+    func attempted() -> Outgoing { var o = self; o.attempts += 1; return o }
+    func accepted(admission: String, files: Int) -> Outgoing {
+        var o = self; o.admission = admission; o.attachments = nil; o.files = files; o.problem = nil; return o
+    }
+    func refused(_ reason: String) -> Outgoing { var o = self; o.problem = reason.isEmpty ? "Hermes refused this message." : reason; return o }
+    /// An edit: instant while it never left the phone, otherwise held until the Mac confirms where it is.
+    func edited(_ text: String) -> Outgoing {
+        var o = self
+        switch phase {
+        case .onPhone, .needsYou:
+            o.text = text; o.problem = nil; o.edit = nil
+        case .retrying, .onMac, .editPending:
+            o.edit = text
+        }
+        return o
+    }
+    func editApplied(admission: String) -> Outgoing {
+        var o = self; o.text = edit ?? text; o.edit = nil; o.admission = admission; return o
+    }
+    /// A steer whose reply ended becomes the next message, and says so.
+    func demotedToQueue(note: String) -> Outgoing {
+        var o = self
+        if o.mode == "steer" { o.mode = "queue"; o.note = note }
+        return o
+    }
 }
 
 actor InboxDisk {
