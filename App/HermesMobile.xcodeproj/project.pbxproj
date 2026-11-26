@@ -34,6 +34,7 @@
 		A4A842B468F6E4BFD7629888 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBF6F2AB0BD3858AAAAF4FFA /* AppModel.swift */; };
 		B16507F21903C2EEF6219FFB /* Projects.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD07289071E7483A587F926 /* Projects.swift */; };
 		B720454FD199801DFD0CDB87 /* ReplyNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */; };
+		BB68DFC49A2486A264232013 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B7ADE2F1616D13629C51A3B /* PushRegistration.swift */; };
 		C6254CDC81B9E435FBB3B981 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77BE1304B3824EAD4CAE8086 /* SignInView.swift */; };
 		CE8872AD244AC2FE04FB85DB /* API.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1476455C52D00777817E0CF2 /* API.swift */; };
 		DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2964B8E32E7A6E7CAE8E6CD /* Models.swift */; };
@@ -43,6 +44,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		0B7ADE2F1616D13629C51A3B /* PushRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushRegistration.swift; sourceTree = "<group>"; };
 		0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplyNotifier.swift; sourceTree = "<group>"; };
 		1476455C52D00777817E0CF2 /* API.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = API.swift; sourceTree = "<group>"; };
 		149305800C6FA857809273F1 /* DeletionPinView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionPinView.swift; sourceTree = "<group>"; };
@@ -59,6 +61,7 @@
 		81D8AF5D872DE5BB11D76FA3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		84E690DA9F04A70286E6A83B /* StreamRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamRecovery.swift; sourceTree = "<group>"; };
 		88150F0A49310BFAA320BF50 /* ChatMedia.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMedia.swift; sourceTree = "<group>"; };
+		8D1BD1BBC66787BAACBBF154 /* HermesMobile.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HermesMobile.entitlements; sourceTree = "<group>"; };
 		8E0CEC74256653C26970ED7B /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		A7064B9C91B578271B8CD8CC /* ManagementAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagementAPI.swift; sourceTree = "<group>"; };
 		AA8AF41DA7F59809B8B46AA5 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
@@ -95,6 +98,7 @@
 				C87199BB4AB4041206610E84 /* MediaStaging.swift */,
 				B2964B8E32E7A6E7CAE8E6CD /* Models.swift */,
 				AAD07289071E7483A587F926 /* Projects.swift */,
+				0B7ADE2F1616D13629C51A3B /* PushRegistration.swift */,
 				D8B09A12DF8227E0055AF3A1 /* RecentModels.swift */,
 				0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */,
 				785C4DB8C31E64EB728F4674 /* StatusModel.swift */,
@@ -125,6 +129,7 @@
 			isa = PBXGroup;
 			children = (
 				D7223536BDFD6A8A524C9B2B /* Assets.xcassets */,
+				8D1BD1BBC66787BAACBBF154 /* HermesMobile.entitlements */,
 				81D8AF5D872DE5BB11D76FA3 /* Info.plist */,
 				E7B82EEB179DC61751CFE04C /* PrivacyInfo.xcprivacy */,
 			);
@@ -256,6 +261,7 @@
 				B16507F21903C2EEF6219FFB /* Projects.swift in Sources */,
 				13EC70EBF845B6FBB26EADC7 /* ProjectsView.swift in Sources */,
 				9871CAA201B1E5134B060C34 /* ProviderUsageView.swift in Sources */,
+				BB68DFC49A2486A264232013 /* PushRegistration.swift in Sources */,
 				808875C4E9669A8894F742F5 /* RecentModels.swift in Sources */,
 				B720454FD199801DFD0CDB87 /* ReplyNotifier.swift in Sources */,
 				2D4D15E7A8B918383BC236CB /* RuntimeSheet.swift in Sources */,
@@ -396,8 +402,10 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 8E0CEC74256653C26970ED7B /* Base.xcconfig */;
 			buildSettings = {
+				APS_ENVIRONMENT = development;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Resources/HermesMobile.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				ENABLE_PREVIEWS = YES;
@@ -416,8 +424,10 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 8E0CEC74256653C26970ED7B /* Base.xcconfig */;
 			buildSettings = {
+				APS_ENVIRONMENT = production;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Resources/HermesMobile.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				ENABLE_PREVIEWS = YES;
