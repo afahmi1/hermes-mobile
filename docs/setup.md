@@ -32,6 +32,11 @@ iPhone app (App/)  ──HTTPS over Tailscale──▶  bridge (Bridge/, port 91
      from `…/current`.
    * macOS blocks launch agents from reading `~/Desktop`, `~/Documents` and `~/Downloads`, so a service can't run
      straight from a clone there.
+   * **Code-only redeploy:** run `Bridge/install.sh` again. With unchanged settings the service definition is identical
+     (it points at the `current` symlink), so the installer skips the launchd reload and restarts the loaded job with
+     `launchctl kickstart -k`. That works from automation that can't run `launchctl bootstrap`. A first install, a
+     changed setting or port, or an unloaded job still does bootout and bootstrap. On Linux it runs `daemon-reload`
+     only when the unit changed, and always restarts. The installer prints which path it took.
    * The installer keeps the three newest releases and never deletes one that a service still runs from.
    * Optional: `Status/install.sh` (macOS) adds the status dashboard on port 9230.
 2. **Put it on the tailnet:** `tailscale serve --bg --https=10001 http://127.0.0.1:9131`
