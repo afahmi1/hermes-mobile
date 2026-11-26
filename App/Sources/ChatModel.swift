@@ -584,6 +584,13 @@ final class ChatModel {
                 : try await api.pin(profile: profile, session: sid, message: mid)
             guard sessionId == sid else { return }
             pins = latest
+        } catch where ActionQueue.isOffline(error) {
+            guard let account = API.shared.accountID else { return }
+            let unpinning = isPinned(item)
+            _ = await ActionQueue.shared.perform(QueuedAction(account: account, kind: unpinning ? .unpinMessage : .pinMessage,
+                                                              profile: profile, session: sid, message: mid))
+            if unpinning { pins.removeAll { $0.messageId == mid } }
+            self.error = unpinning ? nil : "Saved. It's pinned as soon as your Mac answers."
         } catch {
             self.error = error.localizedDescription
         }
@@ -594,6 +601,11 @@ final class ChatModel {
         do {
             let latest = try await api.unpin(profile: profile, session: sid, message: pin.messageId)
             if sessionId == sid { pins = latest }
+        } catch where ActionQueue.isOffline(error) {
+            guard let account = API.shared.accountID else { return }
+            _ = await ActionQueue.shared.perform(QueuedAction(account: account, kind: .unpinMessage, profile: profile,
+                                                              session: sid, message: pin.messageId))
+            pins.removeAll { $0.messageId == pin.messageId }
         } catch { self.error = error.localizedDescription }
     }
 
