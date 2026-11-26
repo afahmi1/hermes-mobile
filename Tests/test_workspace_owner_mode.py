@@ -2,6 +2,7 @@
 
 Synthetic HERMES_HOME, synthetic catalog, ephemeral loopback port. No network, no live bridge.
 """
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import base64
 import hashlib
 import http.client
@@ -24,7 +25,7 @@ CATALOG = {"schema_version": 1, "roots": [], "projects": [
     {"id": "delta", "title": "Delta", "bot_ids": []},
     {"id": "zero", "title": "Zero", "bot_ids": ["bot-z"]},
 ]}
-ELIGIBLE = ["bot-a", "bot-b", "quiet", "nokey", "robinhood-cli", "ghost"]
+ELIGIBLE = ["bot-a", "bot-b", "quiet", "nokey", "ghost"]
 OWNER_ENV = {"HERMES_MOBILE_OWNER_MANAGED": "1", "HERMES_MOBILE_WORKSPACE_BOTS": json.dumps(ELIGIBLE)}
 
 
@@ -185,7 +186,7 @@ class AssignmentTests(Base):
         self.assertEqual(self.srv.req("GET", "/m/workspaces")[1]["profiles"], ["bot-a"])
 
     def test_rejections_change_nothing(self):
-        # ghost unknown, robinhood-cli protected name, quiet opted out, nokey no key, bot-b not in alpha's catalog list
+        # ghost unknown, robinhood-cli protected name and unlisted, quiet opted out, nokey no key, bot-b not in alpha's catalog list
         for bad in ("ghost", "robinhood-cli", "quiet", "nokey", "bot-b", "default", "bot-zz", "../x"):
             st, d = self.put_assign("alpha", ["bot-a", bad], 0)
             self.assertEqual((st, d.get("code")), (403, "not_eligible"), bad)

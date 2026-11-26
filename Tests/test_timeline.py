@@ -1,3 +1,4 @@
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import hashlib
 import json
 import sqlite3

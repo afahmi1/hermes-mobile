@@ -1,4 +1,5 @@
 """Replay retention, checkpoint boundaries and shared fanout bytes."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import http.client
 import importlib
 import json

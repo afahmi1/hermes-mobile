@@ -32,6 +32,11 @@ iPhone app (App/)  ──HTTPS over Tailscale──▶  bridge (Bridge/, port 91
      from `…/current`.
    * macOS blocks launch agents from reading `~/Desktop`, `~/Documents` and `~/Downloads`, so a service can't run
      straight from a clone there.
+   * **Code-only redeploy:** run `Bridge/install.sh` again. With unchanged settings the service definition is identical
+     (it points at the `current` symlink), so the installer skips the launchd reload and restarts the loaded job with
+     `launchctl kickstart -k`. That works from automation that can't run `launchctl bootstrap`. A first install, a
+     changed setting or port, or an unloaded job still does bootout and bootstrap. On Linux it runs `daemon-reload`
+     only when the unit changed, and always restarts. The installer prints which path it took.
    * The installer keeps the three newest releases and never deletes one that a service still runs from.
    * Optional: `Status/install.sh` (macOS) adds the status dashboard on port 9230.
 2. **Put it on the tailnet:** `tailscale serve --bg --https=10001 http://127.0.0.1:9131`
@@ -46,6 +51,13 @@ iPhone app (App/)  ──HTTPS over Tailscale──▶  bridge (Bridge/, port 91
 
    Never paste a code or password into a chat log.
 5. **Done** when the doctor exits 0 and the phone lists the person's chats.
+
+**Reinstalling keeps your settings.** `install.sh` writes every `HERMES_MOBILE_*` variable in its environment
+(`OWNER_LOGIN`, `OWNER_MANAGED`, `TRUST_TAILSCALE_SERVE`, `WORKSPACE_BOTS`, `PERSONA_HOSTS`, `MANAGEABLE_BOTS`, the push
+settings and so on) into the service, except the installer-only `HERMES_MOBILE_LABEL`. If a service with the same label
+is already installed, its `HERMES_MOBILE_*` settings are the defaults, and your environment overrides them. A variable
+set to the empty string removes that setting. The installer prints the names it kept, never the values. A systemd unit
+can't hold a newline in a value; the installer refuses it with a message.
 
 **Uninstall:** run `Bridge/install.sh --uninstall`, or remove the Windows scheduled tasks. The Tailscale route stays
 until you run `tailscale serve --https=10001 off`.

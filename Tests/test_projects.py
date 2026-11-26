@@ -1,3 +1,4 @@
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import copy
 import http.client
 import importlib
@@ -313,7 +314,7 @@ class FileSafetyTests(Base):
 
     def test_install_script_uses_plutil_insert_string(self):
         s = (BRIDGE_DIR / "install.sh").read_text()
-        self.assertIn("plutil -insert EnvironmentVariables.HERMES_MOBILE_PROJECTS_CATALOG -string", s)
+        self.assertIn('plutil -insert "EnvironmentVariables.$_name" -string "${!_name}"', s)
         self.assertLess(s.index("-insert"), s.index("plutil -lint"))
 
 

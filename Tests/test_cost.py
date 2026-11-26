@@ -1,4 +1,5 @@
 """Per-reply cost from Hermes's ledger: subscription routes are included, unknown routes are not $0."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import sqlite3
 import sys
 import tempfile

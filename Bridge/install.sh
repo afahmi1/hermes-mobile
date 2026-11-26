@@ -5,6 +5,11 @@
 #   ./install.sh            install (or update) and start it
 #   ./install.sh --uninstall stop and remove it
 #
+# A code-only redeploy (same settings, so the same service definition) needs no launchd reload: macOS restarts the
+# loaded job with `launchctl kickstart -k`, so it works from automation that can't run `launchctl bootstrap`.
+# bootout + bootstrap run only on a first install, a changed definition, or when the job isn't loaded. On Linux,
+# daemon-reload runs only when the unit changed and the service is always restarted. Which path ran is printed.
+#
 # Env overrides: HERMES_HOME (default ~/.hermes), HERMES_PYTHON (Hermes's venv python),
 # HERMES_MOBILE_PORT (default 9131), HERMES_MOBILE_LABEL (default local.hermes-mobile.bridge),
 # HERMES_MOBILE_PROJECTS_CATALOG (optional absolute path to a project catalog JSON; off if unset),
@@ -12,6 +17,11 @@
 # opts those project/bot pairs in to Project instructions, files, chats and output files. Needs the catalog.
 # Single owner only. Paired phones can chat and approve tools, while owner grants control workspace changes.
 # Do not enable it on a shared or multi-user bridge.)
+# Every other HERMES_MOBILE_* variable in your environment (HERMES_MOBILE_OWNER_LOGIN, _OWNER_MANAGED,
+# _TRUST_TAILSCALE_SERVE, _WORKSPACE_BOTS, _PERSONA_HOSTS, _MANAGEABLE_BOTS, ...) is written into the service too,
+# except installer-only HERMES_MOBILE_LABEL. If a service with the same label is already installed, its
+# HERMES_MOBILE_* settings are the defaults, so re-running never loses configuration; your environment wins, and
+# a variable set to the empty string removes that setting. Only setting names are printed, never values.
 # Push notifications (optional, see README "Push notifications"): HERMES_MOBILE_APNS_KEY_PATH (the .p8),
 # HERMES_MOBILE_APNS_KEY_ID, HERMES_MOBILE_APNS_TEAM_ID and HERMES_MOBILE_APNS_TOPIC (the app's bundle ID;
 # defaults to HERMES_BUNDLE_ID from App/Config/Signing.xcconfig). Set all three of key path, key ID and team ID or none.
@@ -48,6 +58,16 @@ if ! hermes_python; then
   echo "Set HERMES_PYTHON=/path/to/python and run again." >&2
   exit 1
 fi
+# Settings: the installed service's HERMES_MOBILE_* values are defaults, the caller's environment overrides.
+# install_env.py prints NAME NUL VALUE NUL records (and the names it carried over, on stderr).
+MOBILE_NAMES=()
+if [[ "$OS" == "Linux" ]]; then EXISTING_FLAG=(--unit "$UNIT"); else EXISTING_FLAG=(--plist "$PLIST"); fi
+while IFS= read -r -d '' _name && IFS= read -r -d '' _val; do
+  export "$_name=$_val"
+  MOBILE_NAMES+=("$_name")
+done < <("$PY" "$HERE/install_env.py" "${EXISTING_FLAG[@]}")
+PORT="${HERMES_MOBILE_PORT:-9131}"
+
 # Run from a private copy, not from the clone: macOS refuses launch agents access to ~/Desktop, ~/Documents and
 # ~/Downloads (where people clone things), and a copy keeps running while you edit or pull the repo.
 SRC="$HERE"
@@ -100,10 +120,27 @@ if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
   fi
 fi
 
+# The settings to write: everything collected above, except the port (the template carries it) and the push
+# settings when push is off. The topic may have come from Signing.xcconfig.
+if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" && -n "$TOPIC" ]]; then export HERMES_MOBILE_APNS_TOPIC="$TOPIC"; MOBILE_NAMES+=(HERMES_MOBILE_APNS_TOPIC); fi
+WRITE_NAMES=()
+for _name in "${MOBILE_NAMES[@]+"${MOBILE_NAMES[@]}"}"; do
+  [[ "$_name" == HERMES_MOBILE_PORT ]] && continue
+  [[ "$_name" == HERMES_MOBILE_APNS_* && -z "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]] && continue
+  [[ " ${WRITE_NAMES[*]-} " == *" $_name "* ]] && continue
+  if [[ "$OS" == "Linux" && "${!_name}" == *[[:cntrl:]]* ]]; then
+    echo "$_name has a newline or control character, which a systemd unit can't hold. Put it on one line." >&2
+    exit 1
+  fi
+  WRITE_NAMES+=("$_name")
+done
+
 mkdir -p "$HERMES_HOME/mobile"
 if [[ "$OS" == "Linux" ]]; then
   # A systemd user service. `loginctl enable-linger $USER` keeps it running when you're logged out.
   mkdir -p "$(dirname "$UNIT")"
+  NEW_UNIT="$(mktemp "${TMPDIR:-/tmp}/hermes-mobile-unit.XXXXXX")"
+  trap 'rm -f "$NEW_UNIT"' EXIT
   {
     echo "[Unit]"
     echo "Description=Hermes Mobile bridge (phone companion for Hermes Agent)"
@@ -114,14 +151,11 @@ if [[ "$OS" == "Linux" ]]; then
     echo "Environment=HERMES_HOME=$HERMES_HOME"
     echo "Environment=HERMES_MOBILE_PORT=$PORT"
     [[ -n "${HERMES_PYTHON:-}" ]] && echo "Environment=HERMES_PYTHON=$HERMES_PYTHON"
-    [[ -n "${HERMES_MOBILE_PROJECTS_CATALOG:-}" ]] && echo "Environment=HERMES_MOBILE_PROJECTS_CATALOG=$HERMES_MOBILE_PROJECTS_CATALOG"
-    [[ -n "${HERMES_MOBILE_WORKSPACES:-}" ]] && echo "Environment='HERMES_MOBILE_WORKSPACES=$HERMES_MOBILE_WORKSPACES'"
-    if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
-      echo "Environment=HERMES_MOBILE_APNS_KEY_PATH=$HERMES_MOBILE_APNS_KEY_PATH"
-      echo "Environment=HERMES_MOBILE_APNS_KEY_ID=$HERMES_MOBILE_APNS_KEY_ID"
-      echo "Environment=HERMES_MOBILE_APNS_TEAM_ID=$HERMES_MOBILE_APNS_TEAM_ID"
-      [[ -n "$TOPIC" ]] && echo "Environment=HERMES_MOBILE_APNS_TOPIC=$TOPIC"
-    fi
+    for _name in "${WRITE_NAMES[@]+"${WRITE_NAMES[@]}"}"; do
+      _val="${!_name}"
+      _val="${_val//\\/\\\\}"; _val="${_val//\"/\\\"}"; _val="${_val//%/%%}"
+      echo "Environment=\"$_name=$_val\""
+    done
     echo "Restart=always"
     echo "RestartSec=5"
     echo "StandardOutput=append:$LOG"
@@ -129,33 +163,47 @@ if [[ "$OS" == "Linux" ]]; then
     echo
     echo "[Install]"
     echo "WantedBy=default.target"
-  } > "$UNIT"
-  systemctl --user daemon-reload
+  } > "$NEW_UNIT"
+  # daemon-reload only when the unit changed; the service is always restarted so the new release runs.
+  if [[ -f "$UNIT" ]] && cmp -s "$NEW_UNIT" "$UNIT"; then
+    echo "Service definition unchanged: restarting without a daemon-reload."
+  else
+    cp "$NEW_UNIT" "$UNIT"
+    systemctl --user daemon-reload
+    echo "Service definition changed: unit installed and daemon reloaded."
+  fi
   systemctl --user enable --now hermes-mobile-bridge.service
   systemctl --user restart hermes-mobile-bridge.service
 else
   mkdir -p "$HOME/Library/LaunchAgents"
+  # Build the new definition aside; only replace the installed one if it really differs.
+  NEW_PLIST="$(mktemp "${TMPDIR:-/tmp}/hermes-mobile-plist.XXXXXX")"
+  trap 'rm -f "$NEW_PLIST"' EXIT
   sed -e "s#__LABEL__#$LABEL#g" -e "s#__RUNNER__#$HERE/run-bridge.sh#g" \
       -e "s#__PORT__#$PORT#g" -e "s#__LOG__#$LOG#g" -e "s#__HERMES_HOME__#$HERMES_HOME#g" \
-      "$HERE/hermes-mobile-bridge.plist.template" > "$PLIST"
+      "$HERE/hermes-mobile-bridge.plist.template" > "$NEW_PLIST"
   if [[ -n "${HERMES_PYTHON:-}" ]]; then
-    plutil -insert EnvironmentVariables.HERMES_PYTHON -string "$HERMES_PYTHON" "$PLIST"
+    plutil -insert EnvironmentVariables.HERMES_PYTHON -string "$HERMES_PYTHON" "$NEW_PLIST"
   fi
-  if [[ -n "${HERMES_MOBILE_PROJECTS_CATALOG:-}" ]]; then
-    plutil -insert EnvironmentVariables.HERMES_MOBILE_PROJECTS_CATALOG -string "$HERMES_MOBILE_PROJECTS_CATALOG" "$PLIST"
+  for _name in "${WRITE_NAMES[@]+"${WRITE_NAMES[@]}"}"; do
+    plutil -insert "EnvironmentVariables.$_name" -string "${!_name}" "$NEW_PLIST"
+  done
+  plutil -lint "$NEW_PLIST" >/dev/null
+  # `current` is a symlink and the plist points through it, so a code-only update leaves the definition identical.
+  # Then kickstart (restart from the loaded definition) is enough: no bootout/bootstrap, which sandboxed
+  # automation can't run.
+  if [[ -f "$PLIST" ]] && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 \
+     && "$PY" -c 'import plistlib, sys
+a, b = (plistlib.load(open(p, "rb")) for p in sys.argv[1:3])
+sys.exit(0 if a == b else 1)' "$PLIST" "$NEW_PLIST" 2>/dev/null; then
+    echo "Service definition unchanged: restarting with kickstart (no bootstrap)."
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+  else
+    echo "Service definition new or changed: installing it with bootout and bootstrap."
+    cp "$NEW_PLIST" "$PLIST"
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
   fi
-  if [[ -n "${HERMES_MOBILE_WORKSPACES:-}" ]]; then
-    plutil -insert EnvironmentVariables.HERMES_MOBILE_WORKSPACES -string "$HERMES_MOBILE_WORKSPACES" "$PLIST"
-  fi
-  if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
-    plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_KEY_PATH -string "$HERMES_MOBILE_APNS_KEY_PATH" "$PLIST"
-    plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_KEY_ID -string "$HERMES_MOBILE_APNS_KEY_ID" "$PLIST"
-    plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_TEAM_ID -string "$HERMES_MOBILE_APNS_TEAM_ID" "$PLIST"
-    [[ -n "$TOPIC" ]] && plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_TOPIC -string "$TOPIC" "$PLIST"
-  fi
-  plutil -lint "$PLIST" >/dev/null
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
 fi
 sleep 2
 if curl -fsS "http://127.0.0.1:$PORT/m/ping" >/dev/null; then

@@ -3,6 +3,7 @@
 Only the outside edges are mocked (WorkspaceStore, turns.connect / turns._rpc); the bridge handler, the
 allowlist/catalog/profile gates and the real turn engine run unmodified. HERMES_HOME is synthetic.
 """
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import asyncio
 import base64
 import contextlib

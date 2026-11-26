@@ -1,4 +1,5 @@
 """Slice B: owner management over HTTP (projects, bots, PIN archive). Synthetic HERMES_HOME, PIN and gateway only."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import asyncio
 import base64
 import contextlib
@@ -127,8 +128,8 @@ class Base(unittest.TestCase):
         env = {"HERMES_MOBILE_PROJECTS_CATALOG": str(tmp / "cat.json"),
                "HERMES_MOBILE_WORKSPACES": json.dumps(ALLOW),
                "HERMES_MOBILE_OWNER_MANAGED": "1",
-               "HERMES_MOBILE_MANAGEABLE_BOTS": json.dumps(["bot-b", "quiet", "default", "health-coach", "ghost"]),
-               "HERMES_MOBILE_PERSONA_HOSTS": json.dumps(["bot-a", "quiet", "health-coach", "ghost"])}
+               "HERMES_MOBILE_MANAGEABLE_BOTS": json.dumps(["bot-b", "quiet", "default", "ghost"]),
+               "HERMES_MOBILE_PERSONA_HOSTS": json.dumps(["bot-a", "quiet", "ghost"])}
         self.enterContext(patch.dict(os.environ, env))
         self.enterContext(patch.object(bridge, "HERMES", HOME))
         self.enterContext(patch.object(bridge, "STATE_DIR", self.state))
@@ -582,7 +583,7 @@ class LeakTests(Base):
 class CliTests(unittest.TestCase):
     def test_issue_owner_token_and_rotate(self):
         home = Path(tempfile.mkdtemp(prefix="manage-cli-")).resolve()
-        env = dict(os.environ, HERMES_HOME=str(home))
+        env = dict(os.environ, HERMES_HOME=str(home), HERMES_MOBILE_STATE_DIR=str(home / "mobile"))
         script = str(BRIDGE_DIR / "hermes_mobile_bridge.py")
 
         def run(*args):

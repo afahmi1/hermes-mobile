@@ -256,7 +256,8 @@ class PrimaryReceipts(unittest.TestCase):
         with patch.dict(sys.modules, {"gateway.platforms.base": platform}), patch.object(bridge_media, "supported", return_value=True):
             t = self.start(attachments=[row])
             path = Path(t.media[0]["path"])
-            self.assertEqual(path.parent, self.directory.resolve())
+            # Staged in the bot's own gateway image cache (<home>/cache/images), not the bridge's.
+            self.assertEqual(path.parent, (self.directory / "cache" / "images").resolve())
             self.assertNotEqual(path.name, row["filename"])
             with self.assertRaises(engine.TurnError):
                 self.start(attachments=[attachment("blue")])
