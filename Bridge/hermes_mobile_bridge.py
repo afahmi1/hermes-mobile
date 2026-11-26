@@ -571,7 +571,7 @@ def manageable_bots():
         return []
     live = set(profile_ids()) - archived_live_bots()
     return sorted({b for b in listed if isinstance(b, str) and b != "default" and PROFILE_RE.match(b)
-                   and b in live and not profile_protected(b)})
+                   and b in live and not profile_protected(b, explicit=True)})
 
 
 def persona_hosts():
@@ -582,7 +582,7 @@ def persona_hosts():
     except ValueError:
         return []
     live = set(profile_ids()) - archived_live_bots()
-    return sorted({b for b in listed if isinstance(b, str) and b in live and not profile_protected(b)})
+    return sorted({b for b in listed if isinstance(b, str) and b in live and not profile_protected(b, explicit=True)})
 
 
 class _NoStore:  # persona-only turns: no output directory, nothing to capture
@@ -1302,17 +1302,25 @@ def workspace_allowlist():
         return {}
 
 
-def profile_protected(pid):
-    """Generic exclusions on top of the explicit allowlist: unreachable bots and bots the owner opted out
-    of the phone (the same `# hermes-mobile: no-key` marker the key watcher honours)."""
-    # This is independent of current availability/keys. The operator allowlist must
-    # also exclude any differently named private or special-purpose profile.
-    parts = set(re.split(r"[-_]", pid))
-    if parts & {"health", "journal", "journaling", "trading", "robinhood", "captains", "captain", "wellness",
-                "portfolio", "stocks", "trader", "doctor", "medical", "bacta", "finance", "bank", "banking",
-                   "therapy", "secrets", "vault"} or not key_for(pid):
+def profile_protected(pid, explicit=False):
+    """True when a bot must stay off the phone's operator-managed surfaces.
+
+    Always protected: no API key (key_for) or the `# hermes-mobile: no-key` opt-out marker in its .env
+    (the same marker the key watcher honours). On top of that, a NAME heuristic excludes private or
+    special-purpose profiles (health, journal, trading, ...). `explicit=True` means the operator named this
+    bot in the env list being evaluated (MANAGEABLE_BOTS, PERSONA_HOSTS, WORKSPACE_BOTS or WORKSPACES), and
+    that skips only the name heuristic. Key and opt-out checks still apply. A bot nobody named is never
+    reached through here."""
+    if not key_for(pid):
         return True
-    return OPT_OUT in env_text(profile_home(pid) / ".env")
+    if OPT_OUT in env_text(profile_home(pid) / ".env"):
+        return True
+    if explicit:
+        return False
+    parts = set(re.split(r"[-_]", pid))
+    return bool(parts & {"health", "journal", "journaling", "trading", "robinhood", "captains", "captain",
+                         "wellness", "portfolio", "stocks", "trader", "doctor", "medical", "bacta", "finance",
+                         "bank", "banking", "therapy", "secrets", "vault"})
 
 
 def workspace_catalog():
@@ -1352,7 +1360,9 @@ def workspace_base_eligible():
             return set()
         named = set(doc)
     live = set(profile_ids()) - archived_live_bots()
-    return {b for b in named if b in live and not profile_protected(b)}
+    # Every bot in `named` came from an operator env list (WORKSPACE_BOTS, or the WORKSPACES allowlist when
+    # WORKSPACE_BOTS is absent), so each one is explicitly named.
+    return {b for b in named if b in live and not profile_protected(b, explicit=True)}
 
 
 def workspace_eligible(project, catalog, base=None):
@@ -1408,7 +1418,7 @@ def workspace_grants():
         if project not in catalog:
             continue
         listed = catalog[project]
-        ok = {b for b in bots if (not listed or b in listed) and b in live and not profile_protected(b)}
+        ok = {b for b in bots if (not listed or b in listed) and b in live and not profile_protected(b, explicit=True)}
         if ok:
             grants[project] = ok
     return grants

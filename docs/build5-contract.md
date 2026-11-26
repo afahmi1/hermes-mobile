@@ -27,7 +27,7 @@ Settings:
   Off => build-4 behaviour exactly (only allowlisted projects; assignment read-only).
 - `HERMES_MOBILE_WORKSPACE_BOTS` (new, optional JSON list of profile ids): operator-defined eligible set. Absent =>
   union of the bots named in `HERMES_MOBILE_WORKSPACES`. Malformed => empty (fail closed, workspaces still visible).
-  Eligible for project P = that set ∩ live `profile_ids()` ∩ not `profile_protected()` ∩ catalog `bot_ids` of P when
+  Eligible for project P = that set ∩ live `profile_ids()` ∩ no key / opt-out (`profile_protected(b, explicit=True)`; a bot named in this list or in `HERMES_MOBILE_WORKSPACES` skips the protected-NAME check) ∩ catalog `bot_ids` of P when
   that list is non-empty.
 - Active grants (owner mode) for P = stored assignment of P ∩ eligible(P), P in current catalog. Used for chat
   creation, turns (`prepare_workspace_turn`), artifact visibility. Workspace *visibility/editing* needs only that P
@@ -82,8 +82,8 @@ Routes (all `owner_ok`; owner mode off => 403 `code:"owner_required"`):
 - `GET /m/manage/archived` -> `{projects:[...], bots:[...]}`.
 - `GET /m/manage/bots` -> `{personas:[...], hosts:[...], manageable:[...]}`.
 - `POST /m/manage/bots` `{name, persona, host}` -> 201 persona bot. Host from operator list
-  `HERMES_MOBILE_PERSONA_HOSTS` (JSON) ∩ live ∩ not protected; absent => no hosts (fail closed).
+  `HERMES_MOBILE_PERSONA_HOSTS` (JSON) ∩ live ∩ has a key and no opt-out (listed bots skip the protected-name check); absent => no hosts (fail closed).
 - `POST /m/manage/bots/<id>/chats` `{title?}` -> creates a session on the host and links it to the persona.
 - `POST /m/manage/bots/<id>/archive` `{pin}`; `.../restore`. Live profiles archivable only if listed in
-  `HERMES_MOBILE_MANAGEABLE_BOTS` and never `default` or protected; archive = hidden from `/m/bots` and grants;
+  `HERMES_MOBILE_MANAGEABLE_BOTS` and never `default`, keyless or opted out (listed bots skip the protected-name check); archive = hidden from `/m/bots` and grants;
   nothing on disk under profiles/ is touched.
