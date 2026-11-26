@@ -242,6 +242,24 @@ def _private_dir(home, name, label):
     return directory
 
 
+def _image_dir(home):
+    """The image staging dir of the gateway that serves ``home``. The gateway only admits native images
+    staged directly inside ITS image cache, which is per profile (<home>/cache/images). The bridge process
+    runs under the default home, so its own get_image_cache_dir() is the wrong dir for every other bot
+    (prompt.submit then fails with invalid_params)."""
+    from gateway.platforms.base import get_image_cache_dir
+    own = get_image_cache_dir().resolve()
+    try:
+        from hermes_constants import get_hermes_dir, get_hermes_home
+        if Path(home).resolve() == Path(get_hermes_home()).resolve():
+            return own
+        directory = Path(get_hermes_dir("cache/images", "image_cache", home=Path(home).resolve()))
+    except ImportError:
+        return own
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory.resolve()
+
+
 def _clip_dir(home):
     return _private_dir(home, "mobile-video-inputs", "video")
 
@@ -281,8 +299,7 @@ def stage(frames, home):
             if mime == MP4:
                 directory, ext = _clip_dir(home), ".mp4"
             elif mime == JPEG:
-                from gateway.platforms.base import get_image_cache_dir
-                directory, ext = get_image_cache_dir().resolve(), ".jpg"
+                directory, ext = _image_dir(home), ".jpg"
             else:
                 directory, ext = _file_dir(home), _extension(name)
             with tempfile.NamedTemporaryFile(prefix="hm_send_", suffix=ext, dir=directory, delete=False) as f:
