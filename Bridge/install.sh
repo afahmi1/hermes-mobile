@@ -5,6 +5,11 @@
 #   ./install.sh            install (or update) and start it
 #   ./install.sh --uninstall stop and remove it
 #
+# A code-only redeploy (same settings, so the same service definition) needs no launchd reload: macOS restarts the
+# loaded job with `launchctl kickstart -k`, so it works from automation that can't run `launchctl bootstrap`.
+# bootout + bootstrap run only on a first install, a changed definition, or when the job isn't loaded. On Linux,
+# daemon-reload runs only when the unit changed and the service is always restarted. Which path ran is printed.
+#
 # Env overrides: HERMES_HOME (default ~/.hermes), HERMES_PYTHON (Hermes's venv python),
 # HERMES_MOBILE_PORT (default 9131), HERMES_MOBILE_LABEL (default local.hermes-mobile.bridge),
 # HERMES_MOBILE_PROJECTS_CATALOG (optional absolute path to a project catalog JSON; off if unset),
@@ -134,6 +139,8 @@ mkdir -p "$HERMES_HOME/mobile"
 if [[ "$OS" == "Linux" ]]; then
   # A systemd user service. `loginctl enable-linger $USER` keeps it running when you're logged out.
   mkdir -p "$(dirname "$UNIT")"
+  NEW_UNIT="$(mktemp "${TMPDIR:-/tmp}/hermes-mobile-unit.XXXXXX")"
+  trap 'rm -f "$NEW_UNIT"' EXIT
   {
     echo "[Unit]"
     echo "Description=Hermes Mobile bridge (phone companion for Hermes Agent)"
@@ -156,24 +163,47 @@ if [[ "$OS" == "Linux" ]]; then
     echo
     echo "[Install]"
     echo "WantedBy=default.target"
-  } > "$UNIT"
-  systemctl --user daemon-reload
+  } > "$NEW_UNIT"
+  # daemon-reload only when the unit changed; the service is always restarted so the new release runs.
+  if [[ -f "$UNIT" ]] && cmp -s "$NEW_UNIT" "$UNIT"; then
+    echo "Service definition unchanged: restarting without a daemon-reload."
+  else
+    cp "$NEW_UNIT" "$UNIT"
+    systemctl --user daemon-reload
+    echo "Service definition changed: unit installed and daemon reloaded."
+  fi
   systemctl --user enable --now hermes-mobile-bridge.service
   systemctl --user restart hermes-mobile-bridge.service
 else
   mkdir -p "$HOME/Library/LaunchAgents"
+  # Build the new definition aside; only replace the installed one if it really differs.
+  NEW_PLIST="$(mktemp "${TMPDIR:-/tmp}/hermes-mobile-plist.XXXXXX")"
+  trap 'rm -f "$NEW_PLIST"' EXIT
   sed -e "s#__LABEL__#$LABEL#g" -e "s#__RUNNER__#$HERE/run-bridge.sh#g" \
       -e "s#__PORT__#$PORT#g" -e "s#__LOG__#$LOG#g" -e "s#__HERMES_HOME__#$HERMES_HOME#g" \
-      "$HERE/hermes-mobile-bridge.plist.template" > "$PLIST"
+      "$HERE/hermes-mobile-bridge.plist.template" > "$NEW_PLIST"
   if [[ -n "${HERMES_PYTHON:-}" ]]; then
-    plutil -insert EnvironmentVariables.HERMES_PYTHON -string "$HERMES_PYTHON" "$PLIST"
+    plutil -insert EnvironmentVariables.HERMES_PYTHON -string "$HERMES_PYTHON" "$NEW_PLIST"
   fi
   for _name in "${WRITE_NAMES[@]+"${WRITE_NAMES[@]}"}"; do
-    plutil -insert "EnvironmentVariables.$_name" -string "${!_name}" "$PLIST"
+    plutil -insert "EnvironmentVariables.$_name" -string "${!_name}" "$NEW_PLIST"
   done
-  plutil -lint "$PLIST" >/dev/null
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  plutil -lint "$NEW_PLIST" >/dev/null
+  # `current` is a symlink and the plist points through it, so a code-only update leaves the definition identical.
+  # Then kickstart (restart from the loaded definition) is enough: no bootout/bootstrap, which sandboxed
+  # automation can't run.
+  if [[ -f "$PLIST" ]] && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 \
+     && "$PY" -c 'import plistlib, sys
+a, b = (plistlib.load(open(p, "rb")) for p in sys.argv[1:3])
+sys.exit(0 if a == b else 1)' "$PLIST" "$NEW_PLIST" 2>/dev/null; then
+    echo "Service definition unchanged: restarting with kickstart (no bootstrap)."
+    launchctl kickstart -k "gui/$(id -u)/$LABEL"
+  else
+    echo "Service definition new or changed: installing it with bootout and bootstrap."
+    cp "$NEW_PLIST" "$PLIST"
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  fi
 fi
 sleep 2
 if curl -fsS "http://127.0.0.1:$PORT/m/ping" >/dev/null; then

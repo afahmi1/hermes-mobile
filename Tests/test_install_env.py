@@ -61,7 +61,10 @@ class Sandbox(unittest.TestCase):
         self.calls = self.root / "calls.log"
         for name in ("launchctl", "systemctl", "tailscale", "curl", "lsof", "loginctl"):
             f = self.shims / name
-            f.write_text('#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' % (name, self.calls))
+            body = '#!/bin/sh\necho "%s $*" >> "%s"\n' % (name, self.calls)
+            if name == "launchctl":  # `print` fails while the "job" is marked not loaded
+                body += '[ "$1" = print ] && [ -e "%s" ] && exit 1\n' % (self.root / "not-loaded")
+            f.write_text(body + "exit 0\n")
             f.chmod(0o755)
         if self.OS == "Linux":
             f = self.shims / "uname"
@@ -94,6 +97,12 @@ class Sandbox(unittest.TestCase):
             return install_env.read_unit(str(self.unit))["HERMES_MOBILE_PORT"]
         with open(self.plist, "rb") as f:
             return plistlib.load(f)["EnvironmentVariables"]["HERMES_MOBILE_PORT"]
+
+    def calls_since(self, mark):
+        return self.calls.read_text().splitlines()[mark:] if self.calls.exists() else []
+
+    def mark(self):
+        return len(self.calls_since(0))
 
     def check_reinstall(self):
         r1 = self.run_install(**SETTINGS)
@@ -137,6 +146,53 @@ class MacInstaller(Sandbox):
         self.check_reinstall()
         self.assertIn("launchctl bootstrap", self.calls.read_text())
 
+    def test_first_install_bootstraps(self):
+        r = self.run_install(**SETTINGS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = "\n".join(self.calls_since(0))
+        self.assertIn("launchctl bootout", calls)
+        self.assertIn("launchctl bootstrap", calls)
+        self.assertNotIn("launchctl kickstart", calls)
+        self.assertIn("bootstrap", r.stdout)
+
+    def test_unchanged_reinstall_kickstarts_only(self):
+        self.assertEqual(self.run_install(**SETTINGS).returncode, 0)
+        before = self.plist.read_bytes()
+        m = self.mark()
+        r = self.run_install()  # settings come from the installed plist
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = "\n".join(self.calls_since(m))
+        self.assertIn("launchctl kickstart -k gui/", calls)
+        self.assertIn(self.label, calls)
+        self.assertNotIn("bootstrap", calls)
+        self.assertNotIn("bootout", calls)
+        self.assertEqual(self.plist.read_bytes(), before)  # plist left alone
+        self.assertIn("kickstart (no bootstrap)", r.stdout)
+        self.assertIn("/m/ping", "\n".join(self.calls_since(m)))
+        for v in ("owner@example.com", "bacta-protocol"):
+            self.assertNotIn(v, r.stdout + r.stderr)
+
+    def test_changed_setting_bootstraps_again(self):
+        self.assertEqual(self.run_install(**SETTINGS).returncode, 0)
+        m = self.mark()
+        r = self.run_install(HERMES_MOBILE_MEDIA_MAX_BYTES="8192")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = "\n".join(self.calls_since(m))
+        self.assertIn("launchctl bootout", calls)
+        self.assertIn("launchctl bootstrap", calls)
+        self.assertNotIn("kickstart", calls)
+        self.assertEqual(self.written()["HERMES_MOBILE_MEDIA_MAX_BYTES"], "8192")
+
+    def test_unchanged_but_not_loaded_bootstraps(self):
+        self.assertEqual(self.run_install(**SETTINGS).returncode, 0)
+        (self.root / "not-loaded").write_text("")
+        m = self.mark()
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = "\n".join(self.calls_since(m))
+        self.assertIn("launchctl bootstrap", calls)
+        self.assertNotIn("kickstart", calls)
+
 
 class LinuxInstaller(Sandbox):
     OS = "Linux"
@@ -144,6 +200,33 @@ class LinuxInstaller(Sandbox):
     def test_reinstall_keeps_settings(self):
         self.check_reinstall()
         self.assertIn("systemctl --user restart", self.calls.read_text())
+
+    def test_first_install_reloads_and_restarts(self):
+        r = self.run_install(**SETTINGS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = "\n".join(self.calls_since(0))
+        self.assertIn("systemctl --user daemon-reload", calls)
+        self.assertIn("systemctl --user restart", calls)
+
+    def test_unchanged_reinstall_skips_reload_but_restarts(self):
+        self.assertEqual(self.run_install(**SETTINGS).returncode, 0)
+        before = self.unit.read_bytes()
+        m = self.mark()
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = "\n".join(self.calls_since(m))
+        self.assertNotIn("daemon-reload", calls)
+        self.assertIn("systemctl --user restart", calls)
+        self.assertEqual(self.unit.read_bytes(), before)
+
+    def test_changed_setting_reloads_and_restarts(self):
+        self.assertEqual(self.run_install(**SETTINGS).returncode, 0)
+        m = self.mark()
+        r = self.run_install(HERMES_MOBILE_MEDIA_MAX_BYTES="8192")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = "\n".join(self.calls_since(m))
+        self.assertIn("daemon-reload", calls)
+        self.assertIn("systemctl --user restart", calls)
 
     def test_control_character_rejected(self):
         r = self.run_install(HERMES_MOBILE_OWNER_LOGIN="a\nb")
