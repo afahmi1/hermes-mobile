@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// The grant fingerprint scopes both notification grouping and tap navigation across gateways.
 struct ReplyDestination: Equatable {
@@ -7,6 +8,13 @@ struct ReplyDestination: Equatable {
     let session: String
 
     var identifier: String { [account, profile, session].map { "\($0.utf8.count):\($0)" }.joined() }
+
+    /// One notification per chat, whether it arrives locally or through APNs. `apns-collapse-id` allows 64 bytes,
+    /// so the bridge and the phone both use a SHA-256 prefix of `identifier`: the local request and the remote
+    /// push share it, and the later one replaces the earlier. Mirrors `collapse_id` in Bridge/bridge_push.py.
+    var collapseID: String {
+        SHA256.hash(data: Data(identifier.utf8)).map { String(format: "%02x", $0) }.joined().prefix(32).description
+    }
 
     @MainActor func open(in app: AppModel) -> Bool {
         if app.inboxAccount != account {
@@ -25,9 +33,15 @@ import Observation
 
 /// Tells the person a reply landed, or that Hermes is waiting on an approval, after they left the app.
 ///
-/// There is no push server: the phone only knows about an event while it is still following the run.
-/// iOS allows roughly thirty seconds of that after the app leaves the foreground, so this covers the
-/// common case of sending and switching away. A reply that takes longer is shown on return.
+/// Two paths, one notification per chat:
+/// - Local, from here: the phone only knows about an event while it is still following the run, and iOS
+///   allows roughly thirty seconds of that after the app leaves the foreground. This covers the common
+///   case of sending and switching away.
+/// - APNs push, from the bridge: it keeps following every run on the Mac and pushes when the phone is no
+///   longer watching (see `PushRegistration` and Bridge/bridge_push.py). Without an APNs key on the Mac
+///   this path is off and a reply that takes longer than the grace window is shown on return.
+/// Both use `ReplyDestination.collapseID` as the notification identifier, so they replace each other, and
+/// the same generic text: reply excerpts, commands and errors never leave the Mac in a notification.
 @MainActor @Observable
 final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = ReplyNotifier()
@@ -46,7 +60,16 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         Task {
             let center = UNUserNotificationCenter.current()
             guard await center.notificationSettings().authorizationStatus == .notDetermined else { return }
-            _ = try? await center.requestAuthorization(options: [.alert, .sound])
+            let granted = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+            if granted { UIApplication.shared.registerForRemoteNotifications() }
+        }
+    }
+
+    /// Already allowed on an earlier launch: ask APNs for this install's token again (it can change).
+    func registerIfAuthorized() {
+        Task {
+            let status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+            if status == .authorized || status == .provisional { UIApplication.shared.registerForRemoteNotifications() }
         }
     }
 
@@ -94,7 +117,8 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.userInfo = ["account": account, "profile": profile, "session": session]
 
         // One notification per chat: a newer event replaces the older one instead of stacking.
-        let request = UNNotificationRequest(identifier: content.threadIdentifier, content: content, trigger: nil)
+        let request = UNNotificationRequest(identifier: ReplyDestination(account: account, profile: profile, session: session).collapseID,
+                                            content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
 
@@ -123,6 +147,7 @@ final class ReplyNotifier {
     var away = false
     func install() {}
     func askOnce() {}
+    func registerIfAuthorized() {}
     func left(liveRuns: Bool) { away = true }
     func returned() { away = false }
     func settled(liveRuns: Bool) {}

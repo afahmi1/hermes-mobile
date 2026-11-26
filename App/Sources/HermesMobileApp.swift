@@ -3,8 +3,16 @@ import SwiftUI
 private final class NotificationDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, willFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         ReplyNotifier.shared.install()
+        ReplyNotifier.shared.registerIfAuthorized()
         return true
     }
+
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        Task { @MainActor in PushRegistration.shared.received(deviceToken) }
+    }
+
+    // Simulators and builds without the Push capability land here. Local notifications still work.
+    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {}
 }
 
 @main
@@ -22,6 +30,7 @@ struct HermesMobileApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
                     app.retryDraftStorage()
                 }
+                .onChange(of: app.gatewaySession) { _, _ in PushRegistration.shared.sync() }
                 .onChange(of: ReplyNotifier.shared.destination, initial: true) { _, destination in
                     guard let destination else { return }
                     if destination.open(in: app) { selectedTab = 0 }
@@ -29,9 +38,14 @@ struct HermesMobileApp: App {
                 }
         }
         .onChange(of: phase) { _, now in
-            if now == .background { ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns) }
+            if now == .background {
+                ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns)
+                if app.hasLiveRuns { PushRegistration.shared.presence(away: true) }
+            }
             if now == .active {
                 ReplyNotifier.shared.returned()
+                PushRegistration.shared.presence(away: false)
+                PushRegistration.shared.sync()
                 app.retryDraftStorage()
                 app.resumeLiveRuns()
             }
