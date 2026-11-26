@@ -76,6 +76,12 @@ In [App Store Connect](https://appstoreconnect.apple.com), go to Apps, then **+*
 (for example "Hermes Mobile"), and select the same bundle ID as `HERMES_BUNDLE_ID`. If the bundle ID isn't listed yet, register it
 first under Certificates, Identifiers & Profiles, then Identifiers. Xcode can also register it for you on the first archive.
 
+If you want notifications for replies that take longer than half a minute, also turn on **Push Notifications** for this
+App ID (Certificates, Identifiers & Profiles, then Identifiers, then your App ID, then Capabilities). The project already
+carries the entitlement (`App/Resources/HermesMobile.entitlements`): Debug builds use the APNs sandbox, Release and TestFlight
+builds use production. Xcode's automatic signing updates the provisioning profile on the next archive. The Mac side is set
+up under [Push notifications](#push-notifications-optional) below.
+
 ### 3. Archive and upload
 
 **From Xcode:** open `App/HermesMobile.xcodeproj` and choose the **HermesMobile** scheme with destination
@@ -167,6 +173,52 @@ default (`HERMES_MOBILE_MEDIA_MAX_BYTES`, up to 8 MiB). A single video from File
 
 Images the desktop already attached (`[Image attached at: …]` or a `MEDIA:` line) show in the chat when the file is still under your Hermes home. Tool runs open into what they did: the skill that loaded, the command, the delegate's goal, and a failed delegate reads as failed. A background task that is still going shows **Will resume when N background tasks finish**.
 
+### Push notifications (optional)
+
+Without this, the phone tells you a reply is ready only if it is still following the run, which iOS allows for about thirty
+seconds after you leave the app. With it, the bridge on your Mac keeps following every run and sends a push through Apple's
+APNs when a reply is ready, Hermes needs an approval, or a run could not finish and the phone is no longer watching. The text
+is always generic ("Your reply is ready."); no reply text, command or error leaves the Mac. If the phone is still following the run, it
+posts its own notification and the push is skipped; both use one identifier per chat, so you never get two.
+
+The bridge only needs a key from the Apple Developer account that owns the app:
+
+1. In [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources), open **Keys**, then **+**. Name it,
+   tick **Apple Push Notifications service (APNs)** and create it. Download the `AuthKey_<KEYID>.p8` file. Apple lets you download it once.
+   The **Key ID** is in the file name and on the key's page. Your **Team ID** is under Membership details.
+2. Make sure **Push Notifications** is enabled on the app's App ID (see Part 1, step 2), then install a build that has this version of the app.
+3. Put the key on the Mac where only you can read it:
+
+   ```bash
+   mkdir -p ~/.hermes/mobile/apns && mv ~/Downloads/AuthKey_ABC123DEFG.p8 ~/.hermes/mobile/apns/
+   chmod 700 ~/.hermes/mobile/apns && chmod 600 ~/.hermes/mobile/apns/AuthKey_*.p8
+   ```
+
+4. Give the bridge the key, then restart it. `install.sh` writes these into the launch agent:
+
+   ```bash
+   HERMES_MOBILE_APNS_KEY_PATH=~/.hermes/mobile/apns/AuthKey_ABC123DEFG.p8 \
+   HERMES_MOBILE_APNS_KEY_ID=ABC123DEFG \
+   HERMES_MOBILE_APNS_TEAM_ID=ABCDE12345 \
+   HERMES_MOBILE_APNS_TOPIC=com.yourname.hermesmobile \
+   Bridge/install.sh
+   ```
+
+   | Variable | Meaning |
+   |---|---|
+   | `HERMES_MOBILE_APNS_KEY_PATH` | Path to the `.p8` key. Required. |
+   | `HERMES_MOBILE_APNS_KEY_ID` | The key's 10-character ID. Required. |
+   | `HERMES_MOBILE_APNS_TEAM_ID` | Your Apple Team ID. Required. |
+   | `HERMES_MOBILE_APNS_TOPIC` | The app's bundle ID. Defaults to `HERMES_BUNDLE_ID` from `App/Config/Signing.xcconfig` when you use `install.sh`, otherwise `com.example.hermesmobile`. |
+
+5. Open the app once after the update and allow notifications. The phone sends its token to the bridge, signed with the same device grant
+   it uses for everything else, and the bridge forgets it when that grant is revoked or expires.
+
+If any of the first three is missing, push is off and nothing changes. Debug builds register with the APNs sandbox and
+TestFlight/App Store builds with production; the bridge uses whichever the phone reports. The bridge needs `/usr/bin/curl` (HTTP/2, included with
+macOS) and uses the `cryptography` package or `/usr/bin/openssl` to sign, so there is nothing to install. Tokens and key contents are never logged.
+Tokens APNs reports as invalid (410, `BadDeviceToken`, `Unregistered`) are deleted.
+
 ### Slash commands and skills
 
 Type `/`, or tap the `/` button, and the composer lists the commands Hermes can run from a chat (`/learn`, `/status`, `/agents`, `/compress`, and the rest that are not desktop-only). Picking one inserts it. Sending `/learn how I name plates` runs that command on the Mac; it is not handed to the model as a normal message. On a bot, **Teach a skill** writes a new skill, and tapping a skill appends a note, then Hermes rescans its skill folders.
@@ -191,6 +243,7 @@ parallel and reports any row it could not change.
 | `App/project.yml` | [XcodeGen](https://github.com/yonaskolb/XcodeGen) spec. The generated `.xcodeproj` is committed, so XcodeGen is optional. After editing `project.yml`, run `xcodegen generate`. |
 | `Bridge/hermes_mobile_bridge.py` | The bridge: login tokens, merged session list across profiles, read-only state.db queries, pass-through to the gateway. |
 | `Bridge/bridge_turns.py` | Runs chat turns through Hermes's gateway session protocol (the desktop app's), so any chat can be continued and model/effort switches are saved on the session. |
+| `Bridge/bridge_push.py` | APNs push: decides when the phone needs telling, builds the generic payload and sends it over HTTP/2 with a cached ES256 token. Off until the APNs variables are set. |
 | `Bridge/install.sh` | Installs the bridge as a launch agent. |
 | `Status/hermes_status_server.py`, `Status/dashboard.html` | The status dashboard: gateway, bots, cron jobs, running agents, incidents, provider usage, and what's new. It is read-only toward Hermes; its only state is `~/Library/Application Support/hermes-status/seen.json` (what it has seen, for the "new" badges). |
 | `Status/install.sh` | Installs the dashboard as a launch agent on port 9230. The bridge's `/m/status` reads it (`HERMES_STATUS_URL` overrides the address). |

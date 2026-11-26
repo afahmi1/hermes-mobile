@@ -231,6 +231,18 @@ final class API: @unchecked Sendable {
         SHA256.hash(data: Data((login.server.absoluteString + "|" + login.token).utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    // MARK: push
+
+    /// Hand this install's APNs token to the bridge. The grant that signs the request owns the token.
+    func registerPush(token: String, environment: String, account: String) async throws {
+        _ = try await json("/m/push/token", method: "POST", body: ["token": token, "environment": environment, "account": account])
+    }
+
+    /// Tell the bridge the app left or returned to the foreground, so it knows when to push.
+    func pushPresence(away: Bool) async throws {
+        _ = try await json("/m/push/presence", method: "POST", body: ["away": away])
+    }
+
     // MARK: reads
 
     func mediaCapabilities(profile: String) async throws -> MediaCapabilities {

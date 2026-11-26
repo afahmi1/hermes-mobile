@@ -12,6 +12,9 @@
 # opts those project/bot pairs in to Project instructions, files, chats and output files. Needs the catalog.
 # Single owner only. Paired phones can chat and approve tools, while owner grants control workspace changes.
 # Do not enable it on a shared or multi-user bridge.)
+# Push notifications (optional, see README "Push notifications"): HERMES_MOBILE_APNS_KEY_PATH (the .p8),
+# HERMES_MOBILE_APNS_KEY_ID, HERMES_MOBILE_APNS_TEAM_ID and HERMES_MOBILE_APNS_TOPIC (the app's bundle ID;
+# defaults to HERMES_BUNDLE_ID from App/Config/Signing.xcconfig). Set all three of key path, key ID and team ID or none.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -85,6 +88,18 @@ if command -v lsof >/dev/null && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 
   exit 1
 fi
 
+# Push notifications (optional, see README "Push notifications"): all three of key path, key ID and team ID, or none.
+TOPIC="${HERMES_MOBILE_APNS_TOPIC:-}"
+if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
+  if [[ -z "${HERMES_MOBILE_APNS_KEY_ID:-}" || -z "${HERMES_MOBILE_APNS_TEAM_ID:-}" ]]; then
+    echo "Push needs HERMES_MOBILE_APNS_KEY_ID and HERMES_MOBILE_APNS_TEAM_ID as well as the key path." >&2
+    exit 1
+  fi
+  if [[ -z "$TOPIC" && -f "$SRC/../App/Config/Signing.xcconfig" ]]; then
+    TOPIC="$(sed -n 's#^[[:space:]]*HERMES_BUNDLE_ID[[:space:]]*=[[:space:]]*\([^[:space:]/]*\).*#\1#p' "$SRC/../App/Config/Signing.xcconfig" | head -1)"
+  fi
+fi
+
 mkdir -p "$HERMES_HOME/mobile"
 if [[ "$OS" == "Linux" ]]; then
   # A systemd user service. `loginctl enable-linger $USER` keeps it running when you're logged out.
@@ -101,6 +116,12 @@ if [[ "$OS" == "Linux" ]]; then
     [[ -n "${HERMES_PYTHON:-}" ]] && echo "Environment=HERMES_PYTHON=$HERMES_PYTHON"
     [[ -n "${HERMES_MOBILE_PROJECTS_CATALOG:-}" ]] && echo "Environment=HERMES_MOBILE_PROJECTS_CATALOG=$HERMES_MOBILE_PROJECTS_CATALOG"
     [[ -n "${HERMES_MOBILE_WORKSPACES:-}" ]] && echo "Environment='HERMES_MOBILE_WORKSPACES=$HERMES_MOBILE_WORKSPACES'"
+    if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
+      echo "Environment=HERMES_MOBILE_APNS_KEY_PATH=$HERMES_MOBILE_APNS_KEY_PATH"
+      echo "Environment=HERMES_MOBILE_APNS_KEY_ID=$HERMES_MOBILE_APNS_KEY_ID"
+      echo "Environment=HERMES_MOBILE_APNS_TEAM_ID=$HERMES_MOBILE_APNS_TEAM_ID"
+      [[ -n "$TOPIC" ]] && echo "Environment=HERMES_MOBILE_APNS_TOPIC=$TOPIC"
+    fi
     echo "Restart=always"
     echo "RestartSec=5"
     echo "StandardOutput=append:$LOG"
@@ -125,6 +146,12 @@ else
   fi
   if [[ -n "${HERMES_MOBILE_WORKSPACES:-}" ]]; then
     plutil -insert EnvironmentVariables.HERMES_MOBILE_WORKSPACES -string "$HERMES_MOBILE_WORKSPACES" "$PLIST"
+  fi
+  if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
+    plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_KEY_PATH -string "$HERMES_MOBILE_APNS_KEY_PATH" "$PLIST"
+    plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_KEY_ID -string "$HERMES_MOBILE_APNS_KEY_ID" "$PLIST"
+    plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_TEAM_ID -string "$HERMES_MOBILE_APNS_TEAM_ID" "$PLIST"
+    [[ -n "$TOPIC" ]] && plutil -insert EnvironmentVariables.HERMES_MOBILE_APNS_TOPIC -string "$TOPIC" "$PLIST"
   fi
   plutil -lint "$PLIST" >/dev/null
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
