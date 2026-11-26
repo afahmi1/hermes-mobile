@@ -15,7 +15,10 @@ function Resolve-HermesPython {
                Sort-Object Name -Descending | ForEach-Object { Join-Path $_.FullName 'python.exe' } | Where-Object { Test-Path $_ })
     $py = Get-Command py.exe -ErrorAction SilentlyContinue
     $boots += @($(if ($py) { $py.Source }))
-    $query = 'import sys; sys.path.insert(0, "."); from pathlib import Path; from pm.environments import committed_venv; e = committed_venv(Path(".").resolve()); print(e or "")'
+    # No double quotes in this argument: Windows PowerShell 5.1 (what the scheduled tasks run) strips them when it
+    # passes a string to a native program, the query then fails to parse, and the bridge silently falls back to
+    # a legacy venv that may lack aiohttp.
+    $query = 'import os, sys; sys.path.insert(0, os.curdir); from pathlib import Path; from pm.environments import committed_venv; e = committed_venv(Path(os.curdir).resolve()); print(e or str())'
     foreach ($boot in $boots) {
         Push-Location $runtime
         try { $envDir = (& $boot -I -c $query 2>$null | Select-Object -Last 1) } catch { $envDir = '' } finally { Pop-Location }
