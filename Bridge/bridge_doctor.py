@@ -30,6 +30,53 @@ def _env_has(path: Path, key: str) -> bool:
         return False
 
 
+APNS_KEYS = ("HERMES_MOBILE_APNS_KEY_PATH", "HERMES_MOBILE_APNS_KEY_ID", "HERMES_MOBILE_APNS_TEAM_ID")
+
+
+def _service_env(home: Path | None = None) -> dict:
+    """The installed service's environment (launch agent plist or systemd unit), for settings the shell lacks."""
+    home = home or Path.home()
+    out: dict = {}
+    try:
+        import plistlib
+        for plist in sorted((home / "Library" / "LaunchAgents").glob("*hermes-mobile*.plist")):
+            with plist.open("rb") as f:
+                out.update({k: str(v) for k, v in (plistlib.load(f).get("EnvironmentVariables") or {}).items()})
+    except Exception:
+        pass
+    try:
+        for unit in sorted((home / ".config" / "systemd" / "user").glob("hermes-mobile*.service")):
+            for line in unit.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("Environment="):
+                    pair = line[len("Environment="):].strip("'\"")
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        out[k] = v
+    except Exception:
+        pass
+    return out
+
+
+def push_check(env=None, service=None) -> tuple[str, str, str]:
+    """(status, detail, fix) for APNs push. Reports configured or not, never the values."""
+    env = os.environ if env is None else env
+    source = env if any((env.get(k) or "").strip() for k in APNS_KEYS) else (_service_env() if service is None else service)
+    have = [k for k in APNS_KEYS if (source.get(k) or "").strip()]
+    fix_all = ("Set HERMES_MOBILE_APNS_KEY_PATH, HERMES_MOBILE_APNS_KEY_ID and HERMES_MOBILE_APNS_TEAM_ID, then run "
+               "Bridge/install.sh again (README, Push notifications).")
+    if not have:
+        return WARN, "Push notifications are not configured (optional: replies still arrive while the app is open).", fix_all
+    if len(have) < len(APNS_KEYS):
+        missing = ", ".join(k for k in APNS_KEYS if k not in have)
+        return FAIL, "Push is half configured: %s missing, so push stays off." % missing, fix_all
+    if not Path(source["HERMES_MOBILE_APNS_KEY_PATH"].strip()).expanduser().is_file():
+        return FAIL, "Push is configured but the APNs key file isn't there, so push stays off.", \
+            "Put the .p8 back at the configured HERMES_MOBILE_APNS_KEY_PATH, or point the setting at it and reinstall."
+    topic = "set" if (source.get("HERMES_MOBILE_APNS_TOPIC") or "").strip() else "default"
+    return OK, "Push notifications are configured (key file present, topic %s)." % topic, ""
+
+
 def _tailscale():
     for cand in (shutil.which("tailscale"), "/usr/local/bin/tailscale",
                  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
@@ -156,6 +203,9 @@ def run(hermes_home: Path, port: int, profiles, profile_home) -> list[dict]:
            "Voice memos are transcribed (%s)." % (stt.get("provider") or "configured") if enabled
            else "Speech-to-text isn't configured; audio arrives as a file Hermes can't hear.",
            "" if enabled else "hermes config set stt.provider local   (or groq/openai with a key; see Hermes docs, Voice)")
+
+    # 9. Push notifications (optional).
+    _check(r, "push", *push_check())
     return r
 
 

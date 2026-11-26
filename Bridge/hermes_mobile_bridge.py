@@ -64,6 +64,7 @@ POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
 import bridge_devices
+import bridge_push
 import bridge_receipts
 from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
@@ -425,6 +426,24 @@ def devices():
 
 
 STREAMS = bridge_devices.Streams(lambda ids: devices().permitted(ids))
+
+
+def _bot_title(profile):
+    return next((b["name"] for b in bots() if b["id"] == profile), profile)
+
+
+@lru_cache(maxsize=8)
+def _pusher(directory):
+    return bridge_push.Pusher(_devices(directory), title=_bot_title, log=lambda message: log(message))
+
+
+def pusher():
+    """APNs delivery for finished, failed and approval-waiting turns. A no-op until the APNs env vars are set."""
+    return _pusher(STATE_DIR)
+
+
+if turns:
+    turns.EVENT_HOOK = lambda turn, name, fields: pusher().notify(turn, name, fields)
 
 
 def make_token(device, owner=False, method="local", pair_code=None):
@@ -1721,7 +1740,7 @@ class H(BaseHTTPRequestHandler):
         if not self.authed():
             return self.send(401, {"error": "Sign in again."})
         if path == "/m/capabilities" and self.command == "GET":
-            features = ["device_grants", "pair_code"]
+            features = ["device_grants", "pair_code", "push_v1"]
             if turns:
                 features.append("replay_checkpoint")
             if image_attachments_supported():
@@ -1734,6 +1753,8 @@ class H(BaseHTTPRequestHandler):
                                    "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
         if path == "/m/devices" or path.startswith("/m/devices/"):
             return self.device_route(path)
+        if path == "/m/push" or path.startswith("/m/push/"):
+            return self.push_route(path)
         if path == "/m/projects":
             return self.projects_route(u)
         if path == "/m/manage" or path.startswith("/m/manage/"):
@@ -1806,6 +1827,28 @@ class H(BaseHTTPRequestHandler):
         devices().revoke(target)
         STREAMS.revoked(target)
         return self.send(200, {"ok": True})
+
+    def push_route(self, path):
+        """The phone's APNs token and whether the app is in the foreground. Any signed-in device may manage its own."""
+        did = self.device_claims["did"]
+        d = self.json_body()
+        if path == "/m/push/token" and self.command == "POST":
+            token, env, account = d.get("token"), d.get("environment"), d.get("account")
+            if (not isinstance(token, str) or not bridge_push.TOKEN_RE.fullmatch(token)
+                    or env not in bridge_push.HOSTS or not isinstance(account, str)
+                    or not bridge_push.ACCOUNT_RE.fullmatch(account)):
+                return self.send(400, {"error": "Bad push registration."})
+            devices().set_push_token(did, token, env, account)
+            return self.send(200, {"ok": True, "enabled": bridge_push.Config.from_env() is not None})
+        if path == "/m/push/token" and self.command == "DELETE":
+            devices().clear_push_token(did)
+            return self.send(200, {"ok": True})
+        if path == "/m/push/presence" and self.command == "POST":
+            if not isinstance(d.get("away"), bool):
+                return self.send(400, {"error": "Say whether the app is away."})
+            pusher().presence(did, d["away"])
+            return self.send(200, {"ok": True})
+        return self.send(404, {"error": "not found"})
 
     def session_flags(self):
         d = self.json_body()
@@ -2416,6 +2459,7 @@ class H(BaseHTTPRequestHandler):
                 turn = turns.start_primary(pid, home, sid, text, d, d.get("submission_id"), d.get("project_context"),
                                            admissions_dir(), lambda: persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d)),
                                            restore_send_workspace, d.get("attachments"), d.get("video_analysis_consent") is True)
+                turn.device_id = turn.device_id or self.device_claims["did"]
                 return self.send(202, turn.summary())
             workspace = persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d))
             try:
@@ -2428,6 +2472,7 @@ class H(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 raise
+            turn.device_id = turn.device_id or self.device_claims["did"]
             return self.send(202, turn.summary())
         except turns.TurnError as e:
             return self.send(e.code, {"error": str(e)})
@@ -2450,7 +2495,14 @@ class H(BaseHTTPRequestHandler):
             with STREAMS.watch(self.device_claims, self.authed, self.connection) as valid:
                 if not valid:
                     return self.send(401, {"error": "Sign in again."})
-                self._authorized_tail(turn, offset)
+                attach, detach = getattr(turn, "attach", None), getattr(turn, "detach", None)
+                if attach:
+                    attach(self.device_claims["did"])  # a watched turn needs no push
+                try:
+                    self._authorized_tail(turn, offset)
+                finally:
+                    if detach:
+                        detach(self.device_claims["did"])
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 

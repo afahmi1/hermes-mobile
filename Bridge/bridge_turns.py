@@ -299,6 +299,11 @@ REPLAY_BATCH_FRAMES = 128
 _SSE_ENCODER = json.JSONEncoder(separators=(",", ":"))
 
 
+# Set by the bridge: called outside the turn's lock for events the phone may need a push for.
+PUSH_EVENTS = ("run.completed", "run.failed", "approval.request")
+EVENT_HOOK = None
+
+
 def _sse(event):
     payload = _SSE_ENCODER.encode(event).encode()
     return b"id: %d\ndata: " % event["seq"] + payload + b"\n\n"
@@ -338,6 +343,19 @@ class Turn:
         self.workspace = workspace
         self.captured = False
         self.steered = False
+        # Push bookkeeping: the grant that sent the turn, the streams attached per grant, what was announced.
+        self.device_id = None
+        self.watchers = {}
+        self.notified = False
+        self.alerted = set()
+
+    def attach(self, device):
+        with self.cond:
+            self.watchers[device] = self.watchers.get(device, 0) + 1
+
+    def detach(self, device):
+        with self.cond:
+            self.watchers[device] = max(0, self.watchers.get(device, 0) - 1)
 
     def _trim(self, now):
         while self._frames:
@@ -367,6 +385,11 @@ class Turn:
                 self._terminal = {"event": name, "error": str(fields.get("error", ""))[:2000]}
                 self._approval_frames.clear()
             self.cond.notify_all()
+        if name in PUSH_EVENTS and EVENT_HOOK:
+            try:
+                EVENT_HOOK(self, name, fields)
+            except Exception:
+                pass  # a push problem must never disturb the turn
 
     def replay(self, offset, timeout=15, *, reset=False):
         """Return immutable frames, next offset, completion and whether this is a checkpoint."""
@@ -892,6 +915,7 @@ def restored_turn(row, home, journal, restore_workspace):
     turn.admission, turn.generation, turn.frozen_text = row["admission"], row["generation"], row["prompt"]
     if row["terminal"]:
         marker = json.loads(row["terminal"])
+        turn.notified = True  # an outcome replayed after a bridge restart is not news
         turn.push(marker["event"], **({"error": marker["error"]} if marker.get("error") else {}))
         turn.finish()
     else:
@@ -1135,6 +1159,7 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
         queued.canonical_sid = turn.canonical_sid
         queued.admission = admission
         queued.submission = submission
+        queued.device_id = turn.device_id  # a queued reply's push goes to whoever sent the turn it follows
         if receipt.get("status") == "started":
             queued.generation = receipt.get("execution_generation")
         TURNS[queued.id] = queued
