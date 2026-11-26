@@ -1,4 +1,5 @@
 """Large JSON replies are gzipped for clients that ask; small, binary and 304 replies are not."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import gzip
 import io
 import json

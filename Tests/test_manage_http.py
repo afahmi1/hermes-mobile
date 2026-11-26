@@ -1,4 +1,5 @@
 """Slice B: owner management over HTTP (projects, bots, PIN archive). Synthetic HERMES_HOME, PIN and gateway only."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import asyncio
 import base64
 import contextlib
@@ -582,7 +583,7 @@ class LeakTests(Base):
 class CliTests(unittest.TestCase):
     def test_issue_owner_token_and_rotate(self):
         home = Path(tempfile.mkdtemp(prefix="manage-cli-")).resolve()
-        env = dict(os.environ, HERMES_HOME=str(home))
+        env = dict(os.environ, HERMES_HOME=str(home), HERMES_MOBILE_STATE_DIR=str(home / "mobile"))
         script = str(BRIDGE_DIR / "hermes_mobile_bridge.py")
 
         def run(*args):

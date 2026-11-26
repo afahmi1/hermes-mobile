@@ -1,4 +1,5 @@
 """Pinned messages: the store, the state.db snapshot, the HTTP routes and the archive guard."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import io
 import json
 import sqlite3
