@@ -1,4 +1,5 @@
 """Batch archive/pin fanout keeps per-session outcomes and invalidates the inbox once."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import sys
 import unittest
 from pathlib import Path

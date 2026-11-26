@@ -35,7 +35,9 @@ os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
 HOME = Path.home()
 HERMES = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
-STATE_DIR = HERMES / "mobile"
+# HERMES_MOBILE_STATE_DIR relocates all bridge state (secret, devices, pins, receipts...).
+# Unset, it is HERMES_HOME/mobile. The test bootstrap sets it so tests never touch live state.
+STATE_DIR = Path(os.environ["HERMES_MOBILE_STATE_DIR"]) if os.environ.get("HERMES_MOBILE_STATE_DIR") else HERMES / "mobile"
 PORT = int(os.environ.get("HERMES_MOBILE_PORT", "9131"))
 UPSTREAM = ("127.0.0.1", int(os.environ.get("HERMES_API_PORT", "8642")))
 TOKEN_TTL = 180 * 86400

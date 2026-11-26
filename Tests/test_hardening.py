@@ -1,4 +1,5 @@
 """Regressions for faults that lost chats, stopped the bridge at startup or dropped a connection."""
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import io
 import json
 import sqlite3

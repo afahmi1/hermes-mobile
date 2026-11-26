@@ -1,3 +1,4 @@
+import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 from contextlib import closing
 import importlib
 import os
