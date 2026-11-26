@@ -7,6 +7,33 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Bridge"))
 import bridge_media
+from types import ModuleType
+from unittest.mock import patch
+
+_OWN = Path(tempfile.mkdtemp(prefix="hm-own-")).resolve()
+_PLATFORM = ModuleType("gateway.platforms.base")
+_PLATFORM.get_image_cache_dir = lambda: _OWN
+_HOME = ModuleType("hermes_constants")
+_HOME.get_hermes_home = lambda: _OWN
+
+
+def _get_hermes_dir(new, old, home=None):
+    old_path = home / old
+    return old_path if old_path.is_dir() and any(old_path.iterdir()) else home / new
+
+
+_HOME.get_hermes_dir = _get_hermes_dir
+_MODULES = {"gateway.platforms.base": _PLATFORM, "hermes_constants": _HOME}
+
+
+def setUpModule():
+    global _patch
+    _patch = patch.dict(sys.modules, _MODULES)
+    _patch.start()
+
+
+def tearDownModule():
+    _patch.stop()
 
 
 class PhotoStagingTests(unittest.TestCase):
