@@ -142,7 +142,13 @@ final class ChatModel {
     private var lastSnapshotAttempt = false
     private(set) var cachedAt: Date?
     private let composerAccount: String?
-    private var composerScope: String { profile + "|" + (sessionId.map { "session/" + $0 } ?? "new") }
+    private var composerScope: String { Self.scope(profile, sessionId, startIn) }
+    /// A Hermes project's new chat keeps its own unsent draft, apart from the bot's plain new chat.
+    private static func scope(_ profile: String, _ sessionId: String?, _ startIn: String?) -> String {
+        profile + "|" + (sessionId.map { "session/" + $0 } ?? startIn.map { "new/project/" + $0 } ?? "new")
+    }
+    /// The Hermes project this new chat starts in (its folder on the Mac). Nil for ordinary chats.
+    let startIn: String?
     @ObservationIgnored private var restoringComposer = false
     var draft = "" { didSet { if oldValue != draft { persist(.text) } } }
     var draftAttachments: [SendAttachment] = [] { didSet { if oldValue != draftAttachments { persist(.media) } } }
@@ -239,10 +245,11 @@ final class ChatModel {
     /// Approvals already answered (here or anywhere): a replayed request for one is not shown again.
     private var resolvedApprovals = Set<String>()
 
-    init(profile: String, sessionId: String?, app: AppModel, draftID: UUID = UUID()) {
+    init(profile: String, sessionId: String?, app: AppModel, draftID: UUID = UUID(), startIn: String? = nil) {
         let account = app.inboxAccount
         self.composerAccount = account
-        let scope = profile + "|" + (sessionId.map { "session/" + $0 } ?? "new")
+        self.startIn = sessionId == nil ? startIn : nil
+        let scope = Self.scope(profile, sessionId, self.startIn)
         let snapshot: ComposerDisk.Snapshot?
         var restoreError: Error?
         do { snapshot = try account.map { try ComposerDisk.shared.read($0, scope: scope) } }
@@ -715,7 +722,7 @@ final class ChatModel {
         do {
             guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
             if sessionId == nil {
-                let sid = try await api.createSession(profile: profile, draftID: draftID)
+                let sid = try await api.createSession(profile: profile, draftID: draftID, project: startIn)
                 guard account == app?.inboxAccount else { throw APIError.notSignedIn }
                 try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
                 sessionId = sid
@@ -775,7 +782,7 @@ final class ChatModel {
             if picked && sessionId != nil { await refreshServed() }
             guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
             if sessionId == nil {
-                let sid = try await api.createSession(profile: profile, draftID: draftID)
+                let sid = try await api.createSession(profile: profile, draftID: draftID, project: startIn)
                 guard account == app?.inboxAccount else { throw APIError.notSignedIn }
                 try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
                 sessionId = sid

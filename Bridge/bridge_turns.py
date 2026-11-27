@@ -202,8 +202,10 @@ def _created_draft(home, request_id, title):
         return None
 
 
-async def _create(home, profile, title, request_id=None):
+async def _create(home, profile, title, request_id=None, cwd=None):
     params = {"source": "gui"}
+    if cwd:
+        params["cwd"] = cwd  # a chat started in a Hermes project runs in that project's folder
     if title:
         params["title"] = title[:120]
     key = None
@@ -235,8 +237,8 @@ async def _create(home, profile, title, request_id=None):
     return out
 
 
-def create_session(home, profile, title=None, request_id=None):
-    return run(_create(home, profile, title, request_id))
+def create_session(home, profile, title=None, request_id=None, cwd=None):
+    return run(_create(home, profile, title, request_id, cwd))
 
 
 async def _set_runtime(home, sid, choice, ask):

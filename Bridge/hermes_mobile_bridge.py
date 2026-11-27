@@ -65,6 +65,7 @@ WS_BOTS_SETTING = "HERMES_MOBILE_WORKSPACE_BOTS"
 POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
+import bridge_hermes_projects as hermes_projects
 import bridge_devices
 import bridge_push
 import bridge_receipts
@@ -545,9 +546,35 @@ def archived_live_bots():
         return set()
 
 
+def with_hermes_projects(code, body):
+    """Add Hermes's own Projects (the desktop app's, from projects.db) to the catalog, read-only, with
+    each one's chat count. An id the operator's catalog already uses keeps the catalog's entry."""
+    if code != 200 or not hermes_projects.available(HERMES):
+        return code, body
+    try:
+        projects = hermes_projects.load(HERMES)
+        doc = json.loads(body)
+        counts = {}
+        con = _ro("default") if projects else None
+        if con is not None:
+            try:
+                counts = hermes_projects.chat_counts(con, projects)
+            finally:
+                con.close()
+        taken = {p["id"] for p in doc.get("projects") or []}
+        doc["projects"] = (doc.get("projects") or []) + [
+            hermes_projects.catalog_entry(p, counts.get(p["slug"], 0)) for p in projects if p["slug"] not in taken]
+        doc["configured"] = True
+        return 200, json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except (sqlite3.Error, ValueError, OSError) as e:
+        log("hermes projects: %s" % type(e).__name__)
+        return code, body
+
+
 def catalog_response():
-    """bridge_projects.catalog_response() plus the owner overlay (managed projects, minus archived ids)."""
-    code, body = bridge_projects.catalog_response()
+    """bridge_projects.catalog_response() plus Hermes's own Projects, plus the owner overlay (managed
+    projects, minus archived ids)."""
+    code, body = with_hermes_projects(*bridge_projects.catalog_response())
     if code != 200 or not owner_managed():
         return code, body
     try:
@@ -1579,8 +1606,67 @@ def project_timeline_message(message):
     return transcript.project_timeline_message(message, user_media_roots(), assistant_media_roots())
 
 
-def timeline_bytes(messages, has_more=None, next_offset=None):
-    rows = [row for row in (project_timeline_message(m) for m in messages) if row]
+def delegation_usage(pid, ids):
+    """{delegation_id: {task_index: {"input": n, "output": n, "model": str}}} from Hermes's async_delegations.
+    Only token counts and the model leave the Mac: a subagent's own cost is left off because a subscription
+    route's rate-card estimate is not a charge (see billing_kind)."""
+    if not ids or pid is None:
+        return {}
+    try:
+        con = _ro(pid)
+    except (sqlite3.Error, OSError, ValueError):
+        return {}
+    if con is None:
+        return {}
+    out = {}
+    try:
+        ids = sorted(ids)[:50]
+        rows = con.execute("SELECT delegation_id, result_json FROM async_delegations WHERE delegation_id IN (%s)"
+                           % ",".join("?" for _ in ids), ids).fetchall()
+    except sqlite3.Error:
+        rows = []
+    finally:
+        con.close()
+    for did, raw in rows:
+        try:
+            results = (json.loads(raw or "null") or {}).get("results") or []
+        except (ValueError, AttributeError):
+            continue
+        tasks = {}
+        for r in results if isinstance(results, list) else []:
+            if not isinstance(r, dict) or type(r.get("task_index")) is not int:
+                continue
+            t = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+            entry = {k: t[k] for k in ("input", "output") if type(t.get(k)) is int and t[k] >= 0}
+            if isinstance(r.get("model"), str) and r["model"]:
+                entry["model"] = r["model"][:80]
+            if entry:
+                tasks[r["task_index"]] = entry
+        if tasks:
+            out[did] = tasks
+    return out
+
+
+def with_delegation_usage(rows, pid):
+    """Put each finished subagent's token counts on its activity card."""
+    wanted = {i["delegation"] for r in rows for i in r.get("activity") or () if i.get("delegation")}
+    usage = delegation_usage(pid, wanted)
+    for r in rows:
+        for item in r.get("activity") or ():
+            task = usage.get(item.pop("delegation", None), {}).get(item.get("index"))
+            item.pop("index", None)
+            if task:
+                if "input" in task:
+                    item["tokens_in"] = task["input"]
+                if "output" in task:
+                    item["tokens_out"] = task["output"]
+                if not item.get("model") and task.get("model"):
+                    item["model"] = task["model"]
+    return rows
+
+
+def timeline_bytes(messages, has_more=None, next_offset=None, pid=None):
+    rows = with_delegation_usage([row for row in (project_timeline_message(m) for m in messages) if row], pid)
     doc = {"data": rows}
     if has_more is not None:
         doc["has_more"] = bool(has_more)
@@ -1588,9 +1674,9 @@ def timeline_bytes(messages, has_more=None, next_offset=None):
     return json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode()
 
 
-def timeline_page(raw):
+def timeline_page(raw, pid=None):
     """Return exactly the rows consumed by the mobile timeline, retaining pagination positions."""
-    return timeline_bytes(json.loads(raw)["data"])
+    return timeline_bytes(json.loads(raw)["data"], pid=pid)
 
 
 def resume_target(db, session_id, path=None):
@@ -1658,7 +1744,7 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
         else:
             page, has_more = rows, False
         return timeline_bytes([APIServerAdapter._message_response(row) for row in page],
-                              has_more=has_more, next_offset=offset + (limit or 0))
+                              has_more=has_more, next_offset=offset + (limit or 0), pid=pid)
 
 
 # ---------- HTTP ----------
@@ -1837,6 +1923,7 @@ class H(BaseHTTPRequestHandler):
             if turns:
                 features.append("queue_controls_v1")  # GET/POST /m/chat/<bot>/<chat>/queue
                 features.append("resumable_uploads_v1")
+                features.append("hermes_projects_v1")  # Hermes's own Projects: GET /m/projects/<id>/chats, POST /m/chat/<bot>/new {project}
                 features.append("clarify_v1")  # Hermes's questions answered from the phone: POST /m/turns/<id>/clarify  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
             return self.send(200, {"protocol": 2, "features": features,
                                    "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
@@ -1846,6 +1933,9 @@ class H(BaseHTTPRequestHandler):
             return self.push_route(path)
         if path == "/m/projects":
             return self.projects_route(u)
+        m = re.match(r"^/m/projects/([a-z0-9][a-z0-9_-]{0,63})/chats$", path)
+        if m:
+            return self.hermes_project_chats(m.group(1))
         if path == "/m/manage" or path.startswith("/m/manage/"):
             return self.manage_route(path, q)
         if path == "/m/workspaces" or path.startswith(("/m/workspaces/", "/m/workspace-artifacts", "/m/workspace-file/")):
@@ -2015,6 +2105,39 @@ class H(BaseHTTPRequestHandler):
         except sqlite3.Error as e:
             log("pins failed: %s" % type(e).__name__)
             return self.send(503, {"error": "Pinned messages are unavailable right now.", "code": "unavailable"})
+
+    def hermes_project_chats(self, slug):
+        """GET: the chats Hermes files under one of its Projects (working directory inside the project's
+        folders), newest first, in the chat list's row shape."""
+        if self.command != "GET":
+            return self.send(405, {"error": "Method not allowed."})
+        projects = hermes_projects.load(HERMES)
+        project = hermes_projects.find(projects, slug)
+        if project is None:
+            return self.send(404, {"error": "That project isn't in Hermes anymore."})
+        con = _ro("default")
+        if con is None:
+            return self.send(200, {"data": [], "can_start": False})
+        try:
+            ids = hermes_projects.session_ids(con, projects, slug)
+            rows = []
+            if ids:
+                sql = "SELECT %s FROM sessions WHERE id IN (%s)" % (_session_cols(con), ",".join("?" for _ in ids))
+                found = {r["id"]: r for r in con.execute(sql, ids)}
+                for sid in ids:
+                    if sid in found:
+                        d = _session_flags(found[sid])
+                        d["profile"] = "default"
+                        rows.append(d)
+        except sqlite3.Error as e:
+            log("project chats: %s" % type(e).__name__)
+            return self.send(503, {"error": "Couldn't read this project's chats."})
+        finally:
+            con.close()
+        page = bridge_pins.with_pin_counts({"data": with_mobile_origins(rows)}, pin_store())
+        page["can_start"] = hermes_projects.start_folder(project) is not None
+        page["folder"] = os.path.basename(project["primary"]) if project.get("primary") else None
+        return self.send(200, page)
 
     def projects_route(self, u):
         if self.command != "GET":
@@ -2549,7 +2672,18 @@ class H(BaseHTTPRequestHandler):
             home = profile_home(pid)
             d = self.json_body()
             if m.group(2) == "new":
-                created = turns.create_session(home, pid, d.get("title"), d.get("request_id"))
+                cwd = None
+                if d.get("project") is not None:
+                    # A Hermes project: the chat starts in that project's folder, which the Mac resolves.
+                    # The phone only names the project; it never sends a path.
+                    project = hermes_projects.find(hermes_projects.load(HERMES), d.get("project"))
+                    if project is None:
+                        return self.send(404, {"error": "That project isn't in Hermes anymore.", "code": "no_project"})
+                    cwd = hermes_projects.start_folder(project)
+                    if cwd is None:
+                        return self.send(409, {"error": "This project's folder isn't on the Mac anymore. Fix it in the "
+                                                        "Hermes desktop app's Projects.", "code": "no_folder"})
+                created = turns.create_session(home, pid, d.get("title"), d.get("request_id"), cwd=cwd)
                 # A titled create can reopen an existing desktop chat by name.
                 # Only an untitled create through the mobile endpoint proves origin.
                 if not d.get("title") and created.get("session_id"):
@@ -2805,7 +2939,7 @@ class H(BaseHTTPRequestHandler):
                 if (r.status == 200 and self.command == "GET" and self.headers.get("X-Hermes-Transcript") == "timeline-v1"
                         and re.fullmatch(r"/api/sessions/[^/]+/messages", tail)):
                     try:
-                        compact = timeline_page(raw)
+                        compact = timeline_page(raw, pid)
                     except (ValueError, TypeError, KeyError, AttributeError):
                         pass  # Preserve the gateway response for older or unrecognized schemas.
                     else:

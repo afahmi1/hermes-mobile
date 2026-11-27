@@ -289,6 +289,13 @@ final class API: @unchecked Sendable {
     }
     /// Read-only project list (bridge schema V1). Old bridges answer 404; that and other failures
     /// become a ProjectsFailure with fixed wording, never the server's text.
+    /// The chats Hermes files under one of its own Projects, newest first.
+    func hermesProjectChats(_ id: String) async throws -> HermesProjectChats {
+        var r = try request("/m/projects/\(Self.esc(id))/chats")
+        r.cachePolicy = .reloadIgnoringLocalCacheData
+        return try JSONDecoder().decode(HermesProjectChats.self, from: try await send(r))
+    }
+
     func projects() async throws -> ProjectsSnapshot {
         do {
             var catalogRequest = try request("/m/projects")
@@ -613,8 +620,10 @@ final class API: @unchecked Sendable {
         return obj["skills"] as? [String] ?? []
     }
 
-    func createSession(profile: String, draftID: UUID) async throws -> String {
-        let obj = try await json("/m/chat/\(Self.esc(profile))/new", method: "POST", body: ["request_id": draftID.uuidString])
+    func createSession(profile: String, draftID: UUID, project: String? = nil) async throws -> String {
+        var body: [String: Any] = ["request_id": draftID.uuidString]
+        if let project { body["project"] = project }  // a Hermes project: the Mac starts the chat in its folder
+        let obj = try await json("/m/chat/\(Self.esc(profile))/new", method: "POST", body: body)
         guard let id = obj["session_id"] as? String else { throw APIError.badResponse }
         return id
     }

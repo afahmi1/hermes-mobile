@@ -54,11 +54,11 @@ struct ProjectsView: View {
             ProgressView("Loading projects…").frame(maxWidth: .infinity, maxHeight: .infinity)
         case .notConfigured:
             panel("Projects aren't set up", "folder.badge.questionmark",
-                  "Projects are turned off on your Mac's Hermes bridge. Turn them on there, then check again.") {
+                  "Your Mac's bridge doesn't list projects yet. Update it (Bridge/install.sh), then make projects in the Hermes desktop app's Projects view.") {
                 Button("Check again") { Task { await model.load() } }.hmButton(.quiet, classic: .bordered)
             }
         case .empty:
-            panel("No projects yet", "folder", "The catalog on your Mac is empty. Add a project there, then check again.") {
+            panel("No projects yet", "folder", "Make a project in the Hermes desktop app's Projects view, give it a folder, then check again. Chats you run in that folder show up under it here.") {
                 Button("Check again") { Task { await model.load() } }.hmButton(.quiet, classic: .bordered)
             }
         case .failed(let failure):
@@ -116,8 +116,13 @@ private struct ProjectRow: View {
             if let summary = project.summary, !summary.isEmpty {
                 Text(summary).font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(2)
             }
-            Label(botLine, systemImage: project.botIds.isEmpty ? "person.crop.circle.badge.questionmark" : "person.2")
-                .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2).lineLimit(2)
+            if let hermes = project.hermes {
+                Label(hermes.line, systemImage: "folder")
+                    .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2).lineLimit(1)
+            } else {
+                Label(botLine, systemImage: project.botIds.isEmpty ? "person.crop.circle.badge.questionmark" : "person.2")
+                    .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2).lineLimit(2)
+            }
         }
         .padding(.vertical, HMDesign.micro)
         .accessibilityElement(children: .combine)
@@ -148,6 +153,9 @@ struct ProjectDetailView: View {
             if let summary = project.summary, !summary.isEmpty {
                 Section { Text(summary) }.hmRows()
             }
+            if project.hermes != nil {
+                HermesProjectSection(project: project)
+            }
             if hasWorkspace {
                 Section {
                     NavigationLink(value: WorkspaceRoute(scope: WorkspaceScope(projectID: project.id, title: project.title))) {
@@ -168,6 +176,7 @@ struct ProjectDetailView: View {
                     .accessibilityHint("Choose which bots can work in this project")
                 } footer: { Text("Instructions, files, chats and artifacts.") }.hmRows()
             }
+            if project.hermes == nil {
             ManageProjectSection(project: project)  // build5 manage hook
             Section(header: HMHeader("Catalog bots")) {
                 let links = snapshot.botLinks(for: project, bots: app.bots)
@@ -214,10 +223,71 @@ struct ProjectDetailView: View {
             } footer: {
                 if refs.hidden > 0 { Text("\(refs.hidden) \(refs.hidden == 1 ? "reference is" : "references are") hidden because \(refs.hidden == 1 ? "it isn't" : "they aren't") a safe relative path in a known root.") }
             }.hmRows()
+            }
         }
         .hmCanvas()
         .navigationTitle(project.title)
         .navigationBarTitleDisplayMode(.inline)
         .task(id: hasWorkspace) { if hasWorkspace { await assignment.load() } }
+    }
+}
+
+/// One of Hermes's own Projects: its chats (the ones run inside its folders) and a new chat that starts there.
+private struct HermesProjectSection: View {
+    @Environment(AppModel.self) private var app
+    let project: Project
+    @State private var chats: [SessionSummary] = []
+    @State private var canStart = true
+    @State private var loaded = false
+    @State private var failure: String?
+
+    private var defaultBot: Bot? { app.bots.first { $0.id == "default" } ?? app.bots.first }
+
+    var body: some View {
+        Section {
+            if canStart, let bot = defaultBot {
+                NavigationLink(value: ChatRef(profile: bot.id, sessionId: nil, startIn: project.id)) {
+                    Label("New chat in \(project.hermes?.folder ?? project.title)", systemImage: "square.and.pencil")
+                        .font(.body.weight(.semibold))
+                }
+                .accessibilityHint("Starts a chat that works in this project's folder on your Mac")
+            }
+            if let failure {
+                Text(failure).foregroundStyle(HMDesign.text2)
+                Button("Try again") { Task { await load() } }
+            } else if !loaded {
+                HStack { Spacer(); ProgressView(); Spacer() }
+            } else if chats.isEmpty {
+                Text("No chats yet. Chats you run in this project's folder, here or on the desktop, show up here.")
+                    .foregroundStyle(HMDesign.text2)
+            }
+            ForEach(chats) { s in
+                NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
+                    SessionRow(session: s, botName: app.botName(s.profile))
+                }
+            }
+        } header: {
+            HMHeader("Chats")
+        } footer: {
+            if !canStart {
+                Text("This project's folder isn't on your Mac anymore. Fix it in the Hermes desktop app to start chats here.")
+            } else {
+                Text("From Hermes's Projects on your Mac. Rename it or change its folders in the desktop app.")
+            }
+        }
+        .hmRows()
+        .task(id: project.id) { await load() }
+    }
+
+    private func load() async {
+        do {
+            let page = try await API.shared.hermesProjectChats(project.id)
+            chats = page.data
+            canStart = page.canStart
+            failure = nil
+        } catch {
+            failure = "Couldn't load this project's chats."
+        }
+        loaded = true
     }
 }

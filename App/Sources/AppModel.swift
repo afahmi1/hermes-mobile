@@ -7,11 +7,14 @@ struct ChatRef: Hashable, Identifiable {
     let profile: String
     var sessionId: String?
     let draft: UUID
+    /// A new chat started from one of Hermes's own Projects: the Mac starts it in that project's folder.
+    var startIn: String? = nil
 
-    init(profile: String, sessionId: String?) {
+    init(profile: String, sessionId: String?, startIn: String? = nil) {
         self.profile = profile
         self.sessionId = sessionId
         self.draft = UUID()
+        self.startIn = sessionId == nil ? startIn : nil
     }
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -177,16 +180,16 @@ final class AppModel {
     /// One live ChatModel per session, so a reply keeps streaming while you look at other chats.
     func chat(for ref: ChatRef) -> ChatModel {
         let key = ref.id
-        let unfinished = newChats[ref.profile]
+        let unfinished = ref.startIn == nil ? newChats[ref.profile] : nil
         let chat = chats[key] ?? visibleChats.object(forKey: key as NSString)
             ?? (ref.sessionId == nil && unfinished?.sessionId == nil ? unfinished : nil)
-            ?? ChatModel(profile: ref.profile, sessionId: ref.sessionId, app: self, draftID: ref.draft)
+            ?? ChatModel(profile: ref.profile, sessionId: ref.sessionId, app: self, draftID: ref.draft, startIn: ref.startIn)
         if recentChatKeys.last != key {
             recentChatKeys.removeAll { $0 == key }
             recentChatKeys.append(key)
         }
         chats[key] = chat
-        if ref.sessionId == nil && chat.sessionId == nil { newChats[ref.profile] = chat }
+        if ref.sessionId == nil && chat.sessionId == nil && ref.startIn == nil { newChats[ref.profile] = chat }
         visibleChats.setObject(chat, forKey: key as NSString)
         if recentChatKeys.count > 12 {
             for old in Array(recentChatKeys.dropLast(12)) {

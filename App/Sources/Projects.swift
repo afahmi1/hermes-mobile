@@ -41,9 +41,11 @@ struct Project: Decodable, Hashable, Identifiable {
     let relatedFiles: [ProjectFileRef]
     /// True for projects made in the app (editable/archivable); catalog projects are read-only.
     let managed: Bool
+    /// Set for Hermes's own Projects (the desktop app's), which the Mac reads from Hermes. Read-only here.
+    let hermes: HermesProjectInfo?
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, summary, sources, managed
+        case id, title, summary, sources, managed, hermes
         case botIds = "bot_ids", relatedFiles = "related_files"
     }
     init(from decoder: Decoder) throws {
@@ -55,6 +57,38 @@ struct Project: Decodable, Hashable, Identifiable {
         sources = try c.decodeIfPresent([ProjectSource].self, forKey: .sources) ?? []
         relatedFiles = try c.decodeIfPresent([ProjectFileRef].self, forKey: .relatedFiles) ?? []
         managed = (try? c.decodeIfPresent(Bool.self, forKey: .managed)) ?? false
+        hermes = try? c.decodeIfPresent(HermesProjectInfo.self, forKey: .hermes)
+    }
+}
+
+/// A project from Hermes itself: chats belong to it when they run inside its folders.
+struct HermesProjectInfo: Decodable, Hashable {
+    /// The main folder's name (never its path).
+    let folder: String?
+    let folders: Int
+    let chats: Int?
+
+    var line: String {
+        var parts: [String] = []
+        if let folder, !folder.isEmpty { parts.append(folder) }
+        if folders > 1 { parts.append("\(folders) folders") }
+        if let chats { parts.append(chats == 1 ? "1 chat" : "\(chats) chats") }
+        return parts.isEmpty ? "Hermes project" : parts.joined(separator: " · ")
+    }
+}
+
+struct HermesProjectChats: Decodable {
+    let data: [SessionSummary]
+    /// False when the project's folder is gone from the Mac, so a new chat can't start there.
+    let canStart: Bool
+    let folder: String?
+
+    private enum CodingKeys: String, CodingKey { case data, folder, canStart = "can_start" }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        data = (try? c.decode([SessionSummary].self, forKey: .data)) ?? []
+        canStart = (try? c.decode(Bool.self, forKey: .canStart)) ?? false
+        folder = try? c.decodeIfPresent(String.self, forKey: .folder)
     }
 }
 

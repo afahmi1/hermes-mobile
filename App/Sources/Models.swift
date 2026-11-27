@@ -317,10 +317,35 @@ struct ActivityEntry: Codable, Hashable {
     var apiCalls: Int?
     var model: String?
     var state: String?
+    /// A finished subagent's token use, from Hermes's delegation record. Absent on older bridges.
+    var tokensIn: Int?
+    var tokensOut: Int?
 
     enum CodingKeys: String, CodingKey {
         case type, status, label, cwd, command, output, duration, model, state
-        case exitCode = "exit_code", apiCalls = "api_calls"
+        case exitCode = "exit_code", apiCalls = "api_calls", tokensIn = "tokens_in", tokensOut = "tokens_out"
+    }
+
+    /// "3.7M tokens in · 25k out", or nil when Hermes recorded nothing.
+    var tokens: String? {
+        switch (tokensIn, tokensOut) {
+        case let (i?, o?): return Self.compact(i) + " tokens in · " + Self.compact(o) + " out"
+        case let (i?, nil): return Self.compact(i) + " tokens in"
+        case let (nil, o?): return Self.compact(o) + " tokens out"
+        default: return nil
+        }
+    }
+
+    static func compact(_ n: Int) -> String {
+        switch n {
+        case ..<1_000: return "\(n)"
+        case ..<1_000_000:
+            let k = Double(n) / 1_000
+            return k < 10 ? String(format: "%.1fk", k) : "\(Int(k.rounded()))k"
+        default:
+            let m = Double(n) / 1_000_000
+            return m < 10 ? String(format: "%.1fM", m) : "\(Int(m.rounded()))M"
+        }
     }
 
     var isProcess: Bool { type == "process" }
@@ -337,6 +362,7 @@ struct ActivityEntry: Codable, Hashable {
             if let state, !state.isEmpty, state != "completed" { parts.append(state) }
             if let model, !model.isEmpty { parts.append(model) }
             if let apiCalls { parts.append(apiCalls == 1 ? "1 call" : "\(apiCalls) calls") }
+            if let tokens { parts.append(tokens) }
         }
         if let duration, !duration.isEmpty { parts.append(duration) }
         return parts.joined(separator: " · ")
