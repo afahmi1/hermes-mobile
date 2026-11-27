@@ -9,6 +9,7 @@ struct ChatListView: View {
     @State private var generation = UUID()
     @State private var lastSync: Date?
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @State private var loading = false
     @State private var error: String?
@@ -141,7 +142,7 @@ struct ChatListView: View {
             // Large title only on the real top-level inbox, not a bot's inbox or while selecting.
             .navigationBarTitleDisplayMode(fixedProfile == nil && !selecting ? .large : .inline)
             .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
-            .searchable(text: $query, prompt: "Search chats")
+            .hmSearchable($query, prompt: "Search chats")
             .task(id: [query] + inboxScope) { await runSearch() }
             .toolbar { inboxToolbar }
             .onChange(of: inboxScope) { _, _ in endSelection() }
@@ -182,7 +183,7 @@ struct ChatListView: View {
                 Button("Unpin", systemImage: "pin.slash") { Task { await batch(["pinned": false]) } }
             } label: { Label("Pin options", systemImage: "pin").hmTouchTarget() }
         }
-        .padding(.horizontal, HMDesign.gutter).frame(minHeight: HMDesign.touch).background(HMDesign.bar)
+        .padding(.horizontal, HMDesign.gutter).frame(minHeight: HMDesign.touch).hmBar(.none)
         .disabled(batchBusy || selection.isEmpty)
     }
 
@@ -236,13 +237,16 @@ struct ChatListView: View {
                         if !typeSize.isAccessibilitySize { Spacer(minLength: 6) }
                         ConnectionBadge().buttonStyle(.borderless)
                     }
+                    if HMTheme.isThermocline {
+                        HMSearchField(prompt: "Search chats", query: $query).disabled(selecting)
+                    }
                     let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 8))
                     layout { filters }
                     .disabled(selecting)
                 }
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-            }
+            }.hmRows(onCanvasInDark: colorScheme == .dark)
             .listSectionSpacing(.compact)
             if let error, !(sessions.isEmpty && results == nil) {
                 // Cached or partial rows stay visible; say what failed and offer the existing refresh.
@@ -253,27 +257,43 @@ struct ChatListView: View {
                         .buttonStyle(.borderless)
                         .hmTouchTarget()
                         .disabled(loading)
-                }.foregroundStyle(.secondary)
+                }.foregroundStyle(HMDesign.text2).hmRows(onCanvasInDark: colorScheme == .dark)
             }
             if let results {
-                if results.isEmpty { ContentUnavailableView.search(text: query.trimmingCharacters(in: .whitespaces)) }
-                ForEach(results, id: \.key) { row($0) }
+                if results.isEmpty {
+                    if HMTheme.isThermocline {
+                        HMUnavailable(title: "No results for “\(query.trimmingCharacters(in: .whitespaces))”", symbol: "magnifyingglass",
+                                      message: "Check the spelling or try another word.")
+                            .listRowBackground(Color.clear)
+                    } else {
+                        ContentUnavailableView.search(text: query.trimmingCharacters(in: .whitespaces))
+                    }
+                }
+                ForEach(results, id: \.key) { row($0) }.hmRows(onCanvasInDark: colorScheme == .dark)
             } else {
                 ForEach(grouped, id: \.0) { section in
-                    Section(section.0) { ForEach(section.1, id: \.key) { row($0) } }
+                    Section(header: HMHeader(section.0)) { ForEach(section.1, id: \.key) { row($0) } }
+                        .hmRows(onCanvasInDark: colorScheme == .dark)
                 }
                 if cursor != nil {
                     HStack { Spacer(); ProgressView().accessibilityLabel("Loading more chats"); Spacer() }
                         .task(id: cursor) { await loadMore() }  // re-runs for every new page, even an empty one
+                        .listRowBackground(HMTheme.isThermocline && colorScheme == .dark ? Color.clear : nil)
                 } else if sessions.isEmpty && !loading {
-                    if let error { failureState(error) } else { emptyState }
+                    Group { if let error { failureState(error) } else { emptyState } }.listRowBackground(Color.clear)
                 }
             }
         }
         .listStyle(.insetGrouped)
         .safeAreaInset(edge: .bottom, spacing: 0) { if selecting { selectionActions } }
         .overlay {
-            if loading && sessions.isEmpty { ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius)) }
+            if loading && sessions.isEmpty {
+                if HMTheme.isThermocline {
+                    ProgressView("Loading chats…").padding().hmGlass(RoundedRectangle(cornerRadius: HMDesign.panelRadius, style: .continuous))
+                } else {
+                    ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+                }
+            }
         }
     }
 
@@ -286,22 +306,15 @@ struct ChatListView: View {
         case .all: (title, detail, symbol) = ("Nothing here yet", "Chats and automated runs show up here once Hermes records them.", "tray")
         case .chats: (title, detail, symbol) = ("No chats yet", "Start a chat, or choose another source from the filter above.", "bubble.left")
         }
-        return ContentUnavailableView {
-            Label(title, systemImage: symbol)
-        } description: {
-            Text(detail)
-        } actions: {
-            if filter != .archived { Button("New chat") { startNew() } }
+        // The first-run inbox carries the Horizon-eye mark; filtered views keep a quiet symbol.
+        return HMUnavailable(title: title, symbol: symbol, message: detail, mark: filter == .chats) {
+            if filter != .archived { Button("New chat") { startNew() }.hmButton(.primary) }
         }
     }
 
     private func failureState(_ message: String) -> some View {
-        ContentUnavailableView {
-            Label("Can't load chats", systemImage: "wifi.exclamationmark")
-        } description: {
-            Text(message)
-        } actions: {
-            Button("Try again") { Task { await reload() } }.disabled(loading)
+        HMUnavailable(title: "Can't load chats", symbol: "wifi.exclamationmark", message: message) {
+            Button("Try again") { Task { await reload() } }.disabled(loading).hmButton(.quiet)
         }
     }
 
@@ -312,7 +325,7 @@ struct ChatListView: View {
             }
             Divider()
             Button("About chat sources", systemImage: "info.circle") { showSourceGuide = true }
-        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease").fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true) }
+        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease", active: filter != .chats).fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true) }
         .buttonStyle(.borderless)
         .accessibilityLabel("Source, " + filter.rawValue)
         if fixedProfile == nil {
@@ -321,22 +334,24 @@ struct ChatListView: View {
                     Text("All bots").tag(String?.none)
                     ForEach(app.bots) { bot in Text(bot.name == bot.id ? bot.name : "\(bot.name) · \(bot.id)").tag(Optional(bot.id)) }
                 }
-            } label: { filterLabel(selectedBot.map { app.botName($0) } ?? "All bots", symbol: "person.2") }
+            } label: { filterLabel(selectedBot.map { app.botName($0) } ?? "All bots", symbol: "person.2", active: selectedBot != nil) }
             .buttonStyle(.borderless)
             .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
         }
     }
 
-    private func filterLabel(_ title: String, symbol: String) -> some View {
+    /// A filter menu's chip. `active` marks a filter that narrows the list (lead-tinted in Thermocline).
+    private func filterLabel(_ title: String, symbol: String, active: Bool = false) -> some View {
         HStack(spacing: 5) {
             Image(systemName: symbol).imageScale(.small)
             Text(title).lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
-            Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+            Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                .foregroundStyle(active && HMTheme.isThermocline ? HMDesign.accent : HMDesign.text2)
         }
         .font(.subheadline.weight(.medium))
-        .foregroundStyle(.primary)
+        .foregroundStyle(HMDesign.ink)
         .padding(.horizontal, HMDesign.medium).padding(.vertical, 7)
-        .background(Color(.tertiarySystemFill), in: Capsule())
+        .hmChip(active: active)
         .hmTouchTarget()
     }
 
@@ -347,7 +362,7 @@ struct ChatListView: View {
                     Image(systemName: selection.contains(s.key) ? "checkmark.circle.fill" : "circle")
                         .frame(width: HMDesign.touch, height: HMDesign.touch)
                         .font(.title3)
-                        .foregroundStyle(selection.contains(s.key) ? HMDesign.accent : Color.secondary)
+                        .foregroundStyle(selection.contains(s.key) ? HMDesign.accent : HMDesign.text2)
                     SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
                 .contentShape(Rectangle())
@@ -371,14 +386,14 @@ struct ChatListView: View {
                     requestArchive(s)
                 } label: {
                     Label(s.archived == true ? "Unarchive" : "Archive", systemImage: "archivebox")
-                }.tint(.indigo)
+                }.tint(HMDesign.link)
             }
             .swipeActions(edge: .leading) {
                 Button {
                     Task { await setFlag(s, "pinned", !(s.pinned ?? false)) }
                 } label: {
                     Label(s.pinned == true ? "Unpin" : "Pin", systemImage: s.pinned == true ? "pin.slash" : "pin")
-                }.tint(.orange)
+                }.tint(HMDesign.caution)
             }
             .contextMenu {
                 Button {
@@ -739,7 +754,7 @@ struct SessionRow: View {
                 head {
                     Text(session.displayTitle).font(HMDesign.rowTitle).lineLimit(large ? 4 : 2)
                     if !large { Spacer(minLength: HMDesign.micro) }
-                    Text(session.date, format: relative).font(HMDesign.metadata).foregroundStyle(.secondary)
+                    Text(session.date, format: relative).font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2)
                         .monospacedDigit().fixedSize(horizontal: true, vertical: false)
                 }
                 if hasDraft {
@@ -748,11 +763,11 @@ struct SessionRow: View {
                         .font(.subheadline.weight(.medium)).foregroundStyle(.tint)
                         .accessibilityLabel("Unsent draft")
                 } else if let p = session.preview, !p.isEmpty, p != session.displayTitle {
-                    Text(p).font(.subheadline).foregroundStyle(.secondary).lineLimit(large ? 4 : 2)
+                    Text(p).font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(large ? 4 : 2)
                 }
                 // One wrapping line, so a long bot or model name never squeezes the title or the pin state.
                 Text(metadata.joined(separator: " · "))
-                    .font(HMDesign.metadata).foregroundStyle(.secondary)
+                    .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2)
                     .lineLimit(large ? 4 : 2).truncationMode(.middle)
                     .accessibilityLabel(metadata.joined(separator: ", "))
                 if session.pinned == true || session.pinnedMessages > 0 {
@@ -765,7 +780,7 @@ struct SessionRow: View {
                             Label(session.pinnedMessages == 1 ? "1 pinned message" : "\(session.pinnedMessages) pinned messages", systemImage: "pin.circle.fill")
                         }
                     }
-                    .font(HMDesign.metadata).foregroundStyle(.secondary)
+                    .font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                 }
             }
         }
@@ -831,28 +846,28 @@ private struct SourceGuideView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Views") {
+                Section(header: HMHeader("Views")) {
                     ForEach(ChatListView.Filter.allCases) { entry in
                         VStack(alignment: .leading, spacing: 3) {
                             Text(entry.rawValue).font(.subheadline.weight(.semibold))
-                            Text(entry.explanation).font(.footnote).foregroundStyle(.secondary)
+                            Text(entry.explanation).font(.footnote).foregroundStyle(HMDesign.text2)
                         }
                         .padding(.vertical, 2)
                     }
-                }
-                Section("Where a chat came from") {
+                }.hmRows()
+                Section(header: HMHeader("Where a chat came from")) {
                     ForEach(sources) { entry in
                         VStack(alignment: .leading, spacing: 3) {
                             Text(entry.id).font(.subheadline.weight(.semibold))
-                            Text(entry.detail).font(.footnote).foregroundStyle(.secondary)
+                            Text(entry.detail).font(.footnote).foregroundStyle(HMDesign.text2)
                         }
                         .padding(.vertical, 2)
                     }
-                }
-                Section("Faster actions") {
+                }.hmRows()
+                Section(header: HMHeader("Faster actions")) {
                     Text("Touch and hold a chat to archive, pin or select it. Swipe left to archive, swipe right to pin. Tap Select to choose several at once.")
                         .font(.footnote)
-                }
+                }.hmRows()
             }
             .hmCanvas()
             .navigationTitle("Chats, explained")
@@ -884,7 +899,7 @@ struct QueuedActionsBar: View {
                                     : "\(stuck.count) change\(stuck.count == 1 ? "" : "s") didn't apply",
                       systemImage: stuck.isEmpty ? "icloud.and.arrow.up" : "exclamationmark.triangle")
                     .font(.footnote.weight(.medium))
-                    .foregroundStyle(stuck.isEmpty ? Color.secondary : HMDesign.warning)
+                    .foregroundStyle(stuck.isEmpty ? HMDesign.text2 : HMDesign.warningText)
                     .padding(.horizontal, 14).padding(.vertical, 8)
                     .hmCapsule()
             }

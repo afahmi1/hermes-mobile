@@ -329,7 +329,7 @@ struct AttachmentChip: View {
                 content.accessibilityElement(children: .combine)
             }
             Button(action: remove) {
-                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                Image(systemName: "xmark.circle.fill").foregroundStyle(HMDesign.text2)
                     .frame(width: 44, height: 44).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -362,7 +362,7 @@ struct AttachmentChip: View {
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(label).font(.caption2.weight(.semibold)).lineLimit(1)
-                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                Text(detail).font(.caption2).foregroundStyle(HMDesign.text2).lineLimit(1)
             }
             .padding(.trailing, 2)
         }

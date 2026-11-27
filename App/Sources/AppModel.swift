@@ -63,7 +63,7 @@ final class AppModel {
         // without a password. Tokens come from `hermes_mobile_bridge.py --issue-token <name>` on the Mac.
         let d = UserDefaults.standard
         let env = ProcessInfo.processInfo.environment
-        if let s = env["HMServer"] ?? d.string(forKey: "HMServer"), let url = URL(string: s),
+        if !DemoMode.isOn, let s = env["HMServer"] ?? d.string(forKey: "HMServer"), let url = URL(string: s),
            let t = env["HMToken"] ?? d.string(forKey: "HMToken"), !t.isEmpty {
             if let origin = SavedGateways.origin(url) {
                 let login = GatewayLogin(server: origin, token: t)
@@ -80,9 +80,15 @@ final class AppModel {
         if signedIn, let open = env["HMOpenChat"] ?? d.string(forKey: "HMOpenChat"),
            let slash = open.firstIndex(of: "/") {
             inboxPath = [ChatRef(profile: String(open[..<slash]), sessionId: String(open[open.index(after: slash)...]))]
+            if DemoMode.isOn, let ref = inboxPath.first {
+                chat(for: ref).draft = DemoMode.draft ? "The layout looks good on paper." : ""
+            }
         }
         #endif
         savedGateways = accounts.servers
+        #if DEBUG
+        if DemoMode.isOn { return }
+        #endif
         DevicePreferences.migrate(account: inboxAccount)
     }
 
@@ -316,36 +322,5 @@ final class AppModel {
     func saveChoice(_ choice: RuntimeChoice, profile: String, session: String) {
         guard let key = inboxKey(profile: profile, filter: "runtime/" + session) else { return }
         UserDefaults.standard.set(try? JSONEncoder().encode(choice), forKey: key)
-    }
-}
-
-// MARK: - Bot look
-
-extension Bot {
-    static func color(for id: String) -> Color {
-        var h: UInt32 = 2166136261
-        for b in id.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
-        return Color(hue: Double(h % 360) / 360, saturation: 0.65, brightness: 0.46)
-    }
-}
-
-struct BotAvatar: View {
-    let id: String
-    let name: String
-    var size: CGFloat = 40
-
-    var body: some View {
-        ZStack {
-            Circle().fill(Bot.color(for: id))
-            Text(initials).font(.system(size: size * 0.4, weight: .semibold, design: .rounded)).foregroundStyle(.white)
-        }
-        .frame(width: size, height: size)
-        .accessibilityHidden(true)
-    }
-
-    private var initials: String {
-        let words = name.split(whereSeparator: { $0 == " " || $0 == "-" })
-        let s = words.prefix(2).compactMap { $0.first }.map(String.init).joined()
-        return s.isEmpty ? "H" : s.uppercased()
     }
 }

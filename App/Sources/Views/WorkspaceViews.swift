@@ -98,7 +98,7 @@ struct WorkspaceView: View {
             ContentUnavailableView {
                 Label("Workspace unavailable", systemImage: "exclamationmark.triangle")
             } description: { Text(f.message) } actions: {
-                Button("Try again") { Task { await model.load() } }.buttonStyle(.borderedProminent)
+                Button("Try again") { Task { await model.load() } }.hmButton(.quiet, classic: .prominent)
             }
         case .loaded:
             switch tab {
@@ -120,7 +120,7 @@ struct WorkspaceView: View {
                         Text(model.detail.instructions.isEmpty
                              ? (model.detail.editable ? "No instructions yet. Open to add them." : "No instructions yet.")
                              : model.detail.instructions)
-                            .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                            .font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(2)
                     }
                     .accessibilityElement(children: .combine)
                 }
@@ -128,15 +128,15 @@ struct WorkspaceView: View {
                 .accessibilityHint("Opens the project instructions")
             } footer: {
                 Text("Saved on your Mac. Sent to a bot only when you switch project context on for a message.")
-            }
+            }.hmRows()
             Section {
-                if model.detail.files.isEmpty { Text(model.detail.editable ? "No files yet. Use Add to create or import one." : "No files yet.").foregroundStyle(.secondary) }
+                if model.detail.files.isEmpty { Text(model.detail.editable ? "No files yet. Use Add to create or import one." : "No files yet.").foregroundStyle(HMDesign.text2) }
                 ForEach(model.detail.files) { file in
                     NavigationLink {
                         WorkspaceFileView(file: file, project: scope.projectID) { Task { await model.load() } }
                     } label: {
                         LabeledContent {
-                            Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)).font(HMDesign.metadata).foregroundStyle(.secondary)
+                            Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                         } label: {
                             Label(file.name, systemImage: "doc.text")
                         }
@@ -148,9 +148,9 @@ struct WorkspaceView: View {
                         if model.detail.editable { Button("Remove", role: .destructive) { pendingDelete = file } }
                     }
                 }
-            } header: { Text("Files (\(model.detail.files.count)/\(WorkspaceLimits.maxFiles))") } footer: {
+            } header: { HMHeader("Files (\(model.detail.files.count)/\(WorkspaceLimits.maxFiles))") } footer: {
                 Text(".txt, .md, .csv or .json; UTF-8, up to 8192 bytes each.")
-            }
+            }.hmRows()
         }
         .refreshable { await model.load() }
     }
@@ -175,26 +175,26 @@ struct WorkspaceView: View {
                     }
                 } label: { Label("Start chat", systemImage: "square.and.pencil") }
                     .disabled(model.selectedBot == nil)
-            } header: { Text("New chat") } footer: {
+            } header: { HMHeader("New chat") } footer: {
                 Text(bots.isEmpty ? "No reachable bot is enabled for this project." : "Starting a chat opens a real session with the bot you choose.")
-            }
-            Section("Chats") {
+            }.hmRows()
+            Section(header: HMHeader("Chats")) {
                 if model.detail.chats.isEmpty {
                     Text(bots.isEmpty ? "No chats yet." : "No chats yet. Choose a bot above to start one.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(HMDesign.text2)
                 }
                 ForEach(model.detail.chats) { chat in
                     let usable = bots.contains { $0.id == chat.profile }
                     NavigationLink(value: WorkspaceChatRoute(ref: ChatRef(profile: chat.profile, sessionId: chat.sessionId), scope: scope)) {
                         VStack(alignment: .leading, spacing: HMDesign.micro) {
                             Text(chat.title?.nilIfEmpty ?? "Untitled chat").font(HMDesign.rowTitle)
-                            Text(app.botName(chat.profile) + (usable ? "" : " (unavailable)")).font(HMDesign.metadata).foregroundStyle(.secondary)
+                            Text(app.botName(chat.profile) + (usable ? "" : " (unavailable)")).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                         }
                     }
                     .disabled(!usable)
                     .accessibilityHint(usable ? "Resumes this chat" : "This bot isn't available right now")
                 }
-            }
+            }.hmRows()
         }
     }
 
@@ -208,30 +208,30 @@ struct WorkspaceView: View {
     private var artifactsTab: some View {
         let bots = model.selectableBots(app.bots)
         return List {
-            Section("This project") {
-                if model.detail.artifacts.isEmpty { Text("No artifacts yet. Files a bot makes in this project appear here.").foregroundStyle(.secondary) }
+            Section(header: HMHeader("This project")) {
+                if model.detail.artifacts.isEmpty { Text("No artifacts yet. Files a bot makes in this project appear here.").foregroundStyle(HMDesign.text2) }
                 ForEach(model.detail.artifacts) { a in
                     NavigationLink { ArtifactDetailView(artifact: a) } label: { ArtifactRow(artifact: a) }
                 }
-            }
-            Section("Chat artifacts") {
-                if model.detail.chats.isEmpty { Text("No chats yet.").foregroundStyle(.secondary) }
+            }.hmRows()
+            Section(header: HMHeader("Chat artifacts")) {
+                if model.detail.chats.isEmpty { Text("No chats yet.").foregroundStyle(HMDesign.text2) }
                 ForEach(model.detail.chats) { chat in
                     NavigationLink {
                         ArtifactListView(title: chat.title?.nilIfEmpty ?? "Chat", profile: chat.profile, session: chat.sessionId)
                     } label: { Text(chat.title?.nilIfEmpty ?? "Untitled chat") }
                 }
-            }
+            }.hmRows()
             Section {
-                if bots.isEmpty { Text("No reachable bot is enabled for this project.").foregroundStyle(.secondary) }
+                if bots.isEmpty { Text("No reachable bot is enabled for this project.").foregroundStyle(HMDesign.text2) }
                 ForEach(bots) { bot in
                     NavigationLink { ArtifactListView(title: bot.name, profile: bot.id, session: nil, project: scope.projectID) } label: { Text(bot.name) }
                 }
             } header: {
-                Text("Bot library")
+                HMHeader("Bot library")
             } footer: {
                 Text("Files this bot made in this project only. Other projects' files are never shown here.")
-            }
+            }.hmRows()
         }
     }
 }
@@ -246,7 +246,7 @@ private struct ArtifactRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: HMDesign.micro) {
             Text(artifact.name).font(HMDesign.rowTitle).lineLimit(2)
-            Text(ByteCountFormatter.string(fromByteCount: Int64(artifact.size), countStyle: .file)).font(HMDesign.metadata).foregroundStyle(.secondary)
+            Text(ByteCountFormatter.string(fromByteCount: Int64(artifact.size), countStyle: .file)).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
         }
         .accessibilityElement(children: .combine)
     }
@@ -265,11 +265,11 @@ struct ArtifactListView: View {
         List {
             if let failure {
                 VStack(alignment: .leading, spacing: HMDesign.small) {
-                    Label(failure.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.secondary)
+                    Label(failure.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.text2)
                     Button("Try again") { Task { await load() } }.hmTouchTarget()
                 }
             } else if let items {
-                if items.isEmpty { Text("No artifacts yet.").foregroundStyle(.secondary) }
+                if items.isEmpty { Text("No artifacts yet.").foregroundStyle(HMDesign.text2) }
                 ForEach(items) { a in NavigationLink { ArtifactDetailView(artifact: a) } label: { ArtifactRow(artifact: a) } }
             } else {
                 HStack { Spacer(); ProgressView("Loading artifacts…"); Spacer() }.listRowBackground(Color.clear)
@@ -320,13 +320,13 @@ struct ArtifactDetailView: View {
                 LabeledContent("Name", value: artifact.name)
                 LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: Int64(artifact.size), countStyle: .file))
                 if let m = artifact.mime { LabeledContent("Type", value: m) }
-            }
+            }.hmRows()
             Section {
                 if let d = download {
                     if case .text(let s) = ArtifactPreview.make(data: d.data, mime: artifact.mime) {
                         Text(verbatim: s).font(.footnote.monospaced()).textSelection(.enabled)
                     } else {
-                        Text("No preview for this type. Save it to open in another app.").foregroundStyle(.secondary)
+                        Text("No preview for this type. Save it to open in another app.").foregroundStyle(HMDesign.text2)
                     }
                     Button { exporting = true } label: { Label("Save to Files", systemImage: "square.and.arrow.down") }
                 } else if loading {
@@ -335,11 +335,11 @@ struct ArtifactDetailView: View {
                     Button { Task { await fetch() } } label: { Label("Download", systemImage: "arrow.down.circle") }
                         .disabled(artifact.size > WorkspaceLimits.artifactDownloadBytes)
                 }
-                if let failure { Label(failure.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.footnote) }
+                if let failure { Label(failure.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.danger).font(.footnote) }
                 if artifact.size > WorkspaceLimits.artifactDownloadBytes {
-                    Text(WorkspacesFailure.tooLarge.message).font(.footnote).foregroundStyle(.secondary)
+                    Text(WorkspacesFailure.tooLarge.message).font(.footnote).foregroundStyle(HMDesign.text2)
                 }
-            }
+            }.hmRows()
         }
         .hmCanvas()
         .navigationTitle(artifact.name)

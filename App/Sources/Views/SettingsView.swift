@@ -45,14 +45,14 @@ struct SettingsView: View {
                         }
                     }
                     Button("Add Gateway", systemImage: "plus") { addingGateway = true }
-                    if let gatewayError { Label(gatewayError, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
+                    if let gatewayError { Label(gatewayError, systemImage: "exclamationmark.triangle.fill").hmProblem() }
                 } header: {
-                    Text("Gateways")
+                    HMHeader("Gateways")
                 } footer: {
                     Text("Chats, files and approvals stay on the gateway you choose.")
-                }
+                }.hmRows()
                 AppearanceSection()
-                Section("Hermes server") {
+                Section(header: HMHeader("Hermes server")) {
                     if let caps = capabilities, caps.features.contains("device_grants") {
                         NavigationLink { DeviceAccessView(capabilities: caps) } label: {
                             Label("Device access", systemImage: "iphone")
@@ -65,17 +65,17 @@ struct SettingsView: View {
                     }
                     .accessibilityIdentifier("settings.bots")
                     .accessibilityHint("Shows every bot and whether it is reachable")
-                }
+                }.hmRows()
                 Section {
                     NavigationLink { DeletionPinView() } label: { Label("Deletion PIN", systemImage: "lock") }
                         .accessibilityIdentifier("settings.deletionPin")
                         .accessibilityHint("Choose or change the PIN that protects archiving projects and bots")
-                } footer: { Text("Owner only. Each Mac has its own PIN; there is no default.") }
+                } footer: { Text("Owner only. Each Mac has its own PIN; there is no default.") }.hmRows()
                 ProviderUsageSection()
                 Section {
                     Text("Chats, bots and model choices live in Hermes on your server, so this phone and the desktop app show the same thing. Away from home, keep Tailscale on.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
+                        .font(.footnote).foregroundStyle(HMDesign.text2)
+                }.hmRows()
                 Section {
                     Button("Sign Out", role: .destructive) { confirmSignOut = true }
                 } footer: {
@@ -83,7 +83,7 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.top, 8)
                         .accessibilityLabel("App version \(appVersion)")
-                }
+                }.hmRows()
             }
             .hmCanvas()
             .navigationTitle("Settings")
@@ -145,20 +145,20 @@ private struct GatewayRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: HMDesign.medium) {
             Image(systemName: "server.rack")
-                .foregroundStyle(isCurrent ? HMDesign.accent : Color.secondary)
+                .foregroundStyle(isCurrent ? HMDesign.accent : HMDesign.text2)
                 .frame(width: 28)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: HMDesign.micro) {
-                Text(name).font(HMDesign.rowTitle).foregroundStyle(.primary)
-                Text(detail).font(HMDesign.metadata).foregroundStyle(.secondary)
+                Text(name).font(HMDesign.rowTitle).foregroundStyle(HMDesign.ink)
+                Text(detail).font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.link : HMDesign.text2)
                     .lineLimit(2).truncationMode(.middle)
                 if isCurrent {
                     Label {
                         Text("Current")
                     } icon: {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(HMDesign.success)
                     }
-                    .font(HMDesign.metadata.weight(.semibold)).foregroundStyle(.primary)
+                    .font(HMDesign.metadata.weight(.semibold)).foregroundStyle(HMDesign.ink)
                 }
             }
         }
@@ -173,12 +173,12 @@ private struct SettingsBotsList: View {
         List {
             if let e = app.loadError {
                 VStack(alignment: .leading, spacing: HMDesign.small) {
-                    Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
+                    Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(HMDesign.text2)
                     Button("Try again") { Task { await app.refreshBots() } }.hmTouchTarget()
                 }
             }
             if app.botsLoaded && app.bots.isEmpty && app.loadError == nil {
-                Text("This gateway reported no bots. Pull to refresh.").foregroundStyle(.secondary)
+                Text("This gateway reported no bots. Pull to refresh.").foregroundStyle(HMDesign.text2)
             } else if !app.botsLoaded && app.loadError == nil {
                 HStack { Spacer(); ProgressView("Loading bots…"); Spacer() }.listRowBackground(Color.clear)
             }
@@ -204,26 +204,26 @@ private struct DeviceAccessView: View {
 
     var body: some View {
         Form {
-            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
+            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").hmProblem() }
             if capabilities.manageDevices {
-                Section("Signed-in devices") {
+                Section(header: HMHeader("Signed-in devices")) {
                     ForEach(devices) { device in
                         AdaptiveTitleRow {
                             VStack(alignment: .leading, spacing: HMDesign.micro) {
                                 Text(device.name).font(HMDesign.rowTitle)
                                 Text("Expires " + Date(timeIntervalSince1970: device.expires).formatted(date: .abbreviated, time: .omitted))
-                                    .font(HMDesign.metadata).foregroundStyle(.secondary)
+                                    .font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                             }
                         } trailing: {
                             if device.id == capabilities.deviceID {
-                                Text("This phone").font(HMDesign.metadata).foregroundStyle(.secondary)
+                                Text("This phone").font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                             } else {
                                 Button("Revoke", role: .destructive) { selected = device }
                                     .buttonStyle(.borderless).disabled(busy).hmTouchTarget()
                             }
                         }
                     }
-                }
+                }.hmRows()
                 Section {
                     Button("Create One-Time Pairing Code") {
                         Task {
@@ -236,13 +236,13 @@ private struct DeviceAccessView: View {
                     if let offer {
                         Text(offer.code).font(.body.monospaced()).textSelection(.enabled)
                         Text("Expires at " + Date(timeIntervalSince1970: offer.expires).formatted(date: .omitted, time: .shortened))
-                            .font(HMDesign.metadata).foregroundStyle(.secondary)
+                            .font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                     }
-                } footer: { Text("A paired phone can access chats, tools and approvals on this bridge.") }
+                } footer: { Text("A paired phone can access chats, tools and approvals on this bridge.") }.hmRows()
             } else {
                 Section {
                     Text("This phone has its own revocable sign-in. The bridge owner can manage devices on the host.")
-                }
+                }.hmRows()
             }
         }
         .hmCanvas()
@@ -304,7 +304,7 @@ struct GatewayDestinationsView: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: HMDesign.micro) {
                                     Text(SavedGateways.displayName(url)).font(HMDesign.rowTitle)
-                                    Text(url.absoluteString).font(HMDesign.metadata).foregroundStyle(.secondary)
+                                    Text(url.absoluteString).font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.link : HMDesign.text2)
                                 }
                                 Spacer()
                                 if url == API.shared.baseURL {
@@ -314,7 +314,7 @@ struct GatewayDestinationsView: View {
                         }
                     }
                     Button("Add gateway", systemImage: "plus") { adding = true }
-                } header: { Text("Switch gateway") } footer: { Text("Chats, files and approvals stay on the gateway you choose.") }
+                } header: { HMHeader("Switch gateway") } footer: { Text("Chats, files and approvals stay on the gateway you choose.") }.hmRows()
                 if app.savedGateways.count > 1 {
                     Section {
                         HStack {
@@ -324,7 +324,7 @@ struct GatewayDestinationsView: View {
                             Button("Search", action: submit)
                                 .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
-                    } footer: { Text("Search sends these words to each saved gateway.") }
+                    } footer: { Text("Search sends these words to each saved gateway.") }.hmRows()
                     if search != nil {
                         ForEach(app.savedGateways, id: \.self) { url in
                             Section {
@@ -332,9 +332,9 @@ struct GatewayDestinationsView: View {
                                 case .none:
                                     HStack { ProgressView().controlSize(.small); Text("Searching…") }
                                 case .failed(let reason):
-                                    Label(reason, systemImage: "exclamationmark.circle").foregroundStyle(.secondary)
+                                    Label(reason, systemImage: "exclamationmark.circle").foregroundStyle(HMDesign.text2)
                                 case .matches(let login, let rows):
-                                    if rows.isEmpty { Text("No matching chats").foregroundStyle(.secondary) }
+                                    if rows.isEmpty { Text("No matching chats").foregroundStyle(HMDesign.text2) }
                                     ForEach(rows, id: \.key) { row in
                                         Button {
                                             do { try app.openDestinationChat(row, on: login); dismiss() }
@@ -342,19 +342,18 @@ struct GatewayDestinationsView: View {
                                         } label: {
                                             VStack(alignment: .leading) {
                                                 Text(row.displayTitle).lineLimit(2)
-                                                Text(row.profile + " · " + row.sourceLabel).font(HMDesign.metadata).foregroundStyle(.secondary)
+                                                Text(row.profile + " · " + row.sourceLabel).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                                             }
                                         }
                                     }
                                 }
                             } header: {
-                                Text(url.absoluteString.replacingOccurrences(of: "https://", with: ""))
-                                    .textCase(nil)
-                            }
+                                HMHeader(url.absoluteString.replacingOccurrences(of: "https://", with: ""), uppercase: false)
+                            }.hmRows()
                         }
                     }
                 }
-                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
+                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").hmProblem() }
             }
             .hmCanvas()
             .navigationTitle("Gateways")
@@ -393,74 +392,154 @@ struct GatewayDestinationsView: View {
     }
 }
 
-/// Theme and accent. Swatches show the real canvas, surface and accent, so the choice is visual, not a name.
+/// Appearance: Theme (Thermocline or Classic), then that theme's own options. Every visual choice shows itself
+/// in a small preview instead of a bare name, applies at once, and marks the current value.
 struct AppearanceSection: View {
-    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
+    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeKind.thermocline.rawValue
+    @AppStorage(HMTheme.modeKey) private var modeRaw = HMMode.system.rawValue
+    @AppStorage(HMTheme.classicKey) private var classicRaw = HMThemeChoice.native.rawValue
     @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
+    @AppStorage(HMTheme.thermoclineAccentKey) private var thermoclineAccentRaw = Thermocline.Accent.crown.rawValue
     @AppStorage(HMGlass.key) private var glass = true
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    private var isThermocline: Bool { themeRaw != HMThemeKind.classic.rawValue }
 
     var body: some View {
-        Section("Appearance") {
-            ForEach(HMThemeChoice.allCases) { theme in
-                Button { themeRaw = theme.rawValue } label: {
-                    HStack(spacing: 12) {
-                        swatch(theme)
+        Section(header: HMHeader("Appearance")) {
+            let stack = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 12)) : AnyLayout(HStackLayout(alignment: .top, spacing: 12))
+            stack {
+                ForEach(HMThemeKind.allCases) { themeCard($0) }
+            }
+            .padding(.vertical, 6)
+            if isThermocline {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Mode").font(.subheadline)
+                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
+                    layout { ForEach(HMMode.allCases) { modeTile($0) } }
+                }
+                .padding(.vertical, 4)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Accent").font(.subheadline)
+                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10)) : AnyLayout(HStackLayout(spacing: 4))
+                    layout {
+                        ForEach(Thermocline.Accent.allCases) { accent in
+                            Button { thermoclineAccentRaw = accent.rawValue } label: {
+                                AccentSwatch(accent: accent, selected: thermoclineAccentRaw == accent.rawValue)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            } else {
+                // Classic: Build 31's own looks, accents and Liquid Glass, unchanged.
+                ForEach(HMThemeChoice.allCases) { theme in
+                    Button { classicRaw = theme.rawValue } label: {
+                        HStack(spacing: 12) {
+                            classicSwatch(theme)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(theme.title).foregroundStyle(.primary)
+                                Text(theme.detail).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if classicRaw == theme.rawValue {
+                                Image(systemName: "checkmark").font(.body.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(classicRaw == theme.rawValue ? .isSelected : [])
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Accent").font(.subheadline)
+                    HStack(spacing: 10) {
+                        ForEach(HMAccent.allCases) { accent in
+                            Button { accentRaw = accent.rawValue } label: {
+                                Circle()
+                                    .fill(accentFill(accent))
+                                    .frame(width: 26, height: 26)
+                                    .overlay(Circle().strokeBorder(Color(uiColor: HMTheme.classicUIColor(\.ink)).opacity(accentRaw == accent.rawValue ? 0.9 : 0), lineWidth: 2).padding(-4))
+                                    .frame(width: 36, height: 36)
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(accent.title + " accent")
+                            .accessibilityAddTraits(accentRaw == accent.rawValue ? .isSelected : [])
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+                if #available(iOS 26.0, *) {
+                    Toggle(isOn: $glass) {
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(theme.title).foregroundStyle(.primary)
-                            Text(theme.detail).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if themeRaw == theme.rawValue {
-                            Image(systemName: "checkmark").font(.body.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                            Text("Liquid Glass")
+                            Text("Glass message box and controls. Off uses the theme's flat colors.").font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(themeRaw == theme.rawValue ? .isSelected : [])
             }
+        }.hmRows()
+        .sensoryFeedback(.selection, trigger: [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw].joined())
+    }
+
+    private func themeCard(_ kind: HMThemeKind) -> some View {
+        let selected = (kind == .thermocline) == isThermocline
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        return Button { themeRaw = kind.rawValue } label: {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Accent").font(.subheadline)
-                HStack(spacing: 10) {
-                    ForEach(HMAccent.allCases) { accent in
-                        Button { accentRaw = accent.rawValue } label: {
-                            Circle()
-                                .fill(accentFill(accent))
-                                .frame(width: 26, height: 26)
-                                .overlay(Circle().strokeBorder(HMDesign.ink.opacity(accentRaw == accent.rawValue ? 0.9 : 0), lineWidth: 2).padding(-4))
-                                .frame(width: 36, height: 36)
-                                .contentShape(Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(accent.title + " accent")
-                        .accessibilityAddTraits(accentRaw == accent.rawValue ? .isSelected : [])
-                    }
+                ThemePreview(kind: kind)
+                    .frame(height: 78)
+                    .clipShape(shape)
+                    .overlay(shape.strokeBorder(selected ? HMDesign.accent : HMDesign.separator, lineWidth: selected ? 2 : 0.5))
+                HStack(spacing: 4) {
+                    Text(kind.title).font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.ink)
+                    Spacer(minLength: 0)
+                    if selected { Image(systemName: "checkmark.circle.fill").foregroundStyle(HMDesign.accent).accessibilityHidden(true) }
                 }
+                Text(kind.detail).font(.caption).foregroundStyle(HMDesign.text2).fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.vertical, 4)
-            if #available(iOS 26.0, *) {
-                Toggle(isOn: $glass) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Liquid Glass")
-                        Text("Glass message box and controls. Off uses the theme's flat colors.").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .sensoryFeedback(.selection, trigger: themeRaw + accentRaw)
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(kind.title) theme. \(kind.detail)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private func modeTile(_ mode: HMMode) -> some View {
+        let selected = modeRaw == mode.rawValue
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        return Button { modeRaw = mode.rawValue } label: {
+            VStack(spacing: 6) {
+                ModePreview(mode: mode)
+                    .frame(height: 46)
+                    .clipShape(shape)
+                    .overlay(shape.strokeBorder(selected ? HMDesign.accent : HMDesign.separator, lineWidth: selected ? 2 : 0.5))
+                Text(mode.title).font(.caption.weight(selected ? .semibold : .regular))
+                    .foregroundStyle(selected ? HMDesign.ink : HMDesign.text2).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(mode.title + " mode")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func accentFill(_ accent: HMAccent) -> Color {
-        guard let pair = accent.hex else { return HMDesign.accent }
+        guard let pair = accent.hex else { return HMTheme.classicColor(\.accent) }
         return Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(hex: pair.1) : UIColor(hex: pair.0) })
     }
 
-    private func swatch(_ theme: HMThemeChoice) -> some View {
+    private func classicSwatch(_ theme: HMThemeChoice) -> some View {
         let palette: HMPalette = theme == .paper ? .paper : theme == .oled ? .oled : .ash
         return ZStack(alignment: .bottomTrailing) {
-            RoundedRectangle(cornerRadius: 8).fill(Color(uiColor: UIColor(hex: palette.canvas)))
+            RoundedRectangle(cornerRadius: 8).fill(theme == .native ? Color(uiColor: .systemGroupedBackground) : Color(uiColor: UIColor(hex: palette.canvas)))
             RoundedRectangle(cornerRadius: 4).fill(Color(uiColor: UIColor(hex: palette.surface))).frame(width: 22, height: 12).padding(5)
-            Circle().fill(Color(uiColor: UIColor(hex: palette.accent))).frame(width: 7, height: 7).padding(3)
+            Circle().fill(theme == .native ? Color.accentColor : Color(uiColor: UIColor(hex: palette.accent))).frame(width: 7, height: 7).padding(3)
         }
         .overlay {
             if theme == .system {
@@ -469,8 +548,87 @@ struct AppearanceSection: View {
             }
         }
         .frame(width: 40, height: 40)
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(HMDesign.separator, lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color(uiColor: HMTheme.classicUIColor(\.separator)), lineWidth: 1))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .accessibilityHidden(true)
+    }
+}
+
+/// A theme in miniature: its canvas, a card with two lines of text and an outgoing bubble.
+private struct ThemePreview: View {
+    let kind: HMThemeKind
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if kind == .thermocline {
+                HMDepthField()
+                VStack(alignment: .leading, spacing: 5) {
+                    Capsule().fill(Thermocline.text.opacity(0.75)).frame(width: 44, height: 4)
+                    Capsule().fill(Thermocline.text3.opacity(0.6)).frame(width: 30, height: 3)
+                }
+                .padding(8)
+                .frame(width: 70, alignment: .leading)
+                .hmGlass(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .padding(10)
+                Capsule().fill(HMTheme.thermoclineAccent.color).frame(width: 34, height: 12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(10)
+            } else {
+                HMTheme.classicChoice == .native ? Color(uiColor: .systemGroupedBackground) : HMTheme.classicColor(\.canvas)
+                VStack(alignment: .leading, spacing: 5) {
+                    Capsule().fill(Color(uiColor: HMTheme.classicUIColor(\.ink)).opacity(0.75)).frame(width: 44, height: 4)
+                    Capsule().fill(Color(uiColor: .secondaryLabel)).frame(width: 30, height: 3)
+                }
+                .padding(8)
+                .frame(width: 70, alignment: .leading)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .padding(10)
+                Capsule().fill(HMTheme.classicChoice == .native ? HMTheme.nativeAccent : HMTheme.classicColor(\.accent)).frame(width: 34, height: 12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(10)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Thermocline in one mode: paper or ink with a card and a lead dot. Match iPhone shows both, split.
+private struct ModePreview: View {
+    let mode: HMMode
+
+    var body: some View {
+        Group {
+            switch mode {
+            case .light: scene.environment(\.colorScheme, .light)
+            case .dark: scene.environment(\.colorScheme, .dark)
+            case .system:
+                ZStack {
+                    scene.environment(\.colorScheme, .light)
+                    scene.environment(\.colorScheme, .dark)
+                        .mask {
+                            GeometryReader { geometry in
+                                let w = geometry.size.width, h = geometry.size.height
+                                Path { p in
+                                    p.move(to: CGPoint(x: w * 0.68, y: 0))
+                                    p.addLine(to: CGPoint(x: w, y: 0))
+                                    p.addLine(to: CGPoint(x: w, y: h))
+                                    p.addLine(to: CGPoint(x: w * 0.32, y: h))
+                                    p.closeSubpath()
+                                }
+                            }
+                        }
+                }
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var scene: some View {
+        ZStack(alignment: .bottomLeading) {
+            Thermocline.bg
+            RoundedRectangle(cornerRadius: 5, style: .continuous).fill(HMDesign.card)
+                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Thermocline.line, lineWidth: 0.5))
+                .frame(width: 38, height: 18).padding(8)
+            Circle().fill(HMTheme.thermoclineAccent.color).frame(width: 9, height: 9)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(8)
+        }
     }
 }

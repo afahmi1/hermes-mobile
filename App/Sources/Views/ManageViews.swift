@@ -10,7 +10,7 @@ private struct ManageErrorLabel: View {
     var body: some View {
         if let failure {
             Label(failure.message, systemImage: "exclamationmark.triangle")
-                .font(.footnote).foregroundStyle(.red)
+                .font(.footnote).foregroundStyle(HMDesign.danger)
                 .accessibilityLabel("Error: \(failure.message)")
         }
     }
@@ -41,7 +41,7 @@ struct ArchiveConfirmSheet: View {
                 Section {
                     Text("This archives “\(title)”. It's a logical archive: nothing is deleted and you can restore the \(noun) later from Archived.")
                         .font(.subheadline)
-                }
+                }.hmRows()
                 Section {
                     SecureField("4-digit deletion PIN", text: Bindable(model).pinInput)
                         .keyboardType(.numberPad)
@@ -54,7 +54,7 @@ struct ArchiveConfirmSheet: View {
                         .accessibilityLabel("Deletion PIN")
                         .accessibilityHint("Enter the four digit PIN you set on the Mac")
                     ManageErrorLabel(failure: model.failure)
-                } footer: { Text("The PIN is checked on your Mac and isn't saved on this phone.") }
+                } footer: { Text("The PIN is checked on your Mac and isn't saved on this phone.") }.hmRows()
             }
             .hmCanvas()
             .navigationTitle("Archive \(noun)")
@@ -109,6 +109,11 @@ struct ManageProjectsToolbar: ViewModifier {
                 }
             }
             .sheet(isPresented: $adding) { AddProjectView(onCreated: { announceChange() }) }
+            #if DEBUG
+            .task {
+                if DemoMode.isOn && UserDefaults.standard.bool(forKey: "HMOpenProjectEditor") { adding = true }
+            }
+            #endif
             .sheet(isPresented: $showArchived) { ArchivedView() }
             .onReceive(NotificationCenter.default.publisher(for: .manageChanged)) { _ in Task { await reload() } }
     }
@@ -130,18 +135,18 @@ struct AddProjectView: View {
                         .lineLimit(2...5)
                         .accessibilityIdentifier("manage.project.summary")
                     field(.summary)
-                }
+                }.hmRows()
                 Section {
                     TextField("ID (optional)", text: $model.idText)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .accessibilityIdentifier("manage.project.id")
                     field(.id)
-                } header: { Text("ID") } footer: {
+                } header: { HMHeader("ID") } footer: {
                     Text(model.effectiveID.isEmpty ? "The ID is made from the title." : "ID: \(model.effectiveID)")
                         .accessibilityIdentifier("manage.project.slug")
-                }
-                if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) } }
+                }.hmRows()
+                if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) }.hmRows() }
             }
             .hmCanvas()
             .navigationTitle("Add project")
@@ -164,7 +169,7 @@ struct AddProjectView: View {
 
     @ViewBuilder private func field(_ f: ManageField) -> some View {
         if let m = model.issue(f), !(f == .title && model.title.isEmpty) {
-            Text(m).font(.footnote).foregroundStyle(.red)
+            Text(m).font(.footnote).foregroundStyle(HMDesign.danger)
         }
     }
 }
@@ -189,12 +194,12 @@ struct EditProjectView: View {
             Form {
                 Section {
                     TextField("Title", text: $model.title).accessibilityIdentifier("manage.edit.title")
-                    if let m = model.issue(.title) { Text(m).font(.footnote).foregroundStyle(.red) }
+                    if let m = model.issue(.title) { Text(m).font(.footnote).foregroundStyle(HMDesign.danger) }
                     TextField("Summary", text: $model.summary, axis: .vertical).lineLimit(2...5)
                         .accessibilityIdentifier("manage.edit.summary")
-                    if let m = model.issue(.summary) { Text(m).font(.footnote).foregroundStyle(.red) }
-                }
-                if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) } }
+                    if let m = model.issue(.summary) { Text(m).font(.footnote).foregroundStyle(HMDesign.danger) }
+                }.hmRows()
+                if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) }.hmRows() }
             }
             .hmCanvas()
             .navigationTitle("Edit project")
@@ -226,22 +231,22 @@ struct ManageProjectSection: View {
             if project.managed {
                 Button { editing = true } label: {
                     HStack { Label("Edit title and summary", systemImage: "pencil"); Spacer()
-                        Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.tertiary) }
+                        Image(systemName: "chevron.right").font(.footnote).foregroundStyle(HMDesign.text3) }
                         .contentShape(Rectangle())
                 }
-                .foregroundStyle(.primary)
+                .foregroundStyle(HMDesign.ink)
                 .accessibilityIdentifier("manage.editProject")
                 .accessibilityHint("Opens a form to change the title and summary")
             } else {
                 Label("This project comes from the Mac's catalog, so its title and summary are read-only here.", systemImage: "lock")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(HMDesign.text2)
             }
             Button(role: .destructive) { archiving = true } label: {
                 Label("Archive project", systemImage: "archivebox").frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }
             .accessibilityIdentifier("manage.archiveProject")
             .accessibilityHint("Asks for your deletion PIN, then hides the project. You can restore it later")
-        } header: { Text("Manage") }
+        } header: { HMHeader("Manage") }.hmRows()
         .sheet(isPresented: $editing) { EditProjectView(project: project, onSaved: { announceChange() }) }
         .sheet(isPresented: $archiving) {
             let id = project.id
@@ -280,7 +285,7 @@ struct ArchivedView: View {
             ContentUnavailableView {
                 Label("Can't load the archive", systemImage: "exclamationmark.triangle")
             } description: { Text(f.message) } actions: {
-                Button("Try again") { Task { await model.load() } }.buttonStyle(.borderedProminent)
+                Button("Try again") { Task { await model.load() } }.hmButton(.quiet, classic: .prominent)
             }
         case .loaded(let info):
             if info.isEmpty {
@@ -288,12 +293,12 @@ struct ArchivedView: View {
                                        description: Text("Archived projects and bots show up here, and you can restore them."))
             } else {
                 List {
-                    if let f = model.restoreFailure { Section { ManageErrorLabel(failure: f) } }
+                    if let f = model.restoreFailure { Section { ManageErrorLabel(failure: f) }.hmRows() }
                     if !info.projects.isEmpty {
-                        Section("Projects") { ForEach(info.projects) { row($0, project: true) } }
+                        Section(header: HMHeader("Projects")) { ForEach(info.projects) { row($0, project: true) } }.hmRows()
                     }
                     if !info.bots.isEmpty {
-                        Section("Bots") { ForEach(info.bots) { row($0, project: false) } }
+                        Section(header: HMHeader("Bots")) { ForEach(info.bots) { row($0, project: false) } }.hmRows()
                     }
                 }
                 .refreshable { await model.load() }
@@ -352,22 +357,22 @@ struct AddBotView: View {
                 Section {
                     Text("An app-made bot is a persona that runs on an existing bot; it doesn't create a new Hermes profile.")
                         .font(.subheadline)
-                }
-                Section("Name") {
+                }.hmRows()
+                Section(header: HMHeader("Name")) {
                     TextField("Name", text: $model.name).accessibilityIdentifier("manage.bot.name")
-                    if let m = model.issue(.name), !model.name.isEmpty { Text(m).font(.footnote).foregroundStyle(.red) }
-                }
+                    if let m = model.issue(.name), !model.name.isEmpty { Text(m).font(.footnote).foregroundStyle(HMDesign.danger) }
+                }.hmRows()
                 Section {
                     TextEditor(text: $model.persona)
                         .frame(minHeight: 120)
                         .accessibilityIdentifier("manage.bot.persona")
                         .accessibilityLabel("Persona")
-                } header: { Text("Persona") } footer: {
+                } header: { HMHeader("Persona") } footer: {
                     let over = model.personaBytes > ManageLimits.personaBytes
                     Text("\(model.personaBytes) / \(ManageLimits.personaBytes) bytes")
-                        .foregroundStyle(over ? .red : .secondary)
+                        .foregroundStyle(over ? HMDesign.danger : .secondary)
                         .accessibilityLabel("\(model.personaBytes) of \(ManageLimits.personaBytes) bytes used")
-                }
+                }.hmRows()
                 Section {
                     if !model.hostsLoaded && model.hostsFailure == nil {
                         HStack { ProgressView(); Text("Loading bots…") }
@@ -375,7 +380,7 @@ struct AddBotView: View {
                         ManageErrorLabel(failure: f)
                         Button("Try again") { Task { await model.load() } }
                     } else if model.noHosts {
-                        Text("No runtime is enabled for app-made bots on the Mac.").foregroundStyle(.secondary)
+                        Text("No runtime is enabled for app-made bots on the Mac.").foregroundStyle(HMDesign.text2)
                             .accessibilityIdentifier("manage.bot.noHosts")
                     } else {
                         Picker("Runs on", selection: $model.hostID) {
@@ -383,8 +388,8 @@ struct AddBotView: View {
                         }
                         .accessibilityIdentifier("manage.bot.host")
                     }
-                } header: { Text("Runs on") }
-                if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) } }
+                } header: { HMHeader("Runs on") }.hmRows()
+                if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) }.hmRows() }
             }
             .hmCanvas()
             .navigationTitle("Add bot")
@@ -412,14 +417,14 @@ struct ManagePersonasSection: View {
     var body: some View {
         Group {
             if let info = model.info, !info.personas.isEmpty {
-                Section("App-made bots") {
+                Section(header: HMHeader("App-made bots")) {
                     ForEach(info.personas) { p in
                         NavigationLink {
                             PersonaDetailView(persona: p)
                         } label: {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(p.name).font(.body.weight(.semibold))
-                                if !p.host.isEmpty { Text("Runs on \(p.host)").font(.caption).foregroundStyle(.secondary) }
+                                if !p.host.isEmpty { Text("Runs on \(p.host)").font(.caption).foregroundStyle(HMDesign.text2) }
                             }
                             .padding(.vertical, 2)
                             .contentShape(Rectangle())
@@ -427,7 +432,7 @@ struct ManagePersonasSection: View {
                         .accessibilityIdentifier("manage.persona.\(p.id)")
                         .accessibilityHint("Opens this app-made bot")
                     }
-                }
+                }.hmRows()
             }
         }
         .task { await model.load() }
@@ -459,15 +464,15 @@ struct PersonaDetailView: View {
                 ManageErrorLabel(failure: failure)
             } footer: {
                 Text("Runs the persona on \(persona.host.isEmpty ? "its host bot" : persona.host). It isn't a separate Hermes profile.")
-            }
-            if !persona.persona.isEmpty { Section("Persona") { Text(persona.persona).font(.callout) } }
+            }.hmRows()
+            if !persona.persona.isEmpty { Section(header: HMHeader("Persona")) { Text(persona.persona).font(.callout) }.hmRows() }
             Section {
                 Button(role: .destructive) { archiving = true } label: {
                     Label("Archive bot", systemImage: "archivebox").frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                 }
                 .accessibilityIdentifier("manage.archiveBot")
                 .accessibilityHint("Asks for your deletion PIN, then hides this bot. You can restore it later")
-            } header: { Text("Manage") }
+            } header: { HMHeader("Manage") }.hmRows()
         }
         .hmCanvas()
         .navigationTitle(persona.name)
@@ -513,10 +518,10 @@ struct ManageBotSection: View {
             } else if model.state == .loading || model.state == .idle {
                 EmptyView()
             } else {
-                Text("This bot is managed on the Mac.").font(.footnote).foregroundStyle(.secondary)
+                Text("This bot is managed on the Mac.").font(.footnote).foregroundStyle(HMDesign.text2)
                     .accessibilityIdentifier("manage.botManagedOnMac")
             }
-        }
+        }.hmRows()
         .task { await model.load() }
         .sheet(isPresented: $archiving) {
             let id = bot.id

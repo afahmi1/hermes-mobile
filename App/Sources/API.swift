@@ -60,8 +60,21 @@ private final class BridgeTransport: NSObject, URLSessionTaskDelegate, @unchecke
 
 final class API: @unchecked Sendable {
     private static let lock = NSLock()
-    static let accounts = SavedGateways(defaults: .standard, read: Keychain.read, write: Keychain.write, remove: Keychain.delete)
-    private static var client = API(accounts.restore())
+    static let accounts: SavedGateways = {
+        #if DEBUG
+        if DemoMode.isOn {
+            return SavedGateways(defaults: UserDefaults(suiteName: "Hermes.DemoGateways")!,
+                                 read: { _ in nil }, write: { _, _ in false }, remove: { _ in false })
+        }
+        #endif
+        return SavedGateways(defaults: .standard, read: Keychain.read, write: Keychain.write, remove: Keychain.delete)
+    }()
+    private static var client: API = {
+        #if DEBUG
+        if DemoMode.isOn { return API(GatewayLogin(server: DemoMode.origin, token: "demo")) }
+        #endif
+        return API(accounts.restore())
+    }()
 
     static var shared: API { lock.withLock { client } }
     private let login: GatewayLogin?
@@ -105,6 +118,10 @@ final class API: @unchecked Sendable {
         configuration.waitsForConnectivity = false
         configuration.httpShouldSetCookies = false
         configuration.urlCredentialStorage = nil
+        #if DEBUG
+        // Screenshot QA: `-HMDemo 1` answers every request from fixtures in DemoServer.swift, never the network.
+        if DemoMode.isOn { configuration.protocolClasses = [DemoURLProtocol.self] }
+        #endif
         return URLSession(configuration: configuration, delegate: transport, delegateQueue: nil)
     }
 
