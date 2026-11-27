@@ -26,16 +26,47 @@ class SessionFlagTests(unittest.TestCase):
             updated, errors = bridge.set_session_flags("bot", ["s1", "s2", "s3"], {"archived": True})
         self.assertEqual(updated, ["s1"])
         self.assertEqual(errors["s2"], "gone")
-        self.assertEqual(errors["s3"], "OSError")
+        self.assertEqual(errors["s3"], bridge.UNREACHABLE)
         invalidated.assert_called_once()
 
     def test_all_failures_do_not_invalidate_the_page_cache(self):
-        with patch.object(bridge, "gw", return_value=(503, {"error": "busy"})), \
+        with patch.object(bridge, "gw", return_value=(409, {"error": "busy"})), \
                 patch.object(bridge, "invalidate_pages") as invalidated:
             updated, errors = bridge.set_session_flags("bot", ["s1"], {"pinned": True})
         self.assertEqual(updated, [])
         self.assertEqual(errors, {"s1": "busy"})
         invalidated.assert_not_called()
+
+    def test_gateway_starting_up_counts_as_unreachable(self):
+        for status in (502, 503, 504):
+            with patch.object(bridge, "gw", return_value=(status, None)), patch.object(bridge, "invalidate_pages"):
+                self.assertEqual(bridge.set_session_flags("bot", ["s1"], {"archived": True}),
+                                 ([], {"s1": bridge.UNREACHABLE}))
+
+    def test_restart_mid_archive_is_a_503_the_phone_queues(self):
+        handler = MagicMock()
+        handler.command = "POST"
+        handler.json_body.return_value = {"profile": "bot", "ids": ["s1", "s2"], "fields": {"archived": True}}
+        with patch.object(bridge, "profile_ids", return_value=["default", "bot"]), \
+                patch.object(bridge, "key_for", return_value="key"), \
+                patch.object(bridge, "gw", side_effect=ConnectionRefusedError()), \
+                patch.object(bridge, "invalidate_pages"):
+            bridge.H.session_flags(handler)
+        status, body = handler.send.call_args.args
+        self.assertEqual(status, 503)
+        self.assertEqual(sorted(body["unreachable"]), ["s1", "s2"])
+
+    def test_partial_outage_lists_what_to_retry(self):
+        handler = MagicMock()
+        handler.command = "POST"
+        handler.json_body.return_value = {"profile": "bot", "ids": ["s1", "s2"], "fields": {"archived": True}}
+        with patch.object(bridge, "profile_ids", return_value=["default", "bot"]), \
+                patch.object(bridge, "key_for", return_value="key"), \
+                patch.object(bridge, "set_session_flags", return_value=(["s1"], {"s2": bridge.UNREACHABLE})):
+            bridge.H.session_flags(handler)
+        status, body = handler.send.call_args.args
+        self.assertEqual(status, 200)
+        self.assertEqual((body["updated"], body["unreachable"]), (["s1"], ["s2"]))
 
     def test_empty_selection_is_a_noop(self):
         with patch.object(bridge, "invalidate_pages") as invalidated:

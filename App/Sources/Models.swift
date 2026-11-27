@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Observation
 
 /// One Hermes profile ("bot"). `id` is the profile name; "default" is the front door.
@@ -80,7 +81,30 @@ struct SlashCommand: Codable, Identifiable, Hashable {
     ]
 }
 
-struct CommandPalette: Decodable {
+/// The last command/skill list per account and bot, in Caches (rebuildable; never backed up).
+enum PaletteCache {
+    private static func url(_ key: String) -> URL {
+        let name = SHA256Hex.of(key).prefix(24)
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("palette-\(name).json")
+    }
+    static func load(_ key: String) -> CommandPalette? {
+        guard let data = try? Data(contentsOf: url(key)) else { return nil }
+        return try? JSONDecoder().decode(CommandPalette.self, from: data)
+    }
+    static func save(_ page: CommandPalette, key: String) {
+        guard let data = try? JSONEncoder().encode(page) else { return }
+        try? data.write(to: url(key), options: .atomic)
+    }
+}
+
+enum SHA256Hex {
+    static func of(_ s: String) -> String {
+        SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+struct CommandPalette: Codable {
     let commands: [SlashCommand]
     let skills: [String]
     /// Name, category folder and one-line description. Absent on older bridges (names only).
@@ -147,7 +171,7 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     let source: String?
     var createdVia: String? = nil
     let model: String?
-    let title: String?
+    var title: String?
     let preview: String?
     let startedAt: Double?
     let lastActive: Double?
@@ -213,6 +237,8 @@ struct SessionFlagResult {
     let errors: [String: String]
     /// Chats the bridge refused to archive because they hold pinned messages: {session id: pin count}.
     var heldForPins: [String: Int] = [:]
+    /// Chats not changed because Hermes was restarting. The phone keeps these and sends them again.
+    var unreachable: [String] = []
 }
 
 /// One pinned message in a chat. The bridge snapshots the text from Hermes when it is pinned, so the pin
@@ -425,6 +451,13 @@ struct ModelCatalog: Decodable {
         let reasoning: [String: Bool]
         var id: String { slug }
 
+        /// Signed in with an account plan (OAuth / CLI login): calls are covered, not billed per token.
+        var isSubscription: Bool {
+            let s = slug.lowercased()
+            return s.hasSuffix("-oauth") || s.contains("subscription") || s == "openai-codex" || s == "claude-code"
+                || s == "copilot" || s == "github-copilot" || s.hasPrefix("copilot-")
+        }
+
         enum CodingKeys: String, CodingKey { case slug, name, models, authenticated, capabilities, isCurrent = "is_current" }
         struct Cap: Decodable { let reasoning: Bool? }
 
@@ -442,7 +475,23 @@ struct ModelCatalog: Decodable {
         func supportsReasoning(_ model: String) -> Bool { reasoning[model] ?? true }
     }
 
-    var usable: [Provider] { providers.filter { $0.authenticated && !$0.models.isEmpty } }
+    /// Subscriptions first (already paid for), then pay-per-use APIs.
+    var usable: [Provider] {
+        let ready = providers.filter { $0.authenticated && !$0.models.isEmpty }
+        return ready.filter(\.isSubscription) + ready.filter { !$0.isSubscription }
+    }
+
+    /// The same model on a subscription you're signed in to (Grok on OpenRouter -> your xAI subscription).
+    func subscriptionTwin(of model: String, on provider: String) -> (provider: Provider, model: String)? {
+        guard let from = self.provider(slug: provider), !from.isSubscription else { return nil }
+        let bare = model.split(separator: "/").last.map(String.init)?.lowercased() ?? model.lowercased()
+        for p in usable where p.isSubscription {
+            if let m = p.models.first(where: { $0.lowercased() == bare || $0.split(separator: "/").last.map(String.init)?.lowercased() == bare }) {
+                return (p, m)
+            }
+        }
+        return nil
+    }
     /// Exact slug match: `openai-codex` and `openai-api` are different providers.
     func provider(slug: String) -> Provider? { providers.first { $0.slug == slug } }
 }
@@ -1112,4 +1161,14 @@ struct QueueState: Equatable {
     func row(_ admission: String) -> Row? { rows.first { $0.id == admission } }
     /// Still waiting its turn (not started, not finished).
     func isWaiting(_ admission: String) -> Bool { row(admission)?.status == "queued" }
+}
+
+/// A question Hermes asked mid-reply. Answered from the phone: tap a choice, or just reply.
+struct ClarifyRequest: Identifiable, Equatable {
+    let id: String
+    let runId: String
+    let generation: Int?
+    let question: String
+    let choices: [String]
+    let multiSelect: Bool
 }

@@ -51,6 +51,7 @@ struct StatusView: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .listSectionSpacing(.compact)
             .hmCanvas()
             #if DEBUG
             .task(id: p != nil) {
@@ -63,7 +64,7 @@ struct StatusView: View {
             #endif
             .navigationTitle("Status")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { ConnectionBadge() }
+                ToolbarItem(placement: .topBarLeading) { ConnectionBadge(pill: true) }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { Task { await refreshNow() } } label: {
                         Group {
@@ -189,7 +190,66 @@ struct StatusView: View {
     /// Neutral tile symbols: text-3 in Thermocline, the system's secondary in Classic.
     private var quiet: Color { HMTheme.isThermocline ? HMDesign.text3 : .secondary }
 
+    /// One sentence for how everything is, then only the numbers that say something. Zeros stay out.
     @ViewBuilder private func summary(_ p: JV) -> some View {
+        let g = p["gateway"], J = p["jobs"]
+        let jobs = J["jobs"].array
+        let failing = jobs.filter(isFailing).count
+        let incidents = J["incidents"].array.count
+        let health = (g["health"].string ?? "unknown").lowercased()
+        let phase = (app.health?.phase ?? g["state"].string ?? "").lowercased()
+        let name = API.shared.baseURL.map(SavedGateways.displayName) ?? "Your Mac"
+        let running = p["agents"].array.count
+        let heard = g["heartbeat_age_s"].double.map { max(0, Int($0.rounded())) }
+        let (headline, tone): (String, Color) = {
+            if health == "down" || phase == "stopped" { return ("\(name) is down", .red) }
+            if phase == "draining" { return ("Finishing current replies, then restarting", .orange) }
+            if ["starting", "restarting"].contains(phase) { return ("\(name) is restarting", .orange) }
+            if failing > 0 || incidents > 0 || health == "degraded" { return ("\(name) needs a look", .orange) }
+            return (running > 0 ? "\(name) is working" : "All good on \(name)", HMDesign.success)
+        }()
+        let detail: [String] = [
+            running > 0 ? (running == 1 ? "1 reply running" : "\(running) replies running") : "Idle",
+            heard.map { $0 <= 2 ? "heard just now" : $0 < 120 ? "heard \($0)s ago" : "last heard \($0 / 60) min ago" },
+            "\(p["bots"].array.count) bots",
+            failing > 0 ? "\(failing) failing job\(failing == 1 ? "" : "s")" : nil,
+            incidents > 0 ? "\(incidents) incident\(incidents == 1 ? "" : "s")" : nil,
+        ].compactMap { $0 }
+        Section {
+            HStack(alignment: .center, spacing: 14) {
+                ZStack {
+                    Circle().fill(tone.opacity(0.16)).frame(width: 44, height: 44)
+                    Circle().fill(tone).frame(width: 12, height: 12)
+                }
+                .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(headline).font(.headline)
+                    Text(detail.joined(separator: " · ")).font(.subheadline).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 6)
+            .accessibilityElement(children: .combine)
+            let tokens = J["tokens_24h"].array.reduce(0) { $0 + ($1["prompt"].int ?? 0) + ($1["completion"].int ?? 0) }
+            let active = jobs.filter { !$0["paused"].bool }.count
+            let stats: [(String, String)] = [
+                active > 0 ? ("Scheduled", "\(active)") : nil,
+                tokens > 0 ? ("Cron tokens 24h", Self.compact(tokens)) : nil,
+            ].compactMap { $0 }
+            if !stats.isEmpty {
+            HStack(spacing: 0) {
+                ForEach(stats, id: \.0) { s in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(s.1).font(.system(.title3, design: .rounded).weight(.semibold)).monospacedDigit()
+                        Text(s.0).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            }
+        }
+    }
+
+    @ViewBuilder private func legacySummary(_ p: JV) -> some View {
         let g = p["gateway"], J = p["jobs"]
         let jobs = J["jobs"].array
         let active = jobs.filter { !$0["paused"].bool }.count
@@ -287,6 +347,7 @@ struct StatusView: View {
             case .failing: return isFailing(j)
             }
         }
+        if !all.isEmpty {
         Section {
             if showAllJobs {
                 if typeSize.isAccessibilitySize {
@@ -327,7 +388,8 @@ struct StatusView: View {
                 .accessibilityHint(showAllJobs ? "Collapses the job list" : "Shows every cron job")
                 .id("jobsEnd")
             }
-        } header: { HMHeader("Cron jobs · \(all.filter { !$0["paused"].bool }.count) active").id("jobs") }.hmRows()
+        } header: { Text("Scheduled jobs · \(all.filter { !$0["paused"].bool }.count) on").id("jobs") }.hmRows()
+        }
     }
 
     @ViewBuilder private func incidents(_ p: JV) -> some View {
@@ -462,6 +524,16 @@ struct StatusMark: View {
 struct StatusPill: View {
     let text: String?
     var label: String? = nil
+
+    /// Hermes's state words in plain English ("draining" is a gateway finishing its current replies).
+    static func words(_ raw: String) -> String {
+        [
+            "draining": "Finishing current replies", "starting": "Starting up", "restarting": "Restarting",
+            "stopping": "Shutting down", "waiting": "Waiting", "claimed": "Picked up", "ok": "OK",
+            "healthy": "Healthy", "degraded": "Partly working", "down": "Down", "unknown": "Unknown",
+            "missed": "Missed", "connected": "Connected", "disconnected": "Disconnected",
+        ][raw.lowercased()] ?? raw.capitalized
+    }
     var body: some View {
         let t = text ?? "Unknown"
         let color: Color = switch t {
@@ -472,9 +544,9 @@ struct StatusPill: View {
         default: .secondary
         }
         if HMTheme.isThermocline {
-            HMStatusChip(text: label ?? t, color: color == .secondary ? HMDesign.text3 : color)
+            HMStatusChip(text: label ?? Self.words(t), color: color == .secondary ? HMDesign.text3 : color)
         } else {
-            Text(label ?? t).font(.caption2.weight(.semibold)).padding(.horizontal, 7).padding(.vertical, 2)
+            Text(label ?? Self.words(t)).font(.caption2.weight(.semibold)).padding(.horizontal, 7).padding(.vertical, 2)
                 .foregroundStyle(color).background(color.opacity(0.15), in: Capsule())
         }
     }

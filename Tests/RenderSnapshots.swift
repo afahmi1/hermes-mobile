@@ -97,5 +97,10 @@ enum RenderSnapshots {
             MessagePin(messageId: 1, role: "assistant", text: "Lease due Dec 1, bring the deposit check", messageAt: nil, pinnedAt: 2),
             MessagePin(messageId: 2, role: "user", text: "remember this", messageAt: nil, pinnedAt: 1)], cursor: 0, jump: {}, list: {}), to: dir)
         render("toast", CopiedToast(text: "Copied code"), to: dir)
+        let replyText = ReplyQuote.markdown(ReplyQuote.excerpt("The bridge answers 503 while Hermes restarts, so the phone keeps the archive and sends it again when the gateway is back.")) + "\n\nnice, does that cover pins too?"
+        render("user-reply", MessageRow(item: ChatItem(id: "7", kind: .user, text: replyText)), to: dir, dark: true)
+        render("quote-chip", QuoteChip(text: "The bridge answers 503 while Hermes restarts, so the phone keeps the archive and sends it again when the gateway is back.", remove: {}).padding(.horizontal, 12), to: dir, dark: true)
+        render("question", QuestionCard(chat: ChatModel(profile: "default", sessionId: nil, app: AppModel()), question: ClarifyRequest(id: "q", runId: "r", generation: 1,
+            question: "Where should the journal folder live?", choices: ["~/Desktop/journal", "Obsidian vault", "iCloud Drive"], multiSelect: false)), to: dir, dark: true)
     }
 }

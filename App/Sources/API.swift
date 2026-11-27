@@ -8,10 +8,13 @@ struct MediaCapabilities: Decodable {
     let video: Bool
     let maxVideoBytes: Int
     let maxFileBytes: Int
+    /// The bridge takes big files through resumable uploads, up to this size each.
+    var maxUploadBytes: Int? = nil
     enum CodingKeys: String, CodingKey {
         case images, files, video
         case maxVideoBytes = "max_video_bytes"
         case maxFileBytes = "max_file_bytes"
+        case maxUploadBytes = "max_upload_bytes"
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -21,6 +24,7 @@ struct MediaCapabilities: Decodable {
         video = try c.decodeIfPresent(Bool.self, forKey: .video) ?? false
         maxVideoBytes = try c.decodeIfPresent(Int.self, forKey: .maxVideoBytes) ?? 4 * 1024 * 1024
         maxFileBytes = try c.decodeIfPresent(Int.self, forKey: .maxFileBytes) ?? maxVideoBytes
+        maxUploadBytes = try c.decodeIfPresent(Int.self, forKey: .maxUploadBytes)
     }
 }
 
@@ -486,7 +490,8 @@ final class API: @unchecked Sendable {
         }
         guard (200..<300).contains(http.statusCode) else { throw APIError.http(http.statusCode, Self.errorText(data)) }
         return SessionFlagResult(updated: d["updated"] as? [String] ?? [],
-                                 errors: d["errors"] as? [String: String] ?? [:], heldForPins: held)
+                                 errors: d["errors"] as? [String: String] ?? [:], heldForPins: held,
+                                 unreachable: d["unreachable"] as? [String] ?? [])
     }
 
     // MARK: pinned messages
@@ -654,9 +659,84 @@ final class API: @unchecked Sendable {
         }
     }
 
+    // MARK: resumable uploads
+
+    /// Attachments as the bridge takes them: small ones inline, big ones uploaded first and referred to by id.
+    func wire(_ attachments: [SendAttachment], progress: (@Sendable (Double) -> Void)? = nil) async throws -> [[String: Any]] {
+        let total = Double(max(1, attachments.filter(\.isUpload).reduce(0) { $0 + $1.byteCount }))
+        var done = 0
+        var out: [[String: Any]] = []
+        for a in attachments {
+            if a.isUpload {
+                let base = done
+                let id = try await upload(a) { sent in progress?(Double(base + sent) / total) }
+                done += a.byteCount
+                out.append(["mime": a.mime, "filename": a.filename, "upload_id": id])
+            } else {
+                out.append(["mime": a.mime, "filename": a.filename, "base64": a.base64])
+            }
+        }
+        return out
+    }
+
+    /// Send one big file in 8 MB chunks at the offset the bridge reports, resuming after any drop.
+    /// The id is derived from the file itself, so a relaunch or retry picks up where the last attempt stopped.
+    func upload(_ a: SendAttachment, sent: (@Sendable (Int) -> Void)? = nil) async throws -> String {
+        guard let url = a.fileURL, let sha = a.sha256, let size = a.size else { throw APIError.badResponse }
+        let id = UploadFiles.uploadID(a)
+        let announce: [String: Any] = ["upload_id": id, "filename": a.filename, "mime": a.mime, "size": size, "sha256": sha]
+        var state: [String: Any]
+        do { state = try await json("/m/uploads", method: "POST", body: announce) }
+        catch APIError.http(404, _) {
+            throw APIError.http(426, "Your Mac's bridge is too old for big files. Update it, or choose a file under 8 MB.")
+        }
+        var offset = (state["offset"] as? NSNumber)?.intValue ?? 0
+        var complete = state["complete"] as? Bool ?? false
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var failures = 0
+        while !complete {
+            try Task.checkCancellation()
+            sent?(offset)
+            try handle.seek(toOffset: UInt64(offset))
+            guard let chunk = try handle.read(upToCount: 8 * 1024 * 1024), !chunk.isEmpty else { throw APIError.badResponse }
+            var r = try request("/m/uploads/\(id)", method: "PATCH")
+            r.httpBody = chunk
+            r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            r.setValue(String(offset), forHTTPHeaderField: "Upload-Offset")
+            r.timeoutInterval = 300
+            do {
+                let (data, resp) = try await session.data(for: r)
+                guard let http = resp as? HTTPURLResponse else { throw APIError.badResponse }
+                let obj = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                if (200..<300).contains(http.statusCode) {
+                    offset = (obj["offset"] as? NSNumber)?.intValue ?? offset + chunk.count
+                    complete = obj["complete"] as? Bool ?? false
+                    failures = 0
+                } else if [409, 422].contains(http.statusCode), let real = (obj["offset"] as? NSNumber)?.intValue {
+                    offset = real   // a lost acknowledgment or a damaged file: continue where the Mac actually is
+                } else {
+                    throw APIError.http(http.statusCode, Self.errorText(data))
+                }
+            } catch let error as URLError where failures < 8 && !Task.isCancelled {
+                // Wi-Fi to cellular, a tunnel blip, the Mac waking: wait a little, ask where it got to, continue.
+                failures += 1
+                _ = error
+                try await Task.sleep(for: .seconds(min(30, 1 << failures)))
+                if let now = try? await json("/m/uploads/\(id)", method: "GET", body: nil) {
+                    offset = (now["offset"] as? NSNumber)?.intValue ?? offset
+                    complete = now["complete"] as? Bool ?? false
+                }
+            }
+        }
+        sent?(size)
+        return id
+    }
+
     /// Start a turn. The Mac holds it; it keeps running if the phone locks or loses signal.
     func startRun(profile: String, session: String, text: String, choice: RuntimeChoice,
-                  projectContext: String? = nil, submission: UUID? = nil, attachments: [SendAttachment] = [], recovering: Bool = false) async throws -> String {
+                  projectContext: String? = nil, submission: UUID? = nil, attachments: [SendAttachment] = [], recovering: Bool = false,
+                  progress: (@Sendable (Double) -> Void)? = nil) async throws -> String {
         var body = Self.choiceBody(choice)
         body["text"] = text
         ProjectContext.apply(to: &body, projectID: projectContext)
@@ -665,8 +745,11 @@ final class API: @unchecked Sendable {
         if recovering, let submission, !attachments.isEmpty {
             var probe = body
             probe["manifest"] = try attachments.map { item -> [String: String] in
-                guard let data = Data(base64Encoded: item.base64) else { throw APIError.badResponse }
-                let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                let hash: String
+                if item.isUpload, let sha = item.sha256 { hash = sha } else {
+                    guard let data = Data(base64Encoded: item.base64) else { throw APIError.badResponse }
+                    hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                }
                 return ["filename": item.filename, "mime": item.mime, "sha256": hash]
             }
             do {
@@ -681,7 +764,7 @@ final class API: @unchecked Sendable {
         if !attachments.isEmpty {
             guard submission != nil else { throw APIError.badResponse }
             if attachments.contains(where: { $0.mime == "video/mp4" }) { body["video_analysis_consent"] = true }
-            body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
+            body["attachments"] = try await wire(attachments, progress: progress)
         }
         let action = submission == nil ? "send" : "send-once"
         let obj = try await json(endpoint + action, method: "POST", body: body)
@@ -693,7 +776,7 @@ final class API: @unchecked Sendable {
     /// Returns how many attachments the bridge accepted: an older bridge ignores them and reports none.
     @discardableResult
     func followUp(run: String, mode: String, text: String, submission: UUID, choice: RuntimeChoice,
-                  attachments: [SendAttachment] = []) async throws -> Int {
+                  attachments: [SendAttachment] = [], progress: (@Sendable (Double) -> Void)? = nil) async throws -> Int {
         var body = mode == "queue" ? Self.choiceBody(choice) : [:]
         // Older bridges ignore unknown JSON fields. A distinct route refuses an unsupported
         // override before it can submit the message with the wrong model.
@@ -701,7 +784,7 @@ final class API: @unchecked Sendable {
         body["text"] = text
         body["submission_id"] = submission.uuidString
         if !attachments.isEmpty {
-            body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
+            body["attachments"] = try await wire(attachments, progress: progress)
         }
         let result = try await json("/m/turns/\(Self.esc(run))/\(action)", method: "POST", body: body)
         let expected = mode == "queue" ? "queued" : "steer_accepted"
@@ -711,13 +794,13 @@ final class API: @unchecked Sendable {
 
     /// Same as `followUp`, plus the admission Hermes filed a queued message under (newer bridges).
     func followUpReceipt(run: String, mode: String, text: String, submission: UUID, choice: RuntimeChoice,
-                         attachments: [SendAttachment] = []) async throws -> (files: Int, admission: String?) {
+                         attachments: [SendAttachment] = [], progress: (@Sendable (Double) -> Void)? = nil) async throws -> (files: Int, admission: String?) {
         var body = mode == "queue" ? Self.choiceBody(choice) : [:]
         let action = body.isEmpty ? mode : "queue-with-runtime"
         body["text"] = text
         body["submission_id"] = submission.uuidString
         if !attachments.isEmpty {
-            body["attachments"] = attachments.map { ["mime": $0.mime, "filename": $0.filename, "base64": $0.base64] }
+            body["attachments"] = try await wire(attachments, progress: progress)
         }
         let result = try await json("/m/turns/\(Self.esc(run))/\(action)", method: "POST", body: body)
         let expected = mode == "queue" ? "queued" : "steer_accepted"
@@ -748,6 +831,20 @@ final class API: @unchecked Sendable {
 
     func stopRun(profile: String, run: String) async throws {
         _ = try await json("/m/turns/\(Self.esc(run))/stop", method: "POST", body: [:])
+    }
+
+    /// A title for this chat from what it's about now (Hermes's own generator on its cheap helper model).
+    func suggestTitle(profile: String, session: String) async throws -> String {
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/title-suggestion", method: "POST", body: [:])
+        guard let title = obj["title"] as? String, !title.isEmpty else { throw APIError.badResponse }
+        return title
+    }
+
+    /// Answer a question Hermes asked mid-reply (its clarify tool), the way the desktop does.
+    func answerQuestion(run: String, requestId: String, answer: String, generation: Int?) async throws {
+        var body: [String: Any] = ["request_id": requestId, "answer": answer]
+        if let generation { body["execution_generation"] = generation }
+        _ = try await json("/m/turns/\(Self.esc(run))/clarify", method: "POST", body: body)
     }
 
     func approve(profile: String, run: String, choice: String, requestId: String?, generation: Int?) async throws {

@@ -108,8 +108,8 @@ struct ChatScreen: View {
                     }
                     if let s = chat.status {
                         HStack(spacing: 8) {
-                            ThinkingOrb(size: 16)
-                            Text(s).font(.footnote).foregroundStyle(HMDesign.text2)
+                            ThinkingIndicator(size: 16)
+                            ShimmerText(text: s)
                             Spacer()
                         }
                         .padding(.horizontal, 16).id("status")
@@ -119,7 +119,7 @@ struct ChatScreen: View {
                 .padding(.vertical, 12)
             }
             .scrollDismissesKeyboard(.interactively)
-            .defaultScrollAnchor(.bottom)
+            .modifier(ReadingPosition(followLatest: $followLatest))
             .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { drag in
                 if drag.translation.height > 12 { followLatest = false }
                 // Swipe left, like iMessage, to see every message's time.
@@ -257,7 +257,9 @@ struct ChatScreen: View {
             chat.outboxWake()
             // Back from the background: show what happened while away, then land on it.
             guard !chat.isRunning else { return }
-            Task { await chat.load(quiet: true); landTick &+= 1 }
+            // Only land on the newest message if that's where you were. Reading higher up stays put.
+            let wasAtBottom = followLatest
+            Task { await chat.load(quiet: true); if wasAtBottom { landTick &+= 1 } }
         }
         .onReceive(NotificationCenter.default.publisher(for: .hermesCopied)) { note in
             let text = note.object as? String ?? "Copied"
@@ -329,6 +331,9 @@ struct ChatScreen: View {
             }.ignoresSafeArea()
         }
             .confirmationDialog("How should Hermes receive this video?", isPresented: $chooseVideo) {
+            if mediaCapabilities?.maxUploadBytes != nil {
+                Button("Send the original video file") { prepareOriginal() }
+            }
             if mediaCapabilities?.video == true, chat.draftAttachments.isEmpty {
                 Button("Send clip for Hermes video analysis") { prepareClip() }
             }
@@ -357,7 +362,7 @@ struct ChatScreen: View {
     private var runtimeLabel: String {
         if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
-        let who = ModelName.short(c.model ?? bot?.model ?? "Default model")
+        let who = ModelName.short(c.model ?? bot?.model ?? "Default model").components(separatedBy: " · ").first ?? ""
         if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
         var parts = [who]
         if let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) { parts.append(effort) }
@@ -421,17 +426,20 @@ struct ChatScreen: View {
     }
 
     private func composerField(expanded: Bool) -> some View {
-        let name = bot?.name ?? "Hermes"
-        let prompt = HMTheme.isThermocline ? "Message \(name)" : "Message \(name) · / for commands"
-        return ComposerField(text: $chat.draft, placeholder: prompt,
+        ComposerField(text: $chat.draft, placeholder: "Message \(bot?.name ?? "Hermes")",
                       expanded: expanded, onPasteText: chat.absorbPaste, onPasteImage: importPastedImage)
     }
 
     @ViewBuilder private var draftShelf: some View {
-        if !chat.pastedTexts.isEmpty {
+        if let quote = chat.pastedTexts.first(where: \.isQuote) {
+            QuoteChip(text: quote.text) { chat.removePastedText(quote.id) }
+                .padding(.horizontal, 12)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+        if chat.pastedTexts.contains(where: { !$0.isQuote }) {
             ScrollView(.horizontal) {
                 HStack {
-                    ForEach(chat.pastedTexts) { chunk in
+                    ForEach(chat.pastedTexts.filter { !$0.isQuote }) { chunk in
                         PasteChip(text: Binding(get: { chat.pastedTexts.first { $0.id == chunk.id }?.text ?? "" },
                                                set: { value in
                                 if let index = chat.pastedTexts.firstIndex(where: { $0.id == chunk.id }) { chat.pastedTexts[index].text = value }
@@ -495,6 +503,7 @@ struct ChatScreen: View {
                     chat.draft = "/" + name + " "
                 }
             }
+            if let q = chat.question { QuestionCard(chat: chat, question: q) }
             if chat.queue?.paused == true { QueuePausedBanner(chat: chat) }
             if !chat.outgoing.isEmpty { OutboxTray(chat: chat) }
             draftShelf
@@ -636,6 +645,21 @@ struct ChatScreen: View {
 
     /// Quote prepends to the draft; Edit replaces it (asking nothing: the old draft is one Undo away in the field).
     private func compose(_ text: String, replace: Bool) {
+        // A reply quote becomes a compact chip, not raw "> " lines in the box.
+        if !replace, text.hasPrefix("> ") {
+            let raw = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.hasPrefix("> ") ? String($0.dropFirst(2)) : String($0) }.joined(separator: "\n")
+            chat.setReplyQuote(raw)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
+        if replace, case let (quote?, body) = ReplyQuote.split(text) {
+            // Editing a sent reply: its quote goes back into the chip, the words into the box.
+            chat.setReplyQuote(quote)
+            chat.draft = body
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
         chat.draft = replace || chat.draft.isEmpty ? text : text + chat.draft
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
@@ -723,7 +747,8 @@ struct ChatScreen: View {
 
     private func issue(for assets: [SendAttachment]) -> String? {
         AttachmentSelection.issue(assets, fileLimit: mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024,
-                                   videoLimit: mediaCapabilities?.maxVideoBytes ?? 4 * 1024 * 1024)
+                                   videoLimit: mediaCapabilities?.maxVideoBytes ?? 4 * 1024 * 1024,
+                                   uploadLimit: mediaCapabilities?.maxUploadBytes)
     }
 
     private func appendMedia(_ assets: [SendAttachment], account: String?) {
@@ -820,7 +845,7 @@ struct ChatScreen: View {
             return
         case .success(let urls):
             guard !urls.isEmpty else { return }
-            let slots = max(0, 4 - chat.draftAttachments.count)
+            let slots = max(0, ChatMedia.maxAttachments - chat.draftAttachments.count)
             guard urls.count <= slots else { chat.error = "Choose up to \(slots) more attachments for this message."; return }
             let account = app.inboxAccount
             let cap = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
@@ -844,15 +869,18 @@ struct ChatScreen: View {
                             chooseVideo = true
                             return
                         }
+                        let uploadMax = mediaCapabilities?.maxUploadBytes
                         let asset = try await Task.detached(priority: .userInitiated) {
-                            try FileImport.attachment(from: url, maxBytes: cap)
+                            try FileImport.attachment(from: url, maxBytes: cap, uploadMax: uploadMax)
                         }.value
                         guard account == app.inboxAccount else { return }
                         guard chat.draftAttachments.count < ChatMedia.maxAttachments,
                               !chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) else { return }
                         guard asset.mime != "image/jpeg" || imagesAvailable else { chat.error = "This bot cannot receive images."; return }
-                        guard asset.byteCount <= left else { throw FileImport.Failure.tooLarge(cap) }
-                        left -= asset.byteCount
+                        if !asset.isUpload {
+                            guard asset.byteCount <= left else { throw FileImport.Failure.tooLarge(cap) }
+                            left -= asset.byteCount
+                        }
                         added.append(asset)
                     } catch {
                         if !Task.isCancelled { chat.error = error.localizedDescription }
@@ -877,8 +905,23 @@ struct ChatScreen: View {
         Task {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
-                let clip = try await ChatMedia.clip(from: url, maxBytes: caps.maxVideoBytes)
+                let clip = try await ChatMedia.clip(from: url, maxBytes: caps.maxVideoBytes, uploadMax: caps.maxUploadBytes)
                 appendMedia([clip], account: account)
+            } catch { chat.error = error.localizedDescription }
+        }
+    }
+
+    /// The video as recorded, uploaded in resumable chunks. Hermes gets the real file and decides how to use it.
+    private func prepareOriginal() {
+        guard let url = pickedVideo, let uploadMax = mediaCapabilities?.maxUploadBytes else { return }
+        pickedVideo = nil
+        preparingMedia = true
+        let account = app.inboxAccount
+        Task {
+            defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
+            do {
+                let file = try await Task.detached(priority: .userInitiated) { try ChatMedia.original(from: url, uploadMax: uploadMax) }.value
+                appendMedia([file], account: account)
             } catch { chat.error = error.localizedDescription }
         }
     }
@@ -891,7 +934,7 @@ struct ChatScreen: View {
         Task {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
-                let frames = try await ChatMedia.frames(from: url, count: min(3, 4 - chat.draftAttachments.count))
+                let frames = try await ChatMedia.frames(from: url, count: min(3, ChatMedia.maxAttachments - chat.draftAttachments.count))
                 appendMedia(frames, account: account)
             } catch { chat.error = error.localizedDescription }
         }
@@ -1266,8 +1309,9 @@ struct MessageRow: View {
     }
 
     private var quoted: String {
-        let clipped = item.text.count > 600 ? String(item.text.prefix(600)) + "…" : item.text
-        return clipped.split(separator: "\n", omittingEmptySubsequences: false).map { "> " + $0 }.joined(separator: "\n") + "\n\n"
+        // Plain words, not Markdown syntax: the chip and the quote Hermes gets both read cleanly.
+        let source = item.kind == .assistant ? MarkdownBlock.plainText(item.text) : (ReplyQuote.split(item.text).body)
+        return ReplyQuote.markdown(ReplyQuote.excerpt(source)) + "\n\n"
     }
 
     @ViewBuilder private var messageMenu: some View {
@@ -1303,6 +1347,7 @@ struct MessageRow: View {
     }
 
     /// Long pastes fold to their first lines so one message never fills the screen.
+    private var replySplit: (quote: String?, body: String) { ReplyQuote.split(item.text) }
     private var userIsLong: Bool { item.text.count > 700 || item.text.reduce(0) { $1 == "\n" ? $0 + 1 : $0 } > 14 }
     private var userText: String {
         guard userIsLong, !showFull else { return item.text }
@@ -1333,12 +1378,15 @@ struct MessageRow: View {
                     if !item.text.isEmpty {
                         HStack(alignment: .top, spacing: 4) {
                             if pinned { pinMark }
-                            Text(userText)
-                                .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
-                                .foregroundStyle(HMDesign.bubbleText)
-                                .background(HMDesign.bubbleFill, in: bubbleShape)
-                                .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
-                                                                  lineWidth: highlighted ? 2 : 0))
+                            VStack(alignment: .leading, spacing: 8) {
+                                if let q = replySplit.quote { QuoteCard(text: q) }
+                                Text(replySplit.quote == nil ? userText : replySplit.body)
+                                    .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
+                                    .foregroundStyle(HMDesign.bubbleText)
+                                    .background(HMDesign.bubbleFill, in: bubbleShape)
+                                    .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
+                                                                      lineWidth: highlighted ? 2 : 0))
+                            }
                                 .contextMenu { messageMenu }
                         }
                     }
@@ -2533,5 +2581,137 @@ struct OutgoingEditor: View {
             .onAppear { text = item.edit ?? item.text }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+/// Hermes asked something mid-reply. Its choices are one tap; anything typed and sent is the answer too.
+struct QuestionCard: View {
+    @Bindable var chat: ChatModel
+    let question: ClarifyRequest
+    @State private var picked = Set<String>()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Hermes is asking", systemImage: "questionmark.bubble.fill")
+                .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
+            Text(question.question).font(.subheadline).textSelection(.enabled)
+            if !question.choices.isEmpty {
+                // Stacked, full width: choices are often paths or sentences, and each is an easy tap.
+                VStack(alignment: .leading, spacing: 6) {
+                        ForEach(question.choices, id: \.self) { choice in
+                            Button {
+                                if question.multiSelect {
+                                    if picked.contains(choice) { picked.remove(choice) } else { picked.insert(choice) }
+                                } else {
+                                    Task { _ = await chat.answerQuestion(choice) }
+                                }
+                            } label: {
+                                HStack {
+                                    Text(choice).font(.subheadline).lineLimit(3).multilineTextAlignment(.leading)
+                                    Spacer(minLength: 8)
+                                    Image(systemName: question.multiSelect ? (picked.contains(choice) ? "checkmark.circle.fill" : "circle")
+                                                                           : "arrow.up.circle")
+                                        .foregroundStyle(HMDesign.accent)
+                                }
+                                .padding(.horizontal, 12).padding(.vertical, 10)
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                .background(picked.contains(choice) ? HMDesign.accent.opacity(0.25) : HMDesign.panel,
+                                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(chat.answering)
+                        }
+                }
+                if question.multiSelect {
+                    Button("Send \(picked.count) choice\(picked.count == 1 ? "" : "s")") {
+                        let answer = question.choices.filter(picked.contains).joined(separator: ", ")
+                        Task { _ = await chat.answerQuestion(answer) }
+                    }
+                    .buttonStyle(.borderedProminent).disabled(picked.isEmpty || chat.answering)
+                }
+            }
+            Text("Or type your answer below and send.").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 12)
+        .sensoryFeedback(.impact(weight: .light), trigger: question.id)
+    }
+}
+
+/// The message you're replying to, above the message box: accent bar, two lines, remove button.
+struct QuoteChip: View {
+    let text: String
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            RoundedRectangle(cornerRadius: 1.5).fill(HMDesign.accent).frame(width: 3)
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Replying to", systemImage: "arrowshape.turn.up.left.fill")
+                    .font(.caption2.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill").font(.body).foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove reply quote")
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.leading, 10).padding(.vertical, 6).padding(.trailing, 2)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+/// A quoted message inside a sent bubble: small, muted, three lines at most.
+struct QuoteCard: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 1.5).fill(HMDesign.accent.opacity(0.7)).frame(width: 3)
+            Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(3)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+/// Where the reader is. On iOS 18+ the real scroll position decides "following the newest message": within
+/// 80 pt of the bottom follows, anywhere else holds still, however you got there (drag, flick, scroll-to-top tap).
+/// The list starts at the bottom, but growing content (a streaming reply, an older page) doesn't drag you down.
+struct ReadingPosition: ViewModifier {
+    @Binding var followLatest: Bool
+    /// True while your finger or a flick is moving the list. Growing content alone never stops following.
+    @State private var userScrolling = false
+    @State private var atBottom = true
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.top, for: .sizeChanges)
+                .onScrollGeometryChange(for: Bool.self) { geo in
+                    geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) < 80
+                } action: { _, bottom in
+                    atBottom = bottom
+                    if bottom { followLatest = true }
+                    else if userScrolling { followLatest = false }
+                }
+                .onScrollPhaseChange { _, phase in
+                    userScrolling = phase == .interacting || phase == .decelerating
+                    if userScrolling && !atBottom { followLatest = false }
+                    if phase == .idle && atBottom { followLatest = true }
+                }
+        } else {
+            content.defaultScrollAnchor(.bottom)
+        }
     }
 }

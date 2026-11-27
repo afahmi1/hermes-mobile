@@ -31,6 +31,7 @@ struct ChatListView: View {
     @State private var showSourceGuide = false
     @State private var draftScopes = Set<String>()
     /// Archiving chats that hold pinned messages asks twice: a dialog naming the pins, then an alert.
+    @State private var renaming: SessionSummary?
     @State private var pinGuard: PinGuard?
     @State private var pinGuardConfirm: PinGuard?
 
@@ -54,6 +55,16 @@ struct ChatListView: View {
 
 
     enum Filter: String, CaseIterable, Identifiable {
+        /// The short chip label (the full name stays for accessibility and the guide).
+        var chip: String {
+            switch self {
+            case .chats: "Inbox"
+            case .desktop: "Apps"
+            case .telegram: "Telegram"
+            case .all: "Everything"
+            case .archived: "Archived"
+            }
+        }
         case chats = "Conversations", desktop = "Hermes apps", telegram = "Telegram", all = "Everything", archived = "Archived"
         var source: String? {
             switch self {
@@ -86,6 +97,7 @@ struct ChatListView: View {
         NavigationStack(path: navigation) {
             inboxNavigation
                 .safeAreaInset(edge: .bottom) { QueuedActionsBar() }
+                .modifier(RenameSheetModifier(renaming: $renaming, sessions: $sessions, results: $results))
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
                 .sheet(isPresented: $showNew) {
@@ -153,9 +165,9 @@ struct ChatListView: View {
         ToolbarItem(placement: .topBarLeading) {
             if selecting {
                 Button("Cancel") { endSelection() }.disabled(batchBusy)
-            } else {
-                Button("Select") { beginSelection() }.disabled(visibleSessions.isEmpty)
-                    .accessibilityLabel("Select chats")
+            } else if fixedProfile == nil {
+                // Where you are and how it's doing, in one place: status dot + gateway name.
+                ConnectionBadge(pill: true, onSwitch: { showGateways = true })
             }
         }
         ToolbarItem(placement: .topBarTrailing) {
@@ -164,6 +176,16 @@ struct ChatListView: View {
                     .disabled(batchBusy || visibleSessions.isEmpty)
                     .accessibilityLabel("Select all loaded chats")
             } else {
+                Menu {
+                    Button("Select chats", systemImage: "checkmark.circle") { beginSelection() }
+                        .disabled(visibleSessions.isEmpty)
+                    Button("About chat sources", systemImage: "info.circle") { showSourceGuide = true }
+                } label: { Image(systemName: "ellipsis") }
+                .accessibilityLabel("More")
+            }
+        }
+        if !selecting {
+            ToolbarItem(placement: .topBarTrailing) {
                 Button { startNew() } label: { Image(systemName: "square.and.pencil") }
                     .accessibilityLabel("New chat")
             }
@@ -215,39 +237,19 @@ struct ChatListView: View {
 
     @ViewBuilder private var content: some View {
         List {
-            Section {
-                // One quiet strip above the list: where you are, how it is doing, and what is shown.
-                VStack(alignment: .leading, spacing: HMDesign.micro) {
-                    let header = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout())
-                    header {
-                        if let url = API.shared.baseURL {
-                            Button { showGateways = true } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "server.rack").imageScale(.small)
-                                    Text(SavedGateways.displayName(url)).lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
-                                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold))
-                                }
-                                .font(.subheadline.weight(.medium))
-                                .hmTouchTarget()
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(selecting || fixedProfile != nil)
-                            .accessibilityLabel("Choose gateway, current gateway " + SavedGateways.displayName(url))
-                        }
-                        if !typeSize.isAccessibilitySize { Spacer(minLength: 6) }
-                        ConnectionBadge().buttonStyle(.borderless)
-                    }
-                    if HMTheme.isThermocline {
-                        HMSearchField(prompt: "Search chats", query: $query).disabled(selecting)
-                    }
-                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 8))
-                    layout { filters }
+            if HMTheme.isThermocline {
+                HMSearchField(prompt: "Search chats", query: $query)
                     .disabled(selecting)
-                }
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 4, trailing: 16))
+            }
+            // One row of controls above the list: what's shown. Tap a chip; no menus to open first.
+            filters
+                .disabled(selecting)
                 .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-            }.hmRows(onCanvasInDark: colorScheme == .dark)
-            .listSectionSpacing(.compact)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 6, trailing: 0))
             if let error, !(sessions.isEmpty && results == nil) {
                 // Cached or partial rows stay visible; say what failed and offer the existing refresh.
                 VStack(alignment: .leading, spacing: HMDesign.micro) {
@@ -269,11 +271,16 @@ struct ChatListView: View {
                         ContentUnavailableView.search(text: query.trimmingCharacters(in: .whitespaces))
                     }
                 }
-                ForEach(results, id: \.key) { row($0) }.hmRows(onCanvasInDark: colorScheme == .dark)
+                ForEach(results, id: \.key) { row($0) }
             } else {
                 ForEach(grouped, id: \.0) { section in
-                    Section(header: HMHeader(section.0)) { ForEach(section.1, id: \.key) { row($0) } }
-                        .hmRows(onCanvasInDark: colorScheme == .dark)
+                    // The day label is a slim row, not a section header: plain-list headers add a tall gap.
+                    Text(section.0).font(.footnote.weight(.semibold)).foregroundStyle(HMDesign.text2)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 2, trailing: 16))
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(section.1, id: \.key) { row($0) }
                 }
                 if cursor != nil {
                     HStack { Spacer(); ProgressView().accessibilityLabel("Loading more chats"); Spacer() }
@@ -284,7 +291,9 @@ struct ChatListView: View {
                 }
             }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
+        .environment(\.defaultMinListHeaderHeight, 24)
+        .listSectionSpacing(.compact)
         .safeAreaInset(edge: .bottom, spacing: 0) { if selecting { selectionActions } }
         .overlay {
             if loading && sessions.isEmpty {
@@ -318,41 +327,41 @@ struct ChatListView: View {
         }
     }
 
-    @ViewBuilder private var filters: some View {
-        Menu {
-            Picker("Source", selection: $filter) {
-                ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
-            }
-            Divider()
-            Button("About chat sources", systemImage: "info.circle") { showSourceGuide = true }
-        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease", active: filter != .chats).fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true) }
-        .buttonStyle(.borderless)
-        .accessibilityLabel("Source, " + filter.rawValue)
-        if fixedProfile == nil {
-            Menu {
-                Picker("Bot", selection: $selectedBot) {
-                    Text("All bots").tag(String?.none)
-                    ForEach(app.bots) { bot in Text(bot.name == bot.id ? bot.name : "\(bot.name) · \(bot.id)").tag(Optional(bot.id)) }
+    private var filters: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(Filter.allCases) { f in
+                    Button { withAnimation(.snappy(duration: 0.2)) { filter = f } } label: {
+                        Text(f.chip).font(.subheadline.weight(filter == f ? .semibold : .regular))
+                            .foregroundStyle(filter == f ? (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas) : HMDesign.ink)
+                            .padding(.horizontal, 12).frame(minHeight: 32)
+                            .background(filter == f ? HMDesign.accent : HMDesign.panel, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(f.rawValue)
+                    .accessibilityAddTraits(filter == f ? .isSelected : [])
                 }
-            } label: { filterLabel(selectedBot.map { app.botName($0) } ?? "All bots", symbol: "person.2", active: selectedBot != nil) }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
+                if fixedProfile == nil, app.bots.count > 1 {
+                    Menu {
+                        Picker("Bot", selection: $selectedBot) {
+                            Text("All bots").tag(String?.none)
+                            ForEach(app.bots) { bot in Text(bot.name == bot.id ? bot.name : "\(bot.name) · \(bot.id)").tag(Optional(bot.id)) }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(selectedBot.map { app.botName($0) } ?? "All bots")
+                            Image(systemName: "chevron.down").font(.caption2.weight(.bold))
+                        }
+                        .font(.subheadline.weight(selectedBot == nil ? .regular : .semibold))
+                        .foregroundStyle(selectedBot == nil ? HMDesign.ink : (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas))
+                        .padding(.horizontal, 12).frame(minHeight: 32)
+                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accent, in: Capsule())
+                    }
+                    .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
+                }
+            }
+            .padding(.horizontal, 16)
         }
-    }
-
-    /// A filter menu's chip. `active` marks a filter that narrows the list (lead-tinted in Thermocline).
-    private func filterLabel(_ title: String, symbol: String, active: Bool = false) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: symbol).imageScale(.small)
-            Text(title).lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
-            Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
-                .foregroundStyle(active && HMTheme.isThermocline ? HMDesign.accent : HMDesign.text2)
-        }
-        .font(.subheadline.weight(.medium))
-        .foregroundStyle(HMDesign.ink)
-        .padding(.horizontal, HMDesign.medium).padding(.vertical, 7)
-        .hmChip(active: active)
-        .hmTouchTarget()
     }
 
     @ViewBuilder private func row(_ s: SessionSummary) -> some View {
@@ -368,19 +377,27 @@ struct ChatListView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain).disabled(batchBusy)
+            .listRowBackground(Color.clear)
             .accessibilityAddTraits(selection.contains(s.key) ? .isSelected : [])
         } else {
-            HStack(spacing: HMDesign.medium) {
-                // Bot name is in the row's metadata, so give the text the width at accessibility sizes.
-                if !typeSize.isAccessibilitySize {
-                    BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
-                        .frame(width: HMDesign.touch, height: HMDesign.touch)
-                        .accessibilityHidden(true)
+            // The whole row opens the chat. No disclosure chevron: every row opens, so it says nothing.
+            Button { navigation.wrappedValue.append(ChatRef(profile: s.profile, sessionId: s.id)) } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    // An avatar only tells you something when the list mixes bots. Five identical "H"s is noise.
+                    if mixedBots && !typeSize.isAccessibilitySize {
+                        BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32)
+                            .padding(.top, 2)
+                            .accessibilityHidden(true)
+                    }
+                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, showBot: mixedBots,
+                               hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
-                NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
-                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
-                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(RowPress())
+            .listRowBackground(Color.clear)
+            .listRowSeparatorTint(HMDesign.separator)
+            .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
             .swipeActions(edge: .trailing) {
                 Button {
                     requestArchive(s)
@@ -408,6 +425,7 @@ struct ChatListView: View {
                 } label: {
                     Label("Select", systemImage: "checkmark.circle")
                 }
+                Button { renaming = s } label: { Label("Rename", systemImage: "pencil") }
                 Button {
                     UIPasteboard.general.string = s.displayTitle
                 } label: {
@@ -425,6 +443,8 @@ struct ChatListView: View {
     }
 
     private var visibleSessions: [SessionSummary] { results ?? sessions }
+    /// More than one bot in what's on screen: then avatars and bot names earn their space.
+    private var mixedBots: Bool { Set(visibleSessions.prefix(60).map(\.profile)).count > 1 }
 
     private func beginSelection() {
         selecting = true
@@ -475,6 +495,10 @@ struct ChatListView: View {
                 pinGuard = PinGuard(targets: [fresh], batch: false)
                 return
             }
+            if result.unreachable.contains(s.id) {
+                await queueFlags([s], ["archived": true], confirmPins: confirmPins)
+                return
+            }
             if let problem = result.errors[s.id] { self.error = problem; return }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             apply("archived", true, to: s.key)
@@ -522,7 +546,9 @@ struct ChatListView: View {
                                                                 confirmPins: confirmPins)
                     heldForPins += response.heldForPins.count
                     let updated = Set(response.updated)
-                    failures.formUnion(chunk.filter { !updated.contains($0.id) }.map(\.key))
+                    let later = Set(response.unreachable)
+                    if !later.isEmpty { await queueFlags(chunk.filter { later.contains($0.id) }, fields, confirmPins: confirmPins) }
+                    failures.formUnion(chunk.filter { !updated.contains($0.id) && !later.contains($0.id) }.map(\.key))
                 } catch APIError.http(404, _) {
                     for row in chunk {
                         guard gateway == app.gatewaySession else { return }
@@ -732,6 +758,8 @@ struct SessionRow: View {
     let session: SessionSummary
     let botName: String
     var showAvatar = true
+    /// The bot's name in the meta line. Off when every row is the same bot.
+    var showBot = true
     var hasDraft = false
 
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -739,9 +767,12 @@ struct SessionRow: View {
     private var large: Bool { typeSize.isAccessibilitySize }
 
     private var metadata: [String] {
-        var parts = [botName]
-        if !session.sourceLabel.isEmpty { parts.append(session.sourceLabel) }
-        if let m = session.model, !m.isEmpty { parts.append(Self.shortModel(m)) }
+        var parts: [String] = []
+        if showBot { parts.append(botName) }
+        // "Mobile" on every row is noise in your own inbox; other sources (Telegram, desktop, cron) are worth a word.
+        if !session.sourceLabel.isEmpty, session.sourceLabel != "Mobile" { parts.append(session.sourceLabel) }
+        // The model's family and version is what differs between rows; the context size ("1M") doesn't.
+        if let m = session.model, !m.isEmpty { parts.append(ModelName.short(m).components(separatedBy: " · ").first ?? m) }
         return parts
     }
 
@@ -906,5 +937,94 @@ struct QueuedActionsBar: View {
             .padding(.bottom, 6)
             .accessibilityHint("Shows changes saved on this phone. They apply when your Mac is reachable.")
         }
+    }
+}
+
+/// Rename a chat: type a name, or let Hermes suggest one from what the chat is about now.
+struct RenameChatSheet: View {
+    let session: SessionSummary
+    let renamed: (String) -> Void
+    @State private var title = ""
+    @State private var suggesting = false
+    @State private var saving = false
+    @State private var problem: String?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Chat name", text: $title, axis: .vertical).lineLimit(1...3)
+                    Button {
+                        Task { await suggest() }
+                    } label: {
+                        HStack {
+                            Label(suggesting ? "Thinking of a name…" : "Suggest a name", systemImage: "sparkles")
+                            if suggesting { Spacer(); ProgressView() }
+                        }
+                    }
+                    .disabled(suggesting)
+                } footer: {
+                    Text(problem ?? "Suggestions come from Hermes's quick helper model and read what this chat is about now, not just how it started. Tap again for another.")
+                        .foregroundStyle(problem == nil ? Color.secondary : HMDesign.warning)
+                }
+            }
+            .hmCanvas()
+            .navigationTitle("Rename chat")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "Saving…" : "Save") { Task { await save() } }
+                        .disabled(saving || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onAppear { title = session.displayTitle }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func suggest() async {
+        suggesting = true
+        problem = nil
+        defer { suggesting = false }
+        do { title = try await API.shared.suggestTitle(profile: session.profile, session: session.id) }
+        catch { problem = error.localizedDescription }
+    }
+
+    private func save() async {
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        saving = true
+        defer { saving = false }
+        do {
+            try await API.shared.updateSession(profile: session.profile, session: session.id, fields: ["title": name])
+            renamed(name)
+            dismiss()
+        } catch {
+            problem = ActionQueue.isOffline(error) ? "Your Mac isn't reachable. Try again when it is." : error.localizedDescription
+        }
+    }
+}
+
+struct RenameSheetModifier: ViewModifier {
+    @Binding var renaming: SessionSummary?
+    @Binding var sessions: [SessionSummary]
+    @Binding var results: [SessionSummary]?
+
+    func body(content: Content) -> some View {
+        content.sheet(item: $renaming) { target in
+            RenameChatSheet(session: target) { title in
+                if let i = sessions.firstIndex(where: { $0.key == target.key }) { sessions[i].title = title }
+                if let i = results?.firstIndex(where: { $0.key == target.key }) { results?[i].title = title }
+            }
+        }
+    }
+}
+
+/// A list row that dims a touch when pressed, like Messages, instead of a gray selection slab.
+struct RowPress: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.opacity(configuration.isPressed ? 0.55 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

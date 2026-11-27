@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// The outbox message state machine, and that it survives on disk exactly as written.
 @main struct OutboxTests {
@@ -40,6 +41,32 @@ import Foundation
         try await InboxDisk.shared.saveOutgoing([], key: key)
         let cleared = await InboxDisk.shared.outgoing(key)
         precondition(cleared.isEmpty)
-        print("Outbox phases, edits, refusals, steer demotion and disk round trip passed")
+        // Big files: kept as a file, fingerprinted without loading whole, stable upload id, small JSON.
+        let source = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+        let bytes = Data((0..<3_000_000).map { UInt8($0 % 251) })
+        try bytes.write(to: source)
+        let file = try UploadFiles.adopt(source, filename: "rec.mov", mime: "video/quicktime", move: true)
+        precondition(file.isUpload && file.byteCount == bytes.count && file.base64.isEmpty)
+        precondition(file.sha256 == SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+        let onDisk = try Data(contentsOf: file.fileURL!)
+        precondition(onDisk == bytes)
+        precondition(UploadFiles.uploadID(file) == UploadFiles.uploadID(file) && UploadFiles.uploadID(file).count == 32)
+        let json = try JSONEncoder().encode(file)
+        precondition(json.count < 600, "the outbox stores a name, not the bytes")
+        let decoded = try JSONDecoder().decode(SendAttachment.self, from: json)
+        precondition(decoded == file)
+        try? FileManager.default.removeItem(at: file.fileURL!)
+        // Reply quotes: excerpt, wire format, and splitting a sent message back into quote + body.
+        let ex = ReplyQuote.excerpt("Line one\n\n\n  Line two  \n" + String(repeating: "x", count: 400))
+        precondition(ex.hasPrefix("Line one\nLine two\n") && ex.hasSuffix("…") && ex.count <= 321)
+        let wire = ReplyQuote.markdown("a\nb") + "\n\nmy answer"
+        precondition(wire == "> a\n> b\n\nmy answer")
+        let parts = ReplyQuote.split(wire)
+        precondition(parts.quote == "a\nb" && parts.body == "my answer")
+        precondition(ReplyQuote.split("> only a quote").quote == nil)
+        precondition(ReplyQuote.split("no quote here").quote == nil)
+        let legacy = try JSONDecoder().decode(PastedText.self, from: Data(#"{"id":"\#(UUID().uuidString)","text":"t"}"#.utf8))
+        precondition(!legacy.isQuote, "drafts saved by older builds still load")
+        print("Outbox phases, edits, refusals, steer demotion, disk round trip, big-file attachments and reply quotes passed")
     }
 }

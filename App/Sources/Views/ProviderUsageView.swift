@@ -98,7 +98,17 @@ struct ProviderUsageSection: View {
         case "custom": return "Custom route (unspecified)"
         case "auto": return "Automatic route (unspecified)"
         case "unattributed": return "Unattributed activity"
-        default: return name
+        default:
+            // "custom:claude-cli-proxy" -> "Claude CLI proxy"; "openai-codex" -> "OpenAI Codex".
+            let bare = name.hasPrefix("custom:") ? String(name.dropFirst(7)) : name
+            let known = ["anthropic": "Anthropic", "openrouter": "OpenRouter", "openai-codex": "OpenAI Codex", "deepseek": "DeepSeek",
+                         "xai-oauth": "xAI (subscription)", "gemini": "Gemini", "nous": "Nous", "copilot": "GitHub Copilot",
+                         "huggingface": "Hugging Face", "kimi-coding": "Kimi"]
+            if let k = known[bare] { return k }
+            return bare.split(separator: "-").map { w in
+                let s = String(w)
+                return ["cli", "api", "ai", "oauth", "gpu"].contains(s) ? s.uppercased() : s.prefix(1).uppercased() + s.dropFirst()
+            }.joined(separator: " ")
         }
     }
 
