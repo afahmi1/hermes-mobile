@@ -139,13 +139,22 @@ class Jwt(unittest.TestCase):
         der = lambda n: (b"\x00" if n[0] & 0x80 else b"") + n.lstrip(b"\x00") if n.lstrip(b"\x00") else b"\x00"
         r, s = der(raw[:32]), der(raw[32:])
         body = b"\x02" + bytes([len(r)]) + r + b"\x02" + bytes([len(s)]) + s
-        sigfile = Path(self.dir.name) / "sig.der"
-        sigfile.write_bytes(b"\x30" + bytes([len(body)]) + body)
-        message = Path(self.dir.name) / "msg"
-        message.write_bytes(("%s.%s" % (head, claims)).encode())
-        done = subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(self.pub), "-signature", str(sigfile), str(message)],
-                              capture_output=True)
-        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        signature, signed = b"\x30" + bytes([len(body)]) + body, ("%s.%s" % (head, claims)).encode()
+        try:
+            # Verified in-process when possible: the openssl CLI changes under Homebrew (4.1 refuses this dgst call).
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ec
+        except ImportError:
+            sigfile = Path(self.dir.name) / "sig.der"
+            sigfile.write_bytes(signature)
+            message = Path(self.dir.name) / "msg"
+            message.write_bytes(signed)
+            done = subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(self.pub), "-signature", str(sigfile),
+                                   str(message)], capture_output=True)
+            self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+            return
+        key = serialization.load_pem_public_key(Path(self.pub).read_bytes())
+        key.verify(signature, signed, ec.ECDSA(hashes.SHA256()))  # raises InvalidSignature on a bad JWT
 
     def test_signed_with_cryptography_or_default(self):
         self.check(bridge_push.make_jwt(str(self.key), "KEYID12345", "TEAMID1234", 1700000000))
