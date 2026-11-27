@@ -1,12 +1,36 @@
 ---
 name: Prometheus
-description: Native iPhone remote for Hermes Agent
+description: Native iPhone remote for Hermes Agent. Thermocline v1.0, with a Classic option.
 colors:
-  ember-light: "#8e5200"
-  ember-dark: "#f5b942"
+  bg-light: "#E4E0D7"
+  bg-dark: "#000000"
+  surface1-light: "#EEEAE1"
+  surface1-dark: "#151515"
+  surface2-light: "#F5F1E7"
+  surface2-dark: "#222222"
+  surface3-light: "#DCD8CF"
+  surface3-dark: "#2D2D2D"
+  text-light: "#13181D"
+  text-dark: "#EBE7DE"
+  text2-light: "#474047"
+  text2-dark: "#B5AEA5"
+  text3-light: "#645C64"
+  text3-dark: "#9D959D"
+  lead-light: "#186377"
+  lead-dark: "#6BCDC2"
+  link-light: "#186377"
+  link-dark: "#6FB3D0"
+  spark-light: "#AE6B00"
+  spark-dark: "#F4B21F"
+  danger-light: "#CE0A04"
+  danger-dark: "#E62F10"
+  success-light: "#4B6801"
+  success-dark: "#A3C54F"
+  classic-accent-light: "#8e5200"
+  classic-accent-dark: "#f5b942"
 rounded:
   panel: "12px"
-  message: "20px"
+  message: "18px"
 spacing:
   micro: "4px"
   small: "8px"
@@ -16,38 +40,28 @@ spacing:
   touch: "44px"
 ---
 
-## Overview
+## Visual system
 
-Prometheus is an iOS utility for talking to your bots and checking the Mac they run on. The incumbent visual system is native SwiftUI: four system tabs, navigation stacks, grouped lists and forms, SF Symbols, and a mostly unboxed transcript. This is a refinement of that system, not a new theme. Native controls and the content they act on come first.
+Prometheus uses Thermocline over native SwiftUI navigation, lists, forms, and keyboard behavior. The reference is Thermocline's `examples/preview-b2.html`. Finch paper is warm stone with deep wing-blue controls; Dark uses a true OLED-black canvas, neutral elevated surfaces and a turquoise lead. Both are first-class modes. `App/Sources/Views/Thermocline.swift` is vendored from afahmi1/thermocline. Do not edit those values. `DesignSystem.swift` maps the tokens to app roles.
 
-## Colors
+Settings > Appearance shows theme previews and applies the selection live. Thermocline is the default (`appTheme`). Its Mode is Match iPhone, Light or Dark (`appMode`). Classic defaults to adaptive system surfaces and the original amber `AccentColor`; the previous Paper, Ash, Black, Match iPhone and accent choices remain available under Classic with their prior preferences, including the Liquid Glass toggle.
 
-`AccentColor.colorset` remains the only interaction tint: dark ochre in Light Mode, amber in Dark Mode. Both come from the flame family of the Firebringer icon. Use `Color.accentColor` for key controls and tint a surface lightly when it serves a purpose; keep text on tinted surfaces semantic (`.primary`). Use UIKit’s adaptive system backgrounds and fills, `.primary` and `.secondary` for text, and separators/materials for boundaries. Red, green and amber may convey status only when a label or symbol also conveys it. Do not put white text on bright amber.
+## Materials and type
 
-## Typography
+- Light uses a five-percent lead bloom and a five-percent chestnut bloom over paper, with fine grain. Dark leaves the OLED canvas untinted by bloom, wash or grain.
+- Use surface-2 rows on paper and surface-1 grouped rows on black, with hairline separators. Plain inbox rows leave the dark canvas exposed. Glass belongs on bounded controls and cards; use one layer of material with a surface tint, an ink hairline and a restrained edge highlight. Reduce Transparency replaces the material with solid surface-1. Do not put glass on glass, glow on text, or use black drop shadows in light mode.
+- Navigation retains native large titles with semibold weight and tight tracking. Section headers are uppercase 11 pt mono labels with 1.3 pt tracking in text-3. Metadata, code, and tabular figures use SF Mono (JetBrains Mono if registered); body type stays SF Pro. Let controls and summaries stack at accessibility sizes instead of compressing their contents.
+- Keep `lead` with `onLead` on filled controls and bubbles. Use `link` for links, `success` and `danger` for state marks, and text or `warm` for warning copy. Beak red is a mark, not body copy. Gold is never body copy: reserve one `spark` fill or symbol per screen, such as the Horizon-eye dot or a single usage warning. Do not use color as the only state signal.
 
-Use SF Pro, standard SwiftUI text styles, and Dynamic Type. Navigation owns top-level `largeTitle` and inline detail titles. Use semibold body/headline for row titles, body for messages, subheadline for previews, and secondary footnote/caption for metadata. Use monospaced digits for counts and monospaced type only for code/paths. When text pressure grows, stack before shrinking; wrap text that carries an action or state.
+## Screens
 
-## Layout
+- Chats: a surface search field with a hairline and a lead focus ring; filter chips use the same palette with a lead tint when filtering. Titles lead the grouped rows, followed by the preview, quiet initials, mono details and pin state. First-run uses the Horizon-eye; errors offer a quiet bordered retry.
+- Transcript: assistant copy stays unboxed. Outgoing messages use 18 pt continuous corners and opaque lead fill. Code sits in a surface-3 well with a surface-1 header. Pinned and composer bars use the canvas in Dark and restrained glass in Light, with a hairline. The composer field is solid so it doesn't stack glass; the send arrow is on-lead with a soft glow on its disc. A beak-colored dot accompanies the live label.
+- Status: the overview tiles float independently over the canvas. Use mono numbers, labeled success or failure marks, and lateral lines alongside major headers. Provider usage uses the 2 pt on / 2 pt off finch track with an explicit percentage beside it. At most one warning window uses gold; other warnings use warm, and critical windows use beak red.
+- Bots, Projects, Settings and management sheets: grouped rows, quiet solids rather than repeated glass, and the same mono section labels. Sign-in uses the Horizon-eye and a link-colored server hint. No workflow or navigation changes for decoration.
 
-`App/Sources/Views/DesignSystem.swift` is the source for shared SwiftUI spacing, shape, affordance and foreground roles. Numeric values in the frontmatter denote logical points in native code. Keep 4 pt within a label pair, 8–12 pt within a component, 16 pt at content edges and 24 pt between larger groups. Use grouped rows rather than nested cards. Standalone actions have a 44 pt minimum target; keep model selection and send in the bottom composer, and native navigation where it is expected.
+Keep native navigation, swipe actions, and keyboard safe areas; use 44 pt targets for standalone controls. Custom motion uses the Thermocline curves at 120, 200 or 320 ms, without bounce; honor Reduce Motion. Review light, dark, Classic and accessibility text sizes.
 
-## Elevation & Depth
+## Offline screenshot QA
 
-Conversation content sits on the system background. Grouped lists and forms use system layers. Composer and pinned-message bar use system bar material as a boundary while scrolling. No custom shadows or gradient decoration.
-
-## Shapes
-
-Use 12 pt panels for embedded blocks and notices, 20 pt continuous curves for outgoing messages, and capsules only for compact selectors. Rounded surfaces are not the default for ordinary list content.
-
-## Components
-
-- Inbox rows: chat title first, preview or draft next, then bot/source/model context and pin state; date moves below at accessibility sizes.
-- Transcript: flat, full-width assistant responses; right-aligned outgoing bubble with semantic text; lightweight code/callout blocks with accessible copy affordances.
-- Composer: compact utility controls and one primary send/stop action. Visually separate warnings from the editable draft. Keep native menus and system sheets.
-- Status: attention and freshness first, followed by a readable overview and native grouped detail rows. Use labels with status symbols, not color alone.
-- Projects, bots and connection preferences: native grouped rows with short title-and-detail hierarchy. Use native progress and empty states with an actionable next step where available.
-
-## Do's and Don'ts
-
-Do preserve system navigation, swipe actions and keyboard safe areas. Do test light, dark and large text. Do let data and intent set hierarchy. Don’t add dashboard decoration, tiny tap targets, or secondary text in a low-contrast tertiary style. Don’t introduce new branding or product workflow under a polish change.
+Launch the Debug simulator app with `-HMDemo 1 -HMTab N` (0 Chats, 1 Bots, 2 Projects, 3 Status, 4 Settings). The fixture transport keeps requests in-process and does not use a bridge or a real credential. Use `-HMOpenChat default/demo-thermocline` for the transcript, `-HMDemoDraft 1` for the active send control, `-HMDemoLive 1` for a running tool and `-HMDemoApproval 1` with Live for the approval sheet. `-HMOpenProvider openai-codex -HMUsageScrollAccount 1` shows the warning bar from Status. `-HMOpenProjectEditor 1` opens management from Projects; `-HMShowSignIn 1` shows sign-in without changing accounts. None of these fixture switches are available in Release.

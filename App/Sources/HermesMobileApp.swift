@@ -2,6 +2,9 @@ import SwiftUI
 
 private final class NotificationDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, willFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        #if DEBUG
+        if DemoMode.isOn { return true }
+        #endif
         ReplyNotifier.shared.install()
         ReplyNotifier.shared.registerIfAuthorized()
         return true
@@ -18,12 +21,20 @@ private final class NotificationDelegate: NSObject, UIApplicationDelegate {
 @main
 struct HermesMobileApp: App {
     @UIApplicationDelegateAdaptor(NotificationDelegate.self) private var delegate
+    #if DEBUG
+    // Screenshot QA (debug builds only): `-HMTab N` starts on tab N.
+    @State private var selectedTab = UserDefaults.standard.integer(forKey: "HMTab")
+    #else
     @State private var selectedTab = 0
+    #endif
     @State private var app = AppModel()
     @Environment(\.scenePhase) private var phase
     @State private var backgroundedAt: Date?
-    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
+    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeKind.thermocline.rawValue
+    @AppStorage(HMTheme.modeKey) private var modeRaw = HMMode.system.rawValue
+    @AppStorage(HMTheme.classicKey) private var classicRaw = HMThemeChoice.native.rawValue
     @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
+    @AppStorage(HMTheme.thermoclineAccentKey) private var thermoclineAccentRaw = Thermocline.Accent.crown.rawValue
 
     init() {
         HMTheme.applyChrome()
@@ -31,15 +42,19 @@ struct HermesMobileApp: App {
         Task.detached(priority: .background) { UploadFiles.prune(keep: []) }
     }
 
+    /// Everything that changes how colors resolve. The root rebuilds once when it changes.
+    private var look: String { [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw].joined(separator: "|") }
+
     var body: some Scene {
         WindowGroup {
             RootView(selectedTab: $selectedTab)
                 .environment(app)
                 .tint(HMDesign.accent)
-                .preferredColorScheme(HMThemeChoice(rawValue: themeRaw)?.scheme)
+                .thermoclineAccent(HMTheme.thermoclineAccent)
+                .preferredColorScheme(HMTheme.scheme)
                 // Theme colors resolve when views are built: rebuild once on a theme change.
-                .id(themeRaw + accentRaw)
-                .onChange(of: themeRaw + accentRaw) { _, _ in HMTheme.applyChrome() }
+                .id(look)
+                .onChange(of: look) { _, _ in HMTheme.applyChrome() }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
                     app.retryDraftStorage()
                 }
@@ -54,11 +69,14 @@ struct HermesMobileApp: App {
                 }
                 #if DEBUG
                 .task {
+                    guard !DemoMode.isOn else { return }
                     DesignReview.signInIfAsked(app)
-                    if let tab = UserDefaults.standard.string(forKey: "HMReviewTab").flatMap(Int.init) { selectedTab = tab }
-                    if let chat = UserDefaults.standard.string(forKey: "HMReviewChat") {
-                        try? await Task.sleep(for: .seconds(2))
-                        _ = app.open(URL(string: "prometheus://chat/" + chat)!)
+                    let defaults = UserDefaults.standard
+                    if let tab = defaults.string(forKey: "HMReviewTab").flatMap(Int.init) { selectedTab = tab }
+                    if let chat = defaults.string(forKey: "HMReviewChat"),
+                       let url = URL(string: "prometheus://chat/" + chat) {
+                        do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                        _ = app.open(url)
                     }
                 }
                 #endif
@@ -110,6 +128,18 @@ struct RootView: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
+        #if DEBUG
+        if DemoMode.isOn && UserDefaults.standard.bool(forKey: "HMShowSignIn") {
+            SignInView()
+        } else {
+            signedInContent
+        }
+        #else
+        signedInContent
+        #endif
+    }
+
+    @ViewBuilder private var signedInContent: some View {
         if app.signedIn {
             MainTabs(selectedTab: $selectedTab)
                 .id(app.gatewaySession)
@@ -171,16 +201,26 @@ private struct Announcement: View {
     var body: some View {
         Group {
             if shown, let text {
-                Label(text, systemImage: "sparkles")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(.regularMaterial, in: Capsule())
-                    .shadow(radius: 6, y: 2)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .padding(.top, 4)
+                if HMTheme.isThermocline {
+                    Label(text, systemImage: "sparkles")
+                        .font(.subheadline.weight(.semibold))
+                        .labelStyle(HMTintedIconLabel(icon: Thermocline.plum))
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .hmGlass(Capsule())
+                        .transition(.offset(y: -8).combined(with: .opacity))
+                        .padding(.top, 4)
+                } else {
+                    Label(text, systemImage: "sparkles")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(.regularMaterial, in: Capsule())
+                        .shadow(radius: 6, y: 2)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .padding(.top, 4)
+                }
             }
         }
-        .animation(.spring(duration: 0.35), value: shown)
+        .animation(HMMotion.pick(Thermocline.Motion.large, classic: .spring(duration: 0.35)), value: shown)
         .task(id: tick) {  // a newer announcement restarts the timer instead of being hidden early
             guard tick > 0 else { return }
             shown = true
@@ -221,22 +261,22 @@ struct ConnectionBadge: View {
     }
 
     private var state: (label: String, symbol: String, color: Color) {
-        guard app.checkedConnection else { return (named("Checking"), "clock.fill", .yellow) }
+        guard app.checkedConnection else { return (named("Checking"), "clock.fill", HMDesign.pending) }
         if app.needsLogin { return (named("Sign in"), "lock.fill", HMDesign.warning) }
-        if app.healthFailure != nil { return (named("Unreachable"), "wifi.slash", .red) }
-        guard let health = app.health else { return (named("Offline"), "xmark.circle.fill", .red) }
+        if app.healthFailure != nil { return (named("Unreachable"), "wifi.slash", HMDesign.danger) }
+        guard let health = app.health else { return (named("Offline"), "xmark.circle.fill", HMDesign.danger) }
         switch health.phase {
-        case "starting": return (named("Starting"), "clock.fill", .yellow)
-        case "restarting": return (named("Restarting"), "arrow.clockwise.circle.fill", .yellow)
-        case "draining": return (named("Finishing work"), "clock.fill", .yellow)
-        case "waiting": return (named("Waiting"), "clock.fill", .yellow)
-        case "stopping": return (named("Stopping"), "clock.fill", .yellow)
-        case "stopped", "unavailable": return (named("Gateway down"), "xmark.circle.fill", .red)
+        case "starting": return (named("Starting"), "clock.fill", HMDesign.pending)
+        case "restarting": return (named("Restarting"), "arrow.clockwise.circle.fill", HMDesign.pending)
+        case "draining": return (named("Finishing work"), "clock.fill", HMDesign.pending)
+        case "waiting": return (named("Waiting"), "clock.fill", HMDesign.pending)
+        case "stopping": return (named("Stopping"), "clock.fill", HMDesign.pending)
+        case "stopped", "unavailable": return (named("Gateway down"), "xmark.circle.fill", HMDesign.danger)
         default: break
         }
         let gateway = health.gatewayState?.lowercased() ?? ""
         if !health.ok || ["stopped", "down", "failed", "offline"].contains(gateway) {
-            return (named("Gateway down"), "xmark.circle.fill", .red)
+            return (named("Gateway down"), "xmark.circle.fill", HMDesign.danger)
         }
         if ["degraded", "down"].contains(diagnostic?["health"].string ?? "") || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
             return (named("Degraded"), "exclamationmark.triangle.fill", HMDesign.warning)
@@ -260,7 +300,7 @@ struct ConnectionBadge: View {
                         .overlay { if reloading { ProgressView().controlSize(.mini) } }
                 } else {
                     Image(systemName: state.symbol).foregroundStyle(state.color)
-                    Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+                    Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(HMDesign.ink)
                 }
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -270,9 +310,9 @@ struct ConnectionBadge: View {
         .popover(isPresented: $detail) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(state.label).font(.headline)
-                Text(API.shared.baseURL?.absoluteString ?? "Hermes gateway").textSelection(.enabled).font(.footnote).foregroundStyle(.secondary)
+                Text(API.shared.baseURL?.absoluteString ?? "Hermes gateway").textSelection(.enabled).font(.footnote).foregroundStyle(HMDesign.text2)
                 if let at = app.lastHealthCheck {
-                    Text("Last response \(at, style: .relative) ago").font(.caption).foregroundStyle(.secondary)
+                    Text("Last response \(at, style: .relative) ago").font(.caption).foregroundStyle(HMDesign.text2)
                 }
                 if !app.checkedConnection {
                     Text("Checking the bridge and gateway.")
@@ -295,7 +335,7 @@ struct ConnectionBadge: View {
                         if let text = reason.string { Text(text) }
                     }
                 }
-                if app.healthFailure == nil, let reason = app.health?.reason { Text(reason).foregroundStyle(.secondary) }
+                if app.healthFailure == nil, let reason = app.health?.reason { Text(reason).foregroundStyle(HMDesign.text2) }
                 if let fallback = app.health?.inboxFallback { Text("Using gateway history · " + fallback).font(.caption) }
                 if let recent = app.health?.recent, recent.count > 1 {
                     Divider()
