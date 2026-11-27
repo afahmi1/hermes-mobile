@@ -24,6 +24,7 @@ struct ChatListView: View {
         })
     }
     @State private var showNew = false
+    @State private var whatsNew: WhatsNewRelease? = nil
     @State private var selecting = false
     @State private var selection = Set<String>()
     @State private var batchBusy = false
@@ -102,6 +103,8 @@ struct ChatListView: View {
                 .modifier(RenameSheetModifier(renaming: $renaming, sessions: $sessions, results: $results))
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
+                .sheet(item: $whatsNew, onDismiss: { if let w = whatsNew { WhatsNew.markSeen(w) } }) { w in WhatsNewSheet(release: w) }
+                .onAppear { if whatsNew == nil { whatsNew = WhatsNew.due() } }
                 .sheet(isPresented: $showNew) {
                     NewChatSheet { bot in
                         showNew = false
