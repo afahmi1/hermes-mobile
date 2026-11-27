@@ -9,6 +9,7 @@ struct ChatListView: View {
     @State private var generation = UUID()
     @State private var lastSync: Date?
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @State private var loading = false
     @State private var error: String?
@@ -245,7 +246,7 @@ struct ChatListView: View {
                 }
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-            }.hmRows()
+            }.hmRows(onCanvasInDark: colorScheme == .dark)
             .listSectionSpacing(.compact)
             if let error, !(sessions.isEmpty && results == nil) {
                 // Cached or partial rows stay visible; say what failed and offer the existing refresh.
@@ -256,7 +257,7 @@ struct ChatListView: View {
                         .buttonStyle(.borderless)
                         .hmTouchTarget()
                         .disabled(loading)
-                }.foregroundStyle(HMDesign.text2).hmRows()
+                }.foregroundStyle(HMDesign.text2).hmRows(onCanvasInDark: colorScheme == .dark)
             }
             if let results {
                 if results.isEmpty {
@@ -268,14 +269,16 @@ struct ChatListView: View {
                         ContentUnavailableView.search(text: query.trimmingCharacters(in: .whitespaces))
                     }
                 }
-                ForEach(results, id: \.key) { row($0) }.hmRows()
+                ForEach(results, id: \.key) { row($0) }.hmRows(onCanvasInDark: colorScheme == .dark)
             } else {
                 ForEach(grouped, id: \.0) { section in
-                    Section(header: HMHeader(section.0)) { ForEach(section.1, id: \.key) { row($0) } }.hmRows()
+                    Section(header: HMHeader(section.0)) { ForEach(section.1, id: \.key) { row($0) } }
+                        .hmRows(onCanvasInDark: colorScheme == .dark)
                 }
                 if cursor != nil {
                     HStack { Spacer(); ProgressView().accessibilityLabel("Loading more chats"); Spacer() }
                         .task(id: cursor) { await loadMore() }  // re-runs for every new page, even an empty one
+                        .listRowBackground(HMTheme.isThermocline && colorScheme == .dark ? Color.clear : nil)
                 } else if sessions.isEmpty && !loading {
                     Group { if let error { failureState(error) } else { emptyState } }.listRowBackground(Color.clear)
                 }

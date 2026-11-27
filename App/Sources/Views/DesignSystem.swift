@@ -139,7 +139,7 @@ enum HMThemeKind: String, CaseIterable, Identifiable {
     case thermocline, classic
     var id: String { rawValue }
     var title: String { self == .thermocline ? "Thermocline" : "Classic" }
-    var detail: String { self == .thermocline ? "Teal on warm paper or deep ink, with glass" : "The earlier look: Paper, Ash or Black" }
+    var detail: String { self == .thermocline ? "Teal on warm paper or true black" : "The earlier look: Paper, Ash or Black" }
 }
 
 enum HMMode: String, CaseIterable, Identifiable {
@@ -391,28 +391,28 @@ struct BotAvatar: View {
 
 // MARK: - Canvas
 
-/// Thermocline's depth field. Dark: two soft blooms (lead, macaw mid) and the thermocline wash over ink.
-/// Light: the blooms drop to 5%, and the second is chestnut, so the finch paper stays warm stone instead of
-/// turning green-gray. Grain at 2.5% over the field only, never over cards or text.
+/// Dark leaves the palette's canvas untouched. Light retains the two soft blooms and fine grain over paper.
 struct HMDepthField: View {
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        GeometryReader { geo in
-            let r = max(geo.size.width, geo.size.height)
-            let dark = scheme == .dark
-            ZStack {
+        Group {
+            if scheme == .dark {
                 Thermocline.bg
-                RadialGradient(colors: [Thermocline.lead.opacity(dark ? 0.13 : 0.05), .clear],
-                               center: .topTrailing, startRadius: 0, endRadius: r * 0.75)
-                RadialGradient(colors: [(dark ? Thermocline.macawMid.opacity(0.10) : Thermocline.secondary.opacity(0.05)), .clear],
-                               center: .bottomLeading, startRadius: 0, endRadius: r * 0.8)
-                if dark {
-                    LinearGradient(colors: [Thermocline.lead.opacity(0.05), .clear], startPoint: .top, endPoint: UnitPoint(x: 0.5, y: 0.45))
+            } else {
+                GeometryReader { geo in
+                    let r = max(geo.size.width, geo.size.height)
+                    ZStack {
+                        Thermocline.bg
+                        RadialGradient(colors: [Thermocline.lead.opacity(0.05), .clear],
+                                       center: .topTrailing, startRadius: 0, endRadius: r * 0.75)
+                        RadialGradient(colors: [Thermocline.secondary.opacity(0.05), .clear],
+                                       center: .bottomLeading, startRadius: 0, endRadius: r * 0.8)
+                        Image(uiImage: HMGrain.tile).resizable(resizingMode: .tile)
+                            .opacity(0.025)
+                            .blendMode(.multiply)
+                    }
                 }
-                Image(uiImage: HMGrain.tile).resizable(resizingMode: .tile)
-                    .opacity(dark ? 0.035 : 0.025)
-                    .blendMode(dark ? .screen : .multiply)
             }
         }
         .ignoresSafeArea()
@@ -540,8 +540,23 @@ enum HMBarEdge { case top, bottom, none }
 
 private struct HMCanvas: ViewModifier {
     @AppStorage(HMTheme.themeKey) private var theme = HMThemeKind.thermocline.rawValue
+    @Environment(\.colorScheme) private var scheme
+
     func body(content: Content) -> some View {
-        if theme != HMThemeKind.classic.rawValue {
+        if theme != HMThemeKind.classic.rawValue && scheme == .dark {
+            let canvas = content.scrollContentBackground(.hidden)
+                .listRowSeparatorTint(Thermocline.line)
+                .background(HMDepthField())
+            if #available(iOS 26.0, *) {
+                // Forcing an opaque navigation background on Liquid Glass hides the large title.
+                // Its native scroll-edge treatment sits on the black canvas instead.
+                canvas.toolbarBackground(Thermocline.bg, for: .tabBar, .bottomBar)
+                    .toolbarBackground(.visible, for: .tabBar, .bottomBar)
+            } else {
+                canvas.toolbarBackground(Thermocline.bg, for: .navigationBar, .tabBar, .bottomBar)
+                    .toolbarBackground(.visible, for: .navigationBar, .tabBar, .bottomBar)
+            }
+        } else if theme != HMThemeKind.classic.rawValue {
             content.scrollContentBackground(.hidden)
                 .listRowSeparatorTint(Thermocline.line)
                 .background(HMDepthField())
@@ -556,14 +571,14 @@ private struct HMCanvas: ViewModifier {
 
 extension View {
     /// Rows of a list section sit on the card color in Thermocline; Classic keeps the system row color.
-    func hmRows() -> some View {
-        listRowBackground(HMTheme.isThermocline ? HMDesign.card : Optional<Color>.none)
+    func hmRows(onCanvasInDark: Bool = false) -> some View {
+        listRowBackground(HMTheme.isThermocline ? (onCanvasInDark ? Color.clear : HMDesign.card) : nil)
             .listRowSeparatorTint(HMTheme.isThermocline ? Thermocline.line : nil)
     }
-    /// Composer, pinned bar and selection bar: one glass layer with a hairline in Thermocline, the flat bar in Classic.
+    /// Full-width composer, pinned and selection bars use the canvas in Thermocline Dark, glass in Light.
     @ViewBuilder func hmBar(_ edge: HMBarEdge) -> some View {
         if HMTheme.isThermocline {
-            background { HMGlassFill(shape: Rectangle()).ignoresSafeArea(edges: edge == .top ? .bottom : []) }
+            background { HMGlassFill(shape: Rectangle(), flatDarkCanvas: true).ignoresSafeArea(edges: edge == .top ? .bottom : []) }
                 .overlay(alignment: edge == .top ? .top : .bottom) { if edge != .none { Rectangle().fill(Thermocline.line).frame(height: 0.5) } }
         } else {
             background(HMDesign.bar)
@@ -606,11 +621,14 @@ extension View {
 /// The glass fill alone (no border), for full-width bars.
 struct HMGlassFill<S: Shape>: View {
     let shape: S
+    var flatDarkCanvas = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceTransparency) private var solid
 
     var body: some View {
-        if solid {
+        if flatDarkCanvas && scheme == .dark {
+            shape.fill(Thermocline.bg)
+        } else if solid {
             shape.fill(Thermocline.surface1)
         } else {
             ZStack {
