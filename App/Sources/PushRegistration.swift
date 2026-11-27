@@ -31,13 +31,19 @@ final class PushRegistration {
     }
 
     private var token: String?
-    private var sent: String?     // "account|token" last accepted by the bridge
-    private var sending: String?  // the same, while that request is in flight
+    private var sent: (key: String, enabled: Bool)? // "account|token" last accepted by the bridge
+    private var sending = false
     private var wanted = Presence.here
     /// What the bridge last confirmed, per grant. Nil after a launch: the bridge may still hold an "away" from a run
     /// before the app was killed, so the first report always goes out.
     private var confirmed: (account: String, presence: Presence)?
     private var reporting = false
+
+    /// A reply on another gateway can't suppress the current gateway's local fallback.
+    var macCanPush: Bool {
+        guard let token, let account = API.shared.accountID, let sent, sent.key == account + "|" + token else { return false }
+        return sent.enabled
+    }
 
     func received(_ deviceToken: Data) {
         token = deviceToken.map { String(format: "%02x", $0) }.joined()
@@ -50,14 +56,15 @@ final class PushRegistration {
         defer { report() }
         guard let token, let account = API.shared.accountID else { return }
         let key = account + "|" + token
-        guard sent != key, sending != key else { return }
-        sending = key
+        guard sent?.key != key, !sending else { return }
+        sending = true
         let api = API.shared
         Task {
-            let ok = (try? await api.registerPush(token: token, environment: Self.environment, topic: Self.topic,
-                                                  account: account)) != nil
-            if sending == key { sending = nil }
-            if ok, API.shared === api { sent = key }
+            let enabled = try? await api.registerPush(token: token, environment: Self.environment, topic: Self.topic,
+                                                      account: account)
+            sending = false
+            if let enabled, API.shared === api { sent = (key, enabled) }
+            if API.shared !== api || self.token != token { sync() }
         }
     }
 

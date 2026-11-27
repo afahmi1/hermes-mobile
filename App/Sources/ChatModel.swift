@@ -120,8 +120,8 @@ final class ChatModel {
     var title: String?
     var isLoading = false
     var isRunning = false { didSet { if isRunning && !oldValue { runStarted = Date(); thinkingText = "" } } }
-    /// When this reply started, for "finished in 4 min" in the notification.
-    @ObservationIgnored private var runStarted: Date?
+    /// When this reply started, for notification duration and per-run heads-up deduplication.
+    @ObservationIgnored private(set) var runStarted: Date?
     var slashBusy = false
     var slashCommands: [SlashCommand] = SlashCommand.builtIn
     var skillCommands: [String] = []

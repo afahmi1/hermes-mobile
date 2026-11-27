@@ -261,12 +261,12 @@ final class API: @unchecked Sendable {
 
     // MARK: push
 
-    /// Hand this install's APNs token to the bridge. The grant that signs the request owns the token. `topic` is
-    /// this app's bundle ID, which the bridge pushes with (older bridges ignore it and use their own setting).
-    func registerPush(token: String, environment: String, topic: String?, account: String) async throws {
+    /// Registers this install's APNs token and bundle ID, then returns whether this Mac can send pushes.
+    func registerPush(token: String, environment: String, topic: String?, account: String) async throws -> Bool {
         var body: [String: Any] = ["token": token, "environment": environment, "account": account]
         if let topic { body["topic"] = topic }
-        _ = try await json("/m/push/token", method: "POST", body: body)
+        let result = try await json("/m/push/token", method: "POST", body: body)
+        return result["enabled"] as? Bool ?? false
     }
 
     /// Tell the bridge the app left or returned to the foreground, so it knows when to push. `following` false:

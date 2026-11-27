@@ -108,6 +108,8 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     private var grace: UIBackgroundTaskIdentifier = .invalid
     private(set) var away = false
+    /// Last run given a quiet heads-up in each active chat, scoped to its gateway and profile.
+    private var warned: [String: Date] = [:]
     private var asked = false
     weak var appRef: AppModel?
     /// The chat on screen, scoped to its gateway. It shows its own replies; other chats still notify.
@@ -166,13 +168,20 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         guard grace != .invalid else { return }
         defer { endGrace() }
         guard away else { return }
-        PushRegistration.shared.stoppedFollowing()
-        // iOS is about to suspend the app while Hermes still works. Without push, this is the last chance to alert.
-        guard expiring, let app = appRef else { return }
+        let push = PushRegistration.shared
+        push.stoppedFollowing()
+        // If the Mac cannot push, leave one silent heads-up for each run that is still going.
+        guard expiring, !push.macCanPush, let app = appRef, let account = app.inboxAccount else { return }
+        var active: [String: Date] = [:]
         for (_, chat) in app.openChats where chat.isRunning {
-            post(.reply, bot: app.botName(chat.profile), account: app.inboxAccount, profile: chat.profile,
-                 session: chat.sessionId, detail: "Hermes is still working. Open the app to see the reply.")
+            guard let sid = chat.sessionId, let started = chat.runStarted else { continue }
+            let key = ReplyDestination(account: account, profile: chat.profile, session: sid).identifier
+            active[key] = started
+            guard warned[key] != started else { continue }
+            post(.reply, bot: app.botName(chat.profile), account: account, profile: chat.profile,
+                 session: sid, detail: "Still working. Open the app to see the reply.", quiet: true)
         }
+        warned = active
     }
 
     private func endGrace() {
@@ -184,7 +193,7 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
     typealias Event = ReplyEvent
 
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
-              detail: String? = nil, worked: TimeInterval? = nil) {
+              detail: String? = nil, worked: TimeInterval? = nil, quiet: Bool = false) {
         guard let account, let session else { return }
         let chat = ReplyDestination(account: account, profile: profile, session: session)
         guard ForegroundPolicy.shows(chat, visibleChat: visibleChat, away: away) else { return }
@@ -193,7 +202,8 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         // One readable sentence of what happened. iOS hides the body on a locked phone unless the person
         // chose "Show Previews: Always", so excerpts follow their own privacy setting.
         content.body = detail.flatMap { $0.isEmpty ? nil : $0 } ?? event.fallback
-        content.sound = .default
+        content.sound = quiet ? nil : .default
+        if quiet { content.interruptionLevel = .passive }
         content.threadIdentifier = chat.identifier
         content.categoryIdentifier = "reply"
         content.userInfo = chat.userInfo
@@ -259,7 +269,7 @@ final class ReplyNotifier {
     func returned() { away = false }
     func settled(liveRuns: Bool) {}
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
-              detail: String? = nil, worked: TimeInterval? = nil) {}
+              detail: String? = nil, worked: TimeInterval? = nil, quiet: Bool = false) {}
     func watch(_ chat: ReplyDestination?) { visibleChat = chat }
     func unwatch(_ chat: ReplyDestination?) { if visibleChat == chat { visibleChat = nil } }
 }
