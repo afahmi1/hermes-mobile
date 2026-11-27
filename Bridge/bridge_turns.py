@@ -677,7 +677,10 @@ def _follow_up_frames(attachments):
 
 
 def _frames_digest(frames):
-    return hashlib.sha256(b"".join(hashlib.sha256(raw).digest() + mime.encode() for _, _, raw, mime in frames)).hexdigest() if frames else ""
+    """One key for a follow-up's attachments, for idempotent retries. Each frame already carries its SHA-256: an
+    uploaded file's frame holds a path, not bytes, so hashing the third field crashed every steer or queued
+    follow-up that carried an upload (TypeError: object supporting the buffer API required)."""
+    return hashlib.sha256(b"".join(bytes.fromhex(digest) + mime.encode() for _, digest, _, mime in frames)).hexdigest() if frames else ""
 
 
 async def _drive_connection(turn: Turn):

@@ -112,3 +112,26 @@ class FollowUpMediaTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FramesDigestTests(unittest.TestCase):
+    """A follow-up's attachment key must work for uploaded files, whose frames hold a path instead of bytes."""
+
+    def test_uploaded_frame_holding_a_path_gets_a_key(self):
+        import hashlib
+        raw = b"uploaded file body"
+        digest = hashlib.sha256(raw).hexdigest()
+        uploaded = [("clip.txt", digest, Path("/tmp/hm-upload-does-not-matter"), "text/plain")]
+        inline = [("clip.txt", digest, raw, "text/plain")]
+        key = engine._frames_digest(uploaded)
+        self.assertEqual(len(key), 64)
+        # Same file, delivered inline or uploaded ahead: same key, so a retry of either is recognized.
+        self.assertEqual(key, engine._frames_digest(inline))
+
+    def test_key_is_unchanged_for_inline_frames(self):
+        import hashlib
+        frames = bridge_media.decode([item("a.txt", "text/plain", b"one"), item("b.txt", "text/plain", b"two")])
+        legacy = hashlib.sha256(b"".join(hashlib.sha256(raw).digest() + mime.encode()
+                                         for _, _, raw, mime in frames)).hexdigest()
+        self.assertEqual(engine._frames_digest(frames), legacy)
+        self.assertEqual(engine._frames_digest([]), "")
