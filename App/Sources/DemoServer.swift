@@ -7,6 +7,7 @@ import Foundation
 ///
 /// - `-HMOpenChat default/demo-thermocline` opens the demo conversation (existing DEBUG hook).
 /// - `-HMDemoDraft 1` puts a draft in that chat's composer, so the send button shows its live state.
+/// - `-HMDemoFallback 1` makes a different model the last to answer, so the chat header names both models.
 /// - `-HMDemoLive 1` makes that chat's reply still running on the "Mac": a live tool row and the stop button.
 /// - `-HMDemoApproval 1` (with Live) adds an approval request to the running reply.
 /// - `-HMDemoFinishAfter N` (with Live) finishes that reply N seconds after its stream opens. Send the app to the
@@ -349,13 +350,19 @@ enum DemoFixtures {
         ],
     ]
 
-    static let runtime: [String: Any] = [
-        "model": "claude-opus-5-5", "provider": "anthropic", "reasoning_tokens": 18_200, "fallback_active": false,
-        "policy": ["model": "claude-opus-5-5", "provider": "anthropic", "effort": "high"],
-        "models_used": [["model": "claude-opus-5-5", "provider": "anthropic", "calls": 14, "reasoning_tokens": 18_200],
-                        ["model": "deepseek-v4-flash", "provider": "deepseek", "calls": 2]],
-        "cost": ["usd": 0, "included": true, "included_api_usd": 1.84, "unknown": false],
-    ]
+    static var runtime: [String: Any] {
+        var runtime: [String: Any] = [
+            "model": "claude-opus-5-5", "provider": "anthropic", "reasoning_tokens": 18_200, "fallback_active": false,
+            "policy": ["model": "claude-opus-5-5", "provider": "anthropic", "effort": "high"],
+            "models_used": [["model": "claude-opus-5-5", "provider": "anthropic", "calls": 14, "reasoning_tokens": 18_200],
+                            ["model": "deepseek-v4-flash", "provider": "deepseek", "calls": 2]],
+            "cost": ["usd": 0, "included": true, "included_api_usd": 1.84, "unknown": false],
+        ]
+        if UserDefaults.standard.bool(forKey: "HMDemoFallback") {
+            runtime["last_answer"] = ["model": "grok-4.7", "provider": "xai", "at": now - 240]
+        }
+        return runtime
+    }
 
     static let commands: [String: Any] = [
         "commands": [
