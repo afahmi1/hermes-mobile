@@ -12,9 +12,18 @@ struct Bot: Codable, Identifiable, Hashable {
     let reachable: Bool
     let front: Bool
     var skills: [String] = []
+    /// Newer bridges: what Hermes tries, in order, when this bot's model can't answer. Nil = not reported.
+    var fallbacks: [Fallback]? = nil
+
+    struct Fallback: Codable, Hashable {
+        let provider: String
+        let model: String
+        /// "plan" (a subscription covers it), "free" or "paid" (billed per call).
+        let kind: String
+    }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, blurb, model, provider, reachable, front, skills
+        case id, name, blurb, model, provider, reachable, front, skills, fallbacks
     }
 
     init(id: String, name: String, blurb: String, model: String, provider: String, reachable: Bool, front: Bool,
@@ -39,6 +48,7 @@ struct Bot: Codable, Identifiable, Hashable {
         reachable = try c.decode(Bool.self, forKey: .reachable)
         front = try c.decode(Bool.self, forKey: .front)
         skills = (try? c.decode([String].self, forKey: .skills)) ?? []
+        fallbacks = try? c.decodeIfPresent([Fallback].self, forKey: .fallbacks)
     }
 }
 

@@ -76,6 +76,31 @@ struct RuntimeSheet: View {
             Text(s.cost?.unknown == true ? "Some steps ran on a model with no price on record, so they aren't counted."
                  : "From Hermes's usage records, including background helpers like summaries and image reading. The desktop app uses the same model setting.")
         }.hmRows()
+        if let chain = bot?.fallbacks {
+            Section {
+                if chain.isEmpty {
+                    Text("None. If the model can't answer, the reply fails, and you can retry when limits reset.")
+                        .font(.subheadline).foregroundStyle(HMDesign.text2)
+                }
+                ForEach(Array(chain.enumerated()), id: \.offset) { i, f in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("\(i + 1)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary).frame(width: 14)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ModelName.short(f.model).components(separatedBy: " · ").first ?? f.model)
+                            Text(Self.pname(f.provider)).font(.caption).foregroundStyle(HMDesign.text2)
+                        }
+                        Spacer()
+                        Text(f.kind == "plan" ? "Plan" : f.kind == "free" ? "Free" : "Paid per use")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(f.kind == "paid" ? HMDesign.caution : HMDesign.text2)
+                    }
+                }
+            } header: { HMHeader("If this can't answer") } footer: {
+                Text(chain.contains { $0.kind == "paid" }
+                     ? "A paid fallback is billed per use when your pick runs out. Change the order in Hermes on the Mac (fallback_providers)."
+                     : "Tried in order when your pick can't answer, like when a plan runs out. Change it in Hermes on the Mac (fallback_providers).")
+            }.hmRows()
+        }
         if !used.isEmpty {
             Section {
                 ForEach(used, id: \.self) { u in
