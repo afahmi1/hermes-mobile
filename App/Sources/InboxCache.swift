@@ -183,7 +183,8 @@ struct Outgoing: Codable, Identifiable, Equatable {
     /// Transitions. Each returns the next value; nothing else mutates these fields.
     func attempted() -> Outgoing { var o = self; o.attempts += 1; return o }
     func accepted(admission: String, files: Int) -> Outgoing {
-        var o = self; o.admission = admission; o.attachments = nil; o.files = files; o.problem = nil; return o
+        // Attachments stay with it until it leaves the tray, so "Move back to message box" brings them back too.
+        var o = self; o.admission = admission; o.files = files; o.problem = nil; return o
     }
     func refused(_ reason: String) -> Outgoing { var o = self; o.problem = reason.isEmpty ? "Hermes refused this message." : reason; return o }
     /// An edit: instant while it never left the phone, otherwise held until the Mac confirms where it is.
@@ -539,7 +540,7 @@ final class ComposerDisk {
 /// A chat action taken while the Mac couldn't be reached: archive, pin, flags, pinned messages. Every one sets a
 /// final state ("archived = true"), so sending it twice changes nothing, and they can be replayed safely in order.
 struct QueuedAction: Codable, Identifiable, Equatable {
-    enum Kind: String, Codable { case flags, pinMessage, unpinMessage }
+    enum Kind: String, Codable { case flags, pinMessage, unpinMessage, withdraw }
     var id = UUID()
     let account: String
     let kind: Kind
@@ -549,6 +550,9 @@ struct QueuedAction: Codable, Identifiable, Equatable {
     var confirmPins = false
     var session: String? = nil
     var message: Int? = nil
+    /// withdraw: the queued message's admission on the Mac, if known, and the phone's own id for it.
+    var admission: String? = nil
+    var submission: String? = nil
     var created = Date()
     var attempts = 0
     var problem: String? = nil
@@ -566,6 +570,7 @@ struct QueuedAction: Codable, Identifiable, Equatable {
             return ids.count == 1 ? what + " chat" : what + " \(ids.count) chats"
         case .pinMessage: return "Pin a message"
         case .unpinMessage: return "Unpin a message"
+        case .withdraw: return "Take back a queued message"
         }
     }
 }
@@ -650,6 +655,16 @@ final class ActionQueue {
             _ = try await api.pin(profile: action.profile, session: action.session ?? "", message: action.message ?? 0)
         case .unpinMessage:
             _ = try await api.unpin(profile: action.profile, session: action.session ?? "", message: action.message ?? 0)
+        case .withdraw:
+            // By admission when the Mac told us it; otherwise by the phone's own id (the bridge looks it up).
+            let target = action.admission ?? "sub-" + (action.submission ?? "")
+            do {
+                _ = try await api.queueAction(profile: action.profile, session: action.session ?? "", admission: target, action: "cancel")
+            } catch APIError.http(404, _) {
+                // Not on the Mac (never arrived, or already gone): nothing to take back.
+            } catch APIError.http(409, _) {
+                throw APIError.http(409, "Hermes had already started it. Your copy is back in the message box.")
+            }
         }
     }
 
@@ -679,12 +694,14 @@ final class ActionQueue {
 
     /// Wake now (app foreground, network back); otherwise back off quietly up to 30 s.
     func wake() { delay = 2; Task { await flush() } }
+    /// Cheap to call on every successful contact with the Mac: only does anything when something is waiting.
+    func wakeIfWaiting() { if mine.contains(where: { $0.problem == nil }), !running { wake() } }
 
     private func schedule() {
         retry?.cancel()
         guard mine.contains(where: { $0.problem == nil }) else { return }
         let wait = delay
-        delay = min(30, delay * 2)
+        delay = min(10, delay * 2)  // the 15 s health check also wakes it the moment the Mac answers
         retry = Task { [weak self] in
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled else { return }

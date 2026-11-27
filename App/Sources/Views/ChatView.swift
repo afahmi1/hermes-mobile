@@ -86,24 +86,19 @@ struct ChatScreen: View {
                                    onPin: chat.pinsAvailable && chat.sessionId != nil && MessagePin.messageID(for: item) != nil
                                         ? { Task { await chat.togglePin(item) } } : nil,
                                    onCompose: { text, replace in compose(text, replace: replace) },
-                                   showActions: item.id == lastReply,
+                                   showActions: item.kind == .assistant && !item.streaming,  // every finished reply, like T3
                                    showTime: revealTimes || timeMarks.contains(item.id))
                             .id(item.id)
                     }
-                    if !chat.isRunning, !backgroundTasks.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(backgroundTasks.count == 1
+                    if !backgroundTasks.isEmpty {
+                        // Like the desktop: each subagent is a card you can open and watch.
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(chat.isRunning ? "Working in the background" : backgroundTasks.count == 1
                                  ? "Will resume when 1 background task finishes"
                                  : "Will resume when \(backgroundTasks.count) background tasks finish")
-                                .font(.subheadline.weight(.semibold))
-                            ForEach(Array(backgroundTasks.enumerated()), id: \.offset) { _, task in
-                                Text(task.model.isEmpty ? task.title : "\(task.title) · \(task.model)")
-                                    .font(.caption).foregroundStyle(HMDesign.text2).lineLimit(2)
-                            }
+                                .font(.footnote.weight(.semibold)).foregroundStyle(HMDesign.text2)
+                            ForEach(backgroundTasks) { task in SubagentCard(task: task) }
                         }
-                        .padding(12)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .hmPanel(radius: 14, classicStyle: .circular)
                         .padding(.horizontal, 12)
                     }
                     if let s = chat.status {
@@ -256,6 +251,8 @@ struct ChatScreen: View {
             Task { await openPath(path, session: sid) }
         }
         .quickLookPreview($pathPreview)
+        // A chat running somewhere else (a subagent, the desktop, Telegram): follow it while it works.
+        .task(id: chat.sessionId) { await followElsewhere() }
         .onReceive(NotificationCenter.default.publisher(for: .hermesForeground)) { _ in
             // Anything waiting to go tries again right away, then backs off quietly.
             chat.outboxWake()
@@ -375,11 +372,25 @@ struct ChatScreen: View {
         return parts.joined(separator: " · ")
     }
 
-    private var backgroundTasks: [(title: String, model: String)] {
+    /// Every 5 s, only while this chat is running somewhere other than this phone's own reply.
+    private func followElsewhere() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(5))
+            guard let sid = chat.sessionId, !chat.isRunning else { continue }
+            let agents = app.status.payload?["agents"].array ?? []
+            if agents.contains(where: { $0["session_id"].string == sid }) { await chat.load(quiet: true) }
+        }
+    }
+
+    private var backgroundTasks: [SubagentInfo] {
         guard let session = chat.sessionId else { return [] }
         return (app.status.payload?["agents"].array ?? []).compactMap { row in
             guard row["kind"].string == "subagent", row["parent_session_id"].string == session else { return nil }
-            return (row["title"].string ?? row["name"].string ?? "Background task", row["model"].string ?? "")
+            return SubagentInfo(sessionID: row["session_id"].string, profile: row["profile"].string ?? chat.profile,
+                                title: row["title"].string ?? row["name"].string ?? "Background task",
+                                goal: row["goal"].string, model: row["model"].string ?? "",
+                                provider: row["provider"].string, steps: row["steps"].int,
+                                started: row["started_at"].date)
         }
     }
 
@@ -1312,6 +1323,10 @@ struct MessageRow: View {
         return "Worked \(span) · " + base
     }
 
+    private func quoteSelection(_ words: String) {
+        onCompose?(ReplyQuote.markdown(ReplyQuote.excerpt(words)) + "\n\n", false)
+    }
+
     private var quoted: String {
         // Plain words, not Markdown syntax: the chip and the quote Hermes gets both read cleanly.
         let source = item.kind == .assistant ? MarkdownBlock.plainText(item.text) : (ReplyQuote.split(item.text).body)
@@ -1412,23 +1427,38 @@ struct MessageRow: View {
                 }
             }
             .padding(.horizontal, 12)
-            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .assistant:
             // Replies run full width without a bubble (as in T3 and the desktop app): more of the
             // conversation fits on screen, and code blocks get the whole line.
             VStack(alignment: .leading, spacing: 6) {
-                if !item.text.isEmpty {
-                    MarkdownText(text: item.text)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 4).padding(.horizontal, 6)
-                        .background(highlighted ? HMDesign.selectedFill : .clear,
-                                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
-                        .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .contextMenu { messageMenu }
+                // Long-press selects text (like T3); the menu has Copy, Copy as Markdown and Reply with quote.
+                // Images sit where Hermes put them in the reply when the bridge says where.
+                if let parts = item.parts, !parts.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+                            if let words = part.text {
+                                MarkdownText(text: words, onQuote: quoteSelection)
+                            } else if let i = part.media, item.media.indices.contains(i) {
+                                TranscriptImages(refs: [item.media[i]], profile: profile, session: session, alignment: .leading)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4).padding(.horizontal, 6)
+                    .background(highlighted ? HMDesign.selectedFill : .clear, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
+                } else {
+                    if !item.text.isEmpty {
+                        MarkdownText(text: item.text, onQuote: quoteSelection)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 4).padding(.horizontal, 6)
+                            .background(highlighted ? HMDesign.selectedFill : .clear,
+                                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
+                    }
+                    TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
                 }
-                TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
                 if showActions || item.footer != nil {
                     VStack(alignment: .leading, spacing: 0) {
                         if showActions, !item.text.isEmpty {
@@ -1466,7 +1496,6 @@ struct MessageRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
-            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .control:
             // Their words, not a gray system card. The tag says whether it was queued or used to guide the reply.
@@ -2801,6 +2830,59 @@ struct ReadingPosition: ViewModifier {
                 }
         } else {
             content.defaultScrollAnchor(.bottom)
+        }
+    }
+}
+
+/// A subagent working for this chat (from Status's running list).
+struct SubagentInfo: Identifiable {
+    let sessionID: String?
+    let profile: String
+    let title: String
+    let goal: String?
+    let model: String
+    let provider: String?
+    let steps: Int?
+    let started: Date?
+    var id: String { sessionID ?? title }
+}
+
+/// One background task: what it was asked, which model and provider, how long and how many steps.
+/// Tap to open its own transcript and follow it.
+struct SubagentCard: View {
+    let task: SubagentInfo
+
+    var body: some View {
+        let card = VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                ThinkingIndicator(size: 14, activity: task.goal ?? task.title)
+                Text(task.title.replacingOccurrences(of: "Subagent: ", with: "")).font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let started = task.started {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text(ActivityBadge.elapsed(ctx.date.timeIntervalSince(started))).monospacedDigit()
+                    }
+                    .font(.system(.caption, design: .monospaced)).foregroundStyle(HMDesign.text2)
+                }
+                if task.sessionID != nil { Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary) }
+            }
+            if let goal = task.goal, !goal.isEmpty {
+                Text(goal).font(.footnote).foregroundStyle(HMDesign.text2).lineLimit(3)
+            }
+            Text([ModelName.short(task.model).components(separatedBy: " · ").first,
+                  task.provider.map(ProviderUsageSection.displayName),
+                  task.steps.map { "\($0) steps" }].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary).lineLimit(1)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(HMDesign.separator, lineWidth: 0.5))
+        if let id = task.sessionID {
+            NavigationLink(value: ChatRef(profile: task.profile, sessionId: id)) { card }.buttonStyle(.plain)
+        } else {
+            card
         }
     }
 }

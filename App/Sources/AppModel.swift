@@ -163,6 +163,8 @@ final class AppModel {
             let latest = try await API.shared.health()
             guard !Task.isCancelled, signedIn, request == healthRequest else { return }
             beat(Beat(at: Date(), ms: Int(Date().timeIntervalSince(started) * 1000), ok: latest.ok))
+            // The Mac answered: anything waiting goes now, not at the end of a backoff.
+            if latest.ok { ActionQueue.shared.wakeIfWaiting(); for (_, chat) in openChats { chat.outboxWake() } }
             health = latest
             lastHealthCheck = Date()
             healthFailure = nil

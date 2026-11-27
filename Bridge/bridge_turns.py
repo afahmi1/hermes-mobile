@@ -1375,7 +1375,30 @@ def _followers(profile, sid, admission):
                 and t.admission == admission and not t.done]
 
 
+def admission_for_submission(home, submission):
+    """(admission id, status) for a phone submission id, from Hermes's own admission journal, or (None, None)."""
+    try:
+        key = uuid.UUID(str(submission)).hex
+        uri = (Path(home) / "state.db").resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as db:
+            row = db.execute("SELECT admission_id, status FROM session_admissions WHERE request_id = ? "
+                             "ORDER BY seq DESC LIMIT 1", (key,)).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    except (ValueError, OSError, sqlite3.Error):
+        return None, None
+
+
 async def _queue_action(home, profile, sid, admission, action, text=None, submission=None):
+    if admission.startswith("sub-"):
+        # The phone took back a message it isn't sure reached the Mac: find it by the phone's own id.
+        found, status = await asyncio.to_thread(admission_for_submission, home, admission[4:])
+        if found is None:
+            if action == "cancel":  # never arrived: nothing to take back
+                return {"status": "absent", "admission_id": None, "queue": []}
+            raise TurnError(_QUEUE_REFUSALS["not_found"][1], 404)
+        if status not in (None, "queued", "pending", "unknown") and action == "cancel":
+            raise TurnError(_QUEUE_REFUSALS["admission_started"][1], 409)
+        admission = found
     async with connect(home) as c:
         snapshot = await _resume(c, sid)
         canonical = snapshot.get("session_id") or sid

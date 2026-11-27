@@ -394,10 +394,12 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     let activity: [ActivityEntry]?
     /// A short tag under a user bubble ("Sent while Hermes was working · Pasted 6 lines").
     let note: String?
+    /// Newer bridges: the reply split at its images ([{text}, {media: 0}, …]).
+    var contentParts: [ReplyPart]? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, role, content, timestamp, reasoning, notice, preview, ok, media, activity, note
-        case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind"
+        case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind", contentParts = "content_parts"
     }
 
     init(from decoder: Decoder) throws {
@@ -416,6 +418,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         media = try? c.decode([ChatMediaRef].self, forKey: .media)
         activity = try? c.decode([ActivityEntry].self, forKey: .activity)
         note = try? c.decode(String.self, forKey: .note)
+        contentParts = try? c.decode([ReplyPart].self, forKey: .contentParts)
     }
 
     /// Content may be a string or a list of OpenAI-style parts.
@@ -434,6 +437,12 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         let preview: String?
         struct Fn: Codable, Hashable { let name: String?; let arguments: String? }
     }
+}
+
+/// One piece of a reply: some text, or the index of an image in its `media`.
+struct ReplyPart: Codable, Hashable {
+    var text: String?
+    var media: Int?
 }
 
 struct MessagesPage: Codable {

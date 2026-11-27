@@ -43,7 +43,8 @@ struct HermesMobileApp: App {
     }
 
     /// Everything that changes how colors resolve. The root rebuilds once when it changes.
-    private var look: String { [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw].joined(separator: "|") }
+    @AppStorage(Thermocline.Palette.darkCanvasKey) private var darkCanvas = "black"
+    private var look: String { [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw, darkCanvas].joined(separator: "|") }
 
     var body: some Scene {
         WindowGroup {

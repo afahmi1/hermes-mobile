@@ -418,7 +418,9 @@ def agents_status(jobs_payload):
                 "started_at": iso_from_epoch(e.get("started_at")), "pid": e.get("pid"),
                 "pid_alive": pid_alive(e.get("pid")) if e.get("pid") else None,
             })
-        for r in ro_query(db, "SELECT id, title, model, parent_session_id, started_at, "
+        for r in ro_query(db, "SELECT id, title, model, billing_provider, message_count, parent_session_id, started_at, "
+                              "(SELECT substr(content, 1, 400) FROM messages m WHERE m.session_id = sessions.id "
+                              " AND m.role = 'user' ORDER BY m.id LIMIT 1) AS goal, "
                               "coalesce(last_activity_at, started_at) AS last FROM sessions "
                               "WHERE source='subagent' AND ended_at IS NULL "
                               "AND coalesce(last_activity_at, started_at) > ? ORDER BY last DESC LIMIT 20",
@@ -426,7 +428,8 @@ def agents_status(jobs_payload):
             agents.append({
                 "kind": "subagent", "profile": prof, "session_id": r["id"],
                 "title": (r.get("title") or "Subagent").removeprefix("Subagent: "), "model": r.get("model"),
-                "parent_session_id": r.get("parent_session_id"),
+                "parent_session_id": r.get("parent_session_id"), "provider": r.get("billing_provider"),
+                "steps": r.get("message_count"), "goal": " ".join(str(r.get("goal") or "").split())[:300] or None,
                 "started_at": iso_from_epoch(r.get("started_at")), "last_active": iso_from_epoch(r.get("last")),
             })
     for r in jobs_payload.get("live") or []:

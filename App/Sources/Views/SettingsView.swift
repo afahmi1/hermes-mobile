@@ -455,6 +455,7 @@ struct AppearanceSection: View {
     @AppStorage(HMGlass.key) private var glass = true
     @AppStorage(ThinkingStyle.key) private var thinkingRaw = ThinkingStyle.orbs.rawValue
     @AppStorage(ChatIconStyle.key) private var iconRaw = ChatIconStyle.auto.rawValue
+    @AppStorage(Thermocline.Palette.darkCanvasKey) private var darkCanvas = "black"
     @AppStorage(StatusPulse.key) private var pulse = true
     @Environment(\.dynamicTypeSize) private var typeSize
 
@@ -474,6 +475,12 @@ struct AppearanceSection: View {
                     layout { ForEach(HMMode.allCases) { modeTile($0) } }
                 }
                 .padding(.vertical, 4)
+                Picker("Dark canvas", selection: $darkCanvas) {
+                    Text("Black").tag("black")
+                    Text("Ash").tag("ash")
+                }
+                .pickerStyle(.segmented)
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Accent").font(.subheadline)
                     let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10)) : AnyLayout(HStackLayout(spacing: 4))

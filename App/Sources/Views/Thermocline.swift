@@ -21,7 +21,7 @@ public enum Thermocline {
             public var color: Color { Palette.make(light: light, dark: dark) }
             /// Fixed color for an explicit scheme. Works on every platform, including light on watchOS.
             public func color(for scheme: ColorScheme) -> Color {
-                let c = Palette.hex(scheme == .dark ? dark : light)
+                let c = Palette.hex(scheme == .dark ? Palette.darkNeutral(dark) : light)
                 return Color(red: c.r, green: c.g, blue: c.b)
             }
         }
@@ -36,13 +36,26 @@ public enum Thermocline {
         public static let onAccentToken = Token(light: 0xEBE7DE, dark: 0x13181D)
         public static let chestnutToken = Token(light: 0x693D24, dark: 0xD0986A)
         public static let plumToken = Token(light: 0x6C3D6B, dark: 0xB985B7)
+        /// Thermocline's dark canvas: true black (default) or zayd.wtf's ash. Read when a color resolves, so a
+        /// switch repaints at once. Only the four neutral steps change; text and accents keep their measured values.
+        static let darkCanvasKey = "thermoclineDarkCanvas"
+        static func darkNeutral(_ v: UInt32) -> UInt32 {
+            guard UserDefaults.standard.string(forKey: darkCanvasKey) == "ash" else { return v }
+            switch v {
+            case 0x000000: return 0x232322
+            case 0x151515: return 0x2C2C2B
+            case 0x222222: return 0x353533
+            case 0x2D2D2D: return 0x3E3D3A
+            default: return v
+            }
+        }
         static func make(light: UInt32, dark: UInt32) -> Color {
             #if os(watchOS)
             let c = hex(dark)
             return Color(red: c.r, green: c.g, blue: c.b)
             #elseif canImport(UIKit)
             return Color(UIColor { trait in
-                let c = hex(trait.userInterfaceStyle == .dark ? dark : light)
+                let c = hex(trait.userInterfaceStyle == .dark ? darkNeutral(dark) : light)
                 return UIColor(red: c.r, green: c.g, blue: c.b, alpha: 1)
             })
             #elseif canImport(AppKit)

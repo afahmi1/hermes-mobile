@@ -17,6 +17,8 @@ struct ChatItem: Identifiable, Hashable {
     var tools: [String] = []
     var activities: [ToolActivity] = []
     var media: [ChatMediaRef] = []
+    /// The reply split at its images (bridge `content_parts`), so each image shows where Hermes put it.
+    var parts: [ReplyPart]? = nil
     /// Structured background work behind an activity card (empty on older bridges: `detail` is shown).
     var entries: [ActivityEntry] = []
     var detail: String = ""
@@ -515,7 +517,9 @@ final class ChatModel {
                     }
                 }
                 if !text.isEmpty || !(m.media ?? []).isEmpty {
-                    out.append(ChatItem(id: key, kind: .assistant, text: text, media: m.media ?? [], timestamp: m.timestamp))
+                    var row = ChatItem(id: key, kind: .assistant, text: text, media: m.media ?? [], timestamp: m.timestamp)
+                    row.parts = m.contentParts
+                    out.append(row)
                 }
             case "tool":
                 guard let toolGroup, let idx = out[toolGroup].activities.firstIndex(where: {
@@ -1337,52 +1341,23 @@ final class ChatModel {
     }
 
     /// Remove a waiting message. `toComposer` puts its words back in the message box.
+    /// Move back / Remove: instant on the phone. If the message may already be on the Mac, a durable "take it back"
+    /// follows (same retry path as archives: sent now, or as soon as the Mac answers, even after an app restart).
     func removeOutgoing(_ id: UUID, toComposer: Bool) async {
         guard let item = outgoing.first(where: { $0.id == id }) else { return }
-        if let adm = item.admission, !adm.hasPrefix("turn:"), let sid = sessionId {
-            do { _ = try await api.queueAction(profile: profile, session: sid, admission: adm, action: "cancel") }
-            catch APIError.http(409, let message) {
-                error = message
-                await refreshQueue()
-                return
-            } catch APIError.http(404, _) {
-            } catch {
-                self.error = "Couldn't reach your Mac to remove it. Try again when you're connected."
-                return
-            }
-        } else if item.onMac {
-            error = "This Mac's bridge can't remove queued messages yet. It will send after this reply."
-            return
-        } else if item.attempts > 0, item.mode == "queue" {
-            // It may have reached the Mac with the reply lost. Ask with the same ID; if it's there, cancel it there.
-            guard isRunning, let run = runId else {
-                // A reply is starting but has no id yet: ask again in a moment.
-                if isRunning {
-                    error = "It may already be on your Mac. Remove it again in a moment."
-                    return
-                }
-                // Nothing is running, so nothing can be waiting behind a reply on the Mac. Safe to drop here.
-                outgoing.removeAll { $0.id == id }
-                await persistOutgoing()
-                if toComposer { returnToComposer(item) }
-                return
-            }
-            do {
-                let (_, admission) = try await api.followUpReceipt(run: run, mode: "queue", text: item.text, submission: item.id,
-                                                                   choice: item.choice ?? .botDefault, attachments: item.attachments ?? [])
-                if let admission, let sid = sessionId {
-                    _ = try? await api.queueAction(profile: profile, session: sid, admission: admission, action: "cancel")
-                }
-            } catch APIError.http(let code, _) where code == 404 || code == 409 {
-            } catch {
-                self.error = "It may already be on your Mac. Remove it again once you're connected."
-                return
+        outgoing.removeAll { $0.id == id }
+        if toComposer { returnToComposer(item) }
+        await persistOutgoing()
+        let mayBeOnMac = item.admission != nil || item.attempts > 0
+        if mayBeOnMac, let sid = sessionId, let account = api.accountID {
+            let admission = item.admission.flatMap { $0.hasPrefix("turn:") ? nil : $0 }
+            let action = QueuedAction(account: account, kind: .withdraw, profile: profile, session: sid,
+                                      admission: admission, submission: item.id.uuidString)
+            Task {
+                if case .failed(let e) = await ActionQueue.shared.perform(action) { self.error = e.localizedDescription }
+                await self.refreshQueue()
             }
         }
-        outgoing.removeAll { $0.id == id }
-        await persistOutgoing()
-        if toComposer { returnToComposer(item) }
-        await refreshQueue()
     }
 
     private func returnToComposer(_ item: Outgoing) {
