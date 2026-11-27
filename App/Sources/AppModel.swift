@@ -145,18 +145,33 @@ final class AppModel {
         }
     }
 
+    /// The last 60 health checks (the app already makes one every 15 s): drawn as the Status heartbeat strip.
+    /// Recorded from checks that happen anyway, so the strip costs no extra requests.
+    private(set) var beats: [Beat] = []
+    struct Beat: Equatable { let at: Date; let ms: Int?; let ok: Bool }
+
+    private func beat(_ b: Beat) {
+        beats.append(b)
+        if beats.count > 60 { beats.removeFirst(beats.count - 60) }
+    }
+
     func refreshHealth() async {
         let request = UUID()
         healthRequest = request
+        let started = Date()
         do {
             let latest = try await API.shared.health()
             guard !Task.isCancelled, signedIn, request == healthRequest else { return }
+            beat(Beat(at: Date(), ms: Int(Date().timeIntervalSince(started) * 1000), ok: latest.ok))
+            // The Mac answered: anything waiting goes now, not at the end of a backoff.
+            if latest.ok { ActionQueue.shared.wakeIfWaiting(); for (_, chat) in openChats { chat.outboxWake() } }
             health = latest
             lastHealthCheck = Date()
             healthFailure = nil
             needsLogin = false
         } catch {
             guard !Task.isCancelled, signedIn, request == healthRequest else { return }
+            beat(Beat(at: Date(), ms: nil, ok: false))
             needsLogin = false
             if case APIError.http(401, _) = error { needsLogin = true }
             if let reason = error as? URLError, API.shared.baseURL?.host?.hasSuffix(".ts.net") == true {
@@ -178,6 +193,11 @@ final class AppModel {
     }
 
     /// One live ChatModel per session, so a reply keeps streaming while you look at other chats.
+    /// Chats this phone has open in memory, keyed "profile|session" (for the list's Input badge).
+    var openChats: [(String, ChatModel)] {
+        chats.values.compactMap { c in c.sessionId.map { (c.profile + "|" + $0, c) } }
+    }
+
     func chat(for ref: ChatRef) -> ChatModel {
         let key = ref.id
         let unfinished = ref.startIn == nil ? newChats[ref.profile] : nil

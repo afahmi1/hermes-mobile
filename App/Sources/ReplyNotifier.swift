@@ -46,12 +46,28 @@ import Observation
 final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = ReplyNotifier()
     var destination: ReplyDestination?
+    /// Text typed into a notification's Reply action, consumed by the app when it opens that chat.
+    var pendingReply: String? = nil
 
     private var grace: UIBackgroundTaskIdentifier = .invalid
     private(set) var away = false
+    /// Chats already told "still working" for their current run, so leaving the app again doesn't repeat it.
+    private var warned: Set<String> = []
+    /// Set by PushRegistration: the Mac has an APNs key, so it sends the real reply and no heads-up is needed.
+    var macCanPush = false
     private var asked = false
+    weak var appRef: AppModel? = nil
+    /// The chat on screen right now ("profile|session"). A reply for it is already visible; one for another chat isn't.
+    var visibleChat: String? = nil
 
-    func install() { UNUserNotificationCenter.current().delegate = self }
+    func install() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        // Long-press a notification to type a reply. It queues like any other send and goes when the Mac answers.
+        let reply = UNTextInputNotificationAction(identifier: "reply", title: "Reply", options: [],
+                                                   textInputButtonTitle: "Send", textInputPlaceholder: "Reply…")
+        center.setNotificationCategories([UNNotificationCategory(identifier: "reply", actions: [reply], intentIdentifiers: [])])
+    }
 
     /// Ask at the first send, when the reason is obvious, and never again.
     func askOnce() {
@@ -84,6 +100,11 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
     func returned() {
         away = false
         endGrace()
+        // A chat whose run finished can be warned again on its next run.
+        if let app = appRef {
+            let running = Set(app.openChats.filter { $0.1.isRunning }.compactMap { $0.1.sessionId })
+            warned = warned.intersection(running)
+        }
 
     }
 
@@ -94,13 +115,25 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         guard grace != .invalid else { return }
         UIApplication.shared.endBackgroundTask(grace)
         grace = .invalid
+        // iOS is about to suspend the app while Hermes still works. Only needed without push (with push the
+        // Mac sends the real reply), only once per run, and silent: a heads-up, not an alert.
+        guard away, let app = appRef, !macCanPush else { return }
+        for (_, chat) in app.openChats where chat.isRunning {
+            guard let sid = chat.sessionId, !warned.contains(sid) else { continue }
+            warned.insert(sid)
+            post(.reply, bot: app.botName(chat.profile), account: app.inboxAccount, profile: chat.profile,
+                 session: sid, detail: "Still working. Open the app to see the reply.", quiet: true)
+        }
     }
 
     enum Event { case reply, approval, failure }
 
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
-              detail: String? = nil, worked: TimeInterval? = nil) {
-        guard away, let account, let session else { return }
+              detail: String? = nil, worked: TimeInterval? = nil, quiet: Bool = false) {
+        guard let account, let session else { return }
+        // Away: always. In the app: only for a chat you aren't looking at (its reply would otherwise vanish
+        // into the list with no sound). The chat on screen shows it itself.
+        guard away || visibleChat != profile + "|" + session else { return }
         let content = UNMutableNotificationContent()
         let took = worked.flatMap { $0 >= 60 ? " · \(Int($0 / 60)) min" : nil } ?? ""
         switch event {
@@ -117,8 +150,10 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         case .failure: fallback = "Open the chat for details."
         }
         content.body = detail.flatMap { $0.isEmpty ? nil : $0 } ?? fallback
-        content.sound = .default
+        content.sound = quiet ? nil : .default
+        if quiet { content.interruptionLevel = .passive }
         content.threadIdentifier = ReplyDestination(account: account, profile: profile, session: session).identifier
+        content.categoryIdentifier = "reply"
         content.userInfo = ["account": account, "profile": profile, "session": session]
 
         // One notification per chat: a newer event replaces the older one instead of stacking.
@@ -133,6 +168,10 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
               let session = info["session"] as? String else { return }
         await MainActor.run {
             self.destination = ReplyDestination(account: account, profile: profile, session: session)
+            if response.actionIdentifier == "reply", let text = (response as? UNTextInputNotificationResponse)?.userText,
+               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.pendingReply = text
+            }
         }
     }
 
@@ -150,6 +189,8 @@ final class ReplyNotifier {
     static let shared = ReplyNotifier()
     enum Event { case reply, approval, failure }
     var away = false
+    var visibleChat: String? = nil
+    var pendingReply: String? = nil
     func install() {}
     func askOnce() {}
     func registerIfAuthorized() {}
@@ -157,7 +198,7 @@ final class ReplyNotifier {
     func returned() { away = false }
     func settled(liveRuns: Bool) {}
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
-              detail: String? = nil, worked: TimeInterval? = nil) {}
+              detail: String? = nil, worked: TimeInterval? = nil, quiet: Bool = false) {}
 }
 #endif
 

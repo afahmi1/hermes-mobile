@@ -262,8 +262,11 @@ final class API: @unchecked Sendable {
     // MARK: push
 
     /// Hand this install's APNs token to the bridge. The grant that signs the request owns the token.
-    func registerPush(token: String, environment: String, account: String) async throws {
-        _ = try await json("/m/push/token", method: "POST", body: ["token": token, "environment": environment, "account": account])
+    /// Returns whether the Mac can actually send pushes (it has an APNs key).
+    @discardableResult
+    func registerPush(token: String, environment: String, account: String) async throws -> Bool {
+        let r = try await json("/m/push/token", method: "POST", body: ["token": token, "environment": environment, "account": account])
+        return r["enabled"] as? Bool ?? false
     }
 
     /// Tell the bridge the app left or returned to the foreground, so it knows when to push.
@@ -854,6 +857,17 @@ final class API: @unchecked Sendable {
         let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/title-suggestion", method: "POST", body: [:])
         guard let title = obj["title"] as? String, !title.isEmpty else { throw APIError.badResponse }
         return title
+    }
+
+    /// Send later from the Mac ("try again when limits reset"). Returns the chat's waiting messages.
+    struct ScheduledSend: Identifiable, Hashable { let id: String; let text: String; let due: Date; let error: String? }
+    func schedule(profile: String, session: String, action: String, body: [String: Any] = [:]) async throws -> [ScheduledSend] {
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/\(action)", method: "POST", body: body)
+        return (obj["waiting"] as? [[String: Any]] ?? []).compactMap { r in
+            guard let id = r["id"] as? String, let due = (r["due"] as? NSNumber)?.doubleValue else { return nil }
+            return ScheduledSend(id: id, text: r["text"] as? String ?? "", due: Date(timeIntervalSince1970: due),
+                                 error: r["error"] as? String)
+        }
     }
 
     /// Answer a question Hermes asked mid-reply (its clarify tool), the way the desktop does.

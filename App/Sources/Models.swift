@@ -12,9 +12,18 @@ struct Bot: Codable, Identifiable, Hashable {
     let reachable: Bool
     let front: Bool
     var skills: [String] = []
+    /// Newer bridges: what Hermes tries, in order, when this bot's model can't answer. Nil = not reported.
+    var fallbacks: [Fallback]? = nil
+
+    struct Fallback: Codable, Hashable {
+        let provider: String
+        let model: String
+        /// "plan" (a subscription covers it), "free" or "paid" (billed per call).
+        let kind: String
+    }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, blurb, model, provider, reachable, front, skills
+        case id, name, blurb, model, provider, reachable, front, skills, fallbacks
     }
 
     init(id: String, name: String, blurb: String, model: String, provider: String, reachable: Bool, front: Bool,
@@ -39,6 +48,7 @@ struct Bot: Codable, Identifiable, Hashable {
         reachable = try c.decode(Bool.self, forKey: .reachable)
         front = try c.decode(Bool.self, forKey: .front)
         skills = (try? c.decode([String].self, forKey: .skills)) ?? []
+        fallbacks = try? c.decodeIfPresent([Fallback].self, forKey: .fallbacks)
     }
 }
 
@@ -204,7 +214,7 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     var sourceLabel: String {
         if createdVia == "mobile_bridge" { return "Mobile" }
         switch source ?? "" {
-        case "local": return "Local"
+        case "local": return "Desktop app"  // Hermes records the desktop app's own chats as "local"
         case "desktop": return "Desktop"
         case "gui": return "Hermes app"
         case "api_server": return "API"
@@ -394,10 +404,12 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     let activity: [ActivityEntry]?
     /// A short tag under a user bubble ("Sent while Hermes was working · Pasted 6 lines").
     let note: String?
+    /// Newer bridges: the reply split at its images ([{text}, {media: 0}, …]).
+    var contentParts: [ReplyPart]? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, role, content, timestamp, reasoning, notice, preview, ok, media, activity, note
-        case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind"
+        case toolName = "tool_name", toolCalls = "tool_calls", displayKind = "display_kind", contentParts = "content_parts"
     }
 
     init(from decoder: Decoder) throws {
@@ -416,6 +428,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         media = try? c.decode([ChatMediaRef].self, forKey: .media)
         activity = try? c.decode([ActivityEntry].self, forKey: .activity)
         note = try? c.decode(String.self, forKey: .note)
+        contentParts = try? c.decode([ReplyPart].self, forKey: .contentParts)
     }
 
     /// Content may be a string or a list of OpenAI-style parts.
@@ -434,6 +447,12 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         let preview: String?
         struct Fn: Codable, Hashable { let name: String?; let arguments: String? }
     }
+}
+
+/// One piece of a reply: some text, or the index of an image in its `media`.
+struct ReplyPart: Codable, Hashable {
+    var text: String?
+    var media: Int?
 }
 
 struct MessagesPage: Codable {
@@ -682,18 +701,34 @@ struct ServedRuntime: Codable, Hashable {
     let policy: Policy?
     let modelsUsed: [Used]?
     let cost: CostSummary?
+    /// Newer bridges: the model that wrote the last real reply, and when (epoch seconds).
+    var lastAnswer: LastAnswer? = nil
 
     struct Policy: Codable, Hashable { let model: String?; let provider: String?; let effort: String? }
+    struct LastAnswer: Codable, Hashable { let model: String; let provider: String?; let at: Double? }
     struct Used: Codable, Hashable {
         let model: String
         let provider: String?
         let calls: Int?
         let reasoningTokens: Int?
-        enum CodingKeys: String, CodingKey { case model, provider, calls, reasoningTokens = "reasoning_tokens" }
+        /// Newer bridges: what this model cost. kind = "priced" (usd paid), "included" (a plan; api_usd is the
+        /// API-price equivalent) or "unknown".
+        var usd: Double? = nil
+        var apiUsd: Double? = nil
+        var kind: String? = nil
+        enum CodingKeys: String, CodingKey { case model, provider, calls, usd, kind, reasoningTokens = "reasoning_tokens", apiUsd = "api_usd" }
     }
     enum CodingKeys: String, CodingKey {
         case model, provider, policy, cost
         case reasoningTokens = "reasoning_tokens", fallbackActive = "fallback_active", modelsUsed = "models_used"
+        case lastAnswer = "last_answer"
+    }
+
+    /// The last reply came from a different model than the one picked (a fallback when a plan ran out, or
+    /// an older answer from before you switched). Nil when they match or there's nothing to compare.
+    func stand(in picked: String?) -> LastAnswer? {
+        guard let last = lastAnswer, let picked, !picked.isEmpty else { return nil }
+        return ModelName.same(last.model, picked) ? nil : last
     }
 
     /// The session's persisted setting as a picker choice (nil fields = not set on the session).
@@ -709,7 +744,18 @@ struct LiveTurn: Codable, Hashable {
     let profile: String
     let sessionId: String
     let done: Bool
-    enum CodingKeys: String, CodingKey { case profile, done, turnId = "turn_id", sessionId = "session_id" }
+    /// Newer bridges: when it started and finished, and whether Hermes is waiting on you ("question"/"approval").
+    var startedAt: Double? = nil
+    var endedAt: Double? = nil
+    var waiting: String? = nil
+    enum CodingKeys: String, CodingKey {
+        case profile, done, waiting, turnId = "turn_id", sessionId = "session_id", startedAt = "started_at", endedAt = "ended_at"
+    }
+}
+
+/// What a chat is doing, for its row in the list (like T3: Input · 3m 12s · Done).
+enum ChatActivity: Equatable {
+    case input, working(since: Date), done
 }
 
 struct HealthInfo: Codable {
@@ -1099,6 +1145,17 @@ enum MarkdownBlock: Equatable {
 /// Model ids as people say them: "claude-opus-5-5[1m]" reads "Opus 5.5 · 1M", "deepseek-v4-pro" reads
 /// "DeepSeek V4 Pro", "accounts/fireworks/models/glm-5p1" reads "GLM 5.1". Display only; the id is kept everywhere else.
 enum ModelName {
+    /// Same model, ignoring provider prefixes and context tags: "x-ai/grok-4.7" = "grok-4.7", "claude-opus-5-5[1m]" = "claude-opus-5-5".
+    static func same(_ a: String, _ b: String) -> Bool {
+        func key(_ s: String) -> String {
+            var k = s.lowercased()
+            if let slash = k.lastIndex(of: "/") { k = String(k[k.index(after: slash)...]) }
+            if let br = k.firstIndex(of: "[") { k = String(k[..<br]) }
+            return k.replacingOccurrences(of: ".", with: "-").trimmingCharacters(in: .whitespaces)
+        }
+        return key(a) == key(b)
+    }
+
     private static let upper: Set<String> = ["gpt", "glm", "llm", "ai", "oss", "vl", "moe", "r1", "o1", "o3", "o4"]
     private static let brands: [String: String] = ["deepseek": "DeepSeek", "openai": "OpenAI", "xai": "xAI",
                                                    "qwen": "Qwen", "kimi": "Kimi", "minimax": "MiniMax", "grok": "Grok"]

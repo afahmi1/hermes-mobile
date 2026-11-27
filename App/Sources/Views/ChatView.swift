@@ -86,32 +86,24 @@ struct ChatScreen: View {
                                    onPin: chat.pinsAvailable && chat.sessionId != nil && MessagePin.messageID(for: item) != nil
                                         ? { Task { await chat.togglePin(item) } } : nil,
                                    onCompose: { text, replace in compose(text, replace: replace) },
-                                   showActions: item.id == lastReply,
+                                   showActions: item.kind == .assistant && !item.streaming,  // every finished reply, like T3
+                                   chat: chat,
                                    showTime: revealTimes || timeMarks.contains(item.id))
                             .id(item.id)
                     }
-                    if !chat.isRunning, !backgroundTasks.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(backgroundTasks.count == 1
+                    if !backgroundTasks.isEmpty {
+                        // Like the desktop: each subagent is a card you can open and watch.
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(chat.isRunning ? "Working in the background" : backgroundTasks.count == 1
                                  ? "Will resume when 1 background task finishes"
                                  : "Will resume when \(backgroundTasks.count) background tasks finish")
-                                .font(.subheadline.weight(.semibold))
-                            ForEach(Array(backgroundTasks.enumerated()), id: \.offset) { _, task in
-                                Text(task.model.isEmpty ? task.title : "\(task.title) · \(task.model)")
-                                    .font(.caption).foregroundStyle(HMDesign.text2).lineLimit(2)
-                            }
+                                .font(.footnote.weight(.semibold)).foregroundStyle(HMDesign.text2)
+                            ForEach(backgroundTasks) { task in SubagentCard(task: task) }
                         }
-                        .padding(12)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .hmPanel(radius: 14, classicStyle: .circular)
                         .padding(.horizontal, 12)
                     }
                     if let s = chat.status {
-                        HStack(spacing: 8) {
-                            ThinkingIndicator(size: 16)
-                            ShimmerText(text: s)
-                            Spacer()
-                        }
+                        ThinkingStatus(chat: chat, status: s)
                         .padding(.horizontal, 16).id("status")
                     }
                     Color.clear.frame(height: 4).id("bottom")
@@ -137,7 +129,11 @@ struct ChatScreen: View {
             // Land on the newest message after a reload, and when coming back to the chat. A lazy list that
             // gets a whole transcript at once can otherwise sit past its content: a blank screen until you scroll.
             .onChange(of: landTick) { _, _ in land(proxy) }
-            .onAppear { if followLatest { land(proxy) } }
+            .onAppear {
+                if followLatest { land(proxy) }
+                if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) }
+            }
+            .onDisappear { if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) } }
             .task(id: chat.items.isEmpty) { if !chat.items.isEmpty, followLatest { land(proxy) } }
             // A long transcript arriving all at once can leave a lazy list parked below its content (a blank
             // screen until you scroll). Land on the newest message once the first page is in, then again after
@@ -244,6 +240,7 @@ struct ChatScreen: View {
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
         .task { await chat.loadPalette() }
+        .modifier(VisibleChat(profile: chat.profile, session: chat.sessionId))
         .task(id: chat.sessionId) { await chat.loadPins() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
@@ -252,6 +249,8 @@ struct ChatScreen: View {
             Task { await openPath(path, session: sid) }
         }
         .quickLookPreview($pathPreview)
+        // A chat running somewhere else (a subagent, the desktop, Telegram): follow it while it works.
+        .task(id: chat.sessionId) { await followElsewhere() }
         .onReceive(NotificationCenter.default.publisher(for: .hermesForeground)) { _ in
             // Anything waiting to go tries again right away, then backs off quietly.
             chat.outboxWake()
@@ -347,9 +346,9 @@ struct ChatScreen: View {
         VStack(spacing: 1) {
             Text(bot?.name ?? chat.profile).font(.headline).lineLimit(1)
             HStack(spacing: 3) {
-                if chat.served?.fallbackActive == true {
+                if chat.served?.fallbackActive == true || answeredByOther != nil {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.caution)
-                        .accessibilityLabel("Answered by a fallback model")
+                        .accessibilityLabel("The last reply came from a different model than the one picked")
                 }
                 Text(runtimeLabel).lineLimit(1)
                 Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).imageScale(.small).accessibilityHidden(true)
@@ -359,23 +358,50 @@ struct ChatScreen: View {
     }
 
     /// "Opus 5.5 · High". The provider and raw id live in the model sheet, one tap away.
+    private var answeredByOther: ServedRuntime.LastAnswer? {
+        chat.served?.stand(in: chat.choice.model ?? bot?.model)
+    }
+
     private var runtimeLabel: String {
         if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
         let who = ModelName.short(c.model ?? bot?.model ?? "Default model").components(separatedBy: " · ").first ?? ""
         if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
+        // A fallback (or an older answer) wrote the last reply: say both, so the header never claims a model
+        // that didn't answer. "Grok 4.7 answered · Opus 5.5 next".
+        if let other = answeredByOther {
+            return (ModelName.short(other.model).components(separatedBy: " · ").first ?? other.model) + " answered · " + who + " next"
+        }
         var parts = [who]
         if let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) { parts.append(effort) }
-        // Real money only: a plan-covered chat shows no price here (the model sheet has the detail).
-        if let usd = chat.served?.cost?.usd, usd >= 0.01 { parts.append(CostSummary.money(usd)) }
+        // What was actually charged, plus "+ plan" when a subscription covered the rest, so the label changes
+        // as plan usage grows instead of looking frozen (the model sheet shows the API-price equivalent).
+        if let cost = chat.served?.cost {
+            if cost.usd >= 0.01 { parts.append(CostSummary.money(cost.usd) + (cost.included ? " + plan" : "")) }
+            else if cost.included, cost.includedApiUsd >= 0.01 { parts.append("Plan") }
+        }
         return parts.joined(separator: " · ")
     }
 
-    private var backgroundTasks: [(title: String, model: String)] {
+    /// Every 5 s, only while this chat is running somewhere other than this phone's own reply.
+    private func followElsewhere() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(5))
+            guard let sid = chat.sessionId, !chat.isRunning else { continue }
+            let agents = app.status.payload?["agents"].array ?? []
+            if agents.contains(where: { $0["session_id"].string == sid }) { await chat.load(quiet: true) }
+        }
+    }
+
+    private var backgroundTasks: [SubagentInfo] {
         guard let session = chat.sessionId else { return [] }
         return (app.status.payload?["agents"].array ?? []).compactMap { row in
             guard row["kind"].string == "subagent", row["parent_session_id"].string == session else { return nil }
-            return (row["title"].string ?? row["name"].string ?? "Background task", row["model"].string ?? "")
+            return SubagentInfo(sessionID: row["session_id"].string, profile: row["profile"].string ?? chat.profile,
+                                title: row["title"].string ?? row["name"].string ?? "Background task",
+                                goal: row["goal"].string, model: row["model"].string ?? "",
+                                provider: row["provider"].string, steps: row["steps"].int,
+                                started: row["started_at"].date)
         }
     }
 
@@ -431,10 +457,34 @@ struct ChatScreen: View {
     }
 
     @ViewBuilder private var draftShelf: some View {
-        if let quote = chat.pastedTexts.first(where: \.isQuote) {
-            QuoteChip(text: quote.text) { chat.removePastedText(quote.id) }
+        let quotes = chat.pastedTexts.filter(\.isQuote)
+        if !quotes.isEmpty {
+            // Replying to several messages: each pill keeps its own answer; the newest one's answer is the box.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(quotes.enumerated()), id: \.element.id) { i, quote in
+                        if !quote.text.isEmpty {
+                            QuoteChip(text: quote.text, count: quotes.count > 1 ? (i + 1, quotes.count) : nil) {
+                                withAnimation(.snappy) { chat.removeReplyQuote(quote.id) }
+                            }
+                        }
+                        if i < quotes.count - 1 {
+                            TextField("Your reply to this…", text: Binding(
+                                get: { chat.pastedTexts.first { $0.id == quote.id }?.answer ?? "" },
+                                set: { v in if let k = chat.pastedTexts.firstIndex(where: { $0.id == quote.id }) { chat.pastedTexts[k].answer = v } }),
+                                      axis: .vertical)
+                                .lineLimit(1...4)
+                                .font(.subheadline)
+                                .padding(.leading, 13).padding(.vertical, 4)
+                        }
+                    }
+                }
                 .padding(.horizontal, 12)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(maxHeight: quotes.count > 1 ? 260 : nil)
+            .fixedSize(horizontal: false, vertical: quotes.count == 1)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
         if chat.pastedTexts.contains(where: { !$0.isQuote }) {
             ScrollView(.horizontal) {
@@ -503,7 +553,7 @@ struct ChatScreen: View {
                     chat.draft = "/" + name + " "
                 }
             }
-            if let q = chat.question { QuestionCard(chat: chat, question: q) }
+            if !chat.questions.isEmpty { QuestionPanel(chat: chat) }
             if chat.queue?.paused == true { QueuePausedBanner(chat: chat) }
             if !chat.outgoing.isEmpty { OutboxTray(chat: chat) }
             draftShelf
@@ -653,10 +703,8 @@ struct ChatScreen: View {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             return
         }
-        if replace, case let (quote?, body) = ReplyQuote.split(text) {
-            // Editing a sent reply: its quote goes back into the chip, the words into the box.
-            chat.setReplyQuote(quote)
-            chat.draft = body
+        if replace, chat.restoreReplies(from: text) {
+            // Editing a sent reply: each quote goes back into a pill with its words, the last words into the box.
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             return
         }
@@ -1291,6 +1339,8 @@ struct MessageRow: View {
     var onCompose: ((String, Bool) -> Void)?
     /// The last reply of a finished turn shows a small row of actions under it, like T3.
     var showActions = false
+    /// Set by the chat screen: lets a failed reply offer Try again / Try at reset.
+    var chat: ChatModel? = nil
     /// Times show where the conversation pauses (or everywhere while the transcript is swiped left).
     var showTime = true
     @State private var showFull = false
@@ -1306,6 +1356,10 @@ struct MessageRow: View {
         let span = seconds < 60 ? "\(seconds)s" : seconds < 3600 ? "\(seconds / 60)m" + (seconds % 60 >= 10 ? " \(seconds % 60)s" : "")
             : "\(seconds / 3600)h \(seconds % 3600 / 60)m"
         return "Worked \(span) · " + base
+    }
+
+    private func quoteSelection(_ words: String) {
+        onCompose?(ReplyQuote.markdown(ReplyQuote.excerpt(words)) + "\n\n", false)
     }
 
     private var quoted: String {
@@ -1348,6 +1402,15 @@ struct MessageRow: View {
 
     /// Long pastes fold to their first lines so one message never fills the screen.
     private var replySplit: (quote: String?, body: String) { ReplyQuote.split(item.text) }
+
+    private func userBubble(_ words: String) -> some View {
+        Text(words)
+            .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
+            .foregroundStyle(HMDesign.bubbleText)
+            .background(HMDesign.bubbleFill, in: bubbleShape)
+            .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
+                                              lineWidth: highlighted ? 2 : 0))
+    }
     private var userIsLong: Bool { item.text.count > 700 || item.text.reduce(0) { $1 == "\n" ? $0 + 1 : $0 } > 14 }
     private var userText: String {
         guard userIsLong, !showFull else { return item.text }
@@ -1379,13 +1442,17 @@ struct MessageRow: View {
                         HStack(alignment: .top, spacing: 4) {
                             if pinned { pinMark }
                             VStack(alignment: .leading, spacing: 8) {
-                                if let q = replySplit.quote { QuoteCard(text: q) }
-                                Text(replySplit.quote == nil ? userText : replySplit.body)
-                                    .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
-                                    .foregroundStyle(HMDesign.bubbleText)
-                                    .background(HMDesign.bubbleFill, in: bubbleShape)
-                                    .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
-                                                                      lineWidth: highlighted ? 2 : 0))
+                                let segs = ReplyQuote.segments(item.text)
+                                if segs.filter({ $0.quote != nil }).count > 1 && !userIsLong {
+                                    // A reply to several messages: each quote card with its answer under it.
+                                    ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
+                                        if let q = seg.quote { QuoteCard(text: q) }
+                                        if !seg.body.isEmpty { userBubble(seg.body) }
+                                    }
+                                } else {
+                                    if let q = replySplit.quote { QuoteCard(text: q) }
+                                    userBubble(replySplit.quote == nil ? userText : replySplit.body)
+                                }
                             }
                                 .contextMenu { messageMenu }
                         }
@@ -1408,23 +1475,43 @@ struct MessageRow: View {
                 }
             }
             .padding(.horizontal, 12)
-            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .assistant:
             // Replies run full width without a bubble (as in T3 and the desktop app): more of the
             // conversation fits on screen, and code blocks get the whole line.
             VStack(alignment: .leading, spacing: 6) {
-                if !item.text.isEmpty {
-                    MarkdownText(text: item.text)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 4).padding(.horizontal, 6)
-                        .background(highlighted ? HMDesign.selectedFill : .clear,
-                                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
-                        .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .contextMenu { messageMenu }
+                if ChatModel.isFailedTurn(item.text), let chat {
+                    FailedTurnCard(chat: chat, itemID: item.id, text: item.text,
+                                   isLatest: item.id == chat.items.last(where: { $0.kind == .assistant })?.id)
+                } else {
+                // Long-press selects text (like T3); the menu has Copy, Copy as Markdown and Reply with quote.
+                // Images sit where Hermes put them in the reply when the bridge says where.
+                if let parts = item.parts, !parts.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+                            if let words = part.text {
+                                MarkdownText(text: words, onQuote: quoteSelection)
+                            } else if let i = part.media, item.media.indices.contains(i) {
+                                TranscriptImages(refs: [item.media[i]], profile: profile, session: session, alignment: .leading)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4).padding(.horizontal, 6)
+                    .background(highlighted ? HMDesign.selectedFill : .clear, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
+                } else {
+                    if !item.text.isEmpty {
+                        MarkdownText(text: item.text, onQuote: quoteSelection)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 4).padding(.horizontal, 6)
+                            .background(highlighted ? HMDesign.selectedFill : .clear,
+                                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
+                    }
+                    TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
                 }
-                TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
+                }
                 if showActions || item.footer != nil {
                     VStack(alignment: .leading, spacing: 0) {
                         if showActions, !item.text.isEmpty {
@@ -1462,7 +1549,6 @@ struct MessageRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
-            .modifier(SwipeToQuote { onCompose?(quoted, false) })
             .sheet(isPresented: $selecting) { SelectTextSheet(text: item.text) }
         case .control:
             // Their words, not a gray system card. The tag says whether it was queued or used to guide the reply.
@@ -1475,12 +1561,18 @@ struct MessageRow: View {
                             .foregroundStyle(HMDesign.bubbleText)
                             .background(HMDesign.bubbleFill, in: bubbleShape)
                     }
+                    // Where the message is: hollow while waiting, filled once Hermes has read it.
+                    let stage = item.annotation ?? "sent"
                     HStack(spacing: 4) {
-                        Image(systemName: (item.footer ?? "").hasPrefix("Guided") ? "arrow.turn.up.right" : "clock")
+                        Image(systemName: stage == "read" ? "checkmark.circle.fill" : stage == "next" ? "arrow.down.circle" : "circle.dotted")
+                            .foregroundStyle(stage == "read" ? HMDesign.success : Color.secondary)
+                            .symbolEffect(.pulse, isActive: stage == "sent")
                         Text(item.footer ?? "Sent")
                         if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
                     }
                     .hmTime(classic: HMDesign.text2)
+                    .contentTransition(.symbolEffect(.replace))
+                    .animation(.snappy, value: stage)
                 }
             }
             .padding(.horizontal, 12)
@@ -1500,9 +1592,13 @@ struct MessageRow: View {
                                     .foregroundStyle(row.state == "failed" ? HMDesign.danger : HMDesign.text2)
                                     .symbolEffect(.pulse, isActive: row.state == "running" && !reduceMotion)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(ToolLanguage.title(row))
-                                        .font(.caption)
-                                        .foregroundStyle(row.state == "failed" ? HMDesign.dangerText : HMDesign.ink)
+                                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                        Text(ToolLanguage.title(row))
+                                            .font(.caption)
+                                            .foregroundStyle(row.state == "failed" ? HMDesign.dangerText : HMDesign.ink)
+                                        Spacer(minLength: 4)
+                                        ToolStamp(row: row)
+                                    }
                                     if !row.result.isEmpty {
                                         Text(row.result).font(.caption2.monospaced()).foregroundStyle(HMDesign.text2).lineLimit(3)
                                     }
@@ -1724,17 +1820,37 @@ private struct TranscriptImages: View {
     var alignment: HorizontalAlignment = .leading
     @State private var preview: UIImage?
 
+    private var images: [ChatMediaRef] { refs.filter { $0.kind == "image" } }
+
     var body: some View {
         if !refs.isEmpty, session != nil {
             VStack(alignment: alignment, spacing: 6) {
-                ForEach(refs, id: \.digest) { ref in
-                    if ref.kind == "image" {
-                        TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name) {
-                            preview = $0
+                if images.count >= 2 {
+                    // Several images in one message: one even-height row you swipe through, in the order sent.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(images, id: \.digest) { ref in
+                                TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name,
+                                                tileHeight: 150) { preview = $0 }
+                            }
                         }
-                    } else {
-                        TranscriptFile(ref: ref, profile: profile, session: session ?? "")
+                        .scrollTargetLayout()
                     }
+                    .scrollTargetBehavior(.viewAligned)
+                    .defaultScrollAnchor(alignment == .trailing ? .trailing : .leading)
+                    .frame(height: 150)
+                    .overlay(alignment: alignment == .trailing ? .bottomLeading : .bottomTrailing) {
+                        Text("\(images.count) images").font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(.ultraThinMaterial, in: Capsule()).padding(6)
+                    }
+                } else {
+                    ForEach(images, id: \.digest) { ref in
+                        TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name) { preview = $0 }
+                    }
+                }
+                ForEach(refs.filter { $0.kind != "image" }, id: \.digest) { ref in
+                    TranscriptFile(ref: ref, profile: profile, session: session ?? "")
                 }
             }
             .fullScreenCover(isPresented: Binding(get: { preview != nil }, set: { if !$0 { preview = nil } })) {
@@ -1749,6 +1865,8 @@ private struct TranscriptImage: View {
     let session: String
     let digest: String
     let name: String
+    /// Set inside a multi-image row: every tile the same height, width from the image's shape.
+    var tileHeight: CGFloat? = nil
     let open: (UIImage) -> Void
     @State private var image: UIImage?
     @State private var failed = false
@@ -1757,9 +1875,16 @@ private struct TranscriptImage: View {
         Group {
             if let image {
                 Button { open(image) } label: {
-                    Image(uiImage: image).resizable().scaledToFit()
-                        .frame(maxWidth: 240, maxHeight: 220)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    if let h = tileHeight {
+                        Image(uiImage: image).resizable().scaledToFill()
+                            .frame(width: min(240, max(90, h * image.size.width / max(image.size.height, 1))), height: h)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    } else {
+                        // Never blown up past its real size: a small image stays small.
+                        Image(uiImage: image).resizable().scaledToFit()
+                            .frame(maxWidth: min(240, image.size.width), maxHeight: min(220, image.size.height))
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(name)
@@ -2501,7 +2626,7 @@ struct OutboxTray: View {
         .onTapGesture { if canEdit(item) { editing = item } }
         .contextMenu {
             if canEdit(item) { Button { editing = item } label: { Label("Edit", systemImage: "pencil") } }
-            if item.mode == "queue", chat.isRunning, item.problem == nil, chat.allows(.steer, item) {
+            if item.mode == "queue", chat.isRunning, item.problem == nil {
                 Button { Task { await chat.guideNow(item.id) } } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
             }
             Button { Task { await chat.removeOutgoing(item.id, toComposer: true) } } label: {
@@ -2584,73 +2709,154 @@ struct OutgoingEditor: View {
     }
 }
 
-/// Hermes asked something mid-reply. Its choices are one tap; anything typed and sent is the answer too.
-struct QuestionCard: View {
+/// Hermes asked something mid-reply (1 to 5 questions at once). Like T3's input panel: every question in one
+/// scrolling card, each choice as a tappable card (title, then its explanation), "+" for your own answer, one
+/// Submit for all. Collapsible, so you can read the reply above it first. Typing in the message box answers too.
+struct QuestionPanel: View {
     @Bindable var chat: ChatModel
-    let question: ClarifyRequest
-    @State private var picked = Set<String>()
+    /// Off only for snapshot renders (ImageRenderer draws no ScrollView content).
+    var scrolls = true
+    @State private var picks: [String: Set<String>] = [:]
+    @State private var custom: [String: String] = [:]
+    @State private var writing: Set<String> = []
+    @State private var collapsed = false
+
+    private var answers: [String: String] {
+        var out: [String: String] = [:]
+        for q in chat.questions {
+            let own = custom[q.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if writing.contains(q.id), !own.isEmpty { out[q.id] = own; continue }
+            let chosen = q.choices.filter { picks[q.id]?.contains($0) == true }
+            if !chosen.isEmpty { out[q.id] = chosen.map { ClarifyChoice($0).title }.joined(separator: ", ") }
+        }
+        return out
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("Hermes is asking", systemImage: "questionmark.bubble.fill")
-                .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
-            Text(question.question).font(.subheadline).textSelection(.enabled)
-            if !question.choices.isEmpty {
-                // Stacked, full width: choices are often paths or sentences, and each is an easy tap.
-                VStack(alignment: .leading, spacing: 6) {
-                        ForEach(question.choices, id: \.self) { choice in
-                            Button {
-                                if question.multiSelect {
-                                    if picked.contains(choice) { picked.remove(choice) } else { picked.insert(choice) }
-                                } else {
-                                    Task { _ = await chat.answerQuestion(choice) }
-                                }
-                            } label: {
-                                HStack {
-                                    Text(choice).font(.subheadline).lineLimit(3).multilineTextAlignment(.leading)
-                                    Spacer(minLength: 8)
-                                    Image(systemName: question.multiSelect ? (picked.contains(choice) ? "checkmark.circle.fill" : "circle")
-                                                                           : "arrow.up.circle")
-                                        .foregroundStyle(HMDesign.accent)
-                                }
-                                .padding(.horizontal, 12).padding(.vertical, 10)
-                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                                .background(picked.contains(choice) ? HMDesign.accent.opacity(0.25) : HMDesign.panel,
-                                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(chat.answering)
-                        }
-                }
-                if question.multiSelect {
-                    Button("Send \(picked.count) choice\(picked.count == 1 ? "" : "s")") {
-                        let answer = question.choices.filter(picked.contains).joined(separator: ", ")
-                        Task { _ = await chat.answerQuestion(answer) }
+            Button { withAnimation(.snappy) { collapsed.toggle() } } label: {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("INPUT NEEDED").font(.caption2.weight(.semibold)).tracking(0.6).foregroundStyle(HMDesign.accent)
+                        Text(chat.questions.count == 1 ? "Hermes has a question" : "Fill in \(chat.questions.count) answers")
+                            .font(.headline).foregroundStyle(.primary)
                     }
-                    .buttonStyle(.borderedProminent).disabled(picked.isEmpty || chat.answering)
+                    Spacer()
+                    Image(systemName: "chevron.down").rotationEffect(.degrees(collapsed ? 180 : 0)).foregroundStyle(.secondary)
                 }
+                .contentShape(Rectangle())
             }
-            Text("Or type your answer below and send.").font(.caption).foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+            if !collapsed {
+                let list = VStack(alignment: .leading, spacing: 18) {
+                    ForEach(Array(chat.questions.enumerated()), id: \.element.id) { index, q in
+                        questionView(q, number: chat.questions.count > 1 ? index + 1 : nil)
+                    }
+                }
+                if scrolls {
+                    ScrollView { list }.frame(maxHeight: 360).scrollBounceBehavior(.basedOnSize)
+                } else { list }
+                Button {
+                    let now = answers
+                    Task { if await chat.answer(now) { picks = [:]; custom = [:]; writing = [] } }
+                } label: {
+                    Text(chat.answering ? "Sending…" : answers.count < chat.questions.count && chat.questions.count > 1
+                         ? "Submit \(answers.count) of \(chat.questions.count)" : "Submit")
+                        .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).frame(height: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(answers.isEmpty || chat.answering)
+            }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(HMDesign.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(14)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(HMDesign.separator, lineWidth: 1))
         .padding(.horizontal, 12)
-        .sensoryFeedback(.impact(weight: .light), trigger: question.id)
+        .sensoryFeedback(.impact(weight: .light), trigger: chat.questions.count)
+    }
+
+    @ViewBuilder private func questionView(_ q: ClarifyRequest, number: Int?) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if let number { Text("\(number).").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary) }
+                Text(q.question).font(.subheadline).textSelection(.enabled)
+            }
+            ForEach(q.choices, id: \.self) { raw in
+                let choice = ClarifyChoice(raw)
+                let on = picks[q.id]?.contains(raw) == true && !writing.contains(q.id)
+                Button {
+                    writing.remove(q.id)
+                    var set = picks[q.id] ?? []
+                    if q.multiSelect { if set.contains(raw) { set.remove(raw) } else { set.insert(raw) } }
+                    else { set = set.contains(raw) ? [] : [raw] }
+                    picks[q.id] = set
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(choice.title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let detail = choice.detail {
+                            Text(detail).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(on ? HMDesign.accent.opacity(0.14) : Color.clear, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(on ? HMDesign.accent : HMDesign.separator, lineWidth: on ? 1.5 : 1))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(chat.answering)
+            }
+            if writing.contains(q.id) || q.choices.isEmpty {
+                TextField("Your answer", text: Binding(get: { custom[q.id] ?? "" }, set: { custom[q.id] = $0 }), axis: .vertical)
+                    .lineLimit(1...5)
+                    .padding(12)
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(HMDesign.accent, lineWidth: 1.5))
+                    .onAppear { writing.insert(q.id) }
+            } else {
+                Button { writing.insert(q.id) } label: {
+                    Label("Write my own", systemImage: "plus").font(.subheadline).foregroundStyle(.secondary)
+                        .frame(minHeight: 36)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+/// A choice as Hermes writes it ("Restart it now (Recommended) — Kill the frozen Chrome and…"): a short title and
+/// the explanation under it. Plain choices stay a title.
+struct ClarifyChoice {
+    let title: String
+    let detail: String?
+    init(_ raw: String) {
+        for sep in [" — ", " – ", " - ", ": ", "\n"] {
+            if let r = raw.range(of: sep), raw.distance(from: raw.startIndex, to: r.lowerBound) <= 70 {
+                title = String(raw[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+                let rest = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                detail = rest.isEmpty ? nil : rest
+                return
+            }
+        }
+        title = raw
+        detail = nil
     }
 }
 
 /// The message you're replying to, above the message box: accent bar, two lines, remove button.
 struct QuoteChip: View {
     let text: String
+    /// (n, of) when replying to several messages.
+    var count: (Int, Int)? = nil
     let remove: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1.5).fill(HMDesign.accent).frame(width: 3)
             VStack(alignment: .leading, spacing: 2) {
-                Label("Replying to", systemImage: "arrowshape.turn.up.left.fill")
+                Label(count.map { "Replying to \($0.0) of \($0.1)" } ?? "Replying to", systemImage: "arrowshape.turn.up.left.fill")
                     .font(.caption2.weight(.semibold)).foregroundStyle(HMDesign.accent)
                 Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
             }
@@ -2713,5 +2919,182 @@ struct ReadingPosition: ViewModifier {
         } else {
             content.defaultScrollAnchor(.bottom)
         }
+    }
+}
+
+/// A subagent working for this chat (from Status's running list).
+struct SubagentInfo: Identifiable {
+    let sessionID: String?
+    let profile: String
+    let title: String
+    let goal: String?
+    let model: String
+    let provider: String?
+    let steps: Int?
+    let started: Date?
+    var id: String { sessionID ?? title }
+}
+
+/// One background task: what it was asked, which model and provider, how long and how many steps.
+/// Tap to open its own transcript and follow it.
+struct SubagentCard: View {
+    let task: SubagentInfo
+
+    var body: some View {
+        let card = VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                ThinkingIndicator(size: 14, activity: task.goal ?? task.title)
+                Text(task.title.replacingOccurrences(of: "Subagent: ", with: "")).font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let started = task.started {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text(ActivityBadge.elapsed(ctx.date.timeIntervalSince(started))).monospacedDigit()
+                    }
+                    .font(.system(.caption, design: .monospaced)).foregroundStyle(HMDesign.text2)
+                }
+                if task.sessionID != nil { Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary) }
+            }
+            if let goal = task.goal, !goal.isEmpty {
+                Text(goal).font(.footnote).foregroundStyle(HMDesign.text2).lineLimit(3)
+            }
+            Text([ModelName.short(task.model).components(separatedBy: " · ").first,
+                  task.provider.map(ProviderUsageSection.displayName),
+                  task.steps.map { "\($0) steps" }].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary).lineLimit(1)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(HMDesign.separator, lineWidth: 0.5))
+        if let id = task.sessionID {
+            NavigationLink(value: ChatRef(profile: task.profile, sessionId: id)) { card }.buttonStyle(.plain)
+        } else {
+            card
+        }
+    }
+}
+
+/// "10:42:07 · 3.2s" next to a tool step: when it ran and how long it took (live steps count up).
+struct ToolStamp: View {
+    let row: ToolActivity
+    private static let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
+
+    var body: some View {
+        if let start = row.started {
+            HStack(spacing: 4) {
+                Text(Self.clock.string(from: Date(timeIntervalSince1970: start)))
+                if let end = row.ended, end >= start {
+                    Text("· " + Self.span(end - start))
+                } else if row.state == "running" {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text("· " + Self.span(ctx.date.timeIntervalSince1970 - start))
+                    }
+                }
+            }
+            .font(.system(.caption2, design: .monospaced)).monospacedDigit().foregroundStyle(.tertiary)
+            .fixedSize()
+        }
+    }
+
+    static func span(_ t: Double) -> String {
+        t < 1 ? "<1s" : t < 60 ? String(format: "%.1fs", t) : "\(Int(t) / 60)m \(Int(t) % 60)s"
+    }
+}
+
+/// A reply that didn't go through (provider error, usage limit, lost connection): retry now, or have the Mac send
+/// it again later, by default when the provider's usage window resets. The scheduled send lives on the Mac.
+struct FailedTurnCard: View {
+    @Bindable var chat: ChatModel
+    let itemID: String
+    let text: String
+    let isLatest: Bool
+    @Environment(AppModel.self) private var app
+    @State private var busy = false
+
+    /// The soonest future reset among usage windows that are nearly full (or the chat's provider's soonest reset).
+    private var reset: (date: Date, label: String)? {
+        let providers = app.status.payload?["providers"]["providers"].array ?? []
+        let mine = chat.served?.provider
+        var best: (Date, String)?
+        for p in providers {
+            let name = p["provider"].string ?? ""
+            for w in p["usage"]["windows"].array {
+                guard let at = w["resets_at"].date, at > Date() else { continue }
+                let full = (w["used_percent"].double ?? 0) >= 90
+                guard full || (mine != nil && name == mine) else { continue }
+                if best == nil || at < best!.0 { best = (at, ProviderUsageSection.displayName(name)) }
+            }
+        }
+        return best
+    }
+
+    private var waiting: API.ScheduledSend? {
+        guard let ask = chat.askBefore(itemID) else { return nil }
+        return chat.scheduled.first { $0.text == ask }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("That reply didn't go through", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.ink)
+            Text(text.hasPrefix("This turn") ? "Hermes stopped partway. Some steps may already have run."
+                 : "The model didn't answer (often a usage limit or a dropped connection).")
+                .font(.footnote).foregroundStyle(HMDesign.text2)
+            if let w = waiting {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(HMDesign.accent)
+                    (Text("Your Mac sends it again ") + Text(w.due, style: .relative) + Text(w.due < Date() ? " ago" : ""))
+                        .font(.footnote)
+                    Spacer()
+                    Button("Cancel") { Task { await chat.cancelScheduled(w.id) } }.font(.footnote.weight(.semibold))
+                }
+                if let e = w.error { Text(e).font(.caption2).foregroundStyle(.tertiary).lineLimit(2) }
+            } else if isLatest, chat.askBefore(itemID) != nil {
+                HStack(spacing: 8) {
+                    Button { act { await chat.retryNow(itemID) } } label: {
+                        Label("Try again", systemImage: "arrow.clockwise").font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent).tint(HMDesign.accent)
+                    Menu {
+                        if let r = reset {
+                            Button("When \(r.label) resets · \(r.date.formatted(date: .omitted, time: .shortened))") {
+                                act { await chat.retryLater(itemID, at: r.date.addingTimeInterval(60), reason: "limits") }
+                            }
+                        }
+                        Button("In 15 minutes") { act { await chat.retryLater(itemID, at: .now + 900, reason: "later") } }
+                        Button("In 1 hour") { act { await chat.retryLater(itemID, at: .now + 3600, reason: "later") } }
+                        Button("In 5 hours") { act { await chat.retryLater(itemID, at: .now + 5 * 3600, reason: "later") } }
+                    } label: {
+                        Label(reset.map { "At reset · " + $0.date.formatted(date: .omitted, time: .shortened) } ?? "Later",
+                              systemImage: "clock").font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .disabled(busy)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(HMDesign.separator, lineWidth: 0.5))
+        .task(id: itemID) { if isLatest { await chat.refreshScheduled() } }
+    }
+
+    private func act(_ work: @escaping () async -> Void) {
+        busy = true
+        Task { await work(); busy = false }
+    }
+}
+
+/// The chat on screen doesn't need a notification for its own replies; other chats still do.
+struct VisibleChat: ViewModifier {
+    let profile: String
+    let session: String?
+    private var key: String { profile + "|" + (session ?? "") }
+    func body(content: Content) -> some View {
+        content
+            .onAppear { ReplyNotifier.shared.visibleChat = key }
+            .onDisappear { if ReplyNotifier.shared.visibleChat == key { ReplyNotifier.shared.visibleChat = nil } }
     }
 }

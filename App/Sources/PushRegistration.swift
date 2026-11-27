@@ -18,7 +18,9 @@ final class PushRegistration {
         #endif
     }
 
-    private var token: String?
+    private(set) var token: String?
+    /// The Mac said it can send pushes (it has an APNs key). Until then, replies after the app sleeps can't reach you.
+    private(set) var macCanPush = false
     private var sent: String?  // "account|token" last accepted by the bridge
     private var away = false
 
@@ -34,23 +36,24 @@ final class PushRegistration {
         let api = API.shared
         Task {
             do {
-                try await api.registerPush(token: token, environment: Self.environment, account: account)
-                if API.shared === api { sent = account + "|" + token }
+                let enabled = try await api.registerPush(token: token, environment: Self.environment, account: account)
+                if API.shared === api { sent = account + "|" + token; macCanPush = enabled; ReplyNotifier.shared.macCanPush = enabled }
             } catch {}
         }
     }
 
     func presence(away now: Bool) {
-        guard away != now, API.shared.isSignedIn else { return }
+        guard API.shared.isSignedIn else { return }
         away = now
         let api = API.shared
-        // The request has to leave before iOS suspends the app.
+        // The request has to leave before iOS suspends the app. Sent every time: a launch's in-memory flag
+        // starts false even when the bridge still thinks this phone is away, and a failed send must be retried.
         var task = UIBackgroundTaskIdentifier.invalid
         task = UIApplication.shared.beginBackgroundTask(withName: "Push presence") {
             UIApplication.shared.endBackgroundTask(task)
         }
         Task {
-            try? await api.pushPresence(away: now)
+            do { try await api.pushPresence(away: now) } catch { await MainActor.run { self.away = !now } }
             if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
         }
     }

@@ -7,6 +7,9 @@ struct ToolActivity: Hashable, Identifiable {
     var preview: String
     var result: String
     var state: String
+    /// When the step started and finished (epoch seconds): shown next to each step in the dropdown.
+    var started: Double? = nil
+    var ended: Double? = nil
 }
 
 struct ChatItem: Identifiable, Hashable {
@@ -17,6 +20,8 @@ struct ChatItem: Identifiable, Hashable {
     var tools: [String] = []
     var activities: [ToolActivity] = []
     var media: [ChatMediaRef] = []
+    /// The reply split at its images (bridge `content_parts`), so each image shows where Hermes put it.
+    var parts: [ReplyPart]? = nil
     /// Structured background work behind an activity card (empty on older bridges: `detail` is shown).
     var entries: [ActivityEntry] = []
     var detail: String = ""
@@ -49,6 +54,9 @@ struct PastedText: Identifiable, Equatable, Codable {
     var text: String
     /// A reply quote: shown as a compact "Replying to" chip, sent as a Markdown quote ahead of the message.
     var quote: Bool? = nil
+    /// Replying to several messages: your words for this quote (the newest quote's words are the main box).
+    /// A quote whose `text` is empty is a plain segment left behind when its pill was removed.
+    var answer: String? = nil
     var isQuote: Bool { quote == true }
 }
 
@@ -63,6 +71,32 @@ enum ReplyQuote {
         let body = lines.dropFirst(head.count).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !quote.isEmpty, !body.isEmpty else { return (nil, text) }
         return (quote, body)
+    }
+
+    /// Every quote in a sent message with the words under it, in order: [(quote, body)]. A body before the first
+    /// quote has quote nil. Lets a reply to three messages show three quote cards, each with its answer.
+    static func segments(_ text: String) -> [(quote: String?, body: String)] {
+        var out: [(String?, String)] = []
+        var quote: [String] = [], body: [String] = []
+        var inQuote = false
+        func flush() {
+            let q = quote.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            let b = body.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !q.isEmpty || !b.isEmpty { out.append((q.isEmpty ? nil : q, b)) }
+            quote = []; body = []
+        }
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix(">") {
+                if !inQuote && (!quote.isEmpty || !body.isEmpty) { flush() }
+                inQuote = true
+                quote.append(line.dropFirst().trimmingCharacters(in: .whitespaces))
+            } else {
+                inQuote = false
+                body.append(String(line))
+            }
+        }
+        flush()
+        return out
     }
 
     /// What goes on the wire: a short Markdown quote Hermes reads as "this is what I'm replying to".
@@ -85,7 +119,7 @@ final class ChatModel {
     var items: [ChatItem] = []
     var title: String?
     var isLoading = false
-    var isRunning = false { didSet { if isRunning && !oldValue { runStarted = Date() } } }
+    var isRunning = false { didSet { if isRunning && !oldValue { runStarted = Date(); thinkingText = "" } } }
     /// When this reply started, for "finished in 4 min" in the notification.
     @ObservationIgnored private var runStarted: Date?
     var slashBusy = false
@@ -215,19 +249,75 @@ final class ChatModel {
 
     /// What the next send actually delivers: the draft plus every pasted chunk.
     var combinedDraft: String {
-        let quote = pastedTexts.first(where: \.isQuote).map { ReplyQuote.markdown($0.text) }
+        let quotes = pastedTexts.filter(\.isQuote)
         let extra = pastedTexts.filter { !$0.isQuote }.map(\.text).joined(separator: "\n\n")
         let body = extra.isEmpty ? draft : draft.isEmpty ? extra : draft + "\n\n" + extra
-        guard let quote else { return body }
-        return body.isEmpty ? quote : quote + "\n\n" + body
+        guard !quotes.isEmpty else { return body }
+        // > quote 1, your words for it, > quote 2, …, the newest quote, then the main box.
+        var parts: [String] = []
+        for (i, q) in quotes.enumerated() {
+            if !q.text.isEmpty { parts.append(ReplyQuote.markdown(q.text)) }
+            let words = (i == quotes.count - 1 ? body : (q.answer ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !words.isEmpty { parts.append(words) }
+        }
+        return parts.joined(separator: "\n\n")
     }
 
-    /// Reply to a message: one quote chip at a time (a new one replaces the old).
+    /// Reply to a message. Replying to another one keeps the first: what you typed becomes your answer to the
+    /// previous quote, and the box starts your answer to the new one.
     func setReplyQuote(_ raw: String) {
         let excerpt = ReplyQuote.excerpt(raw)
         guard !excerpt.isEmpty else { return }
+        if pastedTexts.contains(where: { $0.isQuote && $0.text == excerpt }) { return }
+        if let last = pastedTexts.lastIndex(where: \.isQuote) {
+            let typed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !typed.isEmpty {
+                let had = pastedTexts[last].answer ?? ""
+                pastedTexts[last].answer = had.isEmpty ? typed : had + "\n\n" + typed
+                draft = ""
+            }
+        }
+        let at = (pastedTexts.lastIndex(where: \.isQuote).map { $0 + 1 }) ?? 0
+        pastedTexts.insert(PastedText(text: excerpt, quote: true), at: at)
+    }
+
+    /// Remove a reply pill. Only the quote goes: the words you wrote for it stay where they were.
+    func removeReplyQuote(_ id: UUID) {
+        let quotes = pastedTexts.filter(\.isQuote)
+        guard let i = quotes.firstIndex(where: { $0.id == id }), let at = pastedTexts.firstIndex(where: { $0.id == id }) else { return }
+        let words = (quotes[i].answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if i == quotes.count - 1 {
+            // The newest quote: its words are the main box, which now answers the quote before it (or nothing).
+            pastedTexts.remove(at: at)
+            // The quote that is newest now answers through the box: pull its words (and any plain segments
+            // that ended up last) down into the box, in order.
+            while let prev = pastedTexts.lastIndex(where: \.isQuote) {
+                let carried = (pastedTexts[prev].answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                pastedTexts[prev].answer = nil
+                if !carried.isEmpty { draft = draft.isEmpty ? carried : carried + "\n\n" + draft }
+                guard pastedTexts[prev].text.isEmpty else { break }
+                pastedTexts.remove(at: prev)
+            }
+        } else if words.isEmpty {
+            pastedTexts.remove(at: at)
+        } else {
+            pastedTexts[at].text = ""  // keep the words as a plain segment in place
+        }
+    }
+
+    /// "Edit as New Message" on a reply to several messages: every quote back as a pill with its words.
+    func restoreReplies(from text: String) -> Bool {
+        let segs = ReplyQuote.segments(text)
+        guard segs.contains(where: { $0.quote != nil }) else { return false }
         pastedTexts.removeAll(where: \.isQuote)
-        pastedTexts.insert(PastedText(text: excerpt, quote: true), at: 0)
+        var restored: [PastedText] = []
+        for (i, seg) in segs.enumerated() {
+            let last = i == segs.count - 1
+            restored.append(PastedText(text: seg.quote ?? "", quote: true, answer: last || seg.body.isEmpty ? nil : seg.body))
+            if last { draft = seg.body }
+        }
+        pastedTexts.insert(contentsOf: restored, at: 0)
+        return true
     }
     private var transcriptKey: String? {
         sessionId.flatMap { app?.inboxKey(profile: profile, filter: "transcript/" + $0) }
@@ -503,7 +593,7 @@ final class ChatModel {
                 if !calls.isEmpty {
                     let activities = calls.enumerated().map { offset, call in
                         ToolActivity(id: key + "-\(offset)", name: call.function?.name ?? "tool",
-                                     preview: call.preview ?? "", result: "", state: "done")
+                                     preview: call.preview ?? "", result: "", state: "done", started: m.timestamp)
                     }
                     if let toolGroup {
                         out[toolGroup].activities += activities
@@ -515,7 +605,9 @@ final class ChatModel {
                     }
                 }
                 if !text.isEmpty || !(m.media ?? []).isEmpty {
-                    out.append(ChatItem(id: key, kind: .assistant, text: text, media: m.media ?? [], timestamp: m.timestamp))
+                    var row = ChatItem(id: key, kind: .assistant, text: text, media: m.media ?? [], timestamp: m.timestamp)
+                    row.parts = m.contentParts
+                    out.append(row)
                 }
             case "tool":
                 guard let toolGroup, let idx = out[toolGroup].activities.firstIndex(where: {
@@ -523,6 +615,7 @@ final class ChatModel {
                 }) else { continue }
                 if m.ok == false { out[toolGroup].activities[idx].state = "failed" }
                 if let preview = m.preview, !preview.isEmpty { out[toolGroup].activities[idx].result = preview }
+                out[toolGroup].activities[idx].ended = m.timestamp
                 if let end = m.timestamp { out[toolGroup].ended = end }
             default:
                 continue
@@ -996,33 +1089,101 @@ final class ChatModel {
         await enqueue(raw, mode: "queue", attachments: attachments)
     }
 
+    // MARK: failed replies
+
+    /// Messages the Mac will send later in this chat (bridge `schedule_v1`).
+    var scheduled: [API.ScheduledSend] = []
+
+    static func isFailedTurn(_ text: String) -> Bool {
+        text.hasPrefix("Your request was not processed") || text.hasPrefix("This turn did not complete")
+    }
+
+    /// The person's message a failed reply was answering.
+    func askBefore(_ itemID: String) -> String? {
+        guard let i = items.firstIndex(where: { $0.id == itemID }) else { return nil }
+        return items[..<i].last(where: { $0.kind == .user && !$0.text.isEmpty })?.text
+    }
+
+    func retryNow(_ itemID: String) async {
+        guard let ask = askBefore(itemID) else { error = "Couldn't find the message to resend."; return }
+        if isRunning { _ = await enqueue(ask, mode: "queue", attachments: []) } else { await send(ask) }
+    }
+
+    func retryLater(_ itemID: String, at date: Date, reason: String) async {
+        guard let ask = askBefore(itemID), let sid = sessionId else { error = "Couldn't find the message to resend."; return }
+        do {
+            scheduled = try await api.schedule(profile: profile, session: sid, action: "schedule",
+                                               body: ["text": ask, "at": date.timeIntervalSince1970, "reason": reason])
+        } catch APIError.http(404, _) {
+            error = "Update the bridge on your Mac to schedule a retry."
+        } catch {
+            self.error = "Couldn't reach your Mac to schedule it. Try again in a moment."
+        }
+    }
+
+    func cancelScheduled(_ id: String) async {
+        guard let sid = sessionId else { return }
+        scheduled.removeAll { $0.id == id }
+        scheduled = (try? await api.schedule(profile: profile, session: sid, action: "unschedule", body: ["id": id])) ?? scheduled
+    }
+
+    func refreshScheduled() async {
+        guard let sid = sessionId else { return }  // an older bridge answers 404; nothing shows
+        if let rows = try? await api.schedule(profile: profile, session: sid, action: "scheduled") { scheduled = rows }
+    }
+
+    // MARK: thinking
+
+    /// Hermes's reasoning for the current reply (streamed), and a counter that moves on every new step.
+    var thinkingText = ""
+    var activityTick = 0
+    private func appendThinking(_ s: String) {
+        thinkingText += s
+        if thinkingText.count > 24_000 { thinkingText = String(thinkingText.suffix(20_000)) }
+    }
+
     // MARK: Hermes's questions
 
-    /// A question Hermes is waiting on. While it's up, a sent message is the answer.
-    var question: ClarifyRequest?
+    /// Questions Hermes is waiting on (its clarify tool asks 1 to 5 at once), oldest first.
+    var questions: [ClarifyRequest] = []
+    var question: ClarifyRequest? { questions.first }
     @ObservationIgnored private var answeredQuestions = Set<String>()
     private(set) var answering = false
 
-    /// Answer the open question. Shows the answer as your own message, like any reply.
+    /// Answer the oldest open question (a message typed while Hermes waits).
     func answerQuestion(_ raw: String) async -> Bool {
-        let answer = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let q = question, !answer.isEmpty, !answering else { return false }
+        guard let q = question else { return false }
+        return await answer([q.id: raw])
+    }
+
+    /// Send answers for several questions at once (the question panel's Submit). Each goes as Hermes's own
+    /// clarify answer; whatever went through is shown as your message, whatever failed stays open.
+    func answer(_ answers: [String: String]) async -> Bool {
+        guard !answering else { return false }
         answering = true
         defer { answering = false }
-        do {
-            try await api.answerQuestion(run: q.runId.isEmpty ? (runId ?? "") : q.runId, requestId: q.id,
-                                         answer: answer, generation: q.generation)
-            answeredQuestions.insert(q.id)
-            if question?.id == q.id { question = nil }
-            var bubble = ChatItem(id: "answer-\(q.id)", kind: .user, text: answer)
-            bubble.contextNote = "Answered: " + String(q.question.prefix(80))
-            if !items.contains(where: { $0.id == bubble.id }) { items.append(bubble) }
-            status = "Working…"
-            return true
-        } catch {
-            self.error = "Couldn't send your answer: " + error.localizedDescription
-            return false
+        var sent: [(ClarifyRequest, String)] = []
+        for q in questions {
+            guard let raw = answers[q.id] else { continue }
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            do {
+                try await api.answerQuestion(run: q.runId.isEmpty ? (runId ?? "") : q.runId, requestId: q.id,
+                                             answer: text, generation: q.generation)
+                answeredQuestions.insert(q.id)
+                sent.append((q, text))
+            } catch {
+                self.error = "Couldn't send your answer: " + error.localizedDescription
+            }
         }
+        guard !sent.isEmpty else { return false }
+        questions.removeAll { q in sent.contains { $0.0.id == q.id } }
+        var bubble = ChatItem(id: "answer-\(sent[0].0.id)", kind: .user,
+                              text: sent.count == 1 ? sent[0].1 : sent.map { "\($0.0.question)\n→ \($0.1)" }.joined(separator: "\n\n"))
+        bubble.contextNote = sent.count == 1 ? "Answered: " + String(sent[0].0.question.prefix(80)) : "Answered \(sent.count) questions"
+        if !items.contains(where: { $0.id == bubble.id }) { items.append(bubble) }
+        if questions.isEmpty { status = "Working…" }
+        return sent.count == answers.count
     }
 
     /// Queue (Send next) or steer (Guide this reply). Returns true once it is safely on disk.
@@ -1150,6 +1311,23 @@ final class ChatModel {
         guard let key = receiptKey else { return }
         let keep = receipts
         Task { try? await InboxDisk.shared.replaceReceipts(keep, key: key) }
+    }
+
+    /// A guide or queued message moved on (read by Hermes, or up next). Updates the row in place, no reload.
+    private func markReceipt(wireID: String, stage: String, at: Date?) async {
+        guard let i = receipts.firstIndex(where: { $0.wireID == wireID }), receipts[i].stage != stage else { return }
+        receipts[i].stage = stage
+        if let at { receipts[i].readAt = at }
+        let updated = receipts[i]
+        if let row = items.firstIndex(where: { $0.id == updated.id.uuidString }) { items[row] = updated.item }
+        if let key = receiptKey { try? await InboxDisk.shared.record(updated, key: key) }
+    }
+
+    /// The reply ended: queued messages are next in line now.
+    private func promoteQueuedReceipts() {
+        for r in receipts where r.mode == "queue" && r.stage == nil {
+            Task { await markReceipt(wireID: r.wireID, stage: "next", at: nil) }
+        }
     }
 
     private func recordReceipt(_ receipt: ControlReceipt) async {
@@ -1305,52 +1483,23 @@ final class ChatModel {
     }
 
     /// Remove a waiting message. `toComposer` puts its words back in the message box.
+    /// Move back / Remove: instant on the phone. If the message may already be on the Mac, a durable "take it back"
+    /// follows (same retry path as archives: sent now, or as soon as the Mac answers, even after an app restart).
     func removeOutgoing(_ id: UUID, toComposer: Bool) async {
         guard let item = outgoing.first(where: { $0.id == id }) else { return }
-        if let adm = item.admission, !adm.hasPrefix("turn:"), let sid = sessionId {
-            do { _ = try await api.queueAction(profile: profile, session: sid, admission: adm, action: "cancel") }
-            catch APIError.http(409, let message) {
-                error = message
-                await refreshQueue()
-                return
-            } catch APIError.http(404, _) {
-            } catch {
-                self.error = "Couldn't reach your Mac to remove it. Try again when you're connected."
-                return
-            }
-        } else if item.onMac {
-            error = "This Mac's bridge can't remove queued messages yet. It will send after this reply."
-            return
-        } else if item.attempts > 0, item.mode == "queue" {
-            // It may have reached the Mac with the reply lost. Ask with the same ID; if it's there, cancel it there.
-            guard isRunning, let run = runId else {
-                // A reply is starting but has no id yet: ask again in a moment.
-                if isRunning {
-                    error = "It may already be on your Mac. Remove it again in a moment."
-                    return
-                }
-                // Nothing is running, so nothing can be waiting behind a reply on the Mac. Safe to drop here.
-                outgoing.removeAll { $0.id == id }
-                await persistOutgoing()
-                if toComposer { returnToComposer(item) }
-                return
-            }
-            do {
-                let (_, admission) = try await api.followUpReceipt(run: run, mode: "queue", text: item.text, submission: item.id,
-                                                                   choice: item.choice ?? .botDefault, attachments: item.attachments ?? [])
-                if let admission, let sid = sessionId {
-                    _ = try? await api.queueAction(profile: profile, session: sid, admission: admission, action: "cancel")
-                }
-            } catch APIError.http(let code, _) where code == 404 || code == 409 {
-            } catch {
-                self.error = "It may already be on your Mac. Remove it again once you're connected."
-                return
+        outgoing.removeAll { $0.id == id }
+        if toComposer { returnToComposer(item) }
+        await persistOutgoing()
+        let mayBeOnMac = item.admission != nil || item.attempts > 0
+        if mayBeOnMac, let sid = sessionId, let account = api.accountID {
+            let admission = item.admission.flatMap { $0.hasPrefix("turn:") ? nil : $0 }
+            let action = QueuedAction(account: account, kind: .withdraw, profile: profile, session: sid,
+                                      admission: admission, submission: item.id.uuidString)
+            Task {
+                if case .failed(let e) = await ActionQueue.shared.perform(action) { self.error = e.localizedDescription }
+                await self.refreshQueue()
             }
         }
-        outgoing.removeAll { $0.id == id }
-        await persistOutgoing()
-        if toComposer { returnToComposer(item) }
-        await refreshQueue()
     }
 
     private func returnToComposer(_ item: Outgoing) {
@@ -1364,7 +1513,22 @@ final class ChatModel {
         guard let item = outgoing.first(where: { $0.id == id }) else { return }
         if item.onMac, let adm = item.admission, !adm.hasPrefix("turn:"), let sid = sessionId {
             guard allows(.steer, item) else {
-                error = Self.filesLocked
+                // Hermes won't convert this admission (files, or its controls say no): take it back off the Mac's
+                // queue and send the same words and files as a guide. Shown as "Guiding…" right away.
+                do {
+                    _ = try await api.queueAction(profile: profile, session: sid, admission: adm, action: "cancel")
+                } catch APIError.http(409, _) {
+                    error = "Hermes already started that message, so it can't become guidance now."
+                    await refreshQueue()
+                    return
+                } catch APIError.http(404, _) {
+                } catch {
+                    self.error = "Couldn't reach your Mac to move it. Try again in a moment."
+                    return
+                }
+                update(id) { $0.mode = "steer"; $0.note = nil; $0.admission = nil; $0.attempts = 0 }
+                await persistOutgoing()
+                await pump()
                 return
             }
             do {
@@ -1612,7 +1776,7 @@ final class ChatModel {
         case "tool.started", "tool.start":
             let name = ev.string("tool_name") ?? ev.string("tool") ?? ev.string("name") ?? "tool"
             let activity = ToolActivity(id: "live-\(UUID().uuidString)", name: name, preview: ev.string("preview") ?? "",
-                                        result: "", state: "running")
+                                        result: "", state: "running", started: Date().timeIntervalSince1970)
             closeStreamingBubble()
             if let i = liveToolGroup, items.indices.contains(i), items[i].kind == .tools {
                 items[i].tools.append(name)
@@ -1622,12 +1786,14 @@ final class ChatModel {
                 items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name], activities: [activity]))
             }
             status = "Using \(name.replacingOccurrences(of: "_", with: " "))…"
+            activityTick &+= 1
         case "tool.completed":
             let name = ev.string("tool_name") ?? ev.string("name") ?? ""
             let ok = ev.raw["ok"] as? Bool ?? true
             if let i = liveToolGroup, items.indices.contains(i),
                let idx = items[i].activities.lastIndex(where: { $0.state == "running" && (name.isEmpty || $0.name == name) }) {
                 items[i].activities[idx].state = ok ? "done" : "failed"
+                items[i].activities[idx].ended = Date().timeIntervalSince1970
                 if let preview = ev.string("preview"), !preview.isEmpty, items[i].activities[idx].result.isEmpty {
                     items[i].activities[idx].result = preview
                 }
@@ -1647,24 +1813,32 @@ final class ChatModel {
                 items[i].contextNote = summary
             }
         case "reasoning.available", "reasoning.delta":
-            if streamingIndex == nil && status != "Thinking…" { status = "Thinking…" }
+            if let d = ev.string("delta"), !d.isEmpty { appendThinking(d) }
+            if streamingIndex == nil && status != "Thinking…" { status = "Thinking…"; activityTick &+= 1 }
         case "status":
+            if let t = ev.string("text"), !t.isEmpty { appendThinking(t) }
             if streamingIndex == nil { status = "Thinking…" }
         case "notice":
             items.append(ChatItem(id: "n-\(UUID().uuidString)", kind: .notice, text: ev.string("text") ?? ""))
         case "clarify.request":
-            guard let id = ev.string("request_id"), question?.id != id, !answeredQuestions.contains(id) else { break }
-            question = ClarifyRequest(id: id, runId: runId ?? "", generation: ev.raw["execution_generation"] as? Int,
+            guard let id = ev.string("request_id"), !questions.contains(where: { $0.id == id }),
+                  !answeredQuestions.contains(id) else { break }
+            questions.append(ClarifyRequest(id: id, runId: runId ?? "", generation: ev.raw["execution_generation"] as? Int,
                                       question: ev.string("question") ?? "Hermes has a question.",
                                       choices: (ev.raw["choices"] as? [String]) ?? [],
-                                      multiSelect: ev.raw["multi_select"] as? Bool ?? false)
+                                      multiSelect: ev.raw["multi_select"] as? Bool ?? false))
             status = "Waiting for your answer"
             notify(.approval, detail: Headline.of(ev.string("question") ?? ""))
+        case "steer.picked_up", "steer.carried":
+            guard let sid = ev.string("submission_id") else { break }
+            let read = ev.name == "steer.picked_up"
+            let at = (ev.raw["at"] as? Double).map(Date.init(timeIntervalSince1970:))
+            Task { await markReceipt(wireID: sid, stage: read ? "read" : "next", at: at) }
         case "clarify.resolved":
-            if let id = ev.string("request_id"), question?.id == id {
+            if let id = ev.string("request_id"), questions.contains(where: { $0.id == id }) {
                 answeredQuestions.insert(id)
-                question = nil
-                if status == "Waiting for your answer" { status = "Working…" }
+                questions.removeAll { $0.id == id }
+                if questions.isEmpty, status == "Waiting for your answer" { status = "Working…" }
             }
         case "approval.request":
             let id = ev.string("request_id") ?? UUID().uuidString
@@ -1738,7 +1912,8 @@ final class ChatModel {
             } catch { self.error = "Could not clear this phone’s receipt. The same submission is safe to check again." }
         }
         confirmedPrimary = false
-        question = nil
+        questions = []
+        promoteQueuedReceipts()
         closeStreamingBubble()
         isRunning = false
         status = nil

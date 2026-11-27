@@ -337,6 +337,10 @@ class Turn:
         self.admission = None
         self.retired = False
         self.clarify = {}  # pending clarify prompt id -> execution generation
+        # Guidance Hermes accepted but hasn't read yet: id -> (match key, accepted at). Hermes reads a steer at
+        # its next pause (between tool calls) and writes it to the transcript as a user row of kind "steer".
+        self.unread_steers = {}
+        self.steer_checked = 0.0
         self.generation = None
         self.client = None
         self.steer_receipts = {}
@@ -429,8 +433,10 @@ class Turn:
             self.cond.notify_all()
 
     def summary(self):
+        waiting = "question" if self.clarify else "approval" if self._approval_frames else None
         return {"turn_id": self.id, "profile": self.profile, "session_id": self.sid, "done": self.done,
                 "age": int(time.time() - self.started), "events": self._head,
+                "started_at": self.started, "ended_at": self.ended or None, "waiting": None if self.done else waiting,
                 "attachments": [{"mime": m["mime"], "status": "staged" if self.admission is None else "submitted"}
                                 for m in self.media]}
 
@@ -786,12 +792,15 @@ async def _drive_connection(turn: Turn):
             t = p.get("type")
             if t == "message.delta":
                 turn.push("message.delta", delta=pl.get("text") or pl.get("delta") or "")
+                if turn.unread_steers:
+                    await asyncio.to_thread(check_steers, turn)
             elif t == "reasoning.delta":
                 turn.push("reasoning.delta", delta=pl.get("text") or "")
             elif t == "thinking.delta" and pl.get("text"):
                 turn.push("status", text=pl.get("text"))
             elif t in ("tool.start", "tool.started"):
                 turn.push("tool.started", tool_name=_tool_name(pl), preview=str(pl.get("preview") or "")[:200])
+                await asyncio.to_thread(check_steers, turn)  # a new step began: guidance sent earlier was read
             elif t in ("tool.complete", "tool.completed"):
                 preview = pl.get("preview") if isinstance(pl.get("preview"), str) else ""
                 turn.push("tool.completed", tool_name=_tool_name(pl),
@@ -835,6 +844,12 @@ async def _drive_connection(turn: Turn):
             elif t == "message.complete":
                 if not pl.get("admission_id") and not pl.get("outcome") and not pl.get("status"):
                     continue  # an interim summary, not this turn's end
+                if turn.unread_steers:
+                    await asyncio.to_thread(check_steers, turn, True)
+                    # The reply ended before a pause: Hermes sends leftover guidance as the next message.
+                    for sid in list(turn.unread_steers):
+                        turn.push("steer.carried", submission_id=sid)
+                    turn.unread_steers.clear()
                 await _capture(turn, {**pl, "admission_id": admission}, _outcome(pl))
                 _settle(turn, pl)
                 return
@@ -1171,7 +1186,9 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
                 raise TurnError("Hermes declined this instruction. You can send it as the next turn.", 409)
             # Staged files stay on disk: the steered agent reads them by path later in this turn.
             turn.steered = True  # the answer may now blend a second instruction: never captured as project output
-            return {"status": "steer_accepted", "execution_generation": generation, "attachments": len(staged)}
+            turn.unread_steers[steer_id or uuid.uuid4().hex] = (steer_key(text), time.time())
+            return {"status": "steer_accepted", "execution_generation": generation, "attachments": len(staged),
+                    "picked_up": False}
 
         if steer_id is None:
             return await steer(turn.generation)
@@ -1239,6 +1256,43 @@ def reload_skills(home, profile):
         async with connect(home) as client:
             return await _rpc(client, "skills.reload", profile=profile)
     return run(go(), timeout=30)
+
+
+def steer_key(text):
+    """What a steer row is matched by: its first words, spacing and case ignored (Hermes wraps the text)."""
+    return " ".join(str(text or "").lower().split())[:120]
+
+
+def check_steers(turn, force=False):
+    """Tell the phone which guidance Hermes has read. One small indexed query on this chat's rows, only while
+    something is unread, at most every 1.5 s, and only when the stream shows Hermes moving (no idle polling)."""
+    if not turn.unread_steers:
+        return
+    now = time.time()
+    if not force and now - turn.steer_checked < 1.5:
+        return
+    turn.steer_checked = now
+    since = min(at for _, at in turn.unread_steers.values()) - 5
+    sids = {s for s in (turn.sid, turn.canonical_sid) if s}
+    try:
+        uri = (Path(turn.home) / "state.db").resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.2)) as db:
+            # The chat and any continuation it was compressed into since the steer.
+            kids = [r[0] for r in db.execute(
+                "SELECT id FROM sessions WHERE parent_session_id IN (%s) AND started_at >= ?" % ",".join("?" * len(sids)),
+                (*sids, since))]
+            ids = list(sids) + kids
+            rows = db.execute(
+                "SELECT content, timestamp FROM messages WHERE session_id IN (%s) AND role = 'user' "
+                "AND display_kind = 'steer' AND timestamp >= ?" % ",".join("?" * len(ids)), (*ids, since)).fetchall()
+    except (OSError, ValueError, sqlite3.Error):
+        return
+    seen = [(steer_key(c), ts) for c, ts in rows]
+    for sid, (key, at) in list(turn.unread_steers.items()):
+        hit = next((ts for body, ts in seen if key and key in body), None)
+        if hit is not None:
+            del turn.unread_steers[sid]
+            turn.push("steer.picked_up", submission_id=sid, at=hit)
 
 
 def follow_up(turn, mode, text, submission=None, choice=None, attachments=None):
@@ -1324,7 +1378,30 @@ def _followers(profile, sid, admission):
                 and t.admission == admission and not t.done]
 
 
+def admission_for_submission(home, submission):
+    """(admission id, status) for a phone submission id, from Hermes's own admission journal, or (None, None)."""
+    try:
+        key = uuid.UUID(str(submission)).hex
+        uri = (Path(home) / "state.db").resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as db:
+            row = db.execute("SELECT admission_id, status FROM session_admissions WHERE request_id = ? "
+                             "ORDER BY seq DESC LIMIT 1", (key,)).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    except (ValueError, OSError, sqlite3.Error):
+        return None, None
+
+
 async def _queue_action(home, profile, sid, admission, action, text=None, submission=None):
+    if admission.startswith("sub-"):
+        # The phone took back a message it isn't sure reached the Mac: find it by the phone's own id.
+        found, status = await asyncio.to_thread(admission_for_submission, home, admission[4:])
+        if found is None:
+            if action == "cancel":  # never arrived: nothing to take back
+                return {"status": "absent", "admission_id": None, "queue": []}
+            raise TurnError(_QUEUE_REFUSALS["not_found"][1], 404)
+        if status not in (None, "queued", "pending", "unknown") and action == "cancel":
+            raise TurnError(_QUEUE_REFUSALS["admission_started"][1], 409)
+        admission = found
     async with connect(home) as c:
         snapshot = await _resume(c, sid)
         canonical = snapshot.get("session_id") or sid

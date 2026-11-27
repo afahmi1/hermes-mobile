@@ -43,7 +43,8 @@ struct HermesMobileApp: App {
     }
 
     /// Everything that changes how colors resolve. The root rebuilds once when it changes.
-    private var look: String { [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw].joined(separator: "|") }
+    @AppStorage(Thermocline.Palette.darkCanvasKey) private var darkCanvas = "black"
+    private var look: String { [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw, darkCanvas].joined(separator: "|") }
 
     var body: some Scene {
         WindowGroup {
@@ -84,9 +85,16 @@ struct HermesMobileApp: App {
                     if app.open(url) { selectedTab = 0 }
                 }
                 .onChange(of: app.gatewaySession) { _, _ in PushRegistration.shared.sync() }
+                .onAppear { ReplyNotifier.shared.appRef = app }
                 .onChange(of: ReplyNotifier.shared.destination, initial: true) { _, destination in
                     guard let destination else { return }
                     if destination.open(in: app) { selectedTab = 0 }
+                    // A reply typed into the notification: queue it in that chat. It sends when the Mac answers.
+                    if let text = ReplyNotifier.shared.pendingReply, let ref = app.inboxPath.last {
+                        let chat = app.chat(for: ref)
+                        Task { _ = await chat.enqueue(text, mode: "queue", attachments: []) }
+                        ReplyNotifier.shared.pendingReply = nil
+                    }
                     ReplyNotifier.shared.destination = nil
                 }
         }
@@ -95,7 +103,8 @@ struct HermesMobileApp: App {
                 backgroundedAt = Date()
                 // Ask iOS for a little time so a live reply or an unsent message can finish going out.
                 ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns || app.hasUnsentMessages)
-                if app.hasLiveRuns { PushRegistration.shared.presence(away: true) }
+                // Always: a run can start after the phone goes away (a queued message, a scheduled retry).
+                PushRegistration.shared.presence(away: true)
             }
             if now == .active {
                 ReplyNotifier.shared.returned()

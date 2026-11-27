@@ -1,10 +1,12 @@
 import _isolation  # noqa: F401  (must precede any bridge import; see Tests/_isolation.py)
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Bridge"))
 import bridge_titles as t
 
 CHAT = [("user", "first ask " + "x" * 400), ("assistant", "a1"), ("user", "second"),

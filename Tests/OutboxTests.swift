@@ -15,9 +15,9 @@ import CryptoKit
         precondition(o.phase == .retrying)
         let held = o.edited("second edit")
         precondition(held.text == "first, fixed" && held.phase == .editPending("second edit"))
-        // The Mac confirms it: files leave the phone.
+        // The Mac confirms it: files stay with it until it leaves the tray, so "Move back to message box" brings them back.
         o = o.accepted(admission: "adm_1", files: 1)
-        precondition(o.phase == .onMac("adm_1") && o.attachments == nil && o.files == 1)
+        precondition(o.phase == .onMac("adm_1") && o.attachments?.count == 1 && o.files == 1)
         // An edit on the Mac applies under the new admission.
         o = o.edited("on mac edit")
         precondition(o.phase == .editPending("on mac edit"))

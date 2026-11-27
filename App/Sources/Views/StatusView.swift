@@ -10,6 +10,7 @@ struct StatusView: View {
     @State private var expanded: Set<String> = []
     @State private var gatewayOpen: Bool?
     @State private var tokensOpen = false
+    @AppStorage(StatusPulse.key) private var pulse = true
     @State private var restartAllowed = false
     @Environment(\.dynamicTypeSize) private var typeSize
     #if DEBUG
@@ -233,6 +234,7 @@ struct StatusView: View {
             }
             .padding(.vertical, 6)
             .accessibilityElement(children: .combine)
+            if pulse { HeartbeatStrip(beats: app.beats) }
             let tokens = J["tokens_24h"].array.reduce(0) { $0 + ($1["prompt"].int ?? 0) + ($1["completion"].int ?? 0) }
             let active = jobs.filter { !$0["paused"].bool }.count
             let stats: [(String, String)] = [
@@ -646,6 +648,53 @@ private struct JobRow: View {
     }
 }
 
+enum StatusPulse { static let key = "hm.statusPulse" }
+
+/// The last 60 checks of this gateway, newest on the right: a dot-matrix column per check. Height is how fast
+/// it answered; a gap is a miss. The one bright thing on the page.
+struct HeartbeatStrip: View {
+    let beats: [AppModel.Beat]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Canvas { ctx, box in
+                let cols = 60, rows = 5
+                let cell = box.width / CGFloat(cols)
+                let dot = min(cell * 0.62, box.height / CGFloat(rows) * 0.62)
+                let pad = cols - beats.count
+                for c in 0..<cols {
+                    let b = c >= pad ? beats[c - pad] : nil
+                    // Fast answers fill more of the column: <150 ms = 5 dots, >2 s = 1.
+                    let lit: Int = {
+                        guard let b, b.ok, let ms = b.ms else { return 0 }
+                        return ms < 150 ? 5 : ms < 400 ? 4 : ms < 900 ? 3 : ms < 2000 ? 2 : 1
+                    }()
+                    for r in 0..<rows {
+                        let on = rows - r <= lit
+                        let color: Color = b == nil ? HMDesign.separator.opacity(0.5)
+                            : b!.ok ? (on ? HMDesign.accent : HMDesign.separator) : (r == rows - 1 ? Color.red.opacity(0.8) : HMDesign.separator)
+                        let x = CGFloat(c) * cell + (cell - dot) / 2
+                        let y = CGFloat(r) * (box.height / CGFloat(rows)) + (box.height / CGFloat(rows) - dot) / 2
+                        ctx.fill(Path(roundedRect: CGRect(x: x, y: y, width: dot, height: dot), cornerRadius: dot * 0.25),
+                                 with: .color(on && c == cols - 1 ? HMDesign.ink : color))
+                    }
+                }
+            }
+            .frame(height: 26)
+            HStack {
+                Text(beats.first.map { "\($0.at, style: .relative)" } ?? "Waiting for checks").monospacedDigit()
+                Spacer()
+                if let last = beats.last {
+                    Text(last.ms.map { "\($0) ms" } ?? "no answer").monospacedDigit()
+                }
+            }
+            .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Connection over the last \(beats.count) checks, \(beats.filter { !$0.ok }.count) missed")
+    }
+}
 
 // MARK: - Restart
 

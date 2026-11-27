@@ -34,7 +34,28 @@ _ARG_KEYS = ("command", "code", "query", "search_term", "path", "file", "filepat
              "name", "skill", "goal", "url", "prompt")
 _TASK = re.compile(r"^---\s*([✓✗⚠])\s*TASK\s+\d+/\d+:?\s*(.*?)\s*\(status=([a-z_]+)", re.M)
 _IMAGE_AT = re.compile(r"\[Image attached at:\s*([^\]\n]+?)\s*\]")
-_MEDIA = re.compile(r"(?m)^[ \t]*MEDIA:\s*(\"[^\"]+\"|\S+)\s*$")
+# Hermes's own MEDIA tag grammar when it's importable (paths with spaces, `**MEDIA:/x.png**`, quotes, Windows
+# drives); otherwise a close copy. The old one-token pattern dropped every path with a space ("3D Printing/…").
+_MEDIA_FALLBACK = re.compile(
+    r"""[`"'*_]{0,3}MEDIA:\s*(`[^`\n]+?`|"[^"\n]+?"|'[^'\n]+?'|(?:~/|/|[A-Za-z]:[/\\])[^\n]*?\."""
+    r"""(?:png|jpe?g|gif|webp|heic|pdf|mp4|mov|m4a|mp3|wav|txt|md|csv|json|3mf|stl|zip|html?))(?=[\s`"'*_,;:)\]]|MEDIA:|$)[`"'*_]{0,3}""",
+    re.IGNORECASE)
+try:
+    from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE as _HERMES_MEDIA
+except Exception:  # an older Hermes, or the bridge's tests without Hermes on the path
+    _HERMES_MEDIA = None
+_MEDIA = _HERMES_MEDIA or _MEDIA_FALLBACK
+
+
+def _media_path(m):
+    raw = m.groupdict().get("path") if m.re.groupindex else None
+    raw = raw if raw is not None else m.group(1)
+    return (raw or "").strip().strip("`\"'").strip()
+
+
+# Where an image sat in a reply. Private-use, never typed; replaced by `content_parts` before the row leaves.
+_ANCHOR, _ANCHOR_END = "\ue000", "\ue001"
+_ANCHOR_RE = re.compile("\ue000(\\d+)\ue001")
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\((?:file://)?(/[^)\s]+)\)")
 # The bridge's own hand-off notes (bridge_turns._media_notes): files, clips, audio, and images sent with a steer.
 # One line each, ending in a JSON-quoted path. The person never typed them, so the whole note goes.
@@ -472,25 +493,33 @@ def _json_path(raw):
 def _marker_paths(text):
     """Every path an attachment marker in this text names (what _refs would offer), in order."""
     text = text or ""
-    paths = _IMAGE_AT.findall(text) + _MEDIA.findall(text) + _MD_IMAGE.findall(text)
+    paths = _IMAGE_AT.findall(text) + [_media_path(m) for m in _MEDIA.finditer(text)] + _MD_IMAGE.findall(text)
     paths += [p for p in (_json_path(raw) for _, raw in _BRIDGE_NOTE.findall(text)) if p]
+    paths += mentioned_images(text)
     return paths + _AUDIO_NOTE.findall(text) + _PASTE_NOTE.findall(text)
 
 
-def _refs(text, roots):
-    """Attachment markers in transcript text. Only a file that resolves inside the roots is removed."""
+def _refs(text, roots, bare=False):
+    """Attachment markers in transcript text. Only a file that resolves inside the roots is removed.
+
+    `bare` (Hermes's own replies): an image named by a plain path ("~/Runs/plate.png", backticked or not) also
+    shows, right under the line that names it; the path text stays. Inside a code block or a table the image
+    waits until the block ends, so neither breaks."""
     found = []
     seen = set()
 
-    def take(raw, keep=None, gone="", label=None):
+    def take(raw, keep=None, gone="", label=None, anchor=False):
         # `keep` is the text a marker leaves when its file can't be offered; `gone` what it leaves when it can.
+        # `anchor`: Hermes put this file at a spot in its reply; remember the spot so the phone shows it there.
         path = safe_file(raw, roots) if raw else None
         if path is None:
             return raw if keep is None else keep
         if path in seen:
             return gone
         seen.add(path)
-        if len(found) < 6:
+        if len(found) < 12:
+            if anchor:
+                gone = "\n%s%d%s\n" % (_ANCHOR, len(found), _ANCHOR_END)
             shown = label.strip() if isinstance(label, str) and label.strip() and "/" not in label and "\\" not in label else path.name
             if Path(shown).suffix.lower() != path.suffix.lower():
                 # The phone opens it by this name, so the extension must be the file's (a HEIC staged as JPEG).
@@ -505,15 +534,49 @@ def _refs(text, roots):
 
     cleaned = _INLINE_DATA_PART.sub("", text or "")
     cleaned = _IMAGE_AT.sub(lambda m: take(m.group(1)), cleaned)
-    cleaned = _MEDIA.sub(lambda m: take(m.group(1)), cleaned)
-    cleaned = _MD_IMAGE.sub(lambda m: take(m.group(1)), cleaned)
+    cleaned = _MEDIA.sub(lambda m: take(_media_path(m), keep=m.group(0), anchor=True), cleaned)
+    cleaned = _MD_IMAGE.sub(lambda m: take(m.group(1), keep=m.group(0), anchor=True), cleaned)
     # A hand-off note is never the person's words: it goes whether or not the file is still there.
     cleaned = _BRIDGE_NOTE.sub(lambda m: take(_json_path(m.group(2)), keep=gone_note(m),
                                               label=_json_path(m.group(1)) if m.group(1) else None), cleaned)
     cleaned = _AUDIO_NOTE.sub(lambda m: take(m.group(1).strip(), keep=""), cleaned)
     cleaned = _PASTE_NOTE.sub(lambda m: take(m.group(1).strip(), keep=m.group(0), gone=m.group(0)), cleaned)
+    if bare:
+        out, waiting, fenced = [], [], False
+        for line in cleaned.split("\n"):
+            out.append(line)
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+            for p in mentioned_images(line):
+                if Path(p).suffix.lower() in IMAGE_EXT:
+                    before = len(found)
+                    mark = take(p, keep="", anchor=True)
+                    if len(found) > before:
+                        waiting.append(mark.strip("\n"))
+            if waiting and not fenced and not line.lstrip().startswith("|"):
+                out += waiting
+                waiting = []
+        cleaned = "\n".join(out + waiting)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, found
+
+
+def content_parts(shown):
+    """Split a reply at its image anchors: [{"text"}, {"media": 0}, {"text"}, …], and the text without anchors.
+    Newer phones draw each image where Hermes put it; older ones read `content` and show images below."""
+    if _ANCHOR not in shown:
+        return None, shown
+    parts, last = [], 0
+    for m in _ANCHOR_RE.finditer(shown):
+        piece = shown[last:m.start()].strip("\n")
+        if piece.strip():
+            parts.append({"text": piece})
+        parts.append({"media": int(m.group(1))})
+        last = m.end()
+    tail = shown[last:].strip("\n")
+    if tail.strip():
+        parts.append({"text": tail})
+    return parts, re.sub(r"\n{3,}", "\n\n", _ANCHOR_RE.sub("", shown)).strip()
 
 
 def file_for_digest(texts, digest, roots, assistant_roots=()):
@@ -535,6 +598,19 @@ def file_for_digest(texts, digest, roots, assistant_roots=()):
 
 
 _BARE_PATH = re.compile(r"(?<![\w.~/])((?:~|/(?:Users|tmp|private|var|opt|Volumes|home))/[^\s`'\"<>()\[\]{}|]+)")
+
+
+_BARE_IMAGE = re.compile(r"(?<![\w.~/])((?:~|/(?:Users|tmp|private|var|opt|Volumes|home|mnt))/[^\n`'\"<>|*]*?"
+                         r"\.(?:png|jpe?g|gif|webp|heic|heif|bmp|tiff?))(?![\w])", re.I)
+
+
+def mentioned_images(text):
+    """Image paths written in a reply, spaces allowed ("~/3D Printing/Runs/Plate B.png"), ~ expanded."""
+    out = []
+    for m in _BARE_IMAGE.finditer(text or ""):
+        p = m.group(1)
+        out.append(str(Path.home()) + p[1:] if p.startswith("~") else p)
+    return out
 
 
 def mentioned_paths(text):
@@ -577,10 +653,13 @@ def project_timeline_message(message, roots=None, assistant_roots=()):
     if role == "assistant":
         roots += list(assistant_roots)
     body = content_text(message.get("content"))
-    shown, media = _refs(body, roots)
+    shown, media = _refs(body, roots, bare=role == "assistant")
+    parts, shown = content_parts(shown)
     row = {k: message[k] for k in ("id", "timestamp") if k in message}
     if media:
         row["media"] = media
+        if parts and role == "assistant":
+            row["content_parts"] = parts
     wall = kind in ("async_delegation_complete", "process_complete") or _is_wall(shown)
     if wall:
         title, detail, failed = _activity(kind, body)

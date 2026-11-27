@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(ThinkingOrbs)
+import ThinkingOrbs
+#endif
 import UIKit
 
 /// Shared values for the native SwiftUI surfaces. Colors come from the active theme (see HMThemeSpec).
@@ -165,11 +168,17 @@ struct HMPalette {
     /// True black for OLED, with a calmer accent than the old neon orange.
     static let oled = HMPalette(canvas: 0x000000, surface: 0x141414, raised: 0x1C1C1E, bar: 0x0B0B0B, separator: 0x2A2A2A,
                                 ink: 0xF2F2F2, accent: 0xF0A24B, success: 0x7FBF7A, warning: 0xE0B25E)
+    /// Terminal phosphor: near-black green-gray, one green (after @craigweiss's dashboards).
+    static let phosphor = HMPalette(canvas: 0x0A0B0A, surface: 0x141614, raised: 0x1B1E1B, bar: 0x0F110F, separator: 0x242824,
+                                    ink: 0xE6E8E6, accent: 0x3EE59A, success: 0x3EE59A, warning: 0xE0C25E)
+    /// Ballpoint on cream: the ink is the text and the accent (after @pankajstwt).
+    static let ink = HMPalette(canvas: 0xEFE9DE, surface: 0xE6DFD2, raised: 0xF7F2E8, bar: 0xEAE3D6, separator: 0xD3CCC0,
+                               ink: 0x2B3E9C, accent: 0x2B3E9C, success: 0x3F7A4A, warning: 0xA8701C)
 }
 
 /// Classic's looks. Each one carries its own mode, as it did before Thermocline.
 enum HMThemeChoice: String, CaseIterable, Identifiable {
-    case native, system, ash, paper, oled
+    case native, system, ash, paper, oled, phosphor, ink
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -178,6 +187,8 @@ enum HMThemeChoice: String, CaseIterable, Identifiable {
         case .ash: "Ash"
         case .paper: "Paper"
         case .oled: "Black"
+        case .phosphor: "Phosphor"
+        case .ink: "Ink"
         }
     }
     var shortTitle: String { self == .system ? "Auto" : title }
@@ -188,13 +199,15 @@ enum HMThemeChoice: String, CaseIterable, Identifiable {
         case .ash: "Soft dark gray, easy on the eyes"
         case .paper: "Warm light"
         case .oled: "True black for OLED screens"
+        case .phosphor: "Terminal green on near black"
+        case .ink: "Blue ballpoint on cream"
         }
     }
     var scheme: ColorScheme? {
         switch self {
         case .native, .system: nil
-        case .ash, .oled: .dark
-        case .paper: .light
+        case .ash, .oled, .phosphor: .dark
+        case .paper, .ink: .light
         }
     }
 }
@@ -248,6 +261,8 @@ enum HMTheme {
         case .ash: .ash
         case .paper: .paper
         case .oled: .oled
+        case .phosphor: .phosphor
+        case .ink: .ink
         }
     }
 
@@ -370,10 +385,12 @@ struct BotAvatar: View {
     var body: some View {
         ZStack {
             if HMTheme.isThermocline {
-                // Quiet by design: a well with the initials. A hue per bot would put five accents in one list.
+                // Thermocline stays quiet but still tells bots apart: the well takes a low wash of the bot's own hue
+                // and a ring of it, so five bots read as five, not five identical greys.
                 Circle().fill(Thermocline.surface3)
-                Circle().strokeBorder(Thermocline.lineStrong, lineWidth: 0.5)
-                Text(initials).font(.system(size: size * 0.36, weight: .semibold)).tracking(0.4).foregroundStyle(Thermocline.text2)
+                Circle().fill(Bot.color(for: id).opacity(0.28))
+                Circle().strokeBorder(Bot.color(for: id).opacity(0.85), lineWidth: 1)
+                Text(initials).font(.system(size: size * 0.36, weight: .semibold)).tracking(0.4).foregroundStyle(Thermocline.text)
             } else {
                 Circle().fill(Bot.color(for: id))
                 Text(initials).font(.system(size: size * 0.4, weight: .semibold, design: .rounded)).foregroundStyle(.white)
@@ -933,34 +950,29 @@ struct HMSendGlyph: View {
 
 // MARK: - Thinking orb
 
-/// A small living orb for "Hermes is thinking". Thermocline: the live dot in finch-beak red, slow pulse.
-/// Classic: the accent orb. Both respect Reduce Motion.
+/// The original colorful orb: a blurred spinning gradient with a moving highlight. Always in its own
+/// Classic colors, in every theme (Thermocline used to swap it for a plain dot). Respects Reduce Motion.
 struct ThinkingOrb: View {
     var size: CGFloat = 18
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let accent = HMThemeSpec.classic.accent, success = HMThemeSpec.classic.success
         TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
-            if HMTheme.isThermocline {
-                Circle().fill(HMDesign.danger).frame(width: size * 0.45, height: size * 0.45)
-                    .opacity(reduceMotion ? 1 : 0.6 + 0.4 * sin(t * 2.2))
-                    .frame(width: size, height: size)
-            } else {
-                ZStack {
-                    Circle()
-                        .fill(AngularGradient(colors: [HMDesign.accent, HMDesign.accent.opacity(0.35), HMDesign.success.opacity(0.7),
-                                                       HMDesign.accent], center: .center, angle: .degrees(t * 90)))
-                        .blur(radius: size * 0.12)
-                    Circle()
-                        .fill(RadialGradient(colors: [.white.opacity(0.55), .clear],
-                                             center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3), y: 0.3 + 0.1 * cos(t * 1.1)),
-                                             startRadius: 0, endRadius: size * 0.5))
-                }
-                .frame(width: size, height: size)
-                .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
-                .shadow(color: HMDesign.accent.opacity(0.45), radius: size * 0.35)
+            ZStack {
+                Circle()
+                    .fill(AngularGradient(colors: [accent, accent.opacity(0.35), success.opacity(0.7), accent],
+                                          center: .center, angle: .degrees(t * 90)))
+                    .blur(radius: size * 0.12)
+                Circle()
+                    .fill(RadialGradient(colors: [.white.opacity(0.55), .clear],
+                                         center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3), y: 0.3 + 0.1 * cos(t * 1.1)),
+                                         startRadius: 0, endRadius: size * 0.5))
             }
+            .frame(width: size, height: size)
+            .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
+            .shadow(color: accent.opacity(0.45), radius: size * 0.35)
         }
         .accessibilityHidden(true)
     }
@@ -970,32 +982,67 @@ struct ThinkingOrb: View {
 
 /// How "Hermes is working" looks. Crisp pixels by default: they stay sharp at 16 pt, where a blurred orb smears.
 enum ThinkingStyle: String, CaseIterable, Identifiable {
-    case matrix, sprite, braille, orb
+    case orbs, matrix, sprite, braille, orb
     static let key = "hm.thinking"
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .orbs: "Live orbs"
         case .matrix: "Dot matrix"
         case .sprite: "Pixel flame"
         case .braille: "Terminal"
-        case .orb: "Orb"
+        case .orb: "Color orb"
         }
     }
 }
 
 struct ThinkingIndicator: View {
     var size: CGFloat = 16
-    @AppStorage(ThinkingStyle.key) private var raw = ThinkingStyle.matrix.rawValue
+    @AppStorage(ThinkingStyle.key) private var raw = ThinkingStyle.orbs.rawValue
     var style: ThinkingStyle? = nil
+    /// What Hermes is doing ("Using web_search…", "Thinking…", "Writing…"): live orbs change shape with it.
+    var activity: String = ""
 
     var body: some View {
-        switch style ?? ThinkingStyle(rawValue: raw) ?? .matrix {
+        switch style ?? ThinkingStyle(rawValue: raw) ?? .orbs {
+        case .orbs: LiveOrb(size: size, activity: activity)
         case .matrix: DotMatrixLoader(size: size)
         case .sprite: PixelFlame(size: size + 4)
         case .braille: BrailleSpinner(size: size)
         case .orb: ThinkingOrb(size: size)
         }
     }
+}
+
+/// haplollc/ThinkingOrbs (MIT): a dotted 3D orb whose form says what Hermes is doing.
+struct LiveOrb: View {
+    var size: CGFloat
+    var activity: String
+
+    var body: some View {
+        #if canImport(ThinkingOrbs)
+        ThinkingOrbs.ThinkingOrb(Self.design(for: activity), diameter: max(size + 4, 20))
+            .id(Self.design(for: activity))
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.25), value: Self.design(for: activity))
+        #else
+        DotMatrixLoader(size: size)
+        #endif
+    }
+
+    #if canImport(ThinkingOrbs)
+    static func design(for activity: String) -> OrbDesign {
+        let a = activity.lowercased()
+        if a.contains("search") || a.contains("extract") || a.contains("browse") || a.contains("web") || a.contains("read") { return .searching }
+        if a.contains("delegat") || a.contains("subagent") || a.contains("plan") || a.contains("todo") { return .weaving }
+        if a.contains("terminal") || a.contains("execute") || a.contains("mcp") || a.contains("call") || a.contains("using") { return .connecting }
+        if a.contains("transcri") || a.contains("audio") || a.contains("voice") { return .listening }
+        if a.contains("image") || a.contains("design") || a.contains("render") { return .shaping }
+        if a.contains("writ") || a.contains("compos") || a.contains("reply") { return .composing }
+        if a.contains("reason") || a.contains("solv") { return .solving }
+        return .breathing
+    }
+    #endif
 }
 
 /// A 3×3 grid of square dots; a diagonal wave lights them in turn, like an LED panel thinking.

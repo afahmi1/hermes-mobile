@@ -75,6 +75,7 @@ import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (s
 import bridge_pins  # pinned messages (own SQLite file, stdlib only)
 import bridge_uploads  # resumable uploads for big files (stdlib only)
 import bridge_titles  # title suggestions from Hermes's own generator
+import bridge_schedule  # "try again when limits reset": sends at a set time, from the Mac (stdlib only)
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
     TURNS_ERROR = None
@@ -191,6 +192,42 @@ def _model_default_read(cfg):
     return values.get("default") or values.get("model", ""), values.get("provider", "")
 
 
+# Providers that bill a subscription (a plan), not per call. Anything else with a price is pay-per-use.
+_PLAN_HINTS = ("oauth", "codex", "subscription", "copilot")
+
+
+def fallback_kind(provider, model):
+    """'plan' (a subscription covers it), 'free' (no charge) or 'paid' (billed per call)."""
+    p, m = (provider or "").lower(), (model or "").lower()
+    if m.endswith(":free") or m == "openrouter/free" or p in ("ollama", "lmstudio", "local", "llamacpp"):
+        return "free"
+    if any(h in p for h in _PLAN_HINTS):
+        return "plan"
+    return "paid"
+
+
+def fallback_chain(cfg):
+    """The profile's fallback_providers, in order, each tagged plan/free/paid. None when the key is absent."""
+    return _by_mtime("fallback_chain", cfg, lambda: _fallback_chain_read(cfg))
+
+
+def _fallback_chain_read(cfg):
+    try:
+        import yaml
+        config = yaml.safe_load(cfg.read_text()) or {}
+    except Exception:
+        return None
+    raw = config.get("fallback_providers") if isinstance(config, dict) else None
+    if raw is None:
+        return None
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict) and item.get("provider"):
+            prov, model = str(item.get("provider")), str(item.get("model") or "")
+            out.append({"provider": prov, "model": model, "kind": fallback_kind(prov, model)})
+    return out
+
+
 def fleet_meta():
     """Display names from the fleet list in the main SOUL.md, cached by mtime."""
     return _by_mtime("fleet_meta", HERMES / "SOUL.md", lambda: _fleet_meta_read())
@@ -256,6 +293,7 @@ def bots():
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
                     "reachable": bool(key_for(pid)), "served": pid in served,
                     "front": pid == "default", "managed": False,
+                    "fallbacks": fallback_chain(HERMES / "config.yaml" if pid == "default" else profile_home(pid) / "config.yaml"),
                     "skills": transcript.skill_names(profile_home(pid))})
     return out
 
@@ -1200,10 +1238,27 @@ def session_runtime(pid, sid):
                 "ORDER BY MAX(last_seen) DESC LIMIT 8", (sid,))]
         except sqlite3.Error:
             d["models_used"] = []
+        # Who wrote the last real reply (not a background summary or title). When a plan runs out, Hermes falls
+        # back to another model; this is how the app can say so instead of showing the model you picked.
+        try:
+            r = con.execute(
+                "SELECT model, billing_provider AS provider, MAX(last_seen) AS at FROM session_model_usage "
+                "WHERE session_id=? AND coalesce(task, '')='' GROUP BY model, billing_provider "
+                "ORDER BY at DESC LIMIT 1", (sid,)).fetchone()
+            d["last_answer"] = dict(r) if r and r["model"] else None
+        except sqlite3.Error:
+            d["last_answer"] = None
     finally:
         con.close()
     try:
-        d["cost"] = cost_summary(cost_ledger(pid, sid).values())
+        ledger = cost_ledger(pid, sid)
+        d["cost"] = cost_summary(ledger.values())
+        # Each model's own money: what was paid, or what a plan covered (API-price equivalent), and how.
+        for u in d.get("models_used") or []:
+            e = ledger.get((u.get("model"), u.get("provider") or ""))
+            if e:
+                u.update(usd=round(e["usd"], 6), api_usd=round(e["api_usd"], 6), kind=e["kind"],
+                         input=e["input"], output=e["output"])
     except Exception:
         log("cost ledger read failed")
     return d
@@ -1582,6 +1637,52 @@ if turns is not None:
     turns.bridge_media.UPLOADS = uploads_dir()
 
 
+_SCHEDULE = None
+_SCHEDULE_LOCK = threading.Lock()
+
+
+def schedule_store():
+    """The scheduled-sends store, created on first use; None (logged) if the state dir can't hold it."""
+    global _SCHEDULE
+    with _SCHEDULE_LOCK:
+        if _SCHEDULE is None:
+            try:
+                _SCHEDULE = bridge_schedule.Schedule(STATE_DIR)
+            except (OSError, sqlite3.Error) as exc:
+                log("Schedule store unavailable: %s" % type(exc).__name__)
+                return None
+        return _SCHEDULE
+
+
+def _send_scheduled(row):
+    pid, sid = row["profile"], row["session"]
+    if pid not in profile_ids():
+        raise bridge_schedule.ScheduleError("That bot isn't on this Mac anymore.")
+    body = {}
+    turns.start_primary(pid, profile_home(pid), sid, row["text"], body, row["id"], None, admissions_dir(),
+                        lambda: persona_scope(pid, sid, prepare_workspace_turn(pid, sid, body)), restore_send_workspace)
+    log("Sent a scheduled message in %s/%s" % (pid, sid[:12]))
+
+
+def _phone_turn_running(pid, sid):
+    return any(t.get("profile") == pid and t.get("session_id") == sid and not t.get("done") for t in turns.live_turns())
+
+
+def _schedule_loop():
+    """Every 20 s: send scheduled messages whose time has come (only if any exist; one cheap indexed query)."""
+    while True:
+        time.sleep(20)
+        if turns is None or not (STATE_DIR / "schedule" / "schedule.db").exists():
+            continue
+        store = schedule_store()
+        if store is None:
+            continue
+        try:
+            store.tick(_send_scheduled, busy=_phone_turn_running)
+        except Exception as exc:  # noqa: BLE001  (the loop must never die)
+            log("Schedule tick failed: %s" % type(exc).__name__)
+
+
 def admissions_dir():
     # Deployments with a small system volume can place new receipts on a private data volume.
     override = os.environ.get("HERMES_MOBILE_ADMISSIONS_DIR")
@@ -1925,7 +2026,8 @@ class H(BaseHTTPRequestHandler):
                 features.append("queue_controls_v1")  # GET/POST /m/chat/<bot>/<chat>/queue
                 features.append("resumable_uploads_v1")
                 features.append("hermes_projects_v1")  # Hermes's own Projects: GET /m/projects/<id>/chats, POST /m/chat/<bot>/new {project}
-                features.append("clarify_v1")  # Hermes's questions answered from the phone: POST /m/turns/<id>/clarify  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
+                features.append("clarify_v1")
+                features.append("schedule_v1")  # POST /m/chat/<bot>/<chat>/schedule|scheduled|unschedule  # Hermes's questions answered from the phone: POST /m/turns/<id>/clarify  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
             features.append("restart_v1")  # POST /m/restart {target: hermes|bridge, now}
             owner = self.owner_ok()
             return self.send(200, {"protocol": 2, "features": features,
@@ -2728,6 +2830,8 @@ class H(BaseHTTPRequestHandler):
                 deferred = any(row.get("status") == "deferred" for row in applied.values())
                 return self.send(200, {"applied": applied, "timing": "next_turn" if deferred else "saved",
                                        "policy": (session_runtime(pid, sid) or {}).get("policy")})
+            if action in ("schedule", "scheduled", "unschedule"):
+                return self._schedule(pid, sid, action, d)
             text = str(d.get("text") or "").strip()
             if action == "send-receipt":
                 return self.send(200, turns.match_receipt(pid, sid, text or "Describe the attached media.", d, admissions_dir()))
@@ -2768,6 +2872,21 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             log("chat route %s failed: %s: %s" % (path, type(e).__name__, e))
             return self.send(502, {"error": "%s: %s" % (type(e).__name__, str(e)[:200])})
+
+    def _schedule(self, pid, sid, action, d):
+        store = schedule_store()
+        if store is None:
+            return self.send(503, {"error": "Scheduling isn't available on this Mac right now."})
+        try:
+            if action == "schedule":
+                row = store.add(pid, sid, d.get("text"), d.get("at"), reason=d.get("reason"))
+                return self.send(201, {"scheduled": row, "waiting": store.list(pid, sid)})
+            if action == "unschedule":
+                gone = store.cancel(pid, sid, str(d.get("id") or ""))
+                return self.send(200 if gone else 404, {"cancelled": gone, "waiting": store.list(pid, sid)})
+            return self.send(200, {"waiting": store.list(pid, sid, include_done=bool(d.get("all")))})
+        except bridge_schedule.ScheduleError as e:
+            return self.send(e.code, {"error": str(e)})
 
     def json_body(self):
         try:
@@ -3028,6 +3147,7 @@ if __name__ == "__main__":
         print(make_token(name[0] if name else "paired-device", owner="--owner" in sys.argv))
         sys.exit(0)
     threading.Thread(target=_key_watcher, name="key-watcher", daemon=True).start()
+    threading.Thread(target=_schedule_loop, name="schedule", daemon=True).start()
     srv = ThreadingHTTPServer((os.environ.get("HERMES_MOBILE_BIND", "127.0.0.1"), PORT), H)
     if turns is not None:
         turns.bridge_media.UPLOADS = uploads_dir()

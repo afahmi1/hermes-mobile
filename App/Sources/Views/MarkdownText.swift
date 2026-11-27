@@ -121,11 +121,33 @@ enum InlineMarkdown {
 /// Inline `code` copies on tap. The whole message can still be selected from its menu (Select Text).
 struct MarkdownText: View {
     let text: String
+    /// "Reply with quote" in the selection menu: the selected words.
+    var onQuote: ((String) -> Void)? = nil
+    @Environment(\.openURL) private var openURL
+
+    /// Prose blocks next to each other render as one native text view, so a long-press selects any range
+    /// across paragraphs, lists and headings (like T3). Code, tables and callouts keep their own views.
+    private enum Group { case prose([MarkdownBlock]), other(MarkdownBlock) }
+    private var groups: [Group] {
+        var out: [Group] = []
+        for block in MarkdownBlock.parse(text) {
+            switch block {
+            case .paragraph, .heading, .list, .quote:
+                if case .prose(var run)? = out.last { run.append(block); out[out.count - 1] = .prose(run) }
+                else { out.append(.prose([block])) }
+            default: out.append(.other(block))
+            }
+        }
+        return out
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: HMDesign.medium) {
-            ForEach(Array(MarkdownBlock.parse(text).enumerated()), id: \.offset) { _, block in
-                view(for: block)
+            ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
+                switch group {
+                case .prose(let blocks): ProseText(blocks: blocks, onQuote: onQuote)
+                case .other(let block): view(for: block)
+                }
             }
         }
         .environment(\.openURL, OpenURLAction { url in
@@ -407,5 +429,153 @@ private struct SelectableText: UIViewRepresentable {
 
     func updateUIView(_ view: UITextView, context: Context) {
         if view.text != text { view.text = text }
+    }
+}
+
+// MARK: - Native selectable prose
+
+/// Paragraphs, headings, lists and quotes as one UITextView: real range selection with handles, the system's
+/// Copy, plus Copy as Markdown and Reply with quote. Links (paths, inline code chips, URLs) still tap through.
+struct ProseText: UIViewRepresentable {
+    let blocks: [MarkdownBlock]
+    var onQuote: ((String) -> Void)? = nil
+    @Environment(\.openURL) private var openURL
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = false
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.adjustsFontForContentSizeCategory = true
+        view.delegate = context.coordinator
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        context.coordinator.openURL = openURL
+        context.coordinator.onQuote = onQuote
+        let built = Self.build(blocks)
+        context.coordinator.sources = built.sources
+        if view.attributedText != built.text { view.attributedText = built.text }
+        view.linkTextAttributes = [.foregroundColor: UIColor(HMDesign.link)]
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        let width = proposal.width ?? UIScreen.main.bounds.width - 32
+        let size = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        return CGSize(width: width, height: ceil(size.height))
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var openURL: OpenURLAction?
+        var onQuote: ((String) -> Void)?
+        /// Each block's character range in the text view and its Markdown source, for Copy as Markdown.
+        var sources: [(NSRange, String)] = []
+
+        func textView(_ textView: UITextView, primaryActionFor textItem: UITextItem, defaultAction: UIAction) -> UIAction? {
+            guard case .link(let url) = textItem.content else { return defaultAction }
+            return UIAction { [weak self] _ in self?.openURL?(url) }
+        }
+
+        func textView(_ textView: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
+            let selected = (textView.text as NSString).substring(with: range)
+            var extra: [UIMenuElement] = []
+            let md = sources.filter { NSIntersectionRange($0.0, range).length > 0 }.map(\.1).joined(separator: "\n\n")
+            if !md.isEmpty {
+                extra.append(UIAction(title: "Copy as Markdown", image: UIImage(systemName: "text.badge.checkmark")) { _ in
+                    Clipboard.copy(md, what: "Copied as Markdown")
+                })
+            }
+            if let onQuote, !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                extra.append(UIAction(title: "Reply with quote", image: UIImage(systemName: "text.quote")) { _ in onQuote(selected) })
+            }
+            return UIMenu(children: suggestedActions + extra)
+        }
+    }
+
+    // MARK: building
+
+    static func build(_ blocks: [MarkdownBlock]) -> (text: NSAttributedString, sources: [(NSRange, String)]) {
+        let out = NSMutableAttributedString()
+        var sources: [(NSRange, String)] = []
+        let ink = UIColor(HMDesign.ink), muted = UIColor(HMDesign.text2)
+        for (i, block) in blocks.enumerated() {
+            let start = out.length
+            if i > 0 { out.append(NSAttributedString(string: "\n")) }
+            let para = NSMutableParagraphStyle()
+            para.paragraphSpacingBefore = i == 0 ? 0 : 10
+            para.lineSpacing = 2
+            switch block {
+            case .paragraph(let s):
+                out.append(inline(s, style: .body, color: ink, para: para))
+                sources.append((NSRange(location: start, length: out.length - start), s))
+            case .heading(let level, let s):
+                para.paragraphSpacingBefore = i == 0 ? 0 : (level <= 2 ? 16 : 12)
+                let style: UIFont.TextStyle = level == 1 ? .title3 : level == 2 ? .headline : .subheadline
+                out.append(inline(s, style: style, color: ink, para: para, bold: true))
+                sources.append((NSRange(location: start, length: out.length - start), String(repeating: "#", count: level) + " " + s))
+            case .list(let items):
+                var md: [String] = []
+                for (n, item) in items.enumerated() {
+                    let p = NSMutableParagraphStyle()
+                    let indent = CGFloat(item.depth) * 16
+                    p.firstLineHeadIndent = indent
+                    p.headIndent = indent + 20
+                    p.tabStops = [NSTextTab(textAlignment: .left, location: indent + 20)]
+                    p.paragraphSpacingBefore = n == 0 ? para.paragraphSpacingBefore : 4
+                    p.lineSpacing = 2
+                    if n > 0 { out.append(NSAttributedString(string: "\n")) }
+                    let marker = item.marker.hasSuffix(".") ? item.marker : "•"
+                    out.append(NSAttributedString(string: marker + "\t", attributes: [
+                        .font: UIFont.monospacedDigitSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize, weight: .regular),
+                        .foregroundColor: muted, .paragraphStyle: p]))
+                    out.append(inline(item.text, style: .body, color: ink, para: p))
+                    md.append(String(repeating: "  ", count: item.depth) + (item.marker.hasSuffix(".") ? item.marker : "-") + " " + item.text)
+                }
+                sources.append((NSRange(location: start, length: out.length - start), md.joined(separator: "\n")))
+            case .quote(let s):
+                para.firstLineHeadIndent = 12
+                para.headIndent = 12
+                out.append(inline(s, style: .body, color: muted, para: para))
+                sources.append((NSRange(location: start, length: out.length - start), "> " + s))
+            default:
+                break
+            }
+        }
+        return (out, sources)
+    }
+
+    /// One block's inline Markdown (bold, italic, code chips, links) in UIKit attributes.
+    private static func inline(_ s: String, style: UIFont.TextStyle, color: UIColor, para: NSParagraphStyle,
+                               bold: Bool = false) -> NSAttributedString {
+        let attributed = InlineMarkdown.attributed(s)
+        let base = UIFont.preferredFont(forTextStyle: style)
+        let out = NSMutableAttributedString()
+        for run in attributed.runs {
+            let piece = String(attributed[run.range].characters)
+            var traits: UIFontDescriptor.SymbolicTraits = bold ? [.traitBold] : []
+            let intent = run.inlinePresentationIntent ?? []
+            if intent.contains(.stronglyEmphasized) { traits.insert(.traitBold) }
+            if intent.contains(.emphasized) { traits.insert(.traitItalic) }
+            var font = base
+            if intent.contains(.code) {
+                font = UIFont.monospacedSystemFont(ofSize: base.pointSize * 0.9, weight: .regular)
+            } else if !traits.isEmpty, let d = base.fontDescriptor.withSymbolicTraits(traits) {
+                font = UIFont(descriptor: d, size: base.pointSize)
+            }
+            var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color, .paragraphStyle: para]
+            if intent.contains(.code) { attrs[.backgroundColor] = UIColor.tertiarySystemFill }
+            if intent.contains(.strikethrough) { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            if let link = run.link { attrs[.link] = link }
+            out.append(NSAttributedString(string: piece, attributes: attrs))
+        }
+        return out
     }
 }

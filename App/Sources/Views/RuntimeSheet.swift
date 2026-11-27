@@ -22,8 +22,119 @@ struct RuntimeSheet: View {
     /// Set once the sheet has been filled from the chat's current setting; only later provider changes
     /// (the user's) may re-pick the model, so a custom model name survives reopening the sheet.
     @State private var seeded = false
+    /// The provider and model lists stay folded until asked for (they're long).
+    @State private var showPicker = false
 
     private var scope: CatalogScope? { app.catalogScope(profile) }
+
+    private static func pname(_ p: String?) -> String {
+        guard let p, !p.isEmpty else { return "" }
+        return ProviderUsageSection.displayName(p)
+    }
+
+    /// What's answering, then this chat's money model by model: paid amounts, and what each plan covered.
+    @ViewBuilder private func chatSummary(_ s: ServedRuntime) -> some View {
+        let used = s.modelsUsed ?? []
+        let paid = used.filter { $0.kind == "priced" && ($0.usd ?? 0) >= 0.0005 }
+        let covered = used.filter { $0.kind == "included" }
+        Section {
+            if let last = s.lastAnswer {
+                LabeledContent("Last reply") {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text([ModelName.short(last.model).components(separatedBy: " · ").first ?? last.model, Self.pname(last.provider)]
+                            .filter { !$0.isEmpty }.joined(separator: " · "))
+                            .foregroundStyle(s.stand(in: s.policy?.model) == nil ? HMDesign.ink : HMDesign.caution)
+                        if let at = last.at {
+                            Text(Date(timeIntervalSince1970: at), format: .relative(presentation: .named)).font(.caption2).foregroundStyle(HMDesign.text2)
+                        }
+                    }
+                }
+                if s.stand(in: s.policy?.model) != nil {
+                    Text("Your pick couldn't answer (often a plan limit), so Hermes used a fallback. The next reply tries your pick again.")
+                        .font(.caption).foregroundStyle(HMDesign.caution)
+                }
+            }
+            if let pol = s.policy, let m = pol.model, !m.isEmpty {
+                LabeledContent("Next reply") {
+                    Text([ModelName.short(m).components(separatedBy: " · ").first ?? m, Self.pname(pol.provider),
+                          pol.effort.flatMap { Effort(rawValue: $0)?.label } ?? "Default effort"]
+                        .filter { !$0.isEmpty }.joined(separator: " · "))
+                }
+            } else if let m = s.model {
+                LabeledContent("Last answered by") { Text([ModelName.short(m), Self.pname(s.provider)].filter { !$0.isEmpty }.joined(separator: " · ")) }
+            }
+            if let cost = s.cost, cost.usd >= 0.0005 {
+                LabeledContent("Paid") { Text(CostSummary.money(cost.usd)).monospacedDigit().fontWeight(.semibold) }
+            }
+            if let cost = s.cost, cost.included {
+                let plans = Array(Set(covered.compactMap { $0.provider }.map(Self.pname))).sorted()
+                LabeledContent("Covered by " + (plans.isEmpty ? "your plan" : plans.joined(separator: ", "))) {
+                    Text(cost.includedApiUsd >= 0.01 ? "≈ \(CostSummary.money(cost.includedApiUsd)) API" : "Included").monospacedDigit()
+                }
+            }
+        } header: { HMHeader("This chat") } footer: {
+            Text(s.cost?.unknown == true ? "Some steps ran on a model with no price on record, so they aren't counted."
+                 : "From Hermes's usage records, including background helpers like summaries and image reading. The desktop app uses the same model setting.")
+        }.hmRows()
+        if let chain = bot?.fallbacks {
+            Section {
+                if chain.isEmpty {
+                    Text("None. If the model can't answer, the reply fails, and you can retry when limits reset.")
+                        .font(.subheadline).foregroundStyle(HMDesign.text2)
+                }
+                ForEach(Array(chain.enumerated()), id: \.offset) { i, f in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("\(i + 1)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary).frame(width: 14)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ModelName.short(f.model).components(separatedBy: " · ").first ?? f.model)
+                            Text(Self.pname(f.provider)).font(.caption).foregroundStyle(HMDesign.text2)
+                        }
+                        Spacer()
+                        Text(f.kind == "plan" ? "Plan" : f.kind == "free" ? "Free" : "Paid per use")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(f.kind == "paid" ? HMDesign.caution : HMDesign.text2)
+                    }
+                }
+            } header: { HMHeader("If this can't answer") } footer: {
+                Text(chain.contains { $0.kind == "paid" }
+                     ? "A paid fallback is billed per use when your pick runs out. Change the order in Hermes on the Mac (fallback_providers)."
+                     : "Tried in order when your pick can't answer, like when a plan runs out. Change it in Hermes on the Mac (fallback_providers).")
+            }.hmRows()
+        }
+        if !used.isEmpty {
+            Section {
+                ForEach(used, id: \.self) { u in
+                    HStack(alignment: .firstTextBaseline) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ModelName.short(u.model).components(separatedBy: " · ").first ?? u.model)
+                            let calls = u.calls ?? 0
+                            Text(([Self.pname(u.provider)] + ["\(calls) step\(calls == 1 ? "" : "s")"]
+                                  + ((u.reasoningTokens ?? 0) > 0 ? ["\(UsageWords.compact(u.reasoningTokens ?? 0)) thinking"] : []))
+                                    .filter { !$0.isEmpty }.joined(separator: " · "))
+                                .font(.caption).foregroundStyle(HMDesign.text2)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 2) {
+                            switch u.kind {
+                            case "priced":
+                                Text(CostSummary.money(u.usd ?? 0)).monospacedDigit().fontWeight(.semibold)
+                                Text("paid").font(.caption2).foregroundStyle(HMDesign.text2)
+                            case "included":
+                                Text("Plan").fontWeight(.semibold)
+                                if let api = u.apiUsd, api >= 0.01 {
+                                    Text("≈ \(CostSummary.money(api)) API").font(.caption2).monospacedDigit().foregroundStyle(HMDesign.text2)
+                                }
+                            default:
+                                Text("—").foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                }
+            } header: { HMHeader("Models that answered this chat") } footer: {
+                if !paid.isEmpty, !covered.isEmpty { Text("Paid models were billed per use; plan models cost nothing extra.") }
+            }.hmRows()
+        }
+    }
     private var catalogState: CatalogState { scope.map { app.catalogStore.state($0) } ?? CatalogState() }
     private var catalog: ModelCatalog? { catalogState.catalog }
 
@@ -36,6 +147,7 @@ struct RuntimeSheet: View {
                         Text("Your selection applies to the next message you send or queue.").foregroundStyle(HMDesign.text2)
                     }.hmRows()
                 }
+                if let s = fresh ?? served { chatSummary(s) }
                 Section {
                     effortStrip
                 } header: { HMHeader("Effort") } footer: {
@@ -44,6 +156,27 @@ struct RuntimeSheet: View {
                 }.hmRows()
                 .disabled(!reasoningSupported)
 
+                Section {
+                    Button {
+                        withAnimation(.snappy) { showPicker.toggle() }
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Model").foregroundStyle(HMDesign.ink)
+                                Text([model.map { ModelName.short($0) } ?? bot.map { ModelName.short($0.model) } ?? "Bot default",
+                                      provider.flatMap { catalog?.provider(slug: $0)?.name } ?? (provider == nil ? "bot default" : provider!)]
+                                        .joined(separator: " · "))
+                                    .font(.caption).foregroundStyle(HMDesign.text2)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.down").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                                .rotationEffect(.degrees(showPicker ? 180 : 0))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }.hmRows()
+                if showPicker {
                 Section {
                     Picker("Provider", selection: $provider) {
                         Text("Bot default").tag(String?.none)
@@ -113,49 +246,8 @@ struct RuntimeSheet: View {
                         }
                     }.hmRows()
                 }
-
-                if let s = fresh ?? served {
-                    if let pol = s.policy, let m = pol.model, !m.isEmpty {
-                        Section {
-                            LabeledContent("Model", value: m)
-                            if let p = pol.provider, !p.isEmpty { LabeledContent("Provider", value: p) }
-                            LabeledContent("Effort", value: pol.effort.flatMap { Effort(rawValue: $0)?.label } ?? "Default")
-                        } header: { HMHeader("Saved on this chat in Hermes") } footer: {
-                            Text("The desktop app shows and uses the same setting.")
-                        }.hmRows()
-                    }
-                    if let cost = s.cost, cost.usd >= 0.0005 || cost.included {
-                        Section {
-                            if cost.usd >= 0.0005 {
-                                LabeledContent("Spent", value: CostSummary.money(cost.usd))
-                            }
-                            if cost.included {
-                                LabeledContent("Covered by your plan") {
-                                    Text(cost.includedApiUsd >= 0.01 ? "≈ \(CostSummary.money(cost.includedApiUsd)) at API prices" : "Included")
-                                }
-                            }
-                        } header: { HMHeader("This chat") } footer: {
-                            Text(cost.unknown ? "Some steps ran on a model with no price on record, so they aren't counted."
-                                 : "From Hermes's usage records, including background helpers like summaries and image reading.")
-                        }.hmRows()
-                    }
-                    if let used = s.modelsUsed, !used.isEmpty {
-                        Section(header: HMHeader("Models that answered this chat")) {
-                            ForEach(used, id: \.self) { u in
-                                LabeledContent {
-                                    let calls = u.calls ?? 0
-                                    Text("\(calls) step\(calls == 1 ? "" : "s")" + ((u.reasoningTokens ?? 0) > 0 ? " · \(UsageWords.compact(u.reasoningTokens ?? 0)) thinking tokens" : ""))
-                                        .font(.caption)
-                                } label: {
-                                    VStack(alignment: .leading) {
-                                        Text(ModelName.short(u.model))
-                                        if let p = u.provider, !p.isEmpty { Text(p).font(.caption).foregroundStyle(HMDesign.text2) }
-                                    }
-                                }
-                            }
-                        }.hmRows()
-                    }
                 }
+
             }
             .hmCanvas()
             .navigationTitle("Model & Effort")
