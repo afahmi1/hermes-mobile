@@ -1537,6 +1537,25 @@ def timeline_page(raw):
     return timeline_bytes(json.loads(raw)["data"])
 
 
+def resume_target(db, session_id, path=None):
+    """The session a resume should read: a compacted or continued chat resolves to its live descendant.
+
+    Installed Hermes releases dropped SessionDB.resolve_resume_session_id (hermes_state is a deprecated shim).
+    Use it when present; else the storage interface's read-only lineage lookup on the same state.db;
+    else the id as given. Read-only throughout; never raises for a missing API."""
+    resolve = getattr(db, "resolve_resume_session_id", None)
+    if callable(resolve):
+        return resolve(session_id) or session_id
+    if path is not None:
+        try:
+            from persistence_assembly import open_persistence_reader
+            with open_persistence_reader(Path(path)) as reader:
+                return str(reader.lineage.resolve_resume_target(session_id) or session_id)
+        except Exception:
+            pass
+    return session_id
+
+
 def session_bodies(pid, session_id):
     """Raw transcript text for one chat, so a media digest can be re-derived instead of trusted."""
     if not NATIVE_INBOX or not session_id or any(c in session_id for c in "/\\\x00") or len(session_id) > 200:
@@ -1549,7 +1568,7 @@ def session_bodies(pid, session_id):
     with closing(SessionDB(path, read_only=True)) as db:
         if not db.get_session(session_id):
             return []
-        active = db.resolve_resume_session_id(session_id)
+        active = resume_target(db, session_id, path)
         rows = db.get_messages(active, limit=1000, offset=0, latest=True,
                                include_compacted=False, include_ancestors=True)
         out = []
@@ -1570,7 +1589,7 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
     with closing(SessionDB(path, read_only=True)) as db:
         if not db.get_session(session_id):
             return None
-        active = db.resolve_resume_session_id(session_id)
+        active = resume_target(db, session_id, path)
         # One extra raw row tells the phone whether another page exists. Projected pages are shorter
         # (hidden tool rows are dropped), so the phone cannot infer this from the row count.
         probe = None if limit is None else limit + 1
