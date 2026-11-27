@@ -237,7 +237,7 @@ struct StatusView: View {
                             Text(e["name"].string ?? "Unnamed").font(HMDesign.rowTitle).lineLimit(1)
                             (Text([change, e["kind"].string?.capitalized, e["kind"].string == "bot" ? nil : app.botName(e["profile"].string ?? ""),
                                    e["old_name"].string.map { "was \($0)" }]
-                                .compactMap { $0 }.joined(separator: " · ") + " · ") + RelTime.text(e["at"].date))
+                                .compactMap { $0 }.joined(separator: " · ")) + RelTime.suffix(e["at"].date))
                                 .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
@@ -334,7 +334,7 @@ struct StatusView: View {
                             Spacer(minLength: HMDesign.small)
                             StatusMark(text: r["status"].string)
                         }
-                        (Text(app.botName(r["profile"].string ?? "")) + Text(" · ") + RelTime.text(r["claimed_at"].date))
+                        (Text(app.botName(r["profile"].string ?? "")) + RelTime.suffix(r["claimed_at"].date))
                             .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
                         if ["failed", "error"].contains(r["status"].string ?? ""), let err = r["error"].string {
                             Label(err, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).foregroundStyle(.red).lineLimit(2)
@@ -465,6 +465,9 @@ private struct RelTime: View {
         } else { Text("Unknown") }
     }
 
+    /// " · 5d ago" for a metadata line, or nothing when the date is missing.
+    static func suffix(_ date: Date?) -> Text { date == nil ? Text("") : Text(" · ") + text(date) }
+
     /// The same text as a `Text`, so it can join a sentence on one line.
     static func text(_ date: Date?) -> Text {
         guard let date else { return Text("Unknown") }
@@ -485,7 +488,7 @@ private struct AgentRow: View {
             VStack(alignment: .leading, spacing: HMDesign.micro) {
                 Text(agent["title"].string ?? "Untitled").font(HMDesign.rowTitle).lineLimit(1)
                 (Text([botName, kind == "subagent" ? "subagent" : kind == "cron" ? "cron run" : kind == "phone" ? "from phone" : nil,
-                       agent["model"].string].compactMap { $0 }.joined(separator: " · ") + " · ") + RelTime.text(agent["started_at"].date))
+                       agent["model"].string].compactMap { $0 }.joined(separator: " · ")) + RelTime.suffix(agent["started_at"].date))
                     .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
             }
         }
@@ -504,7 +507,7 @@ private struct JobRow: View {
                 Text(job["name"].string ?? "Unnamed job").font(HMDesign.rowTitle).lineLimit(1)
                 if job["new"].bool { NewBadge() }
                 Spacer(minLength: HMDesign.small)
-                StatusMark(text: paused ? "paused" : job["last_status"].string)
+                if paused || job["last_status"].string != nil { StatusMark(text: paused ? "paused" : job["last_status"].string) }
             }
             line2
                 .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
