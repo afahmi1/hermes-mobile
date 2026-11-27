@@ -1,10 +1,23 @@
-import SwiftUI
+import Foundation
 
 /// One release's What's new. Newest first; a version without its own list shows the newest below it.
 struct WhatsNewRelease: Identifiable, Equatable {
     let version: String
     let items: [WhatsNewItem]
     var id: String { version }
+
+    /// What "seen" remembers: the version plus a stable hash of the list. The marketing version stays 1.0
+    /// across builds, so the version alone would hide a list that gained items; the hash shows it once more.
+    /// FNV-1a, not `hashValue`, which changes on every launch.
+    var fingerprint: String {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for item in items {
+            for b in (item.symbol + "\u{1F}" + item.title + "\u{1F}" + item.detail + "\u{1E}").utf8 {
+                h = (h ^ UInt64(b)) &* 0x0000_0100_0000_01B3
+            }
+        }
+        return version + "#" + String(h, radix: 16)
+    }
 }
 
 /// A feature: an SF Symbol, a short name, one sentence.
@@ -63,18 +76,34 @@ enum WhatsNew {
     /// Due on this launch unless it's a first run (onboarding covers that) or this list already showed.
     static func due(defaults: UserDefaults = .standard) -> WhatsNewRelease? {
         guard let release = current else { return nil }
+        return due(release, defaults: defaults)
+    }
+
+    static func due(_ release: WhatsNewRelease, defaults: UserDefaults) -> WhatsNewRelease? {
         // A first run has never seen a list: onboarding covers it, so mark this one seen instead of showing it.
         if defaults.object(forKey: seenKey) == nil, defaults.string(forKey: "server") == nil {
             markSeen(release, defaults: defaults)
             return nil
         }
-        return defaults.string(forKey: seenKey) == release.version ? nil : release
+        return defaults.string(forKey: seenKey) == release.fingerprint ? nil : release
     }
 
+    /// Mark at presentation, not on dismiss: a sheet's `onDismiss` runs after its `item` binding is already nil,
+    /// so marking there never happened and the list came back on every launch.
     static func markSeen(_ release: WhatsNewRelease, defaults: UserDefaults = .standard) {
-        defaults.set(release.version, forKey: seenKey)
+        defaults.set(release.fingerprint, forKey: seenKey)
+    }
+
+    /// The launch check: returns the list to show, already marked seen, or nil.
+    static func takeDue(defaults: UserDefaults = .standard) -> WhatsNewRelease? {
+        guard let release = due(defaults: defaults) else { return nil }
+        markSeen(release, defaults: defaults)
+        return release
     }
 }
+
+#if canImport(UIKit)
+import SwiftUI
 
 /// The sheet: a title, the newest release's items, older releases collapsed below, Continue pinned at the bottom.
 struct WhatsNewSheet: View {
@@ -174,3 +203,4 @@ private struct WhatsNewRow: View {
         .accessibilityElement(children: .combine)
     }
 }
+#endif

@@ -103,8 +103,8 @@ struct ChatListView: View {
                 .modifier(RenameSheetModifier(renaming: $renaming, sessions: $sessions, results: $results))
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
-                .sheet(item: $whatsNew, onDismiss: { if let w = whatsNew { WhatsNew.markSeen(w) } }) { w in WhatsNewSheet(release: w) }
-                .onAppear { if whatsNew == nil { whatsNew = WhatsNew.due() } }
+                .sheet(item: $whatsNew) { w in WhatsNewSheet(release: w) }
+                .onAppear { if whatsNew == nil { whatsNew = WhatsNew.takeDue() } }
                 .sheet(isPresented: $showNew) {
                     NewChatSheet { bot in
                         showNew = false
