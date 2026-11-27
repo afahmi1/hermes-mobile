@@ -89,6 +89,31 @@ class TimelineTest(unittest.TestCase):
                 self.assertTrue(older["has_more"])
                 self.assertEqual(older["next_offset"], 4)
 
+    def test_phone_reads_the_display_history_not_the_models_compacted_view(self):
+        """A compacted chat must still show Hermes's answers, as the desktop does (include_compacted=True).
+        With the model's view the phone showed only the person's own messages."""
+        try:
+            from hermes_state import SessionDB
+        except ImportError:
+            self.skipTest("installed Hermes required")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            from contextlib import closing
+            with closing(SessionDB(home / "state.db")) as db:
+                db.create_session("chat", source="cli")
+                db.append_message("chat", "user", "hello")
+            original = SessionDB.get_messages
+            seen = []
+
+            def spy(self, *args, **kwargs):
+                seen.append(kwargs.get("include_compacted"))
+                return original(self, *args, **kwargs)
+
+            with patch.object(bridge, "profile_home", return_value=home), patch.object(SessionDB, "get_messages", spy):
+                bridge.native_timeline_page("default", "chat", 100, 0, True)
+                bridge.session_bodies("default", "chat")
+            self.assertEqual(seen, [True, True])
+
 
 if __name__ == "__main__":
     unittest.main()

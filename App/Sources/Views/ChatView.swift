@@ -2339,15 +2339,20 @@ struct OutboxTray: View {
     }
 
     private func status(_ item: Outgoing, position: Int) -> (String, String, Color) {
-        if let problem = item.problem { return ("exclamationmark.triangle.fill", "Didn't send: \(problem). Tap to edit.", HMDesign.warning) }
-        if item.edit != nil { return ("pencil.circle", "Edit saved · applies as soon as your Mac answers", .secondary) }
-        if item.onMac {
+        switch item.phase {
+        case .needsYou(let problem):
+            return ("exclamationmark.triangle.fill", "Didn't send: \(problem). Tap to edit.", HMDesign.warning)
+        case .editPending:
+            return ("pencil.circle", "Edit saved · applies as soon as your Mac answers", .secondary)
+        case .onMac:
             let ahead = chat.outgoing.prefix(position).filter(\.onMac).count
             return ("checkmark.circle.fill", ahead == 0 ? "On your Mac · next up" : "On your Mac · #\(ahead + 1) in line", HMDesign.success)
+        case .retrying:
+            return ("icloud.and.arrow.up", "Saved on this phone · sends when your Mac answers", .secondary)
+        case .onPhone:
+            if item.mode == "steer" { return ("arrow.turn.up.right", "Will guide this reply", HMDesign.accent) }
+            return ("clock.arrow.circlepath", chat.isRunning ? "Sends after this reply" : "Sending…", HMDesign.accent)
         }
-        if item.attempts > 0 { return ("icloud.and.arrow.up", "Saved on this phone · sends when your Mac answers", .secondary) }
-        if item.mode == "steer" { return ("arrow.turn.up.right", "Will guide this reply", HMDesign.accent) }
-        return ("clock.arrow.circlepath", chat.isRunning ? "Sends after this reply" : "Sending…", HMDesign.accent)
     }
 
     @ViewBuilder private func row(_ item: Outgoing, position: Int) -> some View {

@@ -62,6 +62,26 @@ can't hold a newline in a value; the installer refuses it with a message.
 **Uninstall:** run `Bridge/install.sh --uninstall`, or remove the Windows scheduled tasks. The Tailscale route stays
 until you run `tailscale serve --https=10001 off`.
 
+## After updating (new code, a Hermes update, a pulled PR)
+
+The bridge doesn't reload itself. Every machine that runs one must be restarted onto the new code, and then checked:
+
+1. **Wait until no reply is running.** `~/.hermes/gateway_state.json` should show `"active_agents": 0`. Restarting
+   the bridge mid-reply drops the phone's live stream (the reply keeps going on the Mac and reappears on reload).
+2. **Update and restart:**
+   * macOS / Linux: from the repo, `Bridge/install.sh`. It copies the new code into
+     `~/.local/share/hermes-mobile/releases/<commit>`, points `current` at it, and restarts the service.
+     When only the code changed, it restarts in place (`launchctl kickstart` / `systemctl restart`).
+   * Windows: `git pull`, then `powershell -ExecutionPolicy Bypass -File Windows\Install-HermesMobile.ps1`. Or
+     restart the task: `Stop-ScheduledTask HermesMobileBridge; Start-ScheduledTask HermesMobileBridge`.
+3. **Check it's the new code and healthy:** run the doctor (all ✓), then confirm the phone reconnects (the status
+   dot goes green, and a chat loads).
+4. **Do it on every machine.** A phone signed in to several gateways talks to each machine's own bridge.
+
+An agent running *inside* Hermes can't restart the bridge or gateway that is carrying its own conversation: Hermes
+blocks it, because the restart would cut that conversation off. Hand the person the command for their own Terminal,
+or update a different machine over SSH.
+
 ## Things that look broken but aren't
 
 * **A bot shows no chats or refuses messages.** It has no `API_SERVER_KEY`. On macOS and Linux the bridge adds one
