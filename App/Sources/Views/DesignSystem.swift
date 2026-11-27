@@ -475,10 +475,10 @@ struct HMDepthField: View {
 }
 
 /// Thermocline Dark's deep-sea glow: two or three blooms in the chosen accent's tint, far off and mostly past the
-/// screen's edges, like creatures glowing in the distance. Each peaks at 10% and fades to clear, so the middle of
-/// the screen stays black. They breathe (about 6-10%) and drift a few points on their own slow periods (11-23 s),
+/// screen's edges, like creatures glowing in the distance. Each peaks at 25% (his pick, build 45; v1.2 shipped 10%) and fades to clear, so the middle of
+/// the screen stays black. They breathe (about 15-25%) and drift a few points on their own slow periods (11-23 s),
 /// redrawn at 15 fps at most: one timeline per canvas, opacity and offset only. Reduce Motion, Reduce Transparency
-/// and still previews hold them at 8%. Renders nothing in Light.
+/// and still previews hold them at 20%. Renders nothing in Light.
 struct HMDeepSeaBlooms: View {
     var animated = true
     @Environment(\.colorScheme) private var scheme
@@ -486,7 +486,7 @@ struct HMDeepSeaBlooms: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     /// Center (unit point of the canvas; outside 0...1 is off-screen), radius (share of the longer side), peak (share
-    /// of the 10% ceiling), breathing and drift periods in seconds, and a phase so no two move together.
+    /// of the 25% ceiling), breathing and drift periods in seconds, and a phase so no two move together.
     private struct Bloom {
         let center: UnitPoint, radius: CGFloat, peak: Double, breathe: Double, drift: Double, phase: Double
     }
@@ -495,7 +495,7 @@ struct HMDeepSeaBlooms: View {
         Bloom(center: UnitPoint(x: 1.08, y: 0.04), radius: 0.42, peak: 0.7, breathe: 13, drift: 19, phase: 2.1),   // fainter, top-trailing
         Bloom(center: UnitPoint(x: 1.05, y: 0.50), radius: 0.18, peak: 0.55, breathe: 11, drift: 21, phase: 4.2),  // small and far, mid-right
     ]
-    static let ceiling = 0.10
+    static let ceiling = 0.25
 
     var body: some View {
         if scheme == .dark {
@@ -533,7 +533,7 @@ struct HMDeepSeaBlooms: View {
 /// Thermocline Dark only: bubbles, primary buttons, the send button, bot avatars and glass cards get a faint halo
 /// in their own color (the accent's tint; a bot's color for its avatar). Never on text, never inside another glow.
 enum HMGlow {
-    static let opacity = 0.10
+    static let opacity = 0.25
     static let radius: CGFloat = 14
 }
 
@@ -548,7 +548,7 @@ extension EnvironmentValues {
 }
 
 extension View {
-    /// The halo: a shadow in `color` at 10%, radius 14, no offset. Apply it to a shape or fill, never to text.
+    /// The halo: a shadow in `color` at 25%, radius 14, no offset. Apply it to a shape or fill, never to text.
     @ViewBuilder func hmHalo(_ color: Color, active: Bool) -> some View {
         if active { shadow(color: color.opacity(HMGlow.opacity), radius: HMGlow.radius) } else { self }
     }
@@ -979,7 +979,7 @@ struct HMTag: View {
 }
 
 /// Buttons for empty and error states. Primary: the accent's fill, its on-fill label, a soft glow behind the fill
-/// (never on text): 25% in Light, the 10% deep-sea halo in the tint in Dark. Quiet: a hairline capsule in text.
+/// (never on text): 25% in Light, the 25% deep-sea halo in the tint in Dark. Quiet: a hairline capsule in text.
 struct HMButtonStyle: ButtonStyle {
     enum Kind { case primary, quiet }
     var kind: Kind = .quiet
@@ -1094,7 +1094,7 @@ extension View {
 }
 
 /// Thermocline's send button: the accent's fill with an on-fill arrow and a soft glow behind the disc (never on
-/// text): 25% in Light, the 10% deep-sea halo in the tint in Dark. Disabled: a surface-3 disc with a text-3 arrow.
+/// text): 25% in Light, the 25% deep-sea halo in the tint in Dark. Disabled: a surface-3 disc with a text-3 arrow.
 struct HMSendGlyph: View {
     var enabled: Bool
     @Environment(\.colorScheme) private var scheme
