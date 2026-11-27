@@ -262,8 +262,11 @@ final class API: @unchecked Sendable {
     // MARK: push
 
     /// Hand this install's APNs token to the bridge. The grant that signs the request owns the token.
-    func registerPush(token: String, environment: String, account: String) async throws {
-        _ = try await json("/m/push/token", method: "POST", body: ["token": token, "environment": environment, "account": account])
+    /// Returns whether the Mac can actually send pushes (it has an APNs key).
+    @discardableResult
+    func registerPush(token: String, environment: String, account: String) async throws -> Bool {
+        let r = try await json("/m/push/token", method: "POST", body: ["token": token, "environment": environment, "account": account])
+        return r["enabled"] as? Bool ?? false
     }
 
     /// Tell the bridge the app left or returned to the foreground, so it knows when to push.

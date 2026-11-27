@@ -23,6 +23,7 @@ enum WhatsNew {
         WhatsNewRelease(build: 43, items: [
             WhatsNewItem(symbol: "list.bullet.rectangle", text: "What's new is a real changelog, shown once per build"),
             WhatsNewItem(symbol: "circle.hexagongrid", text: "The colorful orb is back: Appearance › Thinking › Color orb"),
+            WhatsNewItem(symbol: "bell.slash", text: "\"Still working\" shows once per reply, silently"),
         ]),
         WhatsNewRelease(build: 42, items: [
             WhatsNewItem(symbol: "exclamationmark.triangle", text: "Header says when a fallback model answered"),

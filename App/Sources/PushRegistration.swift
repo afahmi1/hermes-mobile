@@ -18,7 +18,9 @@ final class PushRegistration {
         #endif
     }
 
-    private var token: String?
+    private(set) var token: String?
+    /// The Mac said it can send pushes (it has an APNs key). Until then, replies after the app sleeps can't reach you.
+    private(set) var macCanPush = false
     private var sent: String?  // "account|token" last accepted by the bridge
     private var away = false
 
@@ -34,8 +36,8 @@ final class PushRegistration {
         let api = API.shared
         Task {
             do {
-                try await api.registerPush(token: token, environment: Self.environment, account: account)
-                if API.shared === api { sent = account + "|" + token }
+                let enabled = try await api.registerPush(token: token, environment: Self.environment, account: account)
+                if API.shared === api { sent = account + "|" + token; macCanPush = enabled; ReplyNotifier.shared.macCanPush = enabled }
             } catch {}
         }
     }

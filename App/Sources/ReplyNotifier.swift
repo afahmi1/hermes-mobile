@@ -51,6 +51,10 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     private var grace: UIBackgroundTaskIdentifier = .invalid
     private(set) var away = false
+    /// Chats already told "still working" for their current run, so leaving the app again doesn't repeat it.
+    private var warned: Set<String> = []
+    /// Set by PushRegistration: the Mac has an APNs key, so it sends the real reply and no heads-up is needed.
+    var macCanPush = false
     private var asked = false
     weak var appRef: AppModel? = nil
     /// The chat on screen right now ("profile|session"). A reply for it is already visible; one for another chat isn't.
@@ -96,6 +100,11 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
     func returned() {
         away = false
         endGrace()
+        // A chat whose run finished can be warned again on its next run.
+        if let app = appRef {
+            let running = Set(app.openChats.filter { $0.1.isRunning }.compactMap { $0.1.sessionId })
+            warned = warned.intersection(running)
+        }
 
     }
 
@@ -106,19 +115,21 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         guard grace != .invalid else { return }
         UIApplication.shared.endBackgroundTask(grace)
         grace = .invalid
-        // iOS is about to suspend the app while Hermes still works: say so, once per chat. Without push
-        // configured, nothing else will tell the person a reply landed.
-        guard away, let app = appRef else { return }
+        // iOS is about to suspend the app while Hermes still works. Only needed without push (with push the
+        // Mac sends the real reply), only once per run, and silent: a heads-up, not an alert.
+        guard away, let app = appRef, !macCanPush else { return }
         for (_, chat) in app.openChats where chat.isRunning {
+            guard let sid = chat.sessionId, !warned.contains(sid) else { continue }
+            warned.insert(sid)
             post(.reply, bot: app.botName(chat.profile), account: app.inboxAccount, profile: chat.profile,
-                 session: chat.sessionId, detail: "Hermes is still working. Open the app to see the reply.")
+                 session: sid, detail: "Still working. Open the app to see the reply.", quiet: true)
         }
     }
 
     enum Event { case reply, approval, failure }
 
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
-              detail: String? = nil, worked: TimeInterval? = nil) {
+              detail: String? = nil, worked: TimeInterval? = nil, quiet: Bool = false) {
         guard let account, let session else { return }
         // Away: always. In the app: only for a chat you aren't looking at (its reply would otherwise vanish
         // into the list with no sound). The chat on screen shows it itself.
@@ -139,7 +150,8 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         case .failure: fallback = "Open the chat for details."
         }
         content.body = detail.flatMap { $0.isEmpty ? nil : $0 } ?? fallback
-        content.sound = .default
+        content.sound = quiet ? nil : .default
+        if quiet { content.interruptionLevel = .passive }
         content.threadIdentifier = ReplyDestination(account: account, profile: profile, session: session).identifier
         content.categoryIdentifier = "reply"
         content.userInfo = ["account": account, "profile": profile, "session": session]
@@ -186,7 +198,7 @@ final class ReplyNotifier {
     func returned() { away = false }
     func settled(liveRuns: Bool) {}
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
-              detail: String? = nil, worked: TimeInterval? = nil) {}
+              detail: String? = nil, worked: TimeInterval? = nil, quiet: Bool = false) {}
 }
 #endif
 
