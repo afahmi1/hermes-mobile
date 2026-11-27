@@ -1,55 +1,87 @@
-# Hermes Mobile
+<p align="center">
+  <img src="docs/screenshots/hero.png" alt="Hermes Mobile: chats, a reply, bots, status and light mode" width="100%">
+</p>
 
-A native SwiftUI iPhone app for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It shows every chat and every bot
-(profile) on your Mac, lets you continue any of them, and switches model, provider and reasoning effort per chat. The
-switch is saved on the chat inside Hermes, so the desktop app sees the same setting.
+<h1 align="center">Hermes Mobile</h1>
 
-You can switch mid-chat without leaving the composer. Tap the model chip above the input to pick a recent model, the bot
-default, an effort level, or "All models". Or type `/model` to open the picker, `/model <name>` or `/model <provider>:<name>`
-to switch, `/model reset` for the bot default, and `/effort <level>` to change effort. These commands are never sent to the
-agent. If a reply is running, the change applies to the next message.
+<p align="center">
+  <b>Your <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>, in your pocket.</b><br>
+  A native SwiftUI iPhone app for every chat, bot and run on your own computer.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/iOS-17%2B-000000?style=for-the-badge&logo=apple&logoColor=white" alt="iOS 17+">
+  <img src="https://img.shields.io/badge/SwiftUI-native-F05138?style=for-the-badge&logo=swift&logoColor=white" alt="SwiftUI">
+  <img src="https://img.shields.io/badge/Hermes-0.23.x-FFD700?style=for-the-badge" alt="Hermes 0.23.x">
+  <img src="https://img.shields.io/badge/Network-Tailscale%20only-242424?style=for-the-badge&logo=tailscale&logoColor=white" alt="Tailscale only">
+</p>
+
+Pick up any conversation from the desktop app, Telegram, the terminal or a cron job, and keep going. Switch model,
+provider and effort per chat, and the desktop app sees the same setting. There's no server in the middle: the app talks
+to a small bridge on **your** machine over your tailnet, and every chat stays in Hermes's own `state.db`.
+
+```
+iPhone app  ──HTTPS over your tailnet──▶  Bridge on your computer (127.0.0.1:9131, exposed with `tailscale serve`)
+                                             └─▶ Hermes gateway (API server + the desktop app's session protocol)
+                                                   └─▶ Hermes state.db: the same chats the desktop app shows
+```
+
+**Setting it up, or asking an agent to?** Jump to [Part 2](#part-2-running-it-for-each-person-who-installs-the-app), or
+follow [docs/setup.md](docs/setup.md), an ordered runbook for macOS, Linux and Windows. `Bridge/run-bridge.sh --doctor`
+checks every step and prints the exact fix for anything missing.
+
+## What it does
+
+<table>
+<tr><td width="28%"><b>Every chat, every bot</b></td><td>Desktop, phone, Telegram, CLI and scheduled runs in one list, filtered by source. Pin, archive and batch-select. Per-chat letters with a small badge for the bot, or each bot in its own color.</td></tr>
+<tr><td><b>Replies you can use</b></td><td>Full Markdown: tables, callouts, checklists, code with Copy and Wrap. Select text across a whole reply, Copy as Markdown, and an action row under every finished reply.</td></tr>
+<tr><td><b>Reply to several messages at once</b></td><td>Tap Reply on each message and a pill stacks up with its own answer. Delete a pill and your words stay. The sent message shows each quote with its answer.</td></tr>
+<tr><td><b>Images where Hermes put them</b></td><td>A file path or <code>MEDIA:</code> tag in a reply turns into the picture, right under that line. Several become a swipeable row. Documents, audio, video and 3D open in Quick Look.</td></tr>
+<tr><td><b>Model, effort and cost, honestly</b></td><td>Switch per chat from the header or with <code>/model</code> and <code>/effort</code>. The model sheet shows what you paid, what your plan covered (at API prices), each model's own share, and who wrote the last reply. After a fallback the header says so: <i>Grok 4.7 answered · Opus 5.5 next</i>.</td></tr>
+<tr><td><b>Fallbacks you can see</b></td><td>Each bot's fallback chain, in order, tagged <b>Plan</b>, <b>Free</b> or <b>Paid per use</b>, so a plan running out never quietly bills an API key.</td></tr>
+<tr><td><b>Messages that can't get lost</b></td><td>Send next and Guide this reply are saved on the phone first and keep one ID across retries. Take a message back (images included), guide the running reply, or retry a failed one when limits reset.</td></tr>
+<tr><td><b>Watch it work</b></td><td>Playful thinking lines (tap to read the real thinking), a timestamp and duration on every tool step, and subagent cards with their goal, model, provider and steps.</td></tr>
+<tr><td><b>Status, from anywhere</b></td><td>What's running, cron jobs, incidents, provider usage and resets. Restart Hermes or the bridge from the phone, now or when replies finish.</td></tr>
+<tr><td><b>Notifications</b></td><td>A reply in another chat notifies even while the app is open; long-press to answer from the notification. With an APNs key on your computer, the bridge pushes when a reply is ready or Hermes needs an approval. No reply text leaves your machine.</td></tr>
+<tr><td><b>Made to be lived in</b></td><td>Thermocline (true black or ash) and Classic themes, Liquid Glass, five thinking indicators including the pixel flame and the color orb, and a What's new changelog once per build.</td></tr>
+</table>
+
+## Screenshots
+
+<table>
+<tr>
+<td align="center"><img src="docs/screenshots/chats.png" width="200"><br><sub>Chats</sub></td>
+<td align="center"><img src="docs/screenshots/chat.png" width="200"><br><sub>A reply, pinned and quotable</sub></td>
+<td align="center"><img src="docs/screenshots/live-reply.png" width="200"><br><sub>A live reply with tools</sub></td>
+<td align="center"><img src="docs/screenshots/chat-light.png" width="200"><br><sub>Thermocline, light</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/bots.png" width="200"><br><sub>Bots and their models</sub></td>
+<td align="center"><img src="docs/screenshots/status.png" width="200"><br><sub>Status</sub></td>
+<td align="center"><img src="docs/screenshots/settings.png" width="200"><br><sub>Themes and settings</sub></td>
+<td align="center"><img src="docs/screenshots/whats-new.png" width="200"><br><sub>What's new, per build</sub></td>
+</tr>
+</table>
+
+<sub>Every screenshot comes from the app's built-in demo mode (<code>-HMDemo 1</code>): synthetic chats, no network. See <a href="#screenshots-and-demo-mode">Screenshots and demo mode</a>.</sub>
+
+## The details
 
 The **Projects** tab shows Hermes's own Projects, the ones you make in the desktop app's Projects view. A chat belongs to a project when it runs inside one of the project's folders (the innermost project wins), so each project lists its chats from the phone, the desktop and the CLI. **New chat in <folder>** starts a chat that works in the project's main folder; the Mac resolves the folder, the phone only names the project. These projects are read-only on the phone: rename them or change their folders on the desktop. An optional operator [project catalog](docs/project-catalog.md) can add more, with links to bots and named relative file references.
 
 Chats are built for lifting the useful part out of a reply. The full contract, including a style guide for agents writing to the phone, is in [docs/message-format.md](docs/message-format.md).
-- **Replies** run full width with real Markdown: headings, lists and checkboxes, quotes, GitHub-style callouts, tables, and code blocks with a file or language label, Wrap and Copy. Tapping `inline code` copies it. Long-press any message for Copy, Copy as Markdown, Select Text, Copy Code, Reply with Quote, Edit as New Message, Pin and Share.
-- **Files** a reply hands over with `MEDIA:/path` open in Quick Look (documents, code, audio, video, 3D and AR). Credentials and Hermes config are never served.
-- **Background work** shows as readable cards ("build.py --mesh in plate B", "2 subagent tasks finished · 1 failed"), with the exact command and output a tap away. A finished subagent shows the tokens Hermes recorded for it ("34 calls · 3.7M tokens in · 25k out · 37m03s"). Its cost is left off, because a subscription route's rate-card estimate isn't a charge.
+- **Replies** run full width with real Markdown: headings, lists and checkboxes, quotes, GitHub-style callouts, tables, and code blocks with a file or language label, Wrap and Copy. Tapping `inline code` copies it. Long-press any message for Copy, Copy as Markdown, Select Text, Copy Code, Reply with Quote, Edit as New Message, Pin and Share. The left-edge swipe always goes back.
+- **Files** a reply hands over with `MEDIA:/path`, or a plain path to a file in an allowed folder, show inline or open in Quick Look (documents, code, audio, video, 3D and AR). Credentials and Hermes config are never served.
+- **Background work** shows as readable cards ("build.py --mesh in plate B", "2 subagent tasks finished · 1 failed"), with the exact command and output a tap away. A finished subagent shows the tokens Hermes recorded for it ("34 calls · 3.7M tokens in · 25k out · 37m03s").
 - **Pinned messages** work like Telegram: a pinned bar, a list of every pin, and a chat with pins asks before it is archived.
-- **Send next and Guide never get lost.** They're saved on the phone before they're sent, and keep one ID across retries
-  so a resend never duplicates. A tray above the composer shows where each one is. Tap to edit it while it waits in
-  Hermes's queue; touch and hold to guide the current reply now, move it back to the message box, or remove it.
-- **The composer** stays small: `+` attaches files (also while a reply runs; Send next and Guide this reply carry them), ⌘ lists every command and skill, and typing `/` filters them inline.
+- **Send next and Guide never get lost.** They're saved on the phone before they're sent, and keep one ID across retries so a resend never duplicates. A tray above the composer shows where each one is. Tap to edit it while it waits in Hermes's queue; touch and hold to guide the current reply now (even once it's on your Mac), move it back to the message box, or remove it.
+- **The composer** stays small: `+` attaches files (also while a reply runs), ⌘ lists every command and skill, and typing `/` filters them inline. Switch model mid-chat by tapping the model chip, or type `/model`, `/model <provider>:<name>`, `/model reset` or `/effort <level>`. These never reach the agent; if a reply is running, the change applies to the next message.
 
-The **Status** tab mirrors the Mac status dashboard (`Status/`, a web page on port 9230). It shows:
-- what's running right now: chats, subagents and cron runs;
-- cron jobs, incidents, recent runs, provider usage, and a "What's new" log.
+The **Status** tab mirrors the status dashboard (`Status/`, a web page on port 9230): what's running right now (chats, subagents and cron runs), cron jobs, incidents, recent runs, provider usage, and a "What's new" log. At the bottom, **Restart** (owner phone only) restarts Hermes without touching the Mac. "Restart when replies finish" keeps the gateway serving and restarts it the moment nothing is running. "Restart now, stop replies" restarts it immediately. "Restart phone connection" restarts the bridge itself (`POST /m/restart {target: hermes|bridge, now}`).
 
-At the bottom, **Restart** (owner phone only) restarts Hermes without touching the Mac. "Restart when replies finish"
-sends the gateway the same signal as `hermes gateway restart`: it keeps serving and restarts the moment nothing is
-running. "Restart now, stop replies" runs `hermes gateway restart --yes`, and starts Hermes if it isn't running.
-"Restart phone connection" restarts the bridge itself, which its service manager brings straight back
-(`POST /m/restart {target: hermes|bridge, now}`).
+Bots, including the skills each one has and its fallback chain, live on the **Bots** tab. The connection pill names the gateway (`mothership · Online`, `mothership · Degraded`) so a healthy machine is not confused with a degraded one. Both the Mac page and the phone re-discover everything on each refresh, so a bot or cron job you create shows up within seconds, with a "new" badge for a day.
 
-Bots, including the skills each one has, live on the **Bots** tab. The connection pill names the gateway (`mothership · Online`, `mothership · Degraded`) so a healthy machine is not confused with a degraded one.
-
-Both the Mac page and the phone re-discover everything on each refresh, so a bot or cron job you create shows up within
-seconds, with a "new" badge for a day. Removals and renames show up too. The phone refreshes every 5 s while the Status
-tab is open and every 30 s otherwise, badges the tab, and shows a banner when something is created or removed.
-
-The app has no server of its own. Each person who installs it points it at **their own computer** (macOS, Linux or
-Windows), which runs Hermes, a small bridge (`Bridge/`) that the app talks to over Tailscale, and the status dashboard.
-
-**Setting it up, or asking an agent to?** Follow [docs/setup.md](docs/setup.md). It's an ordered runbook for all three
-operating systems, and `Bridge/run-bridge.sh --doctor` checks every step and prints the exact fix for anything missing.
-**Wondering whether a message can get lost?** [docs/delivery.md](docs/delivery.md) says where every outgoing message
-lives and what survives an app kill, lost signal, or a bridge or gateway restart.
-
-```
-iPhone app  ──HTTPS over your tailnet──▶  Bridge on your Mac (127.0.0.1:9131, exposed with `tailscale serve`)
-                                             └─▶ Hermes gateway (API server + the desktop app's session protocol)
-                                                   └─▶ Hermes state.db: the same chats the desktop app shows
-```
+**Wondering whether a message can get lost?** [docs/delivery.md](docs/delivery.md) says where every outgoing message lives and what survives an app kill, lost signal, or a bridge or gateway restart.
 
 ---
 
@@ -256,11 +288,34 @@ parallel and reports any row it could not change.
 | `Status/hermes_status_server.py`, `Status/dashboard.html` | The status dashboard: gateway, bots, cron jobs, running agents, incidents, provider usage, and what's new. It is read-only toward Hermes; its only state is `~/Library/Application Support/hermes-status/seen.json` (what it has seen, for the "new" badges). |
 | `Status/install.sh` | Installs the dashboard as a launch agent on port 9230. The bridge's `/m/status` reads it (`HERMES_STATUS_URL` overrides the address). |
 
+### Screenshots and demo mode
+
+Debug builds have a demo mode that answers every request from fixtures in `App/Sources/DemoServer.swift`, never the
+network, so screenshots never show real chats. Launch arguments:
+
+| Argument | Shows |
+|---|---|
+| `-HMDemo 1` | Demo mode on, signed in to a synthetic gateway. |
+| `-HMTab 0` … `4` | Opens Chats, Bots, Projects, Status or Settings. |
+| `-HMOpenChat default/demo-thermocline` | Opens the demo conversation. |
+| `-HMDemoLive 1` · `-HMDemoApproval 1` · `-HMDemoDraft 1` | A reply streaming, an approval waiting, a draft in the box. |
+| `-HMDemoEmpty 1` · `-HMDemoError 1` | The empty and gateway-down states. |
+
+To retake the README set on a booted simulator:
+
+```bash
+xcrun simctl status_bar booted override --time 9:41 --batteryState charged --batteryLevel 100
+xcrun simctl launch booted <bundle id> -HMDemo 1 -HMTab 0
+xcrun simctl io booted screenshot docs/screenshots/chats.png
+```
+
 ### Development tips
 
 - Debug builds accept `-HMServer http://127.0.0.1:9131 -HMToken <token>` as launch arguments to skip the sign-in screen in the
   Simulator. Get a token with `~/.hermes/hermes-agent/.venv/bin/python Bridge/hermes_mobile_bridge.py --issue-token sim`.
 - The bridge keeps nothing but a signing secret (`~/.hermes/mobile/secret`) and its log (`~/.hermes/mobile/bridge.log`).
   Every chat and setting lives in Hermes's own `state.db`.
+
+- Tests: `Tests/run-swift.sh <simulator id>` runs the Swift suites; `python -m unittest discover -s Tests -p 'test_*.py'` runs the bridge suite.
 
 The [mobile engine and beta plan](docs/mobile-engine.md) covers native Windows setup, Telegram history, gateway compatibility, recovery tests and the proposed Rust transport evaluation.
