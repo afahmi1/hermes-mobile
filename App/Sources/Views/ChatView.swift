@@ -240,6 +240,7 @@ struct ChatScreen: View {
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
         .task { await chat.loadPalette() }
+        .modifier(VisibleChat(profile: chat.profile, session: chat.sessionId))
         .task(id: chat.sessionId) { await chat.loadPins() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
@@ -447,10 +448,34 @@ struct ChatScreen: View {
     }
 
     @ViewBuilder private var draftShelf: some View {
-        if let quote = chat.pastedTexts.first(where: \.isQuote) {
-            QuoteChip(text: quote.text) { chat.removePastedText(quote.id) }
+        let quotes = chat.pastedTexts.filter(\.isQuote)
+        if !quotes.isEmpty {
+            // Replying to several messages: each pill keeps its own answer; the newest one's answer is the box.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(quotes.enumerated()), id: \.element.id) { i, quote in
+                        if !quote.text.isEmpty {
+                            QuoteChip(text: quote.text, count: quotes.count > 1 ? (i + 1, quotes.count) : nil) {
+                                withAnimation(.snappy) { chat.removeReplyQuote(quote.id) }
+                            }
+                        }
+                        if i < quotes.count - 1 {
+                            TextField("Your reply to this…", text: Binding(
+                                get: { chat.pastedTexts.first { $0.id == quote.id }?.answer ?? "" },
+                                set: { v in if let k = chat.pastedTexts.firstIndex(where: { $0.id == quote.id }) { chat.pastedTexts[k].answer = v } }),
+                                      axis: .vertical)
+                                .lineLimit(1...4)
+                                .font(.subheadline)
+                                .padding(.leading, 13).padding(.vertical, 4)
+                        }
+                    }
+                }
                 .padding(.horizontal, 12)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(maxHeight: quotes.count > 1 ? 260 : nil)
+            .fixedSize(horizontal: false, vertical: quotes.count == 1)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
         if chat.pastedTexts.contains(where: { !$0.isQuote }) {
             ScrollView(.horizontal) {
@@ -669,10 +694,8 @@ struct ChatScreen: View {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             return
         }
-        if replace, case let (quote?, body) = ReplyQuote.split(text) {
-            // Editing a sent reply: its quote goes back into the chip, the words into the box.
-            chat.setReplyQuote(quote)
-            chat.draft = body
+        if replace, chat.restoreReplies(from: text) {
+            // Editing a sent reply: each quote goes back into a pill with its words, the last words into the box.
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             return
         }
@@ -1370,6 +1393,15 @@ struct MessageRow: View {
 
     /// Long pastes fold to their first lines so one message never fills the screen.
     private var replySplit: (quote: String?, body: String) { ReplyQuote.split(item.text) }
+
+    private func userBubble(_ words: String) -> some View {
+        Text(words)
+            .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
+            .foregroundStyle(HMDesign.bubbleText)
+            .background(HMDesign.bubbleFill, in: bubbleShape)
+            .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
+                                              lineWidth: highlighted ? 2 : 0))
+    }
     private var userIsLong: Bool { item.text.count > 700 || item.text.reduce(0) { $1 == "\n" ? $0 + 1 : $0 } > 14 }
     private var userText: String {
         guard userIsLong, !showFull else { return item.text }
@@ -1401,13 +1433,19 @@ struct MessageRow: View {
                         HStack(alignment: .top, spacing: 4) {
                             if pinned { pinMark }
                             VStack(alignment: .leading, spacing: 8) {
-                                if let q = replySplit.quote { QuoteCard(text: q) }
-                                Text(replySplit.quote == nil ? userText : replySplit.body)
-                                    .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
-                                    .foregroundStyle(HMDesign.bubbleText)
-                                    .hmBubble(bubbleShape)
-                                    .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
-                                                                      lineWidth: highlighted ? 2 : 0))
+
+                                let segs = ReplyQuote.segments(item.text)
+                                if segs.filter({ $0.quote != nil }).count > 1 && !userIsLong {
+                                    // A reply to several messages: each quote card with its answer under it.
+                                    ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
+                                        if let q = seg.quote { QuoteCard(text: q) }
+                                        if !seg.body.isEmpty { userBubble(seg.body) }
+                                    }
+                                } else {
+                                    if let q = replySplit.quote { QuoteCard(text: q) }
+                                    userBubble(replySplit.quote == nil ? userText : replySplit.body)
+                                }
+>>>>>>> origin/zayd/pickup
                             }
                                 .contextMenu { messageMenu }
                         }
@@ -2803,13 +2841,15 @@ struct ClarifyChoice {
 /// The message you're replying to, above the message box: accent bar, two lines, remove button.
 struct QuoteChip: View {
     let text: String
+    /// (n, of) when replying to several messages.
+    var count: (Int, Int)? = nil
     let remove: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1.5).fill(HMDesign.accent).frame(width: 3)
             VStack(alignment: .leading, spacing: 2) {
-                Label("Replying to", systemImage: "arrowshape.turn.up.left.fill")
+                Label(count.map { "Replying to \($0.0) of \($0.1)" } ?? "Replying to", systemImage: "arrowshape.turn.up.left.fill")
                     .font(.caption2.weight(.semibold)).foregroundStyle(HMDesign.accent)
                 Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
             }
@@ -3037,5 +3077,17 @@ struct FailedTurnCard: View {
     private func act(_ work: @escaping () async -> Void) {
         busy = true
         Task { await work(); busy = false }
+    }
+}
+
+/// The chat on screen doesn't need a notification for its own replies; other chats still do.
+struct VisibleChat: ViewModifier {
+    let profile: String
+    let session: String?
+    private var key: String { profile + "|" + (session ?? "") }
+    func body(content: Content) -> some View {
+        content
+            .onAppear { ReplyNotifier.shared.visibleChat = key }
+            .onDisappear { if ReplyNotifier.shared.visibleChat == key { ReplyNotifier.shared.visibleChat = nil } }
     }
 }

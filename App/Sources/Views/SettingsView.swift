@@ -24,10 +24,14 @@ struct SettingsView: View {
         return "\(app.bots.filter(\.reachable).count) of \(app.bots.count) reachable"
     }
 
+    @State private var showWhatsNew = false
     var body: some View {
         NavigationStack {
             Form {
                 // Where this phone is connected, as one card. Other gateways live one tap in.
+                Section {
+                    Button("What's new") { showWhatsNew = true }
+                }.hmRows()
                 Section {
                     NavigationLink {
                         GatewaysPage(addingGateway: $addingGateway, gatewayError: $gatewayError, forgetting: $forgetting)
@@ -83,6 +87,7 @@ struct SettingsView: View {
             #endif
             .hmCanvas()
             .navigationTitle("Settings")
+            .sheet(isPresented: $showWhatsNew) { if let w = WhatsNew.current { WhatsNewSheet(release: w) } }
             .sheet(isPresented: $addingGateway) { SignInView(adding: true) }
             .task(id: app.inboxAccount) {
                 capabilities = nil
