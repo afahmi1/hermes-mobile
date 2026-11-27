@@ -181,11 +181,13 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     let endedAt: Double?
     /// Pinned messages inside this chat (bridge-side). Absent on older bridges and on chats without pins.
     var pinCount: Int?
+    /// What Hermes recorded this chat cost, classified like the chat header. Absent when nothing is priced.
+    var cost: CostSummary?
 
     enum CodingKeys: String, CodingKey {
         case id, profile, source, model, title, preview, pinned, archived, createdVia = "created_via"
         case startedAt = "started_at", lastActive = "last_active", messageCount = "message_count", endedAt = "ended_at"
-        case pinCount = "pin_count"
+        case pinCount = "pin_count", cost
     }
 
     var pinnedMessages: Int { max(0, pinCount ?? 0) }
@@ -1118,6 +1120,23 @@ struct CostSummary: Codable, Hashable {
     static func money(_ usd: Double) -> String {
         if usd < 0.005 { return "<$0.01" }
         return usd.formatted(.currency(code: "USD").precision(.fractionLength(usd < 1 ? 3 : 2)))
+    }
+
+    /// On a chat row: "$1.24", "Plan", "$0.40 + plan". Nil when nothing is priced or included.
+    var rowLabel: String? {
+        let paid = usd >= 0.0005
+        if paid && included { return Self.money(usd) + " + plan" }
+        if paid { return Self.money(usd) }
+        if included { return "Plan" }
+        return nil
+    }
+
+    var spokenLabel: String? {
+        let paid = usd >= 0.0005
+        if paid && included { return "Cost \(Self.money(usd)), plus usage included in a plan" }
+        if paid { return "Cost \(Self.money(usd))" }
+        if included { return "Included in a plan" }
+        return nil
     }
 
     /// Under one reply: "$0.042", "Included in plan", "$0.03 + plan". Nil when nothing is priced or included.

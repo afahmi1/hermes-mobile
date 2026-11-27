@@ -696,8 +696,12 @@ def native_inbox_window(pid, offset, limit, exclude, first_page):
         # Native rich rows can contain session metadata private to the gateway.
         fields = ("id", "source", "model", "title", "preview", "started_at",
                   "ended_at", "last_active", "message_count")
-        return {**{k: row.get(k) for k in fields}, "pinned": bool(row.get("pinned")),
-                "archived": bool(row.get("archived"))}
+        out = {**{k: row.get(k) for k in fields}, "pinned": bool(row.get("pinned")),
+               "archived": bool(row.get("archived"))}
+        cost = row_cost(row)
+        if cost:
+            out["cost"] = cost
+        return out
 
     with closing(SessionDB(profile_home(pid) / "state.db", read_only=True)) as db:
         options = dict(compact_rows=True, exclude_sources=list(exclude), order_by_last_active=True)
@@ -879,8 +883,12 @@ SESSION_COLS = ("id, source, model, title, started_at, ended_at, message_count, 
                 "coalesce(last_activity_at, started_at) AS last_active, parent_session_id")
 
 
+_COST_COLS = ("estimated_cost_usd", "actual_cost_usd", "cost_status", "billing_provider", "billing_mode")
+
+
 def _session_cols(con):
-    return SESSION_COLS + (", pinned" if any(r[1] == "pinned" for r in con.execute("PRAGMA table_info(sessions)")) else "")
+    names = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+    return SESSION_COLS + "".join(", " + name for name in ("pinned", *_COST_COLS) if name in names)
 
 
 def _session_flags(row):
@@ -888,7 +896,33 @@ def _session_flags(row):
     data["archived"] = bool(data["archived"])
     if "pinned" in data:
         data["pinned"] = bool(data["pinned"])
+    cost = row_cost(data)
+    for key in _COST_COLS:
+        data.pop(key, None)
+    if cost:
+        data["cost"] = cost
     return data
+
+
+def _usd(value):
+    """A finite, non-negative dollar amount (0.0 otherwise). Booleans are not money."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return 0.0
+    return float(value) if 0 <= value < float("inf") else 0.0
+
+
+def row_cost(row):
+    """The chat list's cost for one session, classified the way the chat header's ledger is (billing_kind):
+    a subscription's rate-card estimate is "included", never a charge. None when Hermes recorded nothing."""
+    if not any(row.get(key) not in (None, "") for key in _COST_COLS):
+        return None
+    est, act = _usd(row.get("estimated_cost_usd")), _usd(row.get("actual_cost_usd"))
+    kind = billing_kind(row.get("billing_provider"), row.get("billing_mode") or "", row.get("cost_status"), est, act)
+    api = act if act > 0 else est
+    if kind == "unknown" or (kind == "priced" and api <= 0):
+        return None
+    return {"usd": round(api, 6) if kind == "priced" else 0.0, "included": kind == "included",
+            "unknown": False, "included_api_usd": round(api, 6) if kind == "included" else 0.0}
 
 
 _FTS_REBUILD_MARKERS = ("fts_rebuild_high_water", "fts_rebuild_progress",
