@@ -454,6 +454,8 @@ struct AppearanceSection: View {
     @AppStorage(HMTheme.thermoclineAccentKey) private var thermoclineAccentRaw = Thermocline.Accent.crown.rawValue
     @AppStorage(HMGlass.key) private var glass = true
     @AppStorage(ThinkingStyle.key) private var thinkingRaw = ThinkingStyle.orbs.rawValue
+    @AppStorage(ThinkingWords.key) private var wordsRaw = ThinkingWords.playful.rawValue
+    @AppStorage(ThinkingWords.streamKey) private var streamThinking = false
     @AppStorage(ChatIconStyle.key) private var iconRaw = ChatIconStyle.auto.rawValue
     @AppStorage(Thermocline.Palette.darkCanvasKey) private var darkCanvas = "black"
     @AppStorage(StatusPulse.key) private var pulse = true
@@ -568,6 +570,10 @@ struct AppearanceSection: View {
                 }
             }
             .padding(.vertical, 4)
+            Picker("While Hermes works", selection: $wordsRaw) {
+                ForEach(ThinkingWords.allCases) { Text($0.title).tag($0.rawValue) }
+            }
+            Toggle("Stream Hermes's thinking", isOn: $streamThinking)
             Picker("Chat icons", selection: $iconRaw) {
                 ForEach(ChatIconStyle.allCases) { Text($0.title).tag($0.rawValue) }
             }

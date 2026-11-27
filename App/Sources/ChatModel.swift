@@ -7,6 +7,9 @@ struct ToolActivity: Hashable, Identifiable {
     var preview: String
     var result: String
     var state: String
+    /// When the step started and finished (epoch seconds): shown next to each step in the dropdown.
+    var started: Double? = nil
+    var ended: Double? = nil
 }
 
 struct ChatItem: Identifiable, Hashable {
@@ -87,7 +90,7 @@ final class ChatModel {
     var items: [ChatItem] = []
     var title: String?
     var isLoading = false
-    var isRunning = false { didSet { if isRunning && !oldValue { runStarted = Date() } } }
+    var isRunning = false { didSet { if isRunning && !oldValue { runStarted = Date(); thinkingText = "" } } }
     /// When this reply started, for "finished in 4 min" in the notification.
     @ObservationIgnored private var runStarted: Date?
     var slashBusy = false
@@ -505,7 +508,7 @@ final class ChatModel {
                 if !calls.isEmpty {
                     let activities = calls.enumerated().map { offset, call in
                         ToolActivity(id: key + "-\(offset)", name: call.function?.name ?? "tool",
-                                     preview: call.preview ?? "", result: "", state: "done")
+                                     preview: call.preview ?? "", result: "", state: "done", started: m.timestamp)
                     }
                     if let toolGroup {
                         out[toolGroup].activities += activities
@@ -527,6 +530,7 @@ final class ChatModel {
                 }) else { continue }
                 if m.ok == false { out[toolGroup].activities[idx].state = "failed" }
                 if let preview = m.preview, !preview.isEmpty { out[toolGroup].activities[idx].result = preview }
+                out[toolGroup].activities[idx].ended = m.timestamp
                 if let end = m.timestamp { out[toolGroup].ended = end }
             default:
                 continue
@@ -1000,6 +1004,16 @@ final class ChatModel {
         await enqueue(raw, mode: "queue", attachments: attachments)
     }
 
+    // MARK: thinking
+
+    /// Hermes's reasoning for the current reply (streamed), and a counter that moves on every new step.
+    var thinkingText = ""
+    var activityTick = 0
+    private func appendThinking(_ s: String) {
+        thinkingText += s
+        if thinkingText.count > 24_000 { thinkingText = String(thinkingText.suffix(20_000)) }
+    }
+
     // MARK: Hermes's questions
 
     /// Questions Hermes is waiting on (its clarify tool asks 1 to 5 at once), oldest first.
@@ -1371,7 +1385,22 @@ final class ChatModel {
         guard let item = outgoing.first(where: { $0.id == id }) else { return }
         if item.onMac, let adm = item.admission, !adm.hasPrefix("turn:"), let sid = sessionId {
             guard allows(.steer, item) else {
-                error = Self.filesLocked
+                // Hermes won't convert this admission (files, or its controls say no): take it back off the Mac's
+                // queue and send the same words and files as a guide. Shown as "Guiding…" right away.
+                do {
+                    _ = try await api.queueAction(profile: profile, session: sid, admission: adm, action: "cancel")
+                } catch APIError.http(409, _) {
+                    error = "Hermes already started that message, so it can't become guidance now."
+                    await refreshQueue()
+                    return
+                } catch APIError.http(404, _) {
+                } catch {
+                    self.error = "Couldn't reach your Mac to move it. Try again in a moment."
+                    return
+                }
+                update(id) { $0.mode = "steer"; $0.note = nil; $0.admission = nil; $0.attempts = 0 }
+                await persistOutgoing()
+                await pump()
                 return
             }
             do {
@@ -1619,7 +1648,7 @@ final class ChatModel {
         case "tool.started", "tool.start":
             let name = ev.string("tool_name") ?? ev.string("tool") ?? ev.string("name") ?? "tool"
             let activity = ToolActivity(id: "live-\(UUID().uuidString)", name: name, preview: ev.string("preview") ?? "",
-                                        result: "", state: "running")
+                                        result: "", state: "running", started: Date().timeIntervalSince1970)
             closeStreamingBubble()
             if let i = liveToolGroup, items.indices.contains(i), items[i].kind == .tools {
                 items[i].tools.append(name)
@@ -1629,12 +1658,14 @@ final class ChatModel {
                 items.append(ChatItem(id: "tools-\(UUID().uuidString)", kind: .tools, text: "", tools: [name], activities: [activity]))
             }
             status = "Using \(name.replacingOccurrences(of: "_", with: " "))…"
+            activityTick &+= 1
         case "tool.completed":
             let name = ev.string("tool_name") ?? ev.string("name") ?? ""
             let ok = ev.raw["ok"] as? Bool ?? true
             if let i = liveToolGroup, items.indices.contains(i),
                let idx = items[i].activities.lastIndex(where: { $0.state == "running" && (name.isEmpty || $0.name == name) }) {
                 items[i].activities[idx].state = ok ? "done" : "failed"
+                items[i].activities[idx].ended = Date().timeIntervalSince1970
                 if let preview = ev.string("preview"), !preview.isEmpty, items[i].activities[idx].result.isEmpty {
                     items[i].activities[idx].result = preview
                 }
@@ -1654,8 +1685,10 @@ final class ChatModel {
                 items[i].contextNote = summary
             }
         case "reasoning.available", "reasoning.delta":
-            if streamingIndex == nil && status != "Thinking…" { status = "Thinking…" }
+            if let d = ev.string("delta"), !d.isEmpty { appendThinking(d) }
+            if streamingIndex == nil && status != "Thinking…" { status = "Thinking…"; activityTick &+= 1 }
         case "status":
+            if let t = ev.string("text"), !t.isEmpty { appendThinking(t) }
             if streamingIndex == nil { status = "Thinking…" }
         case "notice":
             items.append(ChatItem(id: "n-\(UUID().uuidString)", kind: .notice, text: ev.string("text") ?? ""))

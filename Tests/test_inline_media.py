@@ -37,6 +37,25 @@ class InlineMedia(unittest.TestCase):
         row = self.row('Here: **MEDIA:"%s"**' % self.a)
         self.assertEqual(len(row["media"]), 1)
 
+    def test_plain_paths_show_under_their_line(self):
+        text = ("Built from these:\n- `%s` (front)\n- %s, overall\n\n```\nls %s\n```\nDone." % (self.a, self.b, self.a))
+        row = self.row(text)
+        self.assertEqual([m["name"] for m in row["media"]], [self.a.name, self.b.name])
+        self.assertIn(str(self.a), row["content"])  # the path text stays
+        kinds = [("media" if "media" in p else "text") for p in row["content_parts"]]
+        self.assertEqual(kinds, ["text", "media", "text", "media", "text"])
+        # digest resolves back to the file for the image endpoint
+        self.assertEqual(t.file_for_digest([("assistant", text)], row["media"][0]["digest"], [self.root]), self.a)
+
+    def test_image_in_code_block_waits_for_the_fence(self):
+        row = self.row("```\n%s\n```\nafter" % self.a)
+        first = row["content_parts"][0]["text"]
+        self.assertTrue(first.rstrip().endswith("```"))
+
+    def test_user_paths_are_not_promoted(self):
+        row = t.project_timeline_message({"role": "user", "content": "look at %s" % self.a, "id": 2}, [self.root])
+        self.assertNotIn("media", row)
+
     def test_missing_file_keeps_the_text(self):
         row = self.row("MEDIA:%s/nope here.png" % self.root)
         self.assertIn("MEDIA:", row["content"])

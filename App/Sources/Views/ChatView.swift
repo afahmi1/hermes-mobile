@@ -102,11 +102,7 @@ struct ChatScreen: View {
                         .padding(.horizontal, 12)
                     }
                     if let s = chat.status {
-                        HStack(spacing: 8) {
-                            ThinkingIndicator(size: 16, activity: s)
-                            ShimmerText(text: s)
-                            Spacer()
-                        }
+                        ThinkingStatus(chat: chat, status: s)
                         .padding(.horizontal, 16).id("status")
                     }
                     Color.clear.frame(height: 4).id("bottom")
@@ -367,8 +363,12 @@ struct ChatScreen: View {
         if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
         var parts = [who]
         if let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) { parts.append(effort) }
-        // Real money only: a plan-covered chat shows no price here (the model sheet has the detail).
-        if let usd = chat.served?.cost?.usd, usd >= 0.01 { parts.append(CostSummary.money(usd)) }
+        // What was actually charged, plus "+ plan" when a subscription covered the rest, so the label changes
+        // as plan usage grows instead of looking frozen (the model sheet shows the API-price equivalent).
+        if let cost = chat.served?.cost {
+            if cost.usd >= 0.01 { parts.append(CostSummary.money(cost.usd) + (cost.included ? " + plan" : "")) }
+            else if cost.included, cost.includedApiUsd >= 0.01 { parts.append("Plan") }
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -1539,9 +1539,13 @@ struct MessageRow: View {
                                     .foregroundStyle(row.state == "failed" ? HMDesign.danger : HMDesign.text2)
                                     .symbolEffect(.pulse, isActive: row.state == "running" && !reduceMotion)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(ToolLanguage.title(row))
-                                        .font(.caption)
-                                        .foregroundStyle(row.state == "failed" ? HMDesign.dangerText : HMDesign.ink)
+                                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                        Text(ToolLanguage.title(row))
+                                            .font(.caption)
+                                            .foregroundStyle(row.state == "failed" ? HMDesign.dangerText : HMDesign.ink)
+                                        Spacer(minLength: 4)
+                                        ToolStamp(row: row)
+                                    }
                                     if !row.result.isEmpty {
                                         Text(row.result).font(.caption2.monospaced()).foregroundStyle(HMDesign.text2).lineLimit(3)
                                     }
@@ -1763,17 +1767,37 @@ private struct TranscriptImages: View {
     var alignment: HorizontalAlignment = .leading
     @State private var preview: UIImage?
 
+    private var images: [ChatMediaRef] { refs.filter { $0.kind == "image" } }
+
     var body: some View {
         if !refs.isEmpty, session != nil {
             VStack(alignment: alignment, spacing: 6) {
-                ForEach(refs, id: \.digest) { ref in
-                    if ref.kind == "image" {
-                        TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name) {
-                            preview = $0
+                if images.count >= 2 {
+                    // Several images in one message: one even-height row you swipe through, in the order sent.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(images, id: \.digest) { ref in
+                                TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name,
+                                                tileHeight: 150) { preview = $0 }
+                            }
                         }
-                    } else {
-                        TranscriptFile(ref: ref, profile: profile, session: session ?? "")
+                        .scrollTargetLayout()
                     }
+                    .scrollTargetBehavior(.viewAligned)
+                    .defaultScrollAnchor(alignment == .trailing ? .trailing : .leading)
+                    .frame(height: 150)
+                    .overlay(alignment: alignment == .trailing ? .bottomLeading : .bottomTrailing) {
+                        Text("\(images.count) images").font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(.ultraThinMaterial, in: Capsule()).padding(6)
+                    }
+                } else {
+                    ForEach(images, id: \.digest) { ref in
+                        TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name) { preview = $0 }
+                    }
+                }
+                ForEach(refs.filter { $0.kind != "image" }, id: \.digest) { ref in
+                    TranscriptFile(ref: ref, profile: profile, session: session ?? "")
                 }
             }
             .fullScreenCover(isPresented: Binding(get: { preview != nil }, set: { if !$0 { preview = nil } })) {
@@ -1788,6 +1812,8 @@ private struct TranscriptImage: View {
     let session: String
     let digest: String
     let name: String
+    /// Set inside a multi-image row: every tile the same height, width from the image's shape.
+    var tileHeight: CGFloat? = nil
     let open: (UIImage) -> Void
     @State private var image: UIImage?
     @State private var failed = false
@@ -1796,9 +1822,16 @@ private struct TranscriptImage: View {
         Group {
             if let image {
                 Button { open(image) } label: {
-                    Image(uiImage: image).resizable().scaledToFit()
-                        .frame(maxWidth: 240, maxHeight: 220)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    if let h = tileHeight {
+                        Image(uiImage: image).resizable().scaledToFill()
+                            .frame(width: min(240, max(90, h * image.size.width / max(image.size.height, 1))), height: h)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    } else {
+                        // Never blown up past its real size: a small image stays small.
+                        Image(uiImage: image).resizable().scaledToFit()
+                            .frame(maxWidth: min(240, image.size.width), maxHeight: min(220, image.size.height))
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(name)
@@ -2540,7 +2573,7 @@ struct OutboxTray: View {
         .onTapGesture { if canEdit(item) { editing = item } }
         .contextMenu {
             if canEdit(item) { Button { editing = item } label: { Label("Edit", systemImage: "pencil") } }
-            if item.mode == "queue", chat.isRunning, item.problem == nil, chat.allows(.steer, item) {
+            if item.mode == "queue", chat.isRunning, item.problem == nil {
                 Button { Task { await chat.guideNow(item.id) } } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
             }
             Button { Task { await chat.removeOutgoing(item.id, toComposer: true) } } label: {
@@ -2884,5 +2917,32 @@ struct SubagentCard: View {
         } else {
             card
         }
+    }
+}
+
+/// "10:42:07 · 3.2s" next to a tool step: when it ran and how long it took (live steps count up).
+struct ToolStamp: View {
+    let row: ToolActivity
+    private static let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
+
+    var body: some View {
+        if let start = row.started {
+            HStack(spacing: 4) {
+                Text(Self.clock.string(from: Date(timeIntervalSince1970: start)))
+                if let end = row.ended, end >= start {
+                    Text("· " + Self.span(end - start))
+                } else if row.state == "running" {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text("· " + Self.span(ctx.date.timeIntervalSince1970 - start))
+                    }
+                }
+            }
+            .font(.system(.caption2, design: .monospaced)).monospacedDigit().foregroundStyle(.tertiary)
+            .fixedSize()
+        }
+    }
+
+    static func span(_ t: Double) -> String {
+        t < 1 ? "<1s" : t < 60 ? String(format: "%.1fs", t) : "\(Int(t) / 60)m \(Int(t) % 60)s"
     }
 }

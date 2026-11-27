@@ -495,11 +495,16 @@ def _marker_paths(text):
     text = text or ""
     paths = _IMAGE_AT.findall(text) + [_media_path(m) for m in _MEDIA.finditer(text)] + _MD_IMAGE.findall(text)
     paths += [p for p in (_json_path(raw) for _, raw in _BRIDGE_NOTE.findall(text)) if p]
+    paths += mentioned_images(text)
     return paths + _AUDIO_NOTE.findall(text) + _PASTE_NOTE.findall(text)
 
 
-def _refs(text, roots):
-    """Attachment markers in transcript text. Only a file that resolves inside the roots is removed."""
+def _refs(text, roots, bare=False):
+    """Attachment markers in transcript text. Only a file that resolves inside the roots is removed.
+
+    `bare` (Hermes's own replies): an image named by a plain path ("~/Runs/plate.png", backticked or not) also
+    shows, right under the line that names it; the path text stays. Inside a code block or a table the image
+    waits until the block ends, so neither breaks."""
     found = []
     seen = set()
 
@@ -536,6 +541,22 @@ def _refs(text, roots):
                                               label=_json_path(m.group(1)) if m.group(1) else None), cleaned)
     cleaned = _AUDIO_NOTE.sub(lambda m: take(m.group(1).strip(), keep=""), cleaned)
     cleaned = _PASTE_NOTE.sub(lambda m: take(m.group(1).strip(), keep=m.group(0), gone=m.group(0)), cleaned)
+    if bare:
+        out, waiting, fenced = [], [], False
+        for line in cleaned.split("\n"):
+            out.append(line)
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+            for p in mentioned_images(line):
+                if Path(p).suffix.lower() in IMAGE_EXT:
+                    before = len(found)
+                    mark = take(p, keep="", anchor=True)
+                    if len(found) > before:
+                        waiting.append(mark.strip("\n"))
+            if waiting and not fenced and not line.lstrip().startswith("|"):
+                out += waiting
+                waiting = []
+        cleaned = "\n".join(out + waiting)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, found
 
@@ -579,6 +600,19 @@ def file_for_digest(texts, digest, roots, assistant_roots=()):
 _BARE_PATH = re.compile(r"(?<![\w.~/])((?:~|/(?:Users|tmp|private|var|opt|Volumes|home))/[^\s`'\"<>()\[\]{}|]+)")
 
 
+_BARE_IMAGE = re.compile(r"(?<![\w.~/])((?:~|/(?:Users|tmp|private|var|opt|Volumes|home|mnt))/[^\n`'\"<>|*]*?"
+                         r"\.(?:png|jpe?g|gif|webp|heic|heif|bmp|tiff?))(?![\w])", re.I)
+
+
+def mentioned_images(text):
+    """Image paths written in a reply, spaces allowed ("~/3D Printing/Runs/Plate B.png"), ~ expanded."""
+    out = []
+    for m in _BARE_IMAGE.finditer(text or ""):
+        p = m.group(1)
+        out.append(str(Path.home()) + p[1:] if p.startswith("~") else p)
+    return out
+
+
 def mentioned_paths(text):
     """Absolute or ~ paths written in a reply, with trailing punctuation trimmed."""
     out = []
@@ -619,7 +653,7 @@ def project_timeline_message(message, roots=None, assistant_roots=()):
     if role == "assistant":
         roots += list(assistant_roots)
     body = content_text(message.get("content"))
-    shown, media = _refs(body, roots)
+    shown, media = _refs(body, roots, bare=role == "assistant")
     parts, shown = content_parts(shown)
     row = {k: message[k] for k in ("id", "timestamp") if k in message}
     if media:
