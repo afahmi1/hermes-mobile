@@ -40,7 +40,76 @@ struct SendAttachment: Codable, Hashable {
     let filename: String
     let base64: String
     var sourceFormat: String? = nil
-    var byteCount: Int { base64.utf8.count / 4 * 3 - (base64.hasSuffix("==") ? 2 : base64.hasSuffix("=") ? 1 : 0) }
+    /// Big files (screen recordings, videos, long audio) are never held in memory or written into JSON. They stay
+    /// a file in the app's upload folder (stored by name: the app's container path changes on updates) and travel
+    /// through the bridge's resumable upload. `sha256` and `size` describe that file.
+    var localFile: String? = nil
+    var sha256: String? = nil
+    var size: Int? = nil
+
+    var isUpload: Bool { localFile != nil }
+    var fileURL: URL? { localFile.map { UploadFiles.folder.appendingPathComponent($0) } }
+    var byteCount: Int {
+        if isUpload { return size ?? 0 }
+        return base64.utf8.count / 4 * 3 - (base64.hasSuffix("==") ? 2 : base64.hasSuffix("=") ? 1 : 0)
+    }
+}
+
+/// The app's private folder for files waiting to upload. Survives relaunch; excluded from backups.
+enum UploadFiles {
+    /// Files at or under this size ride inline; bigger ones use the resumable upload when the bridge has it.
+    static let inlineLimit = 8 * 1024 * 1024
+
+    static var folder: URL {
+        let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("HermesUploads", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var u = url
+            try? u.setResourceValues(values)
+        }
+        return url
+    }
+
+    /// Take a file into the upload folder (moving it when we own it) and fingerprint it without loading it whole.
+    static func adopt(_ source: URL, filename: String, mime: String, move: Bool) throws -> SendAttachment {
+        let ext = (filename as NSString).pathExtension
+        let name = UUID().uuidString + (ext.isEmpty ? "" : "." + ext)
+        let target = folder.appendingPathComponent(name)
+        if move { try FileManager.default.moveItem(at: source, to: target) }
+        else { try FileManager.default.copyItem(at: source, to: target) }
+        #if !os(macOS)
+        try? (target as NSURL).setResourceValue(URLFileProtection.completeUntilFirstUserAuthentication, forKey: .fileProtectionKey)
+        #endif
+        let handle = try FileHandle(forReadingFrom: target)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var size = 0
+        while let block = try handle.read(upToCount: 1024 * 1024), !block.isEmpty {
+            hasher.update(data: block)
+            size += block.count
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return SendAttachment(mime: mime, filename: filename, base64: "", localFile: name, sha256: digest, size: size)
+    }
+
+    /// The bridge-side id for this file: stable across retries and relaunches, so an upload always resumes.
+    static func uploadID(_ a: SendAttachment) -> String {
+        let key = [a.sha256 ?? "", a.filename, a.mime].joined(separator: "|")
+        return String(SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined().prefix(32))
+    }
+
+    /// Remove upload copies a month old. Anything still waiting that long is stale; the person can pick it again.
+    static func prune(keep: Set<String>) {
+        let cutoff = Date().addingTimeInterval(-30 * 86400)
+        let urls = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        for url in urls where !keep.contains(url.lastPathComponent) {
+            let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            if date < cutoff { try? FileManager.default.removeItem(at: url) }
+        }
+    }
 }
 
 struct PendingSend: Codable {

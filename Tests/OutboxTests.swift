@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// The outbox message state machine, and that it survives on disk exactly as written.
 @main struct OutboxTests {
@@ -40,6 +41,19 @@ import Foundation
         try await InboxDisk.shared.saveOutgoing([], key: key)
         let cleared = await InboxDisk.shared.outgoing(key)
         precondition(cleared.isEmpty)
-        print("Outbox phases, edits, refusals, steer demotion and disk round trip passed")
+        // Big files: kept as a file, fingerprinted without loading whole, stable upload id, small JSON.
+        let source = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+        let bytes = Data((0..<3_000_000).map { UInt8($0 % 251) })
+        try bytes.write(to: source)
+        let file = try UploadFiles.adopt(source, filename: "rec.mov", mime: "video/quicktime", move: true)
+        precondition(file.isUpload && file.byteCount == bytes.count && file.base64.isEmpty)
+        precondition(file.sha256 == SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+        precondition(try Data(contentsOf: file.fileURL!) == bytes)
+        precondition(UploadFiles.uploadID(file) == UploadFiles.uploadID(file) && UploadFiles.uploadID(file).count == 32)
+        let json = try JSONEncoder().encode(file)
+        precondition(json.count < 600, "the outbox stores a name, not the bytes")
+        precondition(try JSONDecoder().decode(SendAttachment.self, from: json) == file)
+        try? FileManager.default.removeItem(at: file.fileURL!)
+        print("Outbox phases, edits, refusals, steer demotion, disk round trip and big-file attachments passed")
     }
 }

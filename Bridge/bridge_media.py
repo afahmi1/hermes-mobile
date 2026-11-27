@@ -41,6 +41,33 @@ class MediaError(ValueError):
     pass
 
 
+# Set by the bridge: where finished resumable uploads live (bridge_uploads). None = uploads unsupported.
+UPLOADS = None
+
+
+def valid_name(name):
+    return (isinstance(name, str) and 0 < len(name) <= 140 and name.isprintable()
+            and not any(c in name for c in "/\\:") and name not in (".", ".."))
+
+
+def valid_mime(mime):
+    return isinstance(mime, str) and bool(MIME.match(mime)) and not (mime.startswith("image/") and mime != JPEG)
+
+
+def _uploaded(item):
+    """A frame for a file sent through the resumable upload path: (name, sha256, Path, mime)."""
+    import bridge_uploads
+    if UPLOADS is None:
+        raise MediaError("This bridge can't take large uploads yet. Update the bridge.")
+    try:
+        path, meta = bridge_uploads.resolve(UPLOADS, item["upload_id"])
+    except bridge_uploads.UploadError as exc:
+        raise MediaError(str(exc)) from None
+    if (item["filename"], item["mime"]) != (meta["filename"], meta["mime"]):
+        raise MediaError("The attachment doesn't match its upload.")
+    return item["filename"], meta["sha256"], path, item["mime"]
+
+
 @lru_cache(maxsize=1)
 def supported():
     try:
@@ -184,6 +211,33 @@ def decode(items):
     frames = []
     remaining = MAX_BYTES
     for item in items:
+        if isinstance(item, dict) and set(item) == {"filename", "mime", "upload_id"}:
+            # Uploaded ahead (bridge_uploads): verified by SHA-256 there, outside the inline budget.
+            if not valid_name(item["filename"]) or not valid_mime(item["mime"]):
+                raise MediaError("Invalid attachment name or type.")
+            if item["mime"] == MP4 and len(items) != 1:
+                raise MediaError("Attach one MP4 clip, or up to %d other files." % MAX_ITEMS)
+            name, digest, path, mime = _uploaded(item)
+            if mime == MP4:
+                import mmap
+                try:
+                    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as view:
+                        _validate_clip(view)
+                except (ValueError, OSError):
+                    raise MediaError("The video must be a self-contained MP4 with a video track.") from None
+            elif mime == JPEG:
+                if not supported():
+                    raise MediaError("This Hermes installation does not support native image attachments.")
+                from PIL import Image
+                try:
+                    with Image.open(path, formats=("JPEG",)) as image:
+                        if image.width * image.height > 12_000_000:
+                            raise ValueError
+                        image.load()
+                except (ValueError, OSError, Image.DecompressionBombError):
+                    raise MediaError("An image is damaged, is too large, or is not a JPEG.") from None
+            frames.append((name, digest, path, mime))
+            continue
         if not isinstance(item, dict) or set(item) != {"filename", "mime", "base64"}:
             raise MediaError("Invalid attachment fields.")
         name, encoded, mime = item["filename"], item["base64"], item["mime"]
@@ -304,6 +358,18 @@ def stage(frames, home):
                 directory, ext = _image_dir(home), ".jpg"
             else:
                 directory, ext = _file_dir(home), _extension(name)
+            if isinstance(raw, Path):
+                # An uploaded file: hard-link it into place (instant, no second copy), copy across volumes.
+                import uuid
+                target = Path(directory) / ("hm_send_%s%s" % (uuid.uuid4().hex[:12], ext))
+                try:
+                    os.link(raw, target)
+                except OSError:
+                    import shutil
+                    shutil.copyfile(raw, target)
+                target.chmod(0o600)
+                paths.append({"path": str(target), "mime": mime, "name": name, "size": target.stat().st_size})
+                continue
             with tempfile.NamedTemporaryFile(prefix="hm_send_", suffix=ext, dir=directory, delete=False) as f:
                 paths.append({"path": f.name, "mime": mime, "name": name, "size": len(raw)})
                 f.write(raw)

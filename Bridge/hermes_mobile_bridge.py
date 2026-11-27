@@ -71,6 +71,7 @@ import bridge_receipts
 from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 import bridge_pins  # pinned messages (own SQLite file, stdlib only)
+import bridge_uploads  # resumable uploads for big files (stdlib only)
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
     TURNS_ERROR = None
@@ -1504,6 +1505,15 @@ def prepare_workspace_turn(pid, sid, payload):
     return {"store": store, "project": project, "output_dir": out_dir, "suffix": suffix, "summary": summary}
 
 
+def uploads_dir():
+    """Private store for resumable uploads (bridge_uploads)."""
+    return STATE_DIR / "uploads"
+
+
+if turns is not None:
+    turns.bridge_media.UPLOADS = uploads_dir()
+
+
 def admissions_dir():
     # Deployments with a small system volume can place new receipts on a private data volume.
     override = os.environ.get("HERMES_MOBILE_ADMISSIONS_DIR")
@@ -1537,6 +1547,22 @@ def timeline_page(raw):
     return timeline_bytes(json.loads(raw)["data"])
 
 
+def resume_target(db, path, session_id):
+    """The newest session in a compression lineage (where the chat continues). Hermes moved this from
+    SessionDB.resolve_resume_session_id to its storage interface (lineage.resolve_resume_target); use whichever
+    the installed Hermes has, so the bridge keeps working across the update."""
+    old = getattr(db, "resolve_resume_session_id", None)  # the slimmed SessionDB raises AttributeError -> None
+    if callable(old):
+        return old(session_id)
+    try:
+        from persistence_assembly import open_persistence_reader
+        with open_persistence_reader(Path(path)) as store:
+            return store.lineage.resolve_resume_target(session_id) or session_id
+    except Exception as exc:
+        log("resume target lookup failed (%s); reading the chat as named" % type(exc).__name__)
+        return session_id
+
+
 def session_bodies(pid, session_id):
     """Raw transcript text for one chat, so a media digest can be re-derived instead of trusted."""
     if not NATIVE_INBOX or not session_id or any(c in session_id for c in "/\\\x00") or len(session_id) > 200:
@@ -1549,7 +1575,7 @@ def session_bodies(pid, session_id):
     with closing(SessionDB(path, read_only=True)) as db:
         if not db.get_session(session_id):
             return []
-        active = db.resolve_resume_session_id(session_id)
+        active = resume_target(db, path, session_id)
         rows = db.get_messages(active, limit=1000, offset=0, latest=True,
                                include_compacted=True, include_ancestors=True)
         out = []
@@ -1570,7 +1596,7 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
     with closing(SessionDB(path, read_only=True)) as db:
         if not db.get_session(session_id):
             return None
-        active = db.resolve_resume_session_id(session_id)
+        active = resume_target(db, path, session_id)
         # One extra raw row tells the phone whether another page exists. Projected pages are shorter
         # (hidden tool rows are dropped), so the phone cannot infer this from the row count.
         probe = None if limit is None else limit + 1
@@ -1761,6 +1787,7 @@ class H(BaseHTTPRequestHandler):
                 features.append("file_attachments_v1")
             if turns:
                 features.append("queue_controls_v1")  # GET/POST /m/chat/<bot>/<chat>/queue
+                features.append("resumable_uploads_v1")  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
             return self.send(200, {"protocol": 2, "features": features,
                                    "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
         if path == "/m/devices" or path.startswith("/m/devices/"):
@@ -1817,7 +1844,7 @@ class H(BaseHTTPRequestHandler):
             return self.proxy(path, u.query)
         if path == "/m/skills" and self.command == "POST":
             return self.skill_route()
-        if path.startswith("/m/chat/") or path.startswith("/m/turns"):
+        if path.startswith("/m/chat/") or path.startswith("/m/turns") or path.startswith("/m/uploads"):
             return self.chat_route(path, q)
         self.send(404, {"error": "not found"})
 
@@ -2408,6 +2435,22 @@ class H(BaseHTTPRequestHandler):
                     return self.send(200, turns.queue_action(profile_home(pid), pid, sid, admission, action,
                                                              d.get("text"), d.get("submission_id")))
                 return self.send(405, {"error": "method not allowed"})
+            if path == "/m/uploads" and self.command == "POST":
+                d = self.json_body()
+                return self.send(200, bridge_uploads.create(uploads_dir(), str(d.get("upload_id") or ""), d.get("filename"),
+                                                             d.get("mime"), d.get("size"), d.get("sha256"),
+                                                             turns.bridge_media.valid_name, turns.bridge_media.valid_mime))
+            up = re.fullmatch(r"/m/uploads/([0-9a-fA-F-]{32,36})", path)
+            if up:
+                if self.command == "GET":
+                    return self.send(200, bridge_uploads.status(uploads_dir(), up.group(1)))
+                if self.command == "PATCH":
+                    try:
+                        offset = int(self.headers.get("Upload-Offset") or "-1")
+                    except ValueError:
+                        offset = -1
+                    return self.send(200, bridge_uploads.append(uploads_dir(), up.group(1), offset, self._body or b""))
+                return self.send(405, {"error": "method not allowed"})
             slash = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/slash", path)
             if slash and self.command == "POST":
                 pid, sid = slash.groups()
@@ -2425,7 +2468,9 @@ class H(BaseHTTPRequestHandler):
                                        "files": True,
                                        "video": turns.bridge_media.video_supported(profile_home(pid)),
                                        "max_video_bytes": turns.bridge_media.MAX_BYTES,
-                                       "max_file_bytes": turns.bridge_media.MAX_BYTES})
+                                       "max_file_bytes": turns.bridge_media.MAX_BYTES,
+                                       # Big files go through resumable uploads (bridge_uploads), up to this each.
+                                       "max_upload_bytes": bridge_uploads.MAX_BYTES})
             m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|send-receipt|runtime))$", path)
             if not m or self.command != "POST":
                 return self.send(404, {"error": "not found"})
@@ -2488,6 +2533,11 @@ class H(BaseHTTPRequestHandler):
             return self.send(202, turn.summary())
         except turns.TurnError as e:
             return self.send(e.code, {"error": str(e)})
+        except bridge_uploads.UploadError as e:
+            body = {"error": str(e)}
+            if e.offset is not None:
+                body["offset"] = e.offset
+            return self.send(e.code, body)
         except WorkspaceError as e:
             return self.send(e.code, {"error": str(e)})
         except Exception as e:
@@ -2755,6 +2805,8 @@ if __name__ == "__main__":
     threading.Thread(target=_key_watcher, name="key-watcher", daemon=True).start()
     srv = ThreadingHTTPServer((os.environ.get("HERMES_MOBILE_BIND", "127.0.0.1"), PORT), H)
     if turns is not None:
+        turns.bridge_media.UPLOADS = uploads_dir()
+        bridge_uploads.prune(uploads_dir())
         turns.recover_primary(admissions_dir(), profile_home, restore_send_workspace)
         for pid in profile_ids():
             turns.bridge_media.prune_clips(profile_home(pid))

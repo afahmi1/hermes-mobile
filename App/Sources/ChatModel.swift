@@ -785,13 +785,24 @@ final class ChatModel {
         if send.composerText != nil, draftAttachments == (send.attachments ?? []) { draftAttachments = [] }
     }
 
+    /// "Uploading 42%…" while a big file goes up. Resumes, so the number never goes backwards much.
+    private var uploadProgress: @Sendable (Double) -> Void {
+        { [weak self] fraction in
+            Task { @MainActor in
+                guard let self, fraction < 1 else { return }
+                self.status = "Uploading \(Int(fraction * 100))%…"
+            }
+        }
+    }
+
     private func deliver(_ send: PendingSend, session: String, key: String, allowLegacy: Bool) async {
         do {
             let run: String
             do {
                 run = try await api.startRun(profile: profile, session: session, text: send.text,
                                                     choice: send.choice, projectContext: send.project, submission: send.id,
-                                                    attachments: send.attachments ?? [], recovering: !allowLegacy)
+                                                    attachments: send.attachments ?? [], recovering: !allowLegacy,
+                                                    progress: uploadProgress)
             } catch APIError.http(404, _) where allowLegacy && send.attachments == nil {
                 // Legacy sends cannot be repeated safely. Keep the authored data recoverable
                 // across a crash, but turn off automatic delivery before the single legacy POST.
@@ -980,7 +991,7 @@ final class ChatModel {
             // Hermes answers with that same admission instead of filing a second copy. Edits apply after.
             let (accepted, admission) = try await api.followUpReceipt(run: run, mode: item.mode, text: item.text,
                                                                       submission: item.id, choice: item.choice ?? .botDefault,
-                                                                      attachments: item.attachments ?? [])
+                                                                      attachments: item.attachments ?? [], progress: uploadProgress)
             retryDelay = 2
             if error?.hasPrefix("Waiting to send") == true { error = nil }
             if item.mode == "steer" {

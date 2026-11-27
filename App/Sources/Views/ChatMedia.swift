@@ -71,12 +71,19 @@ enum FileImport {
     /// Read a security-scoped file and turn it into the one attachment the bridge accepts.
     /// Images keep the existing camera/library pipeline (decoded and bounded as JPEG); every
     /// other regular file rides as its original bytes and MIME type.
-    static func attachment(from url: URL, maxBytes: Int) throws -> SendAttachment {
+    /// `uploadMax`: the bridge takes big files through resumable uploads, up to this size. Anything over the
+    /// inline limit is then kept as a file on the phone and uploaded in chunks, never read into memory.
+    static func attachment(from url: URL, maxBytes: Int, uploadMax: Int? = nil) throws -> SendAttachment {
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentTypeKey])
         guard values.isRegularFile == true else { throw Failure.unreadable }
         let size = values.fileSize ?? 0
         guard size > 0 else { throw Failure.empty }
         let type = values.contentType ?? UTType(filenameExtension: url.pathExtension)
+        if let uploadMax, size > UploadFiles.inlineLimit, !(type?.conforms(to: .image) ?? false) {
+            guard size <= uploadMax else { throw Failure.tooLarge(uploadMax) }
+            return try UploadFiles.adopt(url, filename: try safeName(url),
+                                         mime: type?.preferredMIMEType ?? "application/octet-stream", move: false)
+        }
         if let type, type.conforms(to: .image) {
             // Downsample the file at its URL. A large original can produce a small valid upload.
             guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
@@ -115,12 +122,19 @@ enum FileImport {
 
 /// Shared by all import sources and the final Send check, including drafts restored from disk.
 enum AttachmentSelection {
-    static func issue(_ assets: [SendAttachment], fileLimit: Int, videoLimit: Int) -> String? {
+    static func issue(_ assets: [SendAttachment], fileLimit: Int, videoLimit: Int, uploadLimit: Int? = nil) -> String? {
         if assets.count > ChatMedia.maxAttachments { return "Choose up to \(ChatMedia.maxAttachments) attachments for one message." }
         let hasVideo = assets.contains { $0.mime == "video/mp4" }
         if hasVideo && assets.count != 1 { return "Send a video on its own, or choose still frames." }
+        // Uploaded files each have their own (much larger) limit; only inline bytes share the message budget.
+        if assets.contains(where: \.isUpload) && uploadLimit == nil {
+            return "This Mac's bridge can't take big files. Update it, or remove the large attachment."
+        }
+        if let uploadLimit, assets.contains(where: { $0.isUpload && $0.byteCount > uploadLimit }) {
+            return "A file is larger than \(ByteCountFormatter.string(fromByteCount: Int64(uploadLimit), countStyle: .file)), the most this Mac takes."
+        }
         let limit = hasVideo ? videoLimit : fileLimit
-        if assets.reduce(0, { $0 + $1.byteCount }) > limit {
+        if assets.filter({ !$0.isUpload }).reduce(0, { $0 + $1.byteCount }) > limit {
             return "The attachments exceed this bot’s limit. Remove an attachment and try again."
         }
         return nil
@@ -188,7 +202,22 @@ enum ChatMedia {
         throw Failure.tooLarge
     }
 
-    static func clip(from url: URL, maxBytes: Int) async throws -> SendAttachment {
+    /// The video exactly as recorded (a screen recording, a .mov), as a file for the resumable upload. No
+    /// re-encoding: Hermes gets every frame and the audio, and can process it with its own tools.
+    static func original(from url: URL, uploadMax: Int) throws -> SendAttachment {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard size > 0 else { throw Failure.unreadable }
+        guard size <= uploadMax else { throw Failure.tooLarge }
+        let type = UTType(filenameExtension: url.pathExtension)
+        let stamp = Date().formatted(.dateTime.year().month(.twoDigits).day(.twoDigits).hour().minute())
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: ".")
+        let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension.lowercased()
+        return try UploadFiles.adopt(url, filename: "Video \(stamp).\(ext)",
+                                     mime: type?.preferredMIMEType ?? "video/quicktime", move: false)
+    }
+
+    static func clip(from url: URL, maxBytes: Int, uploadMax: Int? = nil) async throws -> SendAttachment {
+        let maxBytes = max(maxBytes, uploadMax ?? 0)
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration).seconds
         guard duration.isFinite, duration > 0 else { throw Failure.unreadable }
@@ -215,7 +244,11 @@ enum ChatMedia {
             if size > 0 && size <= maxBytes {
                 let exportedDuration = try await AVURLAsset(url: target).load(.duration).seconds
                 guard exportedDuration.isFinite, abs(exportedDuration - duration) <= min(0.25, duration * 0.02) else { continue }
-                return SendAttachment(mime: "video/mp4", filename: "Video-" + UUID().uuidString.prefix(6) + ".mp4",
+                let filename = "Video-" + UUID().uuidString.prefix(6) + ".mp4"
+                if uploadMax != nil, size > UploadFiles.inlineLimit {
+                    return try UploadFiles.adopt(target, filename: filename, mime: "video/mp4", move: true)
+                }
+                return SendAttachment(mime: "video/mp4", filename: filename,
                                       base64: try Data(contentsOf: target).base64EncodedString())
             }
         }

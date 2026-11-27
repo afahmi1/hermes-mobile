@@ -321,6 +321,9 @@ struct ChatScreen: View {
             }.ignoresSafeArea()
         }
             .confirmationDialog("How should Hermes receive this video?", isPresented: $chooseVideo) {
+            if mediaCapabilities?.maxUploadBytes != nil {
+                Button("Send the original video file") { prepareOriginal() }
+            }
             if mediaCapabilities?.video == true, chat.draftAttachments.isEmpty {
                 Button("Send clip for Hermes video analysis") { prepareClip() }
             }
@@ -704,7 +707,8 @@ struct ChatScreen: View {
 
     private func issue(for assets: [SendAttachment]) -> String? {
         AttachmentSelection.issue(assets, fileLimit: mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024,
-                                   videoLimit: mediaCapabilities?.maxVideoBytes ?? 4 * 1024 * 1024)
+                                   videoLimit: mediaCapabilities?.maxVideoBytes ?? 4 * 1024 * 1024,
+                                   uploadLimit: mediaCapabilities?.maxUploadBytes)
     }
 
     private func appendMedia(_ assets: [SendAttachment], account: String?) {
@@ -801,7 +805,7 @@ struct ChatScreen: View {
             return
         case .success(let urls):
             guard !urls.isEmpty else { return }
-            let slots = max(0, 4 - chat.draftAttachments.count)
+            let slots = max(0, ChatMedia.maxAttachments - chat.draftAttachments.count)
             guard urls.count <= slots else { chat.error = "Choose up to \(slots) more attachments for this message."; return }
             let account = app.inboxAccount
             let cap = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
@@ -825,15 +829,18 @@ struct ChatScreen: View {
                             chooseVideo = true
                             return
                         }
+                        let uploadMax = mediaCapabilities?.maxUploadBytes
                         let asset = try await Task.detached(priority: .userInitiated) {
-                            try FileImport.attachment(from: url, maxBytes: cap)
+                            try FileImport.attachment(from: url, maxBytes: cap, uploadMax: uploadMax)
                         }.value
                         guard account == app.inboxAccount else { return }
                         guard chat.draftAttachments.count < ChatMedia.maxAttachments,
                               !chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) else { return }
                         guard asset.mime != "image/jpeg" || imagesAvailable else { chat.error = "This bot cannot receive images."; return }
-                        guard asset.byteCount <= left else { throw FileImport.Failure.tooLarge(cap) }
-                        left -= asset.byteCount
+                        if !asset.isUpload {
+                            guard asset.byteCount <= left else { throw FileImport.Failure.tooLarge(cap) }
+                            left -= asset.byteCount
+                        }
                         added.append(asset)
                     } catch {
                         if !Task.isCancelled { chat.error = error.localizedDescription }
@@ -858,8 +865,23 @@ struct ChatScreen: View {
         Task {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
-                let clip = try await ChatMedia.clip(from: url, maxBytes: caps.maxVideoBytes)
+                let clip = try await ChatMedia.clip(from: url, maxBytes: caps.maxVideoBytes, uploadMax: caps.maxUploadBytes)
                 appendMedia([clip], account: account)
+            } catch { chat.error = error.localizedDescription }
+        }
+    }
+
+    /// The video as recorded, uploaded in resumable chunks. Hermes gets the real file and decides how to use it.
+    private func prepareOriginal() {
+        guard let url = pickedVideo, let uploadMax = mediaCapabilities?.maxUploadBytes else { return }
+        pickedVideo = nil
+        preparingMedia = true
+        let account = app.inboxAccount
+        Task {
+            defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
+            do {
+                let file = try await Task.detached(priority: .userInitiated) { try ChatMedia.original(from: url, uploadMax: uploadMax) }.value
+                appendMedia([file], account: account)
             } catch { chat.error = error.localizedDescription }
         }
     }
@@ -872,7 +894,7 @@ struct ChatScreen: View {
         Task {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
-                let frames = try await ChatMedia.frames(from: url, count: min(3, 4 - chat.draftAttachments.count))
+                let frames = try await ChatMedia.frames(from: url, count: min(3, ChatMedia.maxAttachments - chat.draftAttachments.count))
                 appendMedia(frames, account: account)
             } catch { chat.error = error.localizedDescription }
         }

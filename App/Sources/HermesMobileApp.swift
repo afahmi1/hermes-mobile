@@ -25,7 +25,11 @@ struct HermesMobileApp: App {
     @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
     @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
 
-    init() { HMTheme.applyChrome() }
+    init() {
+        HMTheme.applyChrome()
+        // Upload copies a month old (sent long ago, or a draft abandoned) are removed in the background.
+        Task.detached(priority: .background) { UploadFiles.prune(keep: []) }
+    }
 
     var body: some Scene {
         WindowGroup {

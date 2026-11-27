@@ -60,6 +60,24 @@ Two things are deliberately **not** automatic:
 The bridge advertises these controls as `queue_controls_v1` in `GET /m/capabilities`. An older bridge still delivers
 queued messages; the phone then hides edit and remove for rows already on the Mac.
 
+## Big files (videos, screen recordings, long audio)
+
+Files over 8 MB don't ride inside the message. The phone keeps the file in its own upload folder
+(`HermesUploads/`, by name, so app updates can't break the path) and sends it to the bridge in 8 MB chunks.
+
+1. `POST /m/uploads {upload_id, filename, mime, size, sha256}`. The id comes from the file's own checksum, so a
+   retry or a relaunch always resumes the same upload. Announcing again returns where it got to.
+2. `PATCH /m/uploads/<id>` with `Upload-Offset: <n>` and the raw bytes. A chunk at the wrong offset answers 409 with
+   the real one (a lost acknowledgment never duplicates data); the phone just continues from there.
+3. After the last byte the bridge checks the SHA-256. A mismatch answers 422 and restarts from 0.
+4. The message then carries `{filename, mime, upload_id}` instead of base64. The bridge hard-links the finished file
+   into the bot's staging folder (no second copy) and Hermes reads it by path.
+
+Wi-Fi to cellular, a Tailscale blip or the Mac waking up: the phone waits 2 s to 30 s, asks for the offset, and
+continues. The limit per file is `HERMES_MOBILE_UPLOAD_MAX_BYTES` (default 2 GB). The bridge refuses up front if the
+Mac doesn't have room. Unfinished uploads are removed after 24 hours; the phone removes its copies after 30 days.
+For videos the app also offers **Send the original video file**: the recording exactly as made, no re-encoding.
+
 ## Chat actions (archive, pin, flags)
 
 Archive, unarchive, pinning a chat and pinning or unpinning a message work offline too. When the Mac can't be
