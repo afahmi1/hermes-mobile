@@ -38,8 +38,24 @@ struct RuntimeSheet: View {
         let paid = used.filter { $0.kind == "priced" && ($0.usd ?? 0) >= 0.0005 }
         let covered = used.filter { $0.kind == "included" }
         Section {
+            if let last = s.lastAnswer {
+                LabeledContent("Last reply") {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text([ModelName.short(last.model).components(separatedBy: " · ").first ?? last.model, Self.pname(last.provider)]
+                            .filter { !$0.isEmpty }.joined(separator: " · "))
+                            .foregroundStyle(s.stand(in: s.policy?.model) == nil ? HMDesign.ink : HMDesign.caution)
+                        if let at = last.at {
+                            Text(Date(timeIntervalSince1970: at), format: .relative(presentation: .named)).font(.caption2).foregroundStyle(HMDesign.text2)
+                        }
+                    }
+                }
+                if s.stand(in: s.policy?.model) != nil {
+                    Text("Your pick couldn't answer (often a plan limit), so Hermes used a fallback. The next reply tries your pick again.")
+                        .font(.caption).foregroundStyle(HMDesign.caution)
+                }
+            }
             if let pol = s.policy, let m = pol.model, !m.isEmpty {
-                LabeledContent("Answering") {
+                LabeledContent("Next reply") {
                     Text([ModelName.short(m).components(separatedBy: " · ").first ?? m, Self.pname(pol.provider),
                           pol.effort.flatMap { Effort(rawValue: $0)?.label } ?? "Default effort"]
                         .filter { !$0.isEmpty }.joined(separator: " · "))

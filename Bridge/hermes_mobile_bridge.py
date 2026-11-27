@@ -1201,6 +1201,16 @@ def session_runtime(pid, sid):
                 "ORDER BY MAX(last_seen) DESC LIMIT 8", (sid,))]
         except sqlite3.Error:
             d["models_used"] = []
+        # Who wrote the last real reply (not a background summary or title). When a plan runs out, Hermes falls
+        # back to another model; this is how the app can say so instead of showing the model you picked.
+        try:
+            r = con.execute(
+                "SELECT model, billing_provider AS provider, MAX(last_seen) AS at FROM session_model_usage "
+                "WHERE session_id=? AND coalesce(task, '')='' GROUP BY model, billing_provider "
+                "ORDER BY at DESC LIMIT 1", (sid,)).fetchone()
+            d["last_answer"] = dict(r) if r and r["model"] else None
+        except sqlite3.Error:
+            d["last_answer"] = None
     finally:
         con.close()
     try:
