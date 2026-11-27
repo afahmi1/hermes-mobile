@@ -186,7 +186,8 @@ class Pusher:
     def presence(self, device, away):
         with self.lock:
             if away:
-                self.away.setdefault(device, self.clock())
+                # Overwrite, never keep an old timestamp: the phone says "away now" and means now.
+                self.away[device] = self.clock()
             else:
                 self.away.pop(device, None)
 

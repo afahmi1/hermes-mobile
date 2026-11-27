@@ -385,10 +385,12 @@ struct BotAvatar: View {
     var body: some View {
         ZStack {
             if HMTheme.isThermocline {
-                // Quiet by design: a well with the initials. A hue per bot would put five accents in one list.
+                // Thermocline stays quiet but still tells bots apart: the well takes a low wash of the bot's own hue
+                // and a ring of it, so five bots read as five, not five identical greys.
                 Circle().fill(Thermocline.surface3)
-                Circle().strokeBorder(Thermocline.lineStrong, lineWidth: 0.5)
-                Text(initials).font(.system(size: size * 0.36, weight: .semibold)).tracking(0.4).foregroundStyle(Thermocline.text2)
+                Circle().fill(Bot.color(for: id).opacity(0.28))
+                Circle().strokeBorder(Bot.color(for: id).opacity(0.85), lineWidth: 1)
+                Text(initials).font(.system(size: size * 0.36, weight: .semibold)).tracking(0.4).foregroundStyle(Thermocline.text)
             } else {
                 Circle().fill(Bot.color(for: id))
                 Text(initials).font(.system(size: size * 0.4, weight: .semibold, design: .rounded)).foregroundStyle(.white)

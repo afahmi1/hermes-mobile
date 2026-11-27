@@ -41,16 +41,17 @@ final class PushRegistration {
     }
 
     func presence(away now: Bool) {
-        guard away != now, API.shared.isSignedIn else { return }
+        guard API.shared.isSignedIn else { return }
         away = now
         let api = API.shared
-        // The request has to leave before iOS suspends the app.
+        // The request has to leave before iOS suspends the app. Sent every time: a launch's in-memory flag
+        // starts false even when the bridge still thinks this phone is away, and a failed send must be retried.
         var task = UIBackgroundTaskIdentifier.invalid
         task = UIApplication.shared.beginBackgroundTask(withName: "Push presence") {
             UIApplication.shared.endBackgroundTask(task)
         }
         Task {
-            try? await api.pushPresence(away: now)
+            do { try await api.pushPresence(away: now) } catch { await MainActor.run { self.away = !now } }
             if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
         }
     }

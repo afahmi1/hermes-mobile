@@ -390,7 +390,18 @@ struct ChatListView: View {
                     if !typeSize.isAccessibilitySize {
                         switch ChatIconStyle(rawValue: iconStyle) ?? .auto {
                         case .monogram:
-                            ChatMonogram(seed: s.id, title: s.displayTitle, size: 32).padding(.top, 2).accessibilityHidden(true)
+                            // The chat's own letter, with its bot as a small colored corner badge when bots are mixed.
+                            ChatMonogram(seed: s.id, title: s.displayTitle, size: 32)
+                                .overlay(alignment: .bottomTrailing) {
+                                    if mixedBots {
+                                        BotAvatar(id: s.profile, name: app.botName(s.profile), size: 15)
+                                            .overlay(Circle().strokeBorder(HMDesign.canvas, lineWidth: 1.5))
+                                            .offset(x: 3, y: 3)
+                                    }
+                                }
+                                .padding(.top, 2).accessibilityHidden(true)
+                        case .bot:
+                            BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32).padding(.top, 2).accessibilityHidden(true)
                         case .auto where mixedBots:
                             BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32).padding(.top, 2).accessibilityHidden(true)
                         default:
@@ -1084,13 +1095,14 @@ struct RowPress: ButtonStyle {
 
 /// What sits at the left of each chat row.
 enum ChatIconStyle: String, CaseIterable, Identifiable {
-    case auto, monogram, none
+    case auto, bot, monogram, none
     static let key = "hm.chatIcons"
     var id: String { rawValue }
     var title: String {
         switch self {
         case .auto: "Bot, when mixed"
-        case .monogram: "Per chat"
+        case .bot: "Every bot"
+        case .monogram: "Per chat + bot"
         case .none: "None"
         }
     }
