@@ -17,12 +17,12 @@ struct BotAssignmentView: View {
         List {
             switch model.phase {
             case .idle, .loading:
-                HStack { ProgressView(); Text("Loading bots…").foregroundStyle(.secondary) }
+                HStack { ProgressView(); Text("Loading bots…").foregroundStyle(HMDesign.text2) }
             case .failed(let f):
                 Section {
-                    Text(f.message).foregroundStyle(.secondary)
+                    Text(f.message).foregroundStyle(HMDesign.text2)
                     Button("Try again") { Task { await model.load() } }
-                }
+                }.hmRows()
             case .loaded:
                 loaded
             }
@@ -55,18 +55,18 @@ struct BotAssignmentView: View {
                 ForEach(model.assignment?.assigned ?? [], id: \.self) { id in
                     Label(app.botName(id), systemImage: "person.crop.circle")
                 }
-                if (model.assignment?.assigned ?? []).isEmpty { Text("No bots assigned").foregroundStyle(.secondary) }
-            } footer: { Text("Bot access for this project is set on the Mac.") }
+                if (model.assignment?.assigned ?? []).isEmpty { Text("No bots assigned").foregroundStyle(HMDesign.text2) }
+            } footer: { Text("Bot access for this project is set on the Mac.") }.hmRows()
         } else {
             Section {
                 if model.eligible.isEmpty {
-                    Text("No bots are eligible yet. Eligible bots are set on the Mac.").foregroundStyle(.secondary)
+                    Text("No bots are eligible yet. Eligible bots are set on the Mac.").foregroundStyle(HMDesign.text2)
                 }
                 ForEach(model.eligible, id: \.self) { id in
                     let on = model.selection.contains(id)
                     Button { model.toggle(id) } label: {
                         HStack {
-                            Text(app.botName(id)).foregroundStyle(.primary)
+                            Text(app.botName(id)).foregroundStyle(HMDesign.ink)
                             Spacer()
                             Image(systemName: on ? "checkmark.circle.fill" : "circle")
                                 .foregroundStyle(on ? HMDesign.accent : .secondary)
@@ -82,27 +82,27 @@ struct BotAssignmentView: View {
                 }
             } header: { Text("Eligible bots") } footer: {
                 Text("Choose which bots can work in this project, then tap Save.")
-            }
+            }.hmRows()
         }
         if !model.inactive.isEmpty {
             Section {
                 ForEach(model.inactive, id: \.self) { id in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(app.botName(id))
-                        Text("Not available on the Mac right now").font(.caption).foregroundStyle(.secondary)
+                        Text("Not available on the Mac right now").font(.caption).foregroundStyle(HMDesign.text2)
                     }
                     .accessibilityElement(children: .combine)
                 }
             } header: { Text("Not available") } footer: {
                 Text("These stay assigned and come back if the bot is available again.")
-            }
+            }.hmRows()
         }
         if let note = model.hiddenChatsNote {
-            Section { Text(note).font(.footnote).foregroundStyle(.secondary) }
+            Section { Text(note).font(.footnote).foregroundStyle(HMDesign.text2) }.hmRows()
         }
         if let m = model.message {
-            Section { Text(m).font(.footnote).foregroundStyle(m == "Saved." ? Color.secondary : Color.orange)
-                .accessibilityIdentifier("assign.message") }
+            Section { Text(m).font(.footnote).foregroundStyle(m == "Saved." ? HMDesign.text2 : HMDesign.caution)
+                .accessibilityIdentifier("assign.message") }.hmRows()
         }
     }
 }
@@ -115,7 +115,7 @@ private struct ByteCounter: View {
     var body: some View {
         Text("\(bytes) / \(limit) bytes")
             .font(.caption.monospacedDigit())
-            .foregroundStyle(bytes > limit ? .red : .secondary)
+            .foregroundStyle(bytes > limit ? HMDesign.danger : .secondary)
             .accessibilityLabel("\(bytes) of \(limit) bytes used")
     }
 }
@@ -125,11 +125,11 @@ private struct ConflictBanner: View {
     var reload: (() -> Void)?
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label(text, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(.orange)
+            Label(text, systemImage: "exclamationmark.triangle").font(.footnote).foregroundStyle(HMDesign.caution)
             if let reload { Button("Reload latest", action: reload).font(.footnote.weight(.semibold)) }
         }
         .padding(10)
-        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .background(HMDesign.caution.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .contain)
     }
 }
@@ -152,7 +152,7 @@ struct InstructionsView: View {
                 TextEditor(text: $m.instructionsDraft)
                     .font(.body)
                     .padding(6)
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.4)))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(HMDesign.text2.opacity(0.4)))
                     .accessibilityIdentifier("instr.editor")
                     .accessibilityLabel("Project instructions")
                     .accessibilityHint("Edit the instructions, then tap Save")
@@ -161,7 +161,7 @@ struct InstructionsView: View {
                 ScrollView {
                     Group {
                         if model.detail.instructions.isEmpty {
-                            Text(model.detail.editable ? "No instructions yet. Tap Edit to add some." : "No instructions yet.").foregroundStyle(.secondary)
+                            Text(model.detail.editable ? "No instructions yet. Tap Edit to add some." : "No instructions yet.").foregroundStyle(HMDesign.text2)
                         } else {
                             Text(verbatim: model.detail.instructions).textSelection(.enabled)
                         }
@@ -170,7 +170,7 @@ struct InstructionsView: View {
                 }
                 .accessibilityLabel("Project instructions")
                 Text("Saved on your Mac. Sent to a bot only when you switch project context on for a message.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(HMDesign.text2)
             }
         }
         .padding()
@@ -229,14 +229,14 @@ struct WorkspaceFileView: View {
                                        : WorkspacesFailure.duplicate.message,
                                        reload: c == .stale ? { Task { await editor.reloadLatest() } } : nil)
                     }
-                    if let p = editor.problem, editor.isEditing { Text(p).font(.footnote).foregroundStyle(.red) }
+                    if let p = editor.problem, editor.isEditing { Text(p).font(.footnote).foregroundStyle(HMDesign.danger) }
                     if editor.isEditing {
                         TextEditor(text: $e.draft)
                             .font(.body.monospaced())
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                             .padding(6)
-                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.4)))
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(HMDesign.text2.opacity(0.4)))
                             .accessibilityIdentifier("file.editor")
                             .accessibilityLabel("Contents of \(editor.name)")
                             .accessibilityHint("Edit the text, then tap Save")
@@ -312,7 +312,7 @@ struct NewFileSheet: View {
                         .accessibilityIdentifier("newfile.name")
                 } header: { Text("File name") } footer: {
                     Text("Ends in .md, .txt, .csv or .json. Up to 4 files, 8192 bytes each.")
-                }
+                }.hmRows()
                 Section {
                     TextEditor(text: $e.draft)
                         .font(.body.monospaced())
@@ -323,10 +323,10 @@ struct NewFileSheet: View {
                         .accessibilityLabel("File contents")
                     ByteCounter(bytes: editor.bytes, limit: WorkspaceLimits.fileBytes)
                 } header: { Text("Contents") } footer: {
-                    if let p = editor.problem { Text(p).foregroundStyle(.red) }
-                    else if let c = editor.conflict, c == .duplicate { Text(WorkspacesFailure.duplicate.message).foregroundStyle(.red) }
-                    else if let c = editor.conflict, c == .stale { Text(WorkspacesFailure.conflict.message).foregroundStyle(.red) }
-                }
+                    if let p = editor.problem { Text(p).foregroundStyle(HMDesign.danger) }
+                    else if let c = editor.conflict, c == .duplicate { Text(WorkspacesFailure.duplicate.message).foregroundStyle(HMDesign.danger) }
+                    else if let c = editor.conflict, c == .stale { Text(WorkspacesFailure.conflict.message).foregroundStyle(HMDesign.danger) }
+                }.hmRows()
             }
             .hmCanvas()
             .navigationTitle("New text file")
@@ -368,13 +368,13 @@ struct ReferenceDetailView: View {
         List {
             Section {
                 Text("A reference to a file on your Mac. Hermes Mobile doesn't open, copy or change the original. You can start a separate Workspace file with the same name and type or import its text yourself; edits there never reach the Mac file.")
-            }
+            }.hmRows()
             Section {
                 LabeledContent("Root", value: reference.rootName)
                 LabeledContent("Kind", value: reference.kind == .vault ? "Vault" : reference.kind == .repo ? "Repo" : "Folder")
                 LabeledContent("Path") { Text(reference.path).font(.body.monospaced()).textSelection(.enabled) }
                     .accessibilityElement(children: .combine)
-            }
+            }.hmRows()
             Section {
                 Button {
                     UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: reference.copyText]],
@@ -393,7 +393,7 @@ struct ReferenceDetailView: View {
                             }
                     } else {
                         Text("This type can't be added to a Workspace. Only .md, .txt, .csv and .json text files can.")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.footnote).foregroundStyle(HMDesign.text2)
                     }
                 }
             } footer: {
@@ -401,7 +401,7 @@ struct ReferenceDetailView: View {
                 else if workspaceProject != nil && typeSupported {
                     Text("The copy starts empty: type or paste its text. It isn't read from your Mac.")
                 }
-            }
+            }.hmRows()
         }
         .hmCanvas()
         .navigationTitle(basename)

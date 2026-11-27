@@ -99,7 +99,7 @@ struct StatusView: View {
     /// The one "Show all N" / "Show fewer" row every capped list ends with.
     private func moreRow(_ key: String, total: Int, open: Bool) -> some View {
         Button {
-            withAnimation(.snappy) { if open { expanded.remove(key) } else { expanded.insert(key) } }
+            withAnimation(Thermocline.Motion.standard) { if open { expanded.remove(key) } else { expanded.insert(key) } }
         } label: {
             HStack {
                 Text(open ? "Show fewer" : "Show all \(total)")
@@ -128,11 +128,11 @@ struct StatusView: View {
         let stop = p?["gateway"]["estop"].array.isEmpty == false
         let reasons = (p?["gateway"]["reasons"].array ?? []).compactMap(\.string)
         if status.error != nil || stop || !reasons.isEmpty {
-            Section("Needs attention") {
+            Section(header: HMHeader("Needs attention")) {
                 if let e = status.error {
                     VStack(alignment: .leading, spacing: HMDesign.small) {
                         Label(e, systemImage: "wifi.exclamationmark")
-                        if p != nil { Text("Showing the last update.").font(HMDesign.metadata).foregroundStyle(.secondary) }
+                        if p != nil { Text("Showing the last update.").font(HMDesign.metadata).foregroundStyle(HMDesign.text2) }
                         Button("Try again") { Task { await refreshNow() } }
                             .disabled(status.refreshingProviders)
                             .hmTouchTarget()
@@ -142,13 +142,13 @@ struct StatusView: View {
                     Label {
                         Text("Emergency stop is on. Cron and new gateway turns are paused. Run `hermes resume` on the server.")
                     } icon: {
-                        Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+                        Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(HMDesign.danger)
                     }
                 }
                 ForEach(Array(reasons.enumerated()), id: \.offset) { _, text in
                     Label(text, systemImage: "exclamationmark.triangle.fill")
                 }
-            }
+            }.hmRows()
         }
     }
 
@@ -159,12 +159,13 @@ struct StatusView: View {
         VStack(spacing: 2) {
             Image(systemName: symbol).foregroundStyle(tint).imageScale(.medium).frame(height: iconHeight).accessibilityHidden(true)
             HStack(spacing: 3) {
-                Text(value).font(.headline).monospacedDigit().lineLimit(1).minimumScaleFactor(0.6)
+                Text(value).font(HMDesign.number(17, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.6)
                 if badge { NewBadge() }
             }
-            Text(caption).font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            Text(caption).font(.caption2).foregroundStyle(HMDesign.text2).lineLimit(1).truncationMode(.tail)
         }
         .frame(maxWidth: .infinity)
+        .hmCard()
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(caption)
         .accessibilityValue(badge ? "\(value), new" : value)
@@ -185,23 +186,23 @@ struct StatusView: View {
             LazyVGrid(columns: columns, alignment: .center, spacing: HMDesign.medium) {
                 tile(gatewayName, health.capitalized,
                      health == "healthy" ? "checkmark.circle.fill" : health == "down" ? "xmark.octagon.fill" : "exclamationmark.triangle.fill",
-                     health == "healthy" ? HMDesign.success : health == "down" ? .red : .orange)
+                     health == "healthy" ? HMDesign.success : health == "down" ? HMDesign.danger : HMDesign.caution)
                 if let hb = g["heartbeat_age_s"].double {
                     let age = max(0, Int(hb.rounded()))
-                    tile("Heartbeat", age == 0 ? "Now" : "\(age)s", hb > 120 ? "clock.badge.exclamationmark" : "clock", hb > 120 ? .orange : .secondary)
+                    tile("Heartbeat", age == 0 ? "Now" : "\(age)s", hb > 120 ? "clock.badge.exclamationmark" : "clock", hb > 120 ? HMDesign.caution : .secondary)
                 }
                 tile("Running", "\(running)", running == 0 ? "moon.zzz" : "play.circle.fill", running == 0 ? .secondary : HMDesign.success)
                 tile("Jobs", "\(active)", "calendar.badge.clock", .secondary)
-                if failing > 0 { tile("Failing", "\(failing)", "exclamationmark.triangle.fill", .red) }
+                if failing > 0 { tile("Failing", "\(failing)", "exclamationmark.triangle.fill", HMDesign.danger) }
                 tile("Incidents", "\(incidents)", incidents == 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill",
-                     incidents == 0 ? HMDesign.success : .red)
+                     incidents == 0 ? HMDesign.success : HMDesign.danger)
                 tile("Bots", "\(p["bots"].array.count)", "person.2.fill", .secondary,
                      badge: p["bots"].array.contains(where: { $0["new"].bool }))
                 tile("Tokens 24h", Self.compact(tokens), "number.circle", .secondary)
             }
             .padding(.vertical, HMDesign.micro)
             .listRowInsets(EdgeInsets(top: HMDesign.small, leading: HMDesign.medium, bottom: HMDesign.small, trailing: HMDesign.medium))
-        }
+        }.hmRows()
     }
 
     // MARK: sections
@@ -209,7 +210,8 @@ struct StatusView: View {
     @ViewBuilder private func running(_ p: JV) -> some View {
         let agents = p["agents"].array
         if !agents.isEmpty {
-            Section("Running now") {
+            HMLateral()
+            Section(header: HMHeader("Running now")) {
                 capped("running", agents, limit: 5) { a in
                     let row = AgentRow(agent: a, botName: app.botName(a["profile"].string ?? ""))
                     if let sid = a["session_id"].string, let prof = a["profile"].string, a["kind"].string != "cron",
@@ -219,30 +221,30 @@ struct StatusView: View {
                         row
                     }
                 }
-            }
+            }.hmRows()
         }
     }
 
     @ViewBuilder private func changes(_ p: JV) -> some View {
         let events = Array(p["changes"]["events"].array.prefix(8))
         if !events.isEmpty {
-            Section("What's new") {
+            Section(header: HMHeader("What's new")) {
                 capped("changes", events, limit: 3) { e in
                     let change = e["type"].string == "removed" ? "Removed" : e["type"].string == "renamed" ? "Renamed" : "Added"
                     HStack(alignment: .firstTextBaseline, spacing: HMDesign.medium) {
                         Image(systemName: ["removed": "minus.circle.fill", "renamed": "pencil.circle.fill"][e["type"].string ?? ""] ?? "plus.circle.fill")
-                            .foregroundStyle(e["type"].string == "removed" ? Color.secondary : e["type"].string == "renamed" ? Color.blue : Color.green)
+                            .foregroundStyle(e["type"].string == "removed" ? HMDesign.text2 : e["type"].string == "renamed" ? HMDesign.link : HMDesign.success)
                             .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: HMDesign.micro) {
                             Text(e["name"].string ?? "Unnamed").font(HMDesign.rowTitle).lineLimit(1)
                             (Text([change, e["kind"].string?.capitalized, e["kind"].string == "bot" ? nil : app.botName(e["profile"].string ?? ""),
                                    e["old_name"].string.map { "was \($0)" }]
                                 .compactMap { $0 }.joined(separator: " · ")) + RelTime.suffix(e["at"].date))
-                                .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
+                                .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(1)
                         }
                     }
                 }
-            }
+            }.hmRows()
         }
     }
 
@@ -270,20 +272,20 @@ struct StatusView: View {
                         .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
                 }
                 if filtered.isEmpty {
-                    Text("No \(jobFilter.rawValue.lowercased()) jobs. Try another filter.").foregroundStyle(.secondary)
+                    Text("No \(jobFilter.rawValue.lowercased()) jobs. Try another filter.").foregroundStyle(HMDesign.text2)
                 }
                 ForEach(Array(filtered.enumerated()), id: \.offset) { _, j in
                     JobRow(job: j, botName: app.botName(j["profile"].string ?? ""), showReason: true)
                 }
             } else {
-                if all.isEmpty { Text("No cron jobs are set up on this Mac.").foregroundStyle(.secondary) }
+                if all.isEmpty { Text("No cron jobs are set up on this Mac.").foregroundStyle(HMDesign.text2) }
                 ForEach(Array(top.enumerated()), id: \.offset) { _, j in
                     JobRow(job: j, botName: app.botName(j["profile"].string ?? ""), showReason: false)
                 }
             }
             if all.count > StatusJobs.defaultLimit {
                 Button {
-                    withAnimation(.snappy) { showAllJobs.toggle(); jobFilter = .all }
+                    withAnimation(Thermocline.Motion.standard) { showAllJobs.toggle(); jobFilter = .all }
                 } label: {
                     HStack {
                         Text(showAllJobs ? "Show fewer" : "All jobs · \(all.count)")
@@ -298,13 +300,14 @@ struct StatusView: View {
                 .accessibilityHint(showAllJobs ? "Collapses the job list" : "Shows every cron job")
                 .id("jobsEnd")
             }
-        } header: { Text("Cron jobs · \(all.filter { !$0["paused"].bool }.count) active").id("jobs") }
+        } header: { Text("Cron jobs · \(all.filter { !$0["paused"].bool }.count) active").id("jobs") }.hmRows()
     }
 
     @ViewBuilder private func incidents(_ p: JV) -> some View {
         let inc = p["jobs"]["incidents"].array
         if !inc.isEmpty {
-            Section("Open incidents") {
+            HMLateral()
+            Section(header: HMHeader("Open incidents")) {
                 capped("incidents", inc, limit: 5) { i in
                     VStack(alignment: .leading, spacing: HMDesign.micro) {
                         AdaptiveTitleRow {
@@ -313,20 +316,20 @@ struct StatusView: View {
                             StatusPill(text: i["state"].string)
                         }
                         Text([app.botName(i["profile"].string ?? ""), i["failure_type"].string].compactMap { $0 }.joined(separator: " · "))
-                            .font(HMDesign.metadata).foregroundStyle(.secondary)
+                            .font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                         if let err = i["error"].string {
-                            Label(err, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).foregroundStyle(.red).lineLimit(3)
+                            Label(err, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).foregroundStyle(HMDesign.danger).lineLimit(3)
                         }
                     }
                 }
-            }
+            }.hmRows()
         }
     }
 
     @ViewBuilder private func recent(_ p: JV) -> some View {
         let rec = Array(p["jobs"]["recent"].array.prefix(10))
         if !rec.isEmpty {
-            Section("Recent runs") {
+            Section(header: HMHeader("Recent runs")) {
                 capped("recent", rec, limit: 5) { r in
                     VStack(alignment: .leading, spacing: HMDesign.micro) {
                         HStack(spacing: HMDesign.small) {
@@ -335,13 +338,13 @@ struct StatusView: View {
                             StatusMark(text: r["status"].string)
                         }
                         (Text(app.botName(r["profile"].string ?? "")) + RelTime.suffix(r["claimed_at"].date))
-                            .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
+                            .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(1)
                         if ["failed", "error"].contains(r["status"].string ?? ""), let err = r["error"].string {
-                            Label(err, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).foregroundStyle(.red).lineLimit(2)
+                            Label(err, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).foregroundStyle(HMDesign.danger).lineLimit(2)
                         }
                     }
                 }
-            }
+            }.hmRows()
         }
     }
 
@@ -353,7 +356,8 @@ struct StatusView: View {
         let healthy = platforms.filter { !($0["needs_attention"].bool || $0["error"].string != nil) }
         let state = g["state"].string ?? "unknown"
         let problem = !["ok", "running", "healthy", "connected"].contains(state)
-        Section("Gateway") {
+        HMLateral()
+            Section(header: HMHeader("Gateway")) {
             ForEach(Array(troubled.enumerated()), id: \.offset) { _, pl in platformRow(pl) }
             DisclosureGroup("Gateway details", isExpanded: Binding(get: { gatewayOpen ?? problem }, set: { gatewayOpen = $0 })) {
                 LabeledContent("State") { StatusPill(text: g["state"].string) }
@@ -366,13 +370,13 @@ struct StatusView: View {
                     LabeledContent("Version") {
                         HStack(spacing: 4) {
                             Text("v\(v)")
-                            if let sha = g["sha"].string { Text(sha).font(HMDesign.metadata).foregroundStyle(.secondary) }
+                            if let sha = g["sha"].string { Text(sha).font(HMDesign.metadata).foregroundStyle(HMDesign.text2) }
                         }
                     }
                 }
                 ForEach(Array(healthy.enumerated()), id: \.offset) { _, pl in platformRow(pl) }
             }
-        }
+        }.hmRows()
     }
 
     private func platformRow(_ pl: JV) -> some View {
@@ -383,14 +387,14 @@ struct StatusView: View {
                 HStack(spacing: HMDesign.micro) {
                     if pl["needs_attention"].bool {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange).imageScale(.small)
+                            .foregroundStyle(HMDesign.caution).imageScale(.small)
                             .accessibilityLabel("Needs attention")
                     }
                     StatusMark(text: pl["state"].string)
                 }
             }
             if let err = pl["error"].string {
-                Label(err, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).foregroundStyle(.red).lineLimit(3)
+                Label(err, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).foregroundStyle(HMDesign.danger).lineLimit(3)
             }
         }
     }
@@ -408,7 +412,7 @@ struct StatusView: View {
                         }
                     }
                 }
-            }
+            }.hmRows()
         }
     }
 
@@ -437,9 +441,9 @@ struct StatusPill: View {
         let t = text ?? "Unknown"
         let color: Color = switch t {
         case "ok", "completed", "delivered", "connected", "healthy": HMDesign.success
-        case "running", "claimed": .blue
-        case "failed", "error", "disconnected", "down": .red
-        case "missed", "paused", "unknown", "degraded", "starting", "restarting", "draining", "waiting", "stopping": .orange
+        case "running", "claimed": HMDesign.link
+        case "failed", "error", "disconnected", "down": HMDesign.danger
+        case "missed", "paused", "unknown", "degraded", "starting", "restarting", "draining", "waiting", "stopping": HMDesign.caution
         default: .secondary
         }
         Text(label ?? t).font(.caption2.weight(.semibold)).padding(.horizontal, 7).padding(.vertical, 2)
@@ -450,7 +454,7 @@ struct StatusPill: View {
 private struct NewBadge: View {
     var body: some View {
         Text("NEW").font(.caption2.weight(.bold)).padding(.horizontal, 6).padding(.vertical, 1)
-            .foregroundStyle(.blue).background(Color.blue.opacity(0.15), in: Capsule())
+            .foregroundStyle(HMDesign.link).background(HMDesign.link.opacity(0.15), in: Capsule())
     }
 }
 
@@ -489,7 +493,7 @@ private struct AgentRow: View {
                 Text(agent["title"].string ?? "Untitled").font(HMDesign.rowTitle).lineLimit(1)
                 (Text([botName, kind == "subagent" ? "subagent" : kind == "cron" ? "cron run" : kind == "phone" ? "from phone" : nil,
                        agent["model"].string].compactMap { $0 }.joined(separator: " · ")) + RelTime.suffix(agent["started_at"].date))
-                    .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
+                    .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(1)
             }
         }
     }
@@ -510,16 +514,16 @@ private struct JobRow: View {
                 if paused || job["last_status"].string != nil { StatusMark(text: paused ? "paused" : job["last_status"].string) }
             }
             line2
-                .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
+                .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(2)
             if failing {
                 let streak = job["failure_streak"].int ?? 0
                 let detail = [streak > 0 ? "\(streak)× failing" : nil, job["last_error"].string].compactMap { $0 }.joined(separator: " · ")
                 if !detail.isEmpty {
                     Label(detail, systemImage: "exclamationmark.triangle.fill")
-                        .font(HMDesign.metadata).foregroundStyle(.red).lineLimit(2)
+                        .font(HMDesign.metadata).foregroundStyle(HMDesign.danger).lineLimit(2)
                 }
             }
-            if showReason, let why = job["paused_reason"].string { Text(why).font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2) }
+            if showReason, let why = job["paused_reason"].string { Text(why).font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(2) }
         }
     }
 

@@ -9,13 +9,13 @@ struct BotsView: View {
             List {
                 if let e = app.loadError {
                     VStack(alignment: .leading, spacing: HMDesign.small) {
-                        Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
+                        Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(HMDesign.text2)
                         Button("Try again") { Task { await app.refreshBots() } }.hmTouchTarget()
                     }
                 } else if !app.botsLoaded {
                     HStack { Spacer(); ProgressView("Loading bots…"); Spacer() }.listRowBackground(Color.clear)
                 } else if app.bots.isEmpty {
-                    Text("No bots reported. Pull to refresh.").foregroundStyle(.secondary)
+                    Text("No bots reported. Pull to refresh.").foregroundStyle(HMDesign.text2)
                 }
                 ForEach(app.bots) { bot in
                     NavigationLink(value: bot) { BotRow(bot: bot) }
@@ -47,15 +47,15 @@ struct BotRow: View {
                             .background(.tint.opacity(0.18), in: Capsule())
                     }
                 }
-                if !bot.blurb.isEmpty { Text(bot.blurb).font(.subheadline).foregroundStyle(.secondary).lineLimit(2) }
-                Text("\(bot.model) · \(bot.provider)").font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
+                if !bot.blurb.isEmpty { Text(bot.blurb).font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(2) }
+                Text("\(bot.model) · \(bot.provider)").font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(2)
                 if !bot.skills.isEmpty {
                     Text(bot.skills.prefix(4).joined(separator: ", ") + (bot.skills.count > 4 ? " +\(bot.skills.count - 4)" : ""))
-                        .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
+                        .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(1)
                 }
                 if !bot.reachable {
                     Label("No API key. Not reachable.", systemImage: "exclamationmark.triangle.fill")
-                        .font(HMDesign.metadata).foregroundStyle(.red)
+                        .font(HMDesign.metadata).foregroundStyle(HMDesign.danger)
                 }
             }
         }
@@ -79,14 +79,14 @@ struct BotDetailView: View {
                 NavigationLink(value: ChatRef(profile: bot.id, sessionId: nil)) {
                     Label("New chat with \(bot.name)", systemImage: "square.and.pencil").font(.body.weight(.semibold))
                 }
-            } footer: { Text("Default: \(bot.model) · \(bot.provider). You can switch per chat.") }
+            } footer: { Text("Default: \(bot.model) · \(bot.provider). You can switch per chat.") }.hmRows()
             Section {
                 Button { skillEditor = SkillEditor(name: "", appending: false) } label: {
                     Label("Teach a skill", systemImage: "plus")
                 }
                 ForEach(skills, id: \.self) { name in
                     Button { skillEditor = SkillEditor(name: name, appending: true) } label: {
-                        LabeledContent(name) { Image(systemName: "note.text.badge.plus").foregroundStyle(.secondary) }
+                        LabeledContent(name) { Image(systemName: "note.text.badge.plus").foregroundStyle(HMDesign.text2) }
                     }
                     .accessibilityLabel("Add a note to \(name)")
                 }
@@ -96,12 +96,12 @@ struct BotDetailView: View {
                 Text(skills.isEmpty
                      ? "Teach \(bot.name) with /learn in a chat, or write a skill here. Hermes stores it on your Mac."
                      : "Tap a skill to append a note. /learn in a chat can also teach from a link or the conversation.")
-            }
+            }.hmRows()
             Section {
                 Toggle("Show scheduled & one-shot runs", isOn: $showAutomations)
-            }
+            }.hmRows()
             ManageBotSection(bot: bot)  // build5 manage hook
-            Section("Sessions") {
+            Section(header: HMHeader("Sessions")) {
                 ForEach(sessions) { s in
                     NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
                         SessionRow(session: s, botName: bot.name)
@@ -110,9 +110,9 @@ struct BotDetailView: View {
                 if cursor != nil {
                     HStack { Spacer(); ProgressView(); Spacer() }.task(id: cursor) { await more() }
                 } else if sessions.isEmpty {
-                    Text("No sessions yet. Start a chat above.").foregroundStyle(.secondary)
+                    Text("No sessions yet. Start a chat above.").foregroundStyle(HMDesign.text2)
                 }
-            }
+            }.hmRows()
         }
         .hmCanvas()
         .navigationTitle(bot.name)
@@ -169,26 +169,26 @@ private struct SkillEditorSheet: View {
         NavigationStack {
             Form {
                 if editor.appending {
-                    Section { Text(editor.name).font(.body.weight(.semibold)) } header: { Text("Skill") }
-                    Section("Note to append") {
+                    Section { Text(editor.name).font(.body.weight(.semibold)) } header: { Text("Skill") }.hmRows()
+                    Section(header: HMHeader("Note to append")) {
                         TextField("What should this skill also say?", text: $bodyText, axis: .vertical)
                             .lineLimit(4...10)
-                    }
+                    }.hmRows()
                 } else {
-                    Section("Name") {
+                    Section(header: HMHeader("Name")) {
                         TextField("print-plates", text: $name)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
-                    }
-                    Section("What it is") {
+                    }.hmRows()
+                    Section(header: HMHeader("What it is")) {
                         TextField("One line", text: $description)
-                    }
-                    Section("Instructions") {
+                    }.hmRows()
+                    Section(header: HMHeader("Instructions")) {
                         TextField("The steps this bot should follow", text: $bodyText, axis: .vertical)
                             .lineLimit(5...12)
-                    }
+                    }.hmRows()
                 }
-                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red) }
+                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(HMDesign.danger) }
             }
             .hmCanvas()
             .navigationTitle(editor.appending ? "Add a note" : "New skill")

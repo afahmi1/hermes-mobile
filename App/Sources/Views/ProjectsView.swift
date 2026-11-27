@@ -108,10 +108,10 @@ private struct ProjectRow: View {
         VStack(alignment: .leading, spacing: HMDesign.micro) {
             Text(project.title).font(HMDesign.rowTitle)
             if let summary = project.summary, !summary.isEmpty {
-                Text(summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                Text(summary).font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(2)
             }
             Label(botLine, systemImage: project.botIds.isEmpty ? "person.crop.circle.badge.questionmark" : "person.2")
-                .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
+                .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(2)
         }
         .padding(.vertical, HMDesign.micro)
         .accessibilityElement(children: .combine)
@@ -140,7 +140,7 @@ struct ProjectDetailView: View {
         let hasWorkspace = workspaces.isEnabled(project.id)
         List {
             if let summary = project.summary, !summary.isEmpty {
-                Section { Text(summary) }
+                Section { Text(summary) }.hmRows()
             }
             if hasWorkspace {
                 Section {
@@ -152,7 +152,7 @@ struct ProjectDetailView: View {
                     NavigationLink { BotAssignmentView(model: assignment) } label: {
                         LabeledContent {
                             Text(assignment.summary(name: { app.botName($0) }))
-                                .foregroundStyle(.secondary).multilineTextAlignment(.trailing)
+                                .foregroundStyle(HMDesign.text2).multilineTextAlignment(.trailing)
                         } label: {
                             Label("Assigned bots", systemImage: "person.2")
                         }
@@ -160,44 +160,44 @@ struct ProjectDetailView: View {
                     }
                     .accessibilityIdentifier("ws.assign")
                     .accessibilityHint("Choose which bots can work in this project")
-                } footer: { Text("Instructions, files, chats and artifacts.") }
+                } footer: { Text("Instructions, files, chats and artifacts.") }.hmRows()
             }
             ManageProjectSection(project: project)  // build5 manage hook
-            Section("Catalog bots") {
+            Section(header: HMHeader("Catalog bots")) {
                 let links = snapshot.botLinks(for: project, bots: app.bots)
                 if links.isEmpty {
-                    Text("No bot is listed for this project in the catalog.").foregroundStyle(.secondary)
+                    Text("No bot is listed for this project in the catalog.").foregroundStyle(HMDesign.text2)
                 }
                 ForEach(links) { link in
                     if let bot = link.bot {
                         NavigationLink(value: bot) { Label(link.displayName, systemImage: "person.crop.circle") }
                     } else {
                         Label(link.displayName, systemImage: "person.crop.circle.badge.questionmark")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(HMDesign.text2)
                             .accessibilityHint("This bot isn't available on this device right now")
                     }
                 }
-            }
-            Section("Sources") {
-                if project.sources.isEmpty { Text("No sources listed.").foregroundStyle(.secondary) }
+            }.hmRows()
+            Section(header: HMHeader("Sources")) {
+                if project.sources.isEmpty { Text("No sources listed.").foregroundStyle(HMDesign.text2) }
                 ForEach(Array(project.sources.enumerated()), id: \.offset) { _, s in
                     VStack(alignment: .leading, spacing: HMDesign.micro) {
                         Text(s.source)
-                        Text(s.provider).font(HMDesign.metadata).foregroundStyle(.secondary)
+                        Text(s.provider).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                     }
                     .accessibilityElement(children: .combine)
                 }
-            }
+            }.hmRows()
             Section {
-                if refs.shown.isEmpty { Text("No related files.").foregroundStyle(.secondary) }
+                if refs.shown.isEmpty { Text("No related files.").foregroundStyle(HMDesign.text2) }
                 ForEach(refs.shown) { ref in
                     NavigationLink {
                         ReferenceDetailView(reference: ref, workspaceProject: hasWorkspace ? project.id : nil)
                     } label: {
                         VStack(alignment: .leading, spacing: HMDesign.micro) {
-                            Text(ref.path).font(.callout.monospaced()).foregroundStyle(.primary)
+                            Text(ref.path).font(.callout.monospaced()).foregroundStyle(HMDesign.ink)
                             Text(ref.rootName + (ref.kind == .vault ? " · vault" : ref.kind == .repo ? " · repo" : ""))
-                                .font(HMDesign.metadata).foregroundStyle(.secondary)
+                                .font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                         }
                     }
                     .accessibilityLabel("\(ref.path) in \(ref.rootName)")
@@ -207,7 +207,7 @@ struct ProjectDetailView: View {
                 Text("Related files")
             } footer: {
                 if refs.hidden > 0 { Text("\(refs.hidden) \(refs.hidden == 1 ? "reference is" : "references are") hidden because \(refs.hidden == 1 ? "it isn't" : "they aren't") a safe relative path in a known root.") }
-            }
+            }.hmRows()
         }
         .hmCanvas()
         .navigationTitle(project.title)

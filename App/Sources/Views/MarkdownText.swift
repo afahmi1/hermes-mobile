@@ -153,7 +153,7 @@ struct MarkdownText: View {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(item.marker)
                             .font(item.marker.hasSuffix(".") ? .body.monospacedDigit() : .body)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(HMDesign.text2)
                             .frame(minWidth: 14, alignment: .trailing)
                         Text(InlineMarkdown.attributed(item.text)).fixedSize(horizontal: false, vertical: true)
                     }
@@ -162,8 +162,8 @@ struct MarkdownText: View {
             }
         case .quote(let s):
             HStack(spacing: 10) {
-                RoundedRectangle(cornerRadius: 1.5).fill(Color.secondary.opacity(0.5)).frame(width: 3)
-                Text(InlineMarkdown.attributed(s)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                RoundedRectangle(cornerRadius: 1.5).fill(HMDesign.text2.opacity(0.5)).frame(width: 3)
+                Text(InlineMarkdown.attributed(s)).foregroundStyle(HMDesign.text2).fixedSize(horizontal: false, vertical: true)
             }
         case .code(let language, let body, let closed, let file):
             CodeBlockView(language: language, code: body, streaming: !closed, file: file)
@@ -206,7 +206,7 @@ struct CodeBlockView: View {
             layout {
                 HStack(spacing: HMDesign.micro) {
                     Label(label, systemImage: file != nil ? "doc.text" : "chevron.left.forwardslash.chevron.right")
-                        .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        .font(.caption.weight(.medium)).foregroundStyle(HMDesign.text2)
                         .lineLimit(typeSize.isAccessibilitySize ? 2 : 1).truncationMode(.middle)
                     if streaming { ProgressView().controlSize(.mini).accessibilityLabel("Receiving code") }
                 }
@@ -217,7 +217,7 @@ struct CodeBlockView: View {
                         Image(systemName: "text.alignleft").font(.footnote).hmTouchTarget()
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(wrap ? HMDesign.accent : Color.secondary)
+                    .foregroundStyle(wrap ? HMDesign.accent : HMDesign.text2)
                     .accessibilityLabel(wrap ? "Stop wrapping lines" : "Wrap lines")
                     Button(action: copy) {
                         Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
@@ -225,7 +225,7 @@ struct CodeBlockView: View {
                             .padding(.horizontal, HMDesign.small).hmTouchTarget()
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(copied ? Color.primary : HMDesign.accent)
+                    .foregroundStyle(copied ? HMDesign.ink : HMDesign.accent)
                     .disabled(streaming)
                     .accessibilityLabel(copied ? "Copied" : "Copy \(label)")
                 }
@@ -255,7 +255,7 @@ struct CodeBlockView: View {
             }
             if lines.count > foldAfter + 4 {
                 Button(expanded ? "Show less" : "Show all \(lines.count) lines") {
-                    withAnimation(.snappy) { expanded.toggle() }
+                    withAnimation(Thermocline.Motion.standard) { expanded.toggle() }
                 }
                 .font(.caption.weight(.semibold))
                 .frame(maxWidth: .infinity, minHeight: HMDesign.touch)
@@ -264,7 +264,7 @@ struct CodeBlockView: View {
         }
         .background(HMDesign.panel)
         .clipShape(RoundedRectangle(cornerRadius: HMDesign.panelRadius))
-        .overlay(RoundedRectangle(cornerRadius: HMDesign.panelRadius).strokeBorder(Color(.separator).opacity(0.5), lineWidth: 0.5))
+        .overlay(RoundedRectangle(cornerRadius: HMDesign.panelRadius).strokeBorder(HMDesign.separator.opacity(0.5), lineWidth: 0.5))
     }
 
     private func copy() {
@@ -272,10 +272,10 @@ struct CodeBlockView: View {
         var text = code
         while text.hasSuffix("\n") { text.removeLast() }
         Clipboard.copy(text, what: "Copied code")
-        withAnimation(.snappy) { copied = true }
+        withAnimation(Thermocline.Motion.standard) { copied = true }
         Task {
             try? await Task.sleep(for: .seconds(1.2))
-            withAnimation(.snappy) { copied = false }
+            withAnimation(Thermocline.Motion.standard) { copied = false }
         }
     }
 }
@@ -287,11 +287,11 @@ struct CalloutView: View {
 
     private var style: (title: String, icon: String, color: Color) {
         switch kind {
-        case "tip": ("Tip", "lightbulb.fill", .green)
-        case "important": ("Important", "exclamationmark.bubble.fill", .purple)
-        case "warning": ("Warning", "exclamationmark.triangle.fill", .orange)
-        case "caution": ("Caution", "octagon.fill", .red)
-        default: ("Note", "info.circle.fill", .blue)
+        case "tip": ("Tip", "lightbulb.fill", HMDesign.success)
+        case "important": ("Important", "exclamationmark.bubble.fill", HMDesign.plum)
+        case "warning": ("Warning", "exclamationmark.triangle.fill", HMDesign.caution)
+        case "caution": ("Caution", "octagon.fill", HMDesign.danger)
+        default: ("Note", "info.circle.fill", HMDesign.link)
         }
     }
 
@@ -316,7 +316,7 @@ struct CalloutView: View {
         func makeBody(configuration: Configuration) -> some View {
             HStack(alignment: .firstTextBaseline, spacing: HMDesign.small) {
                 configuration.icon.foregroundStyle(color)
-                configuration.title.foregroundStyle(.primary)
+                configuration.title.foregroundStyle(HMDesign.ink)
             }
         }
     }
@@ -348,7 +348,7 @@ struct TableBlockView: View {
             Button {
                 Clipboard.copy(rows.map { "| " + $0.joined(separator: " | ") + " |" }.joined(separator: "\n"), what: "Copied table")
             } label: { Label("Copy table", systemImage: "doc.on.doc").font(.caption).hmTouchTarget() }
-            .buttonStyle(.plain).foregroundStyle(.secondary)
+            .buttonStyle(.plain).foregroundStyle(HMDesign.text2)
         }
     }
 }

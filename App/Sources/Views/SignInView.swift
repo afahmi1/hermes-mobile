@@ -26,33 +26,34 @@ struct SignInView: View {
                 Section {
                     VStack(alignment: .leading, spacing: HMDesign.small) {
                         HStack(spacing: HMDesign.small) {
-                            Image(systemName: "flame.fill").font(.title2).foregroundStyle(.tint).accessibilityHidden(true)
+                            if HMTheme.isThermocline { HorizonEyeMark().frame(width: 40, height: 40).accessibilityHidden(true) }
+                            else { Image(systemName: "flame.fill").font(.title2).foregroundStyle(.tint).accessibilityHidden(true) }
                             Text("Hermes").font(.largeTitle.bold()).accessibilityAddTraits(.isHeader)
                         }
                         Text(adding ? "Add a gateway." : "Sign in to your gateway.")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                            .font(.subheadline).foregroundStyle(HMDesign.text2)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, HMDesign.small)
                     .listRowBackground(Color.clear)
-                }
+                }.hmRows()
                 if !adding && !app.savedGateways.isEmpty {
-                    Section("Saved gateways") {
+                    Section(header: HMHeader("Saved gateways")) {
                         ForEach(app.savedGateways, id: \.self) { gateway in
                             Button {
                                 do { try app.switchGateway(gateway) } catch { self.error = error.localizedDescription }
                             } label: {
                                 VStack(alignment: .leading, spacing: HMDesign.micro) {
                                     Text(SavedGateways.displayName(gateway)).font(HMDesign.rowTitle)
-                                    Text(gateway.absoluteString).font(HMDesign.metadata).foregroundStyle(.secondary)
+                                    Text(gateway.absoluteString).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                                         .lineLimit(2).truncationMode(.middle)
                                 }
                                 .hmTouchTarget()
                             }
                         }
-                    }
+                    }.hmRows()
                 }
                 Section {
-                    TextField("Server address", text: $server, prompt: Text("https://your-server.tailnet.ts.net:10001").foregroundStyle(.secondary))
+                    TextField("Server address", text: $server, prompt: Text("https://your-server.tailnet.ts.net:10001").foregroundStyle(HMDesign.text2))
                         .keyboardType(.URL).textContentType(.URL).textInputAutocapitalization(.never)
                         .autocorrectionDisabled().focused($focus, equals: .server)
                         .accessibilityLabel("Server address")
@@ -65,20 +66,20 @@ struct SignInView: View {
                     } else {
                         Text("Use your Hermes bridge’s HTTPS address. Keep Tailscale connected.")
                     }
-                }
+                }.hmRows()
                 Section {
                     methodPicker
                     if pairing {
-                        SecureField("One-time code", text: $code, prompt: Text("One-time code").foregroundStyle(.secondary))
+                        SecureField("One-time code", text: $code, prompt: Text("One-time code").foregroundStyle(HMDesign.text2))
                             .accessibilityLabel("One-time code")
                             .textContentType(.oneTimeCode).autocorrectionDisabled().textInputAutocapitalization(.never)
                             .onSubmit { Task { await signIn() } }
                     } else {
-                        TextField("Username", text: $username, prompt: Text("Username").foregroundStyle(.secondary))
+                        TextField("Username", text: $username, prompt: Text("Username").foregroundStyle(HMDesign.text2))
                             .accessibilityLabel("Username")
                             .textContentType(.username).textInputAutocapitalization(.never).autocorrectionDisabled()
                             .focused($focus, equals: .user).submitLabel(.next).onSubmit { focus = .pass }
-                        SecureField("Password", text: $password, prompt: Text("Password").foregroundStyle(.secondary))
+                        SecureField("Password", text: $password, prompt: Text("Password").foregroundStyle(HMDesign.text2))
                             .accessibilityLabel("Password")
                             .textContentType(.password).focused($focus, equals: .pass)
                             .submitLabel(.go).onSubmit { Task { await signIn() } }
@@ -86,9 +87,9 @@ struct SignInView: View {
                 } header: { Text("Account") } footer: {
                     Text(pairing ? "Use a code from the host or a signed-in owner device. It expires in five minutes."
                                  : "Use your Hermes dashboard login. Google sign-in is for Tailscale.")
-                }
+                }.hmRows()
                 if let error {
-                    Section { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
+                    Section { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.danger) }.hmRows()
                 }
                 Section {
                     Button {
@@ -101,8 +102,9 @@ struct SignInView: View {
                     }
                     .accessibilityLabel(busy ? (pairing ? "Pairing" : "Signing in") : "Sign In")
                     .disabled(busy || server.isEmpty || (pairing ? code.isEmpty : username.isEmpty || password.isEmpty))
-                }
+                }.hmRows()
             }
+            .hmCanvas()
             .navigationBarTitleDisplayMode(.inline)
             .interactiveDismissDisabled(busy)
         }

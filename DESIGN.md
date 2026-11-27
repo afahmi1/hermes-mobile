@@ -1,9 +1,31 @@
 ---
 name: Prometheus
-description: Native iPhone remote for Hermes Agent
+description: Native iPhone remote for Hermes Agent. Visual system: Thermocline v1.0, see afahmi1/thermocline.
 colors:
-  ember-light: "#8e5200"
-  ember-dark: "#f5b942"
+  bg-light: "#E4E0D7"
+  bg-dark: "#13181D"
+  surface1-light: "#EEEAE1"
+  surface1-dark: "#1A2026"
+  surface2-light: "#F5F1E7"
+  surface2-dark: "#22272B"
+  text-light: "#13181D"
+  text-dark: "#EBE7DE"
+  text2-light: "#474047"
+  text2-dark: "#B5AEA5"
+  text3-light: "#645C64"
+  text3-dark: "#9D959D"
+  lead-light: "#186377"
+  lead-dark: "#6BCDC2"
+  link-light: "#186377"
+  link-dark: "#6FB3D0"
+  spark-light: "#AE6B00"
+  spark-dark: "#F4B21F"
+  danger-light: "#CE0A04"
+  danger-dark: "#E62F10"
+  success-light: "#4B6801"
+  success-dark: "#A3C54F"
+  classic-accent-light: "#8e5200"
+  classic-accent-dark: "#f5b942"
 rounded:
   panel: "12px"
   message: "20px"
@@ -22,7 +44,11 @@ Prometheus is an iOS utility for talking to your bots and checking the Mac they 
 
 ## Colors
 
-`AccentColor.colorset` remains the only interaction tint: dark ochre in Light Mode, amber in Dark Mode. Both come from the flame family of the Firebringer icon. Use `Color.accentColor` for key controls and tint a surface lightly when it serves a purpose; keep text on tinted surfaces semantic (`.primary`). Use UIKit’s adaptive system backgrounds and fills, `.primary` and `.secondary` for text, and separators/materials for boundaries. Red, green and amber may convey status only when a label or symbol also conveys it. Do not put white text on bright amber.
+Visual system: Thermocline v1.0 (`App/Sources/Views/Thermocline.swift`, vendored from afahmi1/thermocline; token values are never edited here). `HMDesign` in `DesignSystem.swift` maps app roles to the active theme: canvas `bg`, rows and bars `surface1`, raised `surface2`, text `text`/`text2`/`text3`, separators `line`, tint and controls `lead`, links `link`, errors and destructive `danger` (finch beak red), success `success`, caution text `warm`. Macaw gold (`spark`) appears at most once per screen, as a fill or symbol, never as text on light. Outgoing bubbles are `lead` with `onLead` text. Status is always paired with a label or symbol.
+
+### Theme option
+
+Settings > Appearance has a Theme picker (Thermocline, the default, or Classic) stored in `@AppStorage("appTheme")`, and a Mode picker (System, Light, Dark) stored in `appMode` and applied with `preferredColorScheme`. `HMThemeSpec` holds each theme's roles and `HMDesign` reads the active one. Classic is the pre-Thermocline look: system grouped backgrounds, `.primary`/`.secondary` text, system status colors and the amber `AccentColor.colorset` (#8e5200 light, #f5b942 dark). Thermocline applies its tint through `.tint(Thermocline.lead)`; the asset catalog stays amber for Classic.
 
 ## Typography
 
@@ -34,7 +60,7 @@ Use SF Pro, standard SwiftUI text styles, and Dynamic Type. Navigation owns top-
 
 ## Elevation & Depth
 
-Conversation content sits on the system background. Grouped lists and forms use system layers. Composer and pinned-message bar use system bar material as a boundary while scrolling. No custom shadows or gradient decoration.
+Thermocline depth is glass and light, one layer at a time. Every screen sits on the `bg` canvas with a depth field: one or two large soft radial blooms of `lead` and `link` at 8–14% alpha. Rows and cards sit on `surface1` or `thermoclineGlass` (system material plus a `line` hairline). The composer, pinned-message bar and status tiles are glass; tab and navigation bars are tinted material. Never glass on glass, never glow on text, no black shadows in light mode. Section headers use the mono uppercase label style; counts use mono with tabular digits. Motifs, used lightly: lateral-line dividers between major Status sections, finch bars for usage progress, the Horizon-eye mark on the sign-in screen and empty states, and a `danger` live dot for streaming. Classic keeps system backgrounds and system bar material.
 
 ## Shapes
 

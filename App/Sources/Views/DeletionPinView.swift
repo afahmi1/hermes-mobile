@@ -18,13 +18,13 @@ struct DeletionPinView: View {
                 Section {
                     Text(configured ? "A deletion PIN is set on your Mac. It protects archiving projects and bots."
                                     : "No deletion PIN is set yet. Archiving projects and bots stays locked until you choose one.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
+                        .font(.footnote).foregroundStyle(HMDesign.text2)
+                }.hmRows()
                 Section(configured ? "Change PIN" : "Choose a PIN") {
                     if configured { field("Current PIN", $current, id: "pinsetup.current") }
                     field("New 4-digit PIN", $new, id: "pinsetup.new")
                     field("New PIN again", $confirm, id: "pinsetup.confirm")
-                }
+                }.hmRows()
                 Section {
                     Button(configured ? "Change PIN" : "Set PIN") { Task { await save(configured) } }
                         .disabled(busy || PINSetup.problem(new: new, confirm: confirm, current: current, configured: configured) != nil)
@@ -32,12 +32,12 @@ struct DeletionPinView: View {
                 } footer: {
                     if let p = PINSetup.problem(new: new, confirm: confirm, current: current, configured: configured),
                        !(new.isEmpty && confirm.isEmpty && current.isEmpty) { Text(p) }
-                }
+                }.hmRows()
             } else if failure == nil {
-                Section { ProgressView("Checking your Mac…") }
+                Section { ProgressView("Checking your Mac…") }.hmRows()
             }
-            if let failure { Section { Text(failure).foregroundStyle(.red).accessibilityIdentifier("pinsetup.error") } }
-            if let done { Section { Text(done).accessibilityIdentifier("pinsetup.done") } }
+            if let failure { Section { Text(failure).foregroundStyle(HMDesign.danger).accessibilityIdentifier("pinsetup.error") }.hmRows() }
+            if let done { Section { Text(done).accessibilityIdentifier("pinsetup.done") }.hmRows() }
         }
         .hmCanvas()
         .navigationTitle("Deletion PIN")

@@ -33,15 +33,15 @@ struct RuntimeSheet: View {
                 if running {
                     Section {
                         Label("The current reply will finish with its original model.", systemImage: "arrow.turn.down.right")
-                        Text("Your selection applies to the next message you send or queue.").foregroundStyle(.secondary)
-                    }
+                        Text("Your selection applies to the next message you send or queue.").foregroundStyle(HMDesign.text2)
+                    }.hmRows()
                 }
                 Section {
                     effortStrip
                 } header: { Text("Effort") } footer: {
                     if !reasoningSupported { Text("This model uses its own reasoning settings.") }
                     else if !reasoningKnown { Text("Hermes hasn’t reported reasoning support for this model. Default uses its own settings.") }
-                }
+                }.hmRows()
                 .disabled(!reasoningSupported)
 
                 Section {
@@ -52,20 +52,20 @@ struct RuntimeSheet: View {
                     .pickerStyle(.menu)
                     .disabled(loading)
                     if !loading && (catalog?.usable.isEmpty ?? true) {
-                        Text("Model list unavailable. You can keep this chat’s saved selection.").foregroundStyle(.secondary)
+                        Text("Model list unavailable. You can keep this chat’s saved selection.").foregroundStyle(HMDesign.text2)
                     }
                     Button("Refresh models") {
                         Task { _ = await app.catalog(for: profile, refresh: true) }
                     }
                     .disabled(catalogState.isRefreshing)
-                    if loading { HStack { ProgressView(); Text("Loading models…").foregroundStyle(.secondary) } }
+                    if loading { HStack { ProgressView(); Text("Loading models…").foregroundStyle(HMDesign.text2) } }
                 } header: { Text("Provider") } footer: {
                     if provider == nil, let bot { Text("Uses \(bot.name)'s own setting: \(bot.model) · \(bot.provider).") }
                     if !loading { Text(catalogState.caption(now: Date())) }
-                }
+                }.hmRows()
 
                 if let p = selectedProvider {
-                    Section("Model") {
+                    Section(header: HMHeader("Model")) {
                         if p.models.count > 8 || model.map({ !p.models.contains($0) }) == true {
                             TextField("Filter, or type an exact model name", text: $modelQuery)
                                 .textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -76,7 +76,7 @@ struct RuntimeSheet: View {
                                 withAnimation { model = typed }
                             } label: {
                                 HStack {
-                                    Label("Use “\(typed)”", systemImage: "character.cursor.ibeam").foregroundStyle(Color.primary)
+                                    Label("Use “\(typed)”", systemImage: "character.cursor.ibeam").foregroundStyle(HMDesign.ink)
                                     Spacer()
                                     if model == typed { Image(systemName: "checkmark").foregroundStyle(.tint).fontWeight(.semibold) }
                                 }
@@ -89,7 +89,7 @@ struct RuntimeSheet: View {
                                 withAnimation { model = m }
                             } label: {
                                 HStack {
-                                    Text(m).foregroundStyle(Color.primary)
+                                    Text(m).foregroundStyle(HMDesign.ink)
                                     Spacer()
                                     if model == m { Image(systemName: "checkmark").foregroundStyle(.tint).fontWeight(.semibold) }
                                 }
@@ -97,7 +97,7 @@ struct RuntimeSheet: View {
                             }
                             .buttonStyle(.plain)
                         }
-                    }
+                    }.hmRows()
                 }
 
                 if let s = fresh ?? served {
@@ -108,7 +108,7 @@ struct RuntimeSheet: View {
                             LabeledContent("Effort", value: pol.effort.flatMap { Effort(rawValue: $0)?.label } ?? "Default")
                         } header: { Text("Saved on this chat in Hermes") } footer: {
                             Text("The desktop app shows and uses the same setting.")
-                        }
+                        }.hmRows()
                     }
                     if let cost = s.cost, cost.usd >= 0.0005 || cost.included {
                         Section {
@@ -123,10 +123,10 @@ struct RuntimeSheet: View {
                         } header: { Text("This chat") } footer: {
                             Text(cost.unknown ? "Some steps ran on a model with no price on record, so they aren't counted."
                                  : "From Hermes's usage records, including background helpers like summaries and image reading.")
-                        }
+                        }.hmRows()
                     }
                     if let used = s.modelsUsed, !used.isEmpty {
-                        Section("Models that answered this chat") {
+                        Section(header: HMHeader("Models that answered this chat")) {
                             ForEach(used, id: \.self) { u in
                                 LabeledContent {
                                     let calls = u.calls ?? 0
@@ -135,11 +135,11 @@ struct RuntimeSheet: View {
                                 } label: {
                                     VStack(alignment: .leading) {
                                         Text(ModelName.short(u.model))
-                                        if let p = u.provider, !p.isEmpty { Text(p).font(.caption).foregroundStyle(.secondary) }
+                                        if let p = u.provider, !p.isEmpty { Text(p).font(.caption).foregroundStyle(HMDesign.text2) }
                                     }
                                 }
                             }
-                        }
+                        }.hmRows()
                     }
                 }
             }
@@ -223,12 +223,12 @@ struct RuntimeSheet: View {
     private func chip(_ value: String?, _ label: String) -> some View {
         let on = effort == value
         return Button {
-            withAnimation(.snappy) { effort = value }
+            withAnimation(Thermocline.Motion.standard) { effort = value }
         } label: {
             Text(label).font(.subheadline.weight(on ? .semibold : .regular))
                 .padding(.horizontal, 12).padding(.vertical, 7)
                 .background(on ? HMDesign.selectedFill : Color(uiColor: .tertiarySystemFill), in: Capsule())
-                .foregroundStyle(.primary)
+                .foregroundStyle(HMDesign.ink)
                 .overlay { if on { Capsule().strokeBorder(HMDesign.accent, lineWidth: 1) } }
                 .hmTouchTarget()
         }

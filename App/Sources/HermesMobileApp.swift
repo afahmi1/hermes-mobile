@@ -18,12 +18,17 @@ private final class NotificationDelegate: NSObject, UIApplicationDelegate {
 @main
 struct HermesMobileApp: App {
     @UIApplicationDelegateAdaptor(NotificationDelegate.self) private var delegate
+    #if DEBUG
+    // Screenshot QA (debug builds only): `-HMTab N` starts on tab N.
+    @State private var selectedTab = UserDefaults.standard.integer(forKey: "HMTab")
+    #else
     @State private var selectedTab = 0
+    #endif
     @State private var app = AppModel()
     @Environment(\.scenePhase) private var phase
     @State private var backgroundedAt: Date?
-    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
-    @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
+    @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeKind.thermocline.rawValue
+    @AppStorage(HMTheme.modeKey) private var modeRaw = HMMode.system.rawValue
 
     init() { HMTheme.applyChrome() }
 
@@ -32,10 +37,10 @@ struct HermesMobileApp: App {
             RootView(selectedTab: $selectedTab)
                 .environment(app)
                 .tint(HMDesign.accent)
-                .preferredColorScheme(HMThemeChoice(rawValue: themeRaw)?.scheme)
+                .preferredColorScheme(HMMode(rawValue: modeRaw)?.scheme)
                 // Theme colors resolve when views are built: rebuild once on a theme change.
-                .id(themeRaw + accentRaw)
-                .onChange(of: themeRaw + accentRaw) { _, _ in HMTheme.applyChrome() }
+                .id(themeRaw + modeRaw)
+                .onChange(of: themeRaw + modeRaw) { _, _ in HMTheme.applyChrome() }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
                     app.retryDraftStorage()
                 }
@@ -204,22 +209,22 @@ struct ConnectionBadge: View {
     }
 
     private var state: (label: String, symbol: String, color: Color) {
-        guard app.checkedConnection else { return (named("Checking"), "clock.fill", .yellow) }
+        guard app.checkedConnection else { return (named("Checking"), "clock.fill", HMDesign.caution) }
         if app.needsLogin { return (named("Sign in"), "lock.fill", HMDesign.warning) }
-        if app.healthFailure != nil { return (named("Unreachable"), "wifi.slash", .red) }
-        guard let health = app.health else { return (named("Offline"), "xmark.circle.fill", .red) }
+        if app.healthFailure != nil { return (named("Unreachable"), "wifi.slash", HMDesign.danger) }
+        guard let health = app.health else { return (named("Offline"), "xmark.circle.fill", HMDesign.danger) }
         switch health.phase {
-        case "starting": return (named("Starting"), "clock.fill", .yellow)
-        case "restarting": return (named("Restarting"), "arrow.clockwise.circle.fill", .yellow)
-        case "draining": return (named("Finishing work"), "clock.fill", .yellow)
-        case "waiting": return (named("Waiting"), "clock.fill", .yellow)
-        case "stopping": return (named("Stopping"), "clock.fill", .yellow)
-        case "stopped", "unavailable": return (named("Gateway down"), "xmark.circle.fill", .red)
+        case "starting": return (named("Starting"), "clock.fill", HMDesign.caution)
+        case "restarting": return (named("Restarting"), "arrow.clockwise.circle.fill", HMDesign.caution)
+        case "draining": return (named("Finishing work"), "clock.fill", HMDesign.caution)
+        case "waiting": return (named("Waiting"), "clock.fill", HMDesign.caution)
+        case "stopping": return (named("Stopping"), "clock.fill", HMDesign.caution)
+        case "stopped", "unavailable": return (named("Gateway down"), "xmark.circle.fill", HMDesign.danger)
         default: break
         }
         let gateway = health.gatewayState?.lowercased() ?? ""
         if !health.ok || ["stopped", "down", "failed", "offline"].contains(gateway) {
-            return (named("Gateway down"), "xmark.circle.fill", .red)
+            return (named("Gateway down"), "xmark.circle.fill", HMDesign.danger)
         }
         if ["degraded", "down"].contains(diagnostic?["health"].string ?? "") || (!gateway.isEmpty && !["running", "healthy", "ok", "ready"].contains(gateway)) {
             return (named("Degraded"), "exclamationmark.triangle.fill", HMDesign.warning)
@@ -238,7 +243,7 @@ struct ConnectionBadge: View {
                         .overlay { if reloading { ProgressView().controlSize(.mini) } }
                 } else {
                     Image(systemName: state.symbol).foregroundStyle(state.color)
-                    Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+                    Text(state.label).font(.subheadline.weight(.medium)).foregroundStyle(HMDesign.ink)
                 }
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -248,9 +253,9 @@ struct ConnectionBadge: View {
         .popover(isPresented: $detail) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(state.label).font(.headline)
-                Text(API.shared.baseURL?.absoluteString ?? "Hermes gateway").textSelection(.enabled).font(.footnote).foregroundStyle(.secondary)
+                Text(API.shared.baseURL?.absoluteString ?? "Hermes gateway").textSelection(.enabled).font(.footnote).foregroundStyle(HMDesign.text2)
                 if let at = app.lastHealthCheck {
-                    Text("Last response \(at, style: .relative) ago").font(.caption).foregroundStyle(.secondary)
+                    Text("Last response \(at, style: .relative) ago").font(.caption).foregroundStyle(HMDesign.text2)
                 }
                 if !app.checkedConnection {
                     Text("Checking the bridge and gateway.")
@@ -273,7 +278,7 @@ struct ConnectionBadge: View {
                         if let text = reason.string { Text(text) }
                     }
                 }
-                if app.healthFailure == nil, let reason = app.health?.reason { Text(reason).foregroundStyle(.secondary) }
+                if app.healthFailure == nil, let reason = app.health?.reason { Text(reason).foregroundStyle(HMDesign.text2) }
                 if let fallback = app.health?.inboxFallback { Text("Using gateway history · " + fallback).font(.caption) }
                 if let recent = app.health?.recent, recent.count > 1 {
                     Divider()

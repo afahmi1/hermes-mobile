@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// Shared values for the native SwiftUI surfaces. The accent comes from the app asset catalog.
+/// Shared values for the native SwiftUI surfaces. Colors come from the active theme (see HMThemeSpec).
 enum HMDesign {
     static let micro: CGFloat = 4
     static let small: CGFloat = 8
@@ -10,144 +10,198 @@ enum HMDesign {
     static let section: CGFloat = 24
     static let touch: CGFloat = 44
 
-    static let panelRadius: CGFloat = 12
+    static var panelRadius: CGFloat { HMTheme.isThermocline ? Thermocline.Radius.md : 12 }
     static let messageRadius: CGFloat = 20
 
     static let rowTitle: Font = .body.weight(.semibold)
     static let metadata: Font = .footnote
 
-    // Theme colors. Each resolves per light/dark trait from the chosen theme (see HMTheme).
-    static var canvas: Color { HMTheme.color(\.canvas) }
-    static var panel: Color { HMTheme.color(\.surface) }
-    static var raised: Color { HMTheme.color(\.raised) }
-    static var separator: Color { HMTheme.color(\.separator) }
-    static var ink: Color { HMTheme.color(\.ink) }
-    static var accent: Color { HMTheme.color(\.accent) }
-    static var success: Color { HMTheme.color(\.success) }
-    static var warning: Color { HMTheme.color(\.warning) }
+    private static var spec: HMThemeSpec { HMTheme.spec }
+    static var canvas: Color { spec.canvas }
+    static var panel: Color { spec.panel }
+    static var raised: Color { spec.raised }
+    static var separator: Color { spec.separator }
+    static var ink: Color { spec.ink }
+    static var text2: Color { spec.text2 }
+    static var text3: Color { spec.text3 }
+    static var accent: Color { spec.accent }
+    static var link: Color { spec.link }
+    static var success: Color { spec.success }
+    /// Gold spark in Thermocline: once per screen, as a fill or symbol, never as text on light.
+    static var warning: Color { spec.warning }
+    /// Readable caution text and symbols.
+    static var caution: Color { spec.caution }
+    /// Errors and destructive actions (finch beak red in Thermocline).
+    static var danger: Color { spec.danger }
+    static var plum: Color { spec.plum }
+    static var bar: Color { spec.bar }
     static var selectedFill: Color { accent.opacity(0.16) }
-    /// The composer and inbox header: the canvas, slightly lifted, so it reads as a shelf, not a hole.
-    static var bar: Color { HMTheme.color(\.bar) }
+    /// The outgoing message bubble: lead fill with on-lead text in Thermocline.
+    static var bubbleFill: Color { HMTheme.isThermocline ? Thermocline.lead : selectedFill }
+    static var bubbleText: Color { HMTheme.isThermocline ? Thermocline.onLead : ink }
+    /// Counts and figures: mono with tabular digits in Thermocline, system tabular digits in Classic.
+    static func number(_ size: CGFloat = 13, weight: Font.Weight = .regular) -> Font {
+        HMTheme.isThermocline ? Thermocline.Font.mono(size, weight: weight, relativeTo: .footnote).monospacedDigit()
+            : .system(size: size, weight: weight).monospacedDigit()
+    }
 }
 
-/// One palette. Hex values are sRGB.
-struct HMPalette {
-    var canvas: UInt32, surface: UInt32, raised: UInt32, bar: UInt32, separator: UInt32
-    var ink: UInt32, accent: UInt32, success: UInt32, warning: UInt32
+/// One theme's color roles. Thermocline is the default; Classic is the system look with the amber AccentColor.
+struct HMThemeSpec {
+    var canvas, panel, raised, bar, separator, ink, text2, text3, accent, link, success, warning, caution, danger, plum: Color
 
-    /// zayd.wtf's dark: ash gray, warm cream text, violet. No pure black, no neon.
-    static let ash = HMPalette(canvas: 0x232322, surface: 0x2C2C2B, raised: 0x353533, bar: 0x282827, separator: 0x3E3D3A,
-                               ink: 0xEDE6D3, accent: 0xA48CFF, success: 0x8FBF8A, warning: 0xE0B25E)
-    /// zayd.wtf's light: paper, ink, its orange.
-    static let paper = HMPalette(canvas: 0xF4EEDD, surface: 0xEAE2CC, raised: 0xFFFBF1, bar: 0xEFE8D4, separator: 0xD9CFB6,
-                                 ink: 0x2E2C28, accent: 0xD9622B, success: 0x4F8A4C, warning: 0xB7791F)
-    /// True black for OLED, with a calmer accent than the old neon orange.
-    static let oled = HMPalette(canvas: 0x000000, surface: 0x141414, raised: 0x1C1C1E, bar: 0x0B0B0B, separator: 0x2A2A2A,
-                                ink: 0xF2F2F2, accent: 0xF0A24B, success: 0x7FBF7A, warning: 0xE0B25E)
+    static let thermocline = HMThemeSpec(
+        canvas: Thermocline.bg, panel: Thermocline.surface1, raised: Thermocline.surface2, bar: Thermocline.surface1,
+        separator: Thermocline.line, ink: Thermocline.text, text2: Thermocline.text2, text3: Thermocline.text3,
+        accent: Thermocline.lead, link: Thermocline.link, success: Thermocline.success, warning: Thermocline.spark,
+        caution: Thermocline.warm, danger: Thermocline.danger, plum: Thermocline.plum)
+
+    static let classic = HMThemeSpec(
+        canvas: Color(uiColor: .systemGroupedBackground), panel: Color(uiColor: .secondarySystemGroupedBackground),
+        raised: Color(uiColor: .tertiarySystemGroupedBackground), bar: Color(uiColor: .systemBackground),
+        separator: Color(uiColor: .separator), ink: Color(uiColor: .label), text2: Color(uiColor: .secondaryLabel),
+        text3: Color(uiColor: .tertiaryLabel), accent: Color.accentColor, link: Color(uiColor: .systemBlue),
+        success: Color(uiColor: .systemGreen), warning: Color(uiColor: .systemOrange), caution: Color(uiColor: .systemOrange),
+        danger: Color(uiColor: .systemRed), plum: Color(uiColor: .systemPurple))
 }
 
-enum HMThemeChoice: String, CaseIterable, Identifiable {
-    case system, ash, paper, oled
+enum HMThemeKind: String, CaseIterable, Identifiable {
+    case thermocline, classic
     var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .system: "Match iPhone"
-        case .ash: "Ash"
-        case .paper: "Paper"
-        case .oled: "Black"
-        }
-    }
-    var detail: String {
-        switch self {
-        case .system: "Ash at night, Paper by day"
-        case .ash: "Soft dark gray, easy on the eyes"
-        case .paper: "Warm light"
-        case .oled: "True black for OLED screens"
-        }
-    }
-    var scheme: ColorScheme? {
-        switch self {
-        case .system: nil
-        case .ash, .oled: .dark
-        case .paper: .light
-        }
-    }
+    var title: String { self == .thermocline ? "Thermocline" : "Classic" }
+    var detail: String { self == .thermocline ? "Teal on warm paper or deep ink, with glass" : "System backgrounds, amber accent" }
 }
 
-enum HMAccent: String, CaseIterable, Identifiable {
-    case theme, violet, amber, sage, sky, rose
+enum HMMode: String, CaseIterable, Identifiable {
+    case system, light, dark
     var id: String { rawValue }
-    var title: String { self == .theme ? "Theme" : rawValue.capitalized }
-    /// (light, dark) so the accent keeps contrast on both canvases.
-    var hex: (UInt32, UInt32)? {
-        switch self {
-        case .theme: nil
-        case .violet: (0x6B4FD8, 0xA48CFF)
-        case .amber: (0xC4621F, 0xF0A24B)
-        case .sage: (0x4F7F4B, 0x9CC796)
-        case .sky: (0x2F6FB8, 0x7CB4F0)
-        case .rose: (0xB8456B, 0xF08AAE)
-        }
-    }
+    var title: String { rawValue.capitalized }
+    var scheme: ColorScheme? { self == .light ? .light : self == .dark ? .dark : nil }
 }
 
-/// The chosen theme, read by dynamic colors. Stored in UserDefaults so it is set before the first frame.
+/// The chosen theme and mode, stored in UserDefaults so they are set before the first frame.
 enum HMTheme {
-    static let themeKey = "hm.theme", accentKey = "hm.accent"
-    static var choice: HMThemeChoice { HMThemeChoice(rawValue: UserDefaults.standard.string(forKey: themeKey) ?? "") ?? .system }
-    static var accentChoice: HMAccent { HMAccent(rawValue: UserDefaults.standard.string(forKey: accentKey) ?? "") ?? .theme }
+    static let themeKey = "appTheme", modeKey = "appMode"
+    static var kind: HMThemeKind { HMThemeKind(rawValue: UserDefaults.standard.string(forKey: themeKey) ?? "") ?? .thermocline }
+    static var mode: HMMode { HMMode(rawValue: UserDefaults.standard.string(forKey: modeKey) ?? "") ?? .system }
+    static var isThermocline: Bool { kind == .thermocline }
+    static var spec: HMThemeSpec { isThermocline ? .thermocline : .classic }
 
-    static func palette(dark: Bool) -> HMPalette {
-        switch choice {
-        case .system: dark ? .ash : .paper
-        case .ash: .ash
-        case .paper: .paper
-        case .oled: .oled
-        }
-    }
-
-    static func uiColor(_ key: KeyPath<HMPalette, UInt32>) -> UIColor {
-        UIColor { traits in
-            let dark = traits.userInterfaceStyle == .dark
-            if key == \HMPalette.accent, let pair = accentChoice.hex { return UIColor(hex: dark ? pair.1 : pair.0) }
-            return UIColor(hex: palette(dark: dark)[keyPath: key])
-        }
-    }
-
-    static func color(_ key: KeyPath<HMPalette, UInt32>) -> Color { Color(uiColor: uiColor(key)) }
-
-    /// Navigation and tab bars are UIKit: give them the theme too. Called at launch and on every change.
+    /// Navigation and tab bars are UIKit: tint them for the theme. Called at launch and on every change.
     static func applyChrome() {
-        let nav = UINavigationBarAppearance()
-        nav.configureWithOpaqueBackground()
-        nav.backgroundColor = uiColor(\.canvas)
-        nav.shadowColor = .clear
-        nav.titleTextAttributes = [.foregroundColor: uiColor(\.ink)]
-        nav.largeTitleTextAttributes = [.foregroundColor: uiColor(\.ink)]
+        let nav = UINavigationBarAppearance(), tab = UITabBarAppearance()
+        if isThermocline {
+            let tint = UIColor(Thermocline.bg).withAlphaComponent(0.7)
+            nav.configureWithDefaultBackground(); nav.backgroundColor = tint
+            nav.shadowColor = UIColor(Thermocline.line)
+            nav.titleTextAttributes = [.foregroundColor: UIColor(Thermocline.text)]
+            nav.largeTitleTextAttributes = [.foregroundColor: UIColor(Thermocline.text)]
+            tab.configureWithDefaultBackground(); tab.backgroundColor = tint
+            tab.shadowColor = UIColor(Thermocline.line)
+        } else {
+            nav.configureWithDefaultBackground(); tab.configureWithDefaultBackground()
+        }
+        let scrollEdge = UINavigationBarAppearance()
+        scrollEdge.configureWithTransparentBackground()
+        if isThermocline { scrollEdge.titleTextAttributes = nav.titleTextAttributes; scrollEdge.largeTitleTextAttributes = nav.largeTitleTextAttributes }
         UINavigationBar.appearance().standardAppearance = nav
         UINavigationBar.appearance().compactAppearance = nav
-        UINavigationBar.appearance().scrollEdgeAppearance = nav
-        let tab = UITabBarAppearance()
-        tab.configureWithOpaqueBackground()
-        tab.backgroundColor = uiColor(\.bar)
-        tab.shadowColor = uiColor(\.separator)
+        UINavigationBar.appearance().scrollEdgeAppearance = isThermocline ? scrollEdge : nil
         UITabBar.appearance().standardAppearance = tab
         UITabBar.appearance().scrollEdgeAppearance = tab
     }
 }
 
-extension UIColor {
-    convenience init(hex: UInt32) {
-        self.init(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
-                  blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+/// Thermocline's depth field: the canvas with two large soft blooms of lead and link.
+struct HMDepthField: View {
+    var body: some View {
+        GeometryReader { geo in
+            let r = max(geo.size.width, geo.size.height)
+            ZStack {
+                Thermocline.bg
+                RadialGradient(colors: [Thermocline.lead.opacity(0.13), .clear], center: .topTrailing, startRadius: 0, endRadius: r * 0.75)
+                RadialGradient(colors: [Thermocline.link.opacity(0.09), .clear], center: .bottomLeading, startRadius: 0, endRadius: r * 0.8)
+            }
+        }
+        .ignoresSafeArea()
+    }
+}
+
+/// A section header: Thermocline label (mono, uppercase, tertiary) or the plain system title in Classic.
+struct HMHeader: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+    var body: some View {
+        if HMTheme.isThermocline {
+            Text(title).font(Thermocline.Font.label).tracking(1.3).textCase(.uppercase).foregroundStyle(Thermocline.text3)
+        } else {
+            Text(title)
+        }
+    }
+}
+
+/// Lateral-line divider between major sections (Thermocline only).
+struct HMLateral: View {
+    var body: some View {
+        if HMTheme.isThermocline {
+            LateralLine().frame(maxWidth: .infinity, alignment: .leading)
+                .listRowBackground(Color.clear).listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                .accessibilityHidden(true)
+        }
+    }
+}
+
+/// Usage and progress bar: finch bars in Thermocline, the native bar in Classic.
+struct HMBar: View {
+    let fraction: Double
+    let tint: Color
+    var body: some View {
+        if HMTheme.isThermocline {
+            FinchBars(progress: fraction, height: 8).frame(height: 8)
+        } else {
+            ProgressView(value: fraction).tint(tint)
+        }
+    }
+}
+
+enum HMBarEdge { case top, bottom, none }
+
+private struct HMCanvas: ViewModifier {
+    @AppStorage(HMTheme.themeKey) private var theme = HMThemeKind.thermocline.rawValue
+    func body(content: Content) -> some View {
+        if theme != HMThemeKind.classic.rawValue {
+            content.scrollContentBackground(.hidden)
+                .listRowSeparatorTint(Thermocline.line)
+                .background(HMDepthField())
+        } else {
+            content
+        }
     }
 }
 
 extension View {
+    /// Rows of a list section sit on surface 1 in Thermocline; Classic keeps the system row color.
+    func hmRows() -> some View {
+        listRowBackground(HMTheme.isThermocline ? HMDesign.panel : Optional<Color>.none)
+    }
+    /// Composer, pinned bar and inbox header: system material with a hairline in Thermocline, the flat bar in Classic.
+    @ViewBuilder func hmBar(_ edge: HMBarEdge) -> some View {
+        if HMTheme.isThermocline {
+            background(.regularMaterial)
+                .overlay(alignment: edge == .top ? .top : .bottom) { if edge != .none { Rectangle().fill(Thermocline.line).frame(height: 0.5) } }
+        } else {
+            background(HMDesign.bar)
+                .overlay(alignment: edge == .top ? .top : .bottom) { if edge != .none { Divider() } }
+        }
+    }
+    /// A status tile or compact card: thin glass in Thermocline.
+    @ViewBuilder func hmCard() -> some View {
+        if HMTheme.isThermocline { padding(.vertical, 6).thermoclineGlass(radius: Thermocline.Radius.md, thin: true) } else { self }
+    }
     /// A screen's background: the theme canvas behind lists and forms instead of the system's black or gray.
     func hmCanvas() -> some View {
-        scrollContentBackground(.hidden)
-            .background(HMDesign.canvas.ignoresSafeArea())
+        modifier(HMCanvas())
     }
 }
 
@@ -189,9 +243,12 @@ enum HMGlass {
 private struct HMSurface<S: Shape>: ViewModifier {
     @AppStorage(HMGlass.key) private var glass = true
     let shape: S
+    var radius: CGFloat = Thermocline.Radius.full
     let flat: Color
     func body(content: Content) -> some View {
-        if glass, #available(iOS 26.0, *) {
+        if HMTheme.isThermocline {
+            content.thermoclineGlass(radius: radius)
+        } else if glass, #available(iOS 26.0, *) {
             content.glassEffect(.regular.tint(flat.opacity(0.25)).interactive(), in: shape)
         } else {
             content.background(flat, in: shape)
@@ -202,7 +259,7 @@ private struct HMSurface<S: Shape>: ViewModifier {
 extension View {
     /// The message box and floating chips.
     func hmField(radius: CGFloat = HMDesign.messageRadius) -> some View {
-        modifier(HMSurface(shape: RoundedRectangle(cornerRadius: radius, style: .continuous), flat: HMDesign.panel))
+        modifier(HMSurface(shape: RoundedRectangle(cornerRadius: radius, style: .continuous), radius: radius, flat: HMDesign.panel))
     }
     func hmCapsule() -> some View { modifier(HMSurface(shape: Capsule(), flat: HMDesign.panel)) }
 }
@@ -217,19 +274,26 @@ struct ThinkingOrb: View {
     var body: some View {
         TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
+            if HMTheme.isThermocline {
+                // Live dot: finch-beak red, slow pulse.
+                Circle().fill(HMDesign.danger).frame(width: size * 0.5, height: size * 0.5)
+                    .opacity(reduceMotion ? 1 : 0.65 + 0.35 * sin(t * 2.2))
+                    .frame(width: size, height: size)
+            } else {
             ZStack {
                 Circle()
-                    .fill(AngularGradient(colors: [HMDesign.accent, HMDesign.accent.opacity(0.35), HMDesign.success.opacity(0.7),
+                    .fill(AngularGradient(colors: [HMDesign.accent, HMDesign.accent.opacity(0.35), HMDesign.link.opacity(0.7),
                                                    HMDesign.accent], center: .center, angle: .degrees(t * 90)))
                     .blur(radius: size * 0.12)
                 Circle()
-                    .fill(RadialGradient(colors: [.white.opacity(0.55), .clear], center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3),
+                    .fill(RadialGradient(colors: [Thermocline.text.opacity(0.45), .clear], center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3),
                                                                                                    y: 0.3 + 0.1 * cos(t * 1.1)),
                                          startRadius: 0, endRadius: size * 0.5))
             }
             .frame(width: size, height: size)
             .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
-            .shadow(color: HMDesign.accent.opacity(0.45), radius: size * 0.35)
+            }
+            
         }
         .accessibilityHidden(true)
     }
@@ -250,7 +314,7 @@ struct SwipeToQuote: ViewModifier {
             .offset(x: offset)
             .background(alignment: .leading) {
                 Image(systemName: "arrowshape.turn.up.left.fill")
-                    .font(.callout).foregroundStyle(armed ? HMDesign.accent : .secondary)
+                    .font(.callout).foregroundStyle(armed ? HMDesign.accent : HMDesign.text2)
                     .opacity(Double(min(offset / threshold, 1)))
                     .scaleEffect(armed ? 1.15 : 0.85)
                     .padding(.leading, 6)
@@ -269,7 +333,7 @@ struct SwipeToQuote: ViewModifier {
                     }
                     .onEnded { _ in
                         if armed { onQuote() }
-                        withAnimation(.spring(duration: 0.3)) { offset = 0; armed = false }
+                        withAnimation(Thermocline.Motion.large) { offset = 0; armed = false }
                     }
             )
     }

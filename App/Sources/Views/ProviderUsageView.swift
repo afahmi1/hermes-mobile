@@ -34,7 +34,7 @@ enum UsageWords {
     }
 
     static func severity(_ used: Double) -> Color {
-        used >= 95 ? .red : used >= 80 ? HMDesign.warning : HMDesign.accent
+        used >= 95 ? HMDesign.danger : used >= 80 ? HMDesign.warning : HMDesign.accent
     }
 
     /// The one line a provider row needs: its tightest limit, or what Hermes has used.
@@ -65,7 +65,7 @@ struct ProviderUsageSection: View {
                 if data == nil || data?["loading"].bool == true {
                     if app.status.error == nil { ProgressView("Reading providers…") }
                 } else {
-                    Text("No providers reported. Pull to refresh.").foregroundStyle(.secondary)
+                    Text("No providers reported. Pull to refresh.").foregroundStyle(HMDesign.text2)
                 }
             }
             ForEach(providers.filter { !$0.data["historical_only"].bool }) { row($0.data) }
@@ -82,7 +82,7 @@ struct ProviderUsageSection: View {
             } else if let date = data?["fetched_at"].date {
                 Text("Updated \(date, style: .relative) ago")
             }
-        }
+        }.hmRows()
     }
 
     static func displayName(_ name: String) -> String {
@@ -113,13 +113,13 @@ struct ProviderUsageSection: View {
                         .foregroundStyle(provider["usage"]["windows"].array.contains { ($0["used_percent"].double ?? 0) >= 80 } ? HMDesign.warning : .secondary)
                 }
                 if let calls = local["calls"].int {
-                    Text("\(UsageWords.compact(calls)) requests from Hermes\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
+                    Text("\(UsageWords.compact(calls)) requests from Hermes\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                 } else {
                     let count = provider["credentials"].array.count
-                    Text("\(count) key\(count == 1 ? "" : "s") set up\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(.secondary)
+                    Text("\(count) key\(count == 1 ? "" : "s") set up\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                 }
                 if provider["is_default"].bool {
-                    Label("Default provider", systemImage: "checkmark.circle").font(HMDesign.metadata).foregroundStyle(.secondary)
+                    Label("Default provider", systemImage: "checkmark.circle").font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
                 }
             }
             .accessibilityElement(children: .combine)
@@ -149,11 +149,11 @@ private struct ProviderUsageDetail: View {
                     LabeledContent("Models", value: listed.models.count.formatted())
                     ForEach(listed.models, id: \.self) { Text(verbatim: $0).font(.callout.monospaced()) }
                 } else if state.catalog != nil {
-                    Text("Hermes’s model catalog doesn’t list this provider.").foregroundStyle(.secondary)
+                    Text("Hermes’s model catalog doesn’t list this provider.").foregroundStyle(HMDesign.text2)
                 } else if state.isRefreshing || state.fetchedAt == nil && state.lastError == nil {
                     ProgressView("Loading models…")
                 }
-                if state.catalog == nil, let error = state.lastError { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.secondary) }
+                if state.catalog == nil, let error = state.lastError { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(HMDesign.text2) }
                 Button("Refresh models") {
                     if let scope { Task { await app.catalogStore.refresh(scope) } }
                 }
@@ -163,7 +163,7 @@ private struct ProviderUsageDetail: View {
                     if state.catalog != nil || state.lastError != nil { Text(state.caption(now: Date())) }
                     Text("From Hermes’s model catalog (default profile)")
                 }
-            }
+            }.hmRows()
         }
     }
 
@@ -191,30 +191,30 @@ private struct ProviderUsageDetail: View {
                         let missing = coverage["profiles_unavailable"].int ?? 0
                         Text("All time, across \(read) bot\(read == 1 ? "" : "s")" + (missing > 0 ? ". \(missing) couldn't be read." : "."))
                     }
-                }
+                }.hmRows()
                 modelsSection(historicalOnly: provider["historical_only"].bool)
                 if !provider["historical_only"].bool {
-                    Section("Your account") {
+                    Section(header: HMHeader("Your account")) {
                         LabeledContent("Keys set up", value: provider["credentials"].array.count.formatted())
                         if let plan = usage["plan"].string { LabeledContent("Plan", value: plan) }
                         if let count = usage["key_count"].int {
                             LabeledContent("Keys reporting", value: "\(usage["keys_reporting"].int ?? 0) of \(count)")
                         }
-                        if let scope = usage["scope"].string { Text(scope).font(.footnote).foregroundStyle(.secondary) }
+                        if let scope = usage["scope"].string { Text(scope).font(.footnote).foregroundStyle(HMDesign.text2) }
                         ForEach(["usage_daily", "usage_monthly", "usage"], id: \.self) { period in
                             let reading = usage["spend"][period]
                             if let usd = reading["usd"].double {
                                 let label = ["usage_daily": "Spent today", "usage_monthly": "This month", "usage": "All-time spend"][period]!
                                 LabeledContent(label, value: usd.formatted(.currency(code: "USD").precision(.fractionLength(2...4))))
                                 if reading["reporting"].int != usage["key_count"].int {
-                                    Text("Counts \(reading["reporting"].int ?? 0) of your keys").font(.caption).foregroundStyle(.secondary)
+                                    Text("Counts \(reading["reporting"].int ?? 0) of your keys").font(.caption).foregroundStyle(HMDesign.text2)
                                 }
                             }
                         }
                         let balance = usage["balance"]
                         if let left = balance["remaining"].double {
                             LabeledContent("Balance", value: left.formatted(.currency(code: balance["currency"].string ?? "USD")))
-                            if let label = balance["label"].string { Text(label).font(.footnote).foregroundStyle(.secondary) }
+                            if let label = balance["label"].string { Text(label).font(.footnote).foregroundStyle(HMDesign.text2) }
                         }
                         ForEach(Array(usage["windows"].array.enumerated()), id: \.offset) { _, w in
                             if let percent = w["used_percent"].double {
@@ -223,11 +223,11 @@ private struct ProviderUsageDetail: View {
                                     HStack {
                                         Text(UsageWords.windowTitle(w["label"].string))
                                         Spacer()
-                                        Text("\(Int(used.rounded()))% used").monospacedDigit().foregroundStyle(UsageWords.severity(used))
+                                        Text("\(Int(used.rounded()))% used").font(HMDesign.number(13)).foregroundStyle(UsageWords.severity(used))
                                     }
-                                    ProgressView(value: used, total: 100).tint(UsageWords.severity(used)).accessibilityHidden(true)
+                                    HMBar(fraction: used / 100, tint: UsageWords.severity(used)).accessibilityHidden(true)
                                     Text(UsageWords.windowDetail(used: used, resets: w["resets_at"].date))
-                                        .font(.caption).foregroundStyle(.secondary)
+                                        .font(.caption).foregroundStyle(HMDesign.text2)
                                 }
                                 .padding(.vertical, 2)
                                 .accessibilityElement(children: .combine)
@@ -239,15 +239,15 @@ private struct ProviderUsageDetail: View {
                         ForEach(Array(usage["details"].array.enumerated()), id: \.offset) { _, d in
                             if let text = d.string { Text(text).font(.footnote) }
                         }
-                        if let why = usage["unavailable_reason"].string { Text(why).foregroundStyle(.secondary) }
+                        if let why = usage["unavailable_reason"].string { Text(why).foregroundStyle(HMDesign.text2) }
                         if usage["stale"].bool, let at = usage["stale_since"].date {
                             Label("Couldn't refresh. Showing the reading from \(at.formatted(date: .abbreviated, time: .shortened)).", systemImage: "clock").font(.footnote)
                         }
                         if let at = usage["checked_at"].date { LabeledContent("Checked") { Text(at, style: .relative) + Text(" ago") } }
-                    }
+                    }.hmRows()
                 }
-            } else { Text("This provider is no longer in the latest inventory. Pull to refresh.").foregroundStyle(.secondary) }
-            if let error = app.status.error { Label(error, systemImage: "wifi.exclamationmark").foregroundStyle(.secondary) }
+            } else { Text("This provider is no longer in the latest inventory. Pull to refresh.").foregroundStyle(HMDesign.text2) }
+            if let error = app.status.error { Label(error, systemImage: "wifi.exclamationmark").foregroundStyle(HMDesign.text2) }
         }
         .hmCanvas()
         .navigationTitle(ProviderUsageSection.displayName(name))
