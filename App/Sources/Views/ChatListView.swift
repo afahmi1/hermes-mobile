@@ -334,6 +334,9 @@ struct ChatListView: View {
         }
     }
 
+    /// Thermocline Dark: the selected chip is a colored object, so it glows.
+    private var chipGlows: Bool { HMTheme.isThermocline && colorScheme == .dark }
+
     private var filters: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
@@ -342,7 +345,10 @@ struct ChatListView: View {
                         Text(f.chip).font(.subheadline.weight(filter == f ? .semibold : .regular))
                             .foregroundStyle(filter == f ? (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas) : HMDesign.ink)
                             .padding(.horizontal, 12).frame(minHeight: 32)
-                            .background(filter == f ? HMDesign.accentFill : HMDesign.panel, in: Capsule())
+                            .background {
+                                Capsule().fill(filter == f ? HMDesign.accentFill : HMDesign.panel)
+                                    .hmHalo(HMTheme.thermoclineAccent.tint, active: chipGlows && filter == f)
+                            }
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(f.rawValue)
@@ -362,13 +368,17 @@ struct ChatListView: View {
                         .font(.subheadline.weight(selectedBot == nil ? .regular : .semibold))
                         .foregroundStyle(selectedBot == nil ? HMDesign.ink : (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas))
                         .padding(.horizontal, 12).frame(minHeight: 32)
-                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accentFill, in: Capsule())
+                        .background {
+                            Capsule().fill(selectedBot == nil ? HMDesign.panel : HMDesign.accentFill)
+                                .hmHalo(HMTheme.thermoclineAccent.tint, active: chipGlows && selectedBot != nil)
+                        }
                     }
                     .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
                 }
             }
             .padding(.horizontal, 16)
         }
+        .scrollClipDisabled()  // the selected chip's halo would be cut off at the row's edges
     }
 
     @ViewBuilder private func row(_ s: SessionSummary) -> some View {

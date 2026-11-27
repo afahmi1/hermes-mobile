@@ -440,8 +440,8 @@ struct BotAvatar: View {
 
 // MARK: - Canvas
 
-/// Dark: the palette's canvas with far-off blooms in the accent's tint (`HMDeepSeaBlooms`). Light retains the two
-/// soft blooms and fine grain over paper. `animated: false` holds the dark blooms still (settings thumbnails).
+/// Dark: the palette's black canvas, nothing painted on it; the glow lives on colored objects (`hmHalo`).
+/// Light retains the two soft blooms and fine grain over paper. `animated` is kept for call sites; nothing moves.
 struct HMDepthField: View {
     var animated = true
     @Environment(\.colorScheme) private var scheme
@@ -449,10 +449,7 @@ struct HMDepthField: View {
     var body: some View {
         Group {
             if scheme == .dark {
-                ZStack {
-                    Thermocline.bg
-                    HMDeepSeaBlooms(animated: animated)
-                }
+                Thermocline.bg
             } else {
                 GeometryReader { geo in
                     let r = max(geo.size.width, geo.size.height)
@@ -474,66 +471,14 @@ struct HMDepthField: View {
     }
 }
 
-/// Thermocline Dark's deep-sea glow: two or three blooms in the chosen accent's tint, far off and mostly past the
-/// screen's edges, like creatures glowing in the distance. Each peaks at 25% (his pick, build 45; v1.2 shipped 10%) and fades to clear, so the middle of
-/// the screen stays black. They breathe (about 15-25%) and drift a few points on their own slow periods (11-23 s),
-/// redrawn at 15 fps at most: one timeline per canvas, opacity and offset only. Reduce Motion, Reduce Transparency
-/// and still previews hold them at 20%. Renders nothing in Light.
-struct HMDeepSeaBlooms: View {
-    var animated = true
-    @Environment(\.colorScheme) private var scheme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-
-    /// Center (unit point of the canvas; outside 0...1 is off-screen), radius (share of the longer side), peak (share
-    /// of the 25% ceiling), breathing and drift periods in seconds, and a phase so no two move together.
-    private struct Bloom {
-        let center: UnitPoint, radius: CGFloat, peak: Double, breathe: Double, drift: Double, phase: Double
-    }
-    private static let blooms = [
-        Bloom(center: UnitPoint(x: -0.08, y: 0.84), radius: 0.50, peak: 1.0, breathe: 17, drift: 23, phase: 0),    // deep, bottom-leading
-        Bloom(center: UnitPoint(x: 1.08, y: 0.04), radius: 0.42, peak: 0.7, breathe: 13, drift: 19, phase: 2.1),   // fainter, top-trailing
-        Bloom(center: UnitPoint(x: 1.05, y: 0.50), radius: 0.18, peak: 0.55, breathe: 11, drift: 21, phase: 4.2),  // small and far, mid-right
-    ]
-    static let ceiling = 0.25
-
-    var body: some View {
-        if scheme == .dark {
-            let still = !animated || reduceMotion || reduceTransparency
-            let tint = HMTheme.thermoclineAccent.tint
-            // A soft, roughly Gaussian falloff: no visible rim where the bloom ends.
-            let falloff = Gradient(stops: [.init(color: tint, location: 0), .init(color: tint.opacity(0.78), location: 0.25),
-                                           .init(color: tint.opacity(0.37), location: 0.5), .init(color: tint.opacity(0.11), location: 0.75),
-                                           .init(color: tint.opacity(0), location: 1)])
-            GeometryReader { geo in
-                let side = max(geo.size.width, geo.size.height)
-                TimelineView(.animation(minimumInterval: 1 / 15, paused: still)) { context in
-                    let t = context.date.timeIntervalSinceReferenceDate
-                    ZStack {
-                        ForEach(Self.blooms.indices, id: \.self) { i in
-                            let b = Self.blooms[i]
-                            let breath = still ? 0.8 : 0.8 + 0.2 * sin(2 * .pi * t / b.breathe + b.phase)
-                            RadialGradient(gradient: falloff, center: b.center, startRadius: 0, endRadius: side * b.radius)
-                                .padding(-8)  // drawn past the canvas edges, so drifting never uncovers a strip
-                                .opacity(Self.ceiling * b.peak * breath)
-                                .offset(x: still ? 0 : 5 * sin(2 * .pi * t / b.drift + b.phase),
-                                        y: still ? 0 : 4 * cos(2 * .pi * t / (b.drift * 1.3) + b.phase))
-                        }
-                    }
-                }
-            }
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-        }
-    }
-}
-
 // MARK: - Deep-sea glow
 
-/// Thermocline Dark only: bubbles, primary buttons, the send button, bot avatars and glass cards get a faint halo
-/// in their own color (the accent's tint; a bot's color for its avatar). Never on text, never inside another glow.
+/// Thermocline Dark only: colored objects glow in their own color, like deep-sea creatures. That means bubbles,
+/// primary buttons, the send button, selected chips (the accent's tint) and bot avatars (the bot's color). Neutral
+/// cards and the canvas don't glow (his call, build 46: "around the colored objects", not in the corners). 18%
+/// (v1.2 shipped 10%, build 45 tried 25%). Never on text, never inside another glow.
 enum HMGlow {
-    static let opacity = 0.25
+    static let opacity = 0.18
     static let radius: CGFloat = 14
 }
 
@@ -548,7 +493,7 @@ extension EnvironmentValues {
 }
 
 extension View {
-    /// The halo: a shadow in `color` at 25%, radius 14, no offset. Apply it to a shape or fill, never to text.
+    /// The halo: a shadow in `color` at 18%, radius 14, no offset. Apply it to a shape or fill, never to text.
     @ViewBuilder func hmHalo(_ color: Color, active: Bool) -> some View {
         if active { shadow(color: color.opacity(HMGlow.opacity), radius: HMGlow.radius) } else { self }
     }
@@ -798,15 +743,12 @@ private struct HMGlassModifier<S: InsettableShape>: ViewModifier {
     let shape: S
     let lifted: Bool
     @Environment(\.colorScheme) private var scheme
-    @Environment(\.hmInsideGlow) private var insideGlow
 
     func body(content: Content) -> some View {
         let dark = scheme == .dark
-        // Dark: the card glows faintly in the accent's tint (on its fill, not its text); what sits inside it doesn't.
-        let halo = dark && !insideGlow
+        // Neutral glass doesn't glow; colored things inside it (avatars, buttons) still do.
         content
-            .environment(\.hmInsideGlow, insideGlow || halo)
-            .background { HMGlassFill(shape: shape).hmHalo(HMTheme.thermoclineAccent.tint, active: halo) }
+            .background { HMGlassFill(shape: shape) }
             .overlay {
                 // Top highlight: a light inner edge that fades by mid-height, like the web glass's inset shadow.
                 shape.inset(by: 0.5).stroke(LinearGradient(colors: [dark ? Thermocline.text.opacity(0.10) : Color.white.opacity(0.75), .clear],
@@ -979,7 +921,7 @@ struct HMTag: View {
 }
 
 /// Buttons for empty and error states. Primary: the accent's fill, its on-fill label, a soft glow behind the fill
-/// (never on text): 25% in Light, the 25% deep-sea halo in the tint in Dark. Quiet: a hairline capsule in text.
+/// (never on text): 25% in Light, the 18% deep-sea halo in the tint in Dark. Quiet: a hairline capsule in text.
 struct HMButtonStyle: ButtonStyle {
     enum Kind { case primary, quiet }
     var kind: Kind = .quiet
@@ -1094,7 +1036,7 @@ extension View {
 }
 
 /// Thermocline's send button: the accent's fill with an on-fill arrow and a soft glow behind the disc (never on
-/// text): 25% in Light, the 25% deep-sea halo in the tint in Dark. Disabled: a surface-3 disc with a text-3 arrow.
+/// text): 25% in Light, the 18% deep-sea halo in the tint in Dark. Disabled: a surface-3 disc with a text-3 arrow.
 struct HMSendGlyph: View {
     var enabled: Bool
     @Environment(\.colorScheme) private var scheme

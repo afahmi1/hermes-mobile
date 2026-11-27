@@ -761,7 +761,6 @@ private struct ModePreview: View {
     private var scene: some View {
         ZStack(alignment: .bottomLeading) {
             Thermocline.bg
-            HMDeepSeaBlooms(animated: false)  // Dark only: the far-off glow, held still.
             RoundedRectangle(cornerRadius: 5, style: .continuous).fill(HMDesign.card)
                 .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Thermocline.line, lineWidth: 0.5))
                 .frame(width: 38, height: 18).padding(8)
