@@ -84,7 +84,7 @@ struct SettingsView: View {
             }
             .hmCanvas()
             .navigationTitle("Settings")
-            .sheet(isPresented: $showWhatsNew) { if let w = WhatsNew.current { WhatsNewSheet(release: w) } }
+            .sheet(isPresented: $showWhatsNew) { WhatsNewSheet() }
             .sheet(isPresented: $addingGateway) { SignInView(adding: true) }
             .task(id: app.inboxAccount) {
                 capabilities = nil

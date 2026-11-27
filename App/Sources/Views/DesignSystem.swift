@@ -950,34 +950,29 @@ struct HMSendGlyph: View {
 
 // MARK: - Thinking orb
 
-/// A small living orb for "Hermes is thinking". Thermocline: the live dot in finch-beak red, slow pulse.
-/// Classic: the accent orb. Both respect Reduce Motion.
+/// The original colorful orb: a blurred spinning gradient with a moving highlight. Always in its own
+/// Classic colors, in every theme (Thermocline used to swap it for a plain dot). Respects Reduce Motion.
 struct ThinkingOrb: View {
     var size: CGFloat = 18
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let accent = HMThemeSpec.classic.accent, success = HMThemeSpec.classic.success
         TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
-            if HMTheme.isThermocline {
-                Circle().fill(HMDesign.danger).frame(width: size * 0.45, height: size * 0.45)
-                    .opacity(reduceMotion ? 1 : 0.6 + 0.4 * sin(t * 2.2))
-                    .frame(width: size, height: size)
-            } else {
-                ZStack {
-                    Circle()
-                        .fill(AngularGradient(colors: [HMDesign.accent, HMDesign.accent.opacity(0.35), HMDesign.success.opacity(0.7),
-                                                       HMDesign.accent], center: .center, angle: .degrees(t * 90)))
-                        .blur(radius: size * 0.12)
-                    Circle()
-                        .fill(RadialGradient(colors: [.white.opacity(0.55), .clear],
-                                             center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3), y: 0.3 + 0.1 * cos(t * 1.1)),
-                                             startRadius: 0, endRadius: size * 0.5))
-                }
-                .frame(width: size, height: size)
-                .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
-                .shadow(color: HMDesign.accent.opacity(0.45), radius: size * 0.35)
+            ZStack {
+                Circle()
+                    .fill(AngularGradient(colors: [accent, accent.opacity(0.35), success.opacity(0.7), accent],
+                                          center: .center, angle: .degrees(t * 90)))
+                    .blur(radius: size * 0.12)
+                Circle()
+                    .fill(RadialGradient(colors: [.white.opacity(0.55), .clear],
+                                         center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3), y: 0.3 + 0.1 * cos(t * 1.1)),
+                                         startRadius: 0, endRadius: size * 0.5))
             }
+            .frame(width: size, height: size)
+            .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
+            .shadow(color: accent.opacity(0.45), radius: size * 0.35)
         }
         .accessibilityHidden(true)
     }
@@ -996,7 +991,7 @@ enum ThinkingStyle: String, CaseIterable, Identifiable {
         case .matrix: "Dot matrix"
         case .sprite: "Pixel flame"
         case .braille: "Terminal"
-        case .orb: "Orb"
+        case .orb: "Color orb"
         }
     }
 }
