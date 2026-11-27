@@ -25,6 +25,12 @@ The **Status** tab mirrors the Mac status dashboard (`Status/`, a web page on po
 - what's running right now: chats, subagents and cron runs;
 - cron jobs, incidents, recent runs, provider usage, and a "What's new" log.
 
+At the bottom, **Restart** (owner phone only) restarts Hermes without touching the Mac. "Restart when replies finish"
+sends the gateway the same signal as `hermes gateway restart`: it keeps serving and restarts the moment nothing is
+running. "Restart now, stop replies" runs `hermes gateway restart --yes`, and starts Hermes if it isn't running.
+"Restart phone connection" restarts the bridge itself, which its service manager brings straight back
+(`POST /m/restart {target: hermes|bridge, now}`).
+
 Bots, including the skills each one has, live on the **Bots** tab. The connection pill names the gateway (`mothership · Online`, `mothership · Degraded`) so a healthy machine is not confused with a degraded one.
 
 Both the Mac page and the phone re-discover everything on each refresh, so a bot or cron job you create shows up within

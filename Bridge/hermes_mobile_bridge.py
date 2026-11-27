@@ -66,6 +66,7 @@ POOL = ThreadPoolExecutor(max_workers=16)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_projects
 import bridge_hermes_projects as hermes_projects
+import bridge_restart
 import bridge_devices
 import bridge_push
 import bridge_receipts
@@ -1925,8 +1926,13 @@ class H(BaseHTTPRequestHandler):
                 features.append("resumable_uploads_v1")
                 features.append("hermes_projects_v1")  # Hermes's own Projects: GET /m/projects/<id>/chats, POST /m/chat/<bot>/new {project}
                 features.append("clarify_v1")  # Hermes's questions answered from the phone: POST /m/turns/<id>/clarify  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
+            features.append("restart_v1")  # POST /m/restart {target: hermes|bridge, now}
+            owner = self.owner_ok()
             return self.send(200, {"protocol": 2, "features": features,
-                                   "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
+                                   "device_id": self.device_claims["did"], "manage_devices": owner,
+                                   "can_restart": owner})
+        if path == "/m/restart" and self.command == "POST":
+            return self.restart_route()
         if path == "/m/devices" or path.startswith("/m/devices/"):
             return self.device_route(path)
         if path == "/m/push" or path.startswith("/m/push/"):
@@ -1987,6 +1993,22 @@ class H(BaseHTTPRequestHandler):
         if path.startswith("/m/chat/") or path.startswith("/m/turns") or path.startswith("/m/uploads"):
             return self.chat_route(path, q)
         self.send(404, {"error": "not found"})
+
+    def restart_route(self):
+        """Owner only: restarting Hermes interrupts or delays every chat on the Mac, not just this phone's."""
+        if not self.owner_ok():
+            return self.send(403, {"error": "Only the phone that owns this Mac can restart Hermes."})
+        data = self.json_body()
+        target = data.get("target") if isinstance(data, dict) else None
+        now = isinstance(data, dict) and data.get("now") is True
+        if target == "hermes":
+            status, body = bridge_restart.restart_hermes(HERMES, now=now)
+        elif target == "bridge":
+            status, body = bridge_restart.restart_bridge()
+        else:
+            return self.send(400, {"error": "target must be hermes or bridge"})
+        log("restart %s requested from the phone (%s): %s" % (target, body.get("mode", "-"), status))
+        return self.send(status, body)
 
     def device_route(self, path):
         current = self.device_claims["did"]
