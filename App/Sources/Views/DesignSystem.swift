@@ -50,9 +50,12 @@ enum HMDesign {
     static var plum: Color { spec.plum }
     static var bar: Color { spec.bar }
     static var selectedFill: Color { accent.opacity(0.16) }
-    /// The outgoing message bubble: lead fill with on-lead text in Thermocline.
-    static var bubbleFill: Color { HMTheme.isThermocline ? HMTheme.thermoclineAccent.color : selectedFill }
-    static var bubbleText: Color { HMTheme.isThermocline ? HMTheme.thermoclineAccent.onColor : ink }
+    /// A solid accent surface with text on it (selected chips, prominent buttons): Thermocline's fill role (in
+    /// Dark, Crown and Wing fill with Light's deep blue while `accent` is their lifted tint), Classic's accent.
+    static var accentFill: Color { HMTheme.isThermocline ? HMTheme.thermoclineAccent.fill : spec.accent }
+    /// The outgoing message bubble: the accent's fill with its on-fill text in Thermocline.
+    static var bubbleFill: Color { HMTheme.isThermocline ? HMTheme.thermoclineAccent.fill : selectedFill }
+    static var bubbleText: Color { HMTheme.isThermocline ? HMTheme.thermoclineAccent.onFill : ink }
     /// Shadows are tinted from the ink #13181D in both modes, never black.
     static let shadowInk = Color(uiColor: UIColor(Thermocline.text).resolvedColor(with: UITraitCollection(userInterfaceStyle: .light)))
     /// Counts and figures: mono with tabular digits in Thermocline, system tabular digits in Classic. Scales with Dynamic Type.
@@ -109,10 +112,11 @@ struct HMThemeSpec {
 
     static var thermocline: HMThemeSpec {
         let accent = HMTheme.thermoclineAccent
+        // `accent` is the tint role (text, icons, `.tint`, marks); fills go through `HMDesign.accentFill`.
         return HMThemeSpec(
             canvas: Thermocline.bg, panel: Thermocline.surface1, card: thermoclineCard, raised: Thermocline.surface2,
             bar: Thermocline.surface1, separator: Thermocline.line, ink: Thermocline.text, text2: Thermocline.text2,
-            text3: Thermocline.text3, accent: accent.color, link: Thermocline.link, success: Thermocline.success,
+            text3: Thermocline.text3, accent: accent.tint, link: Thermocline.link, success: Thermocline.success,
             warning: accent.spark, caution: Thermocline.warm, pending: Thermocline.warm, danger: Thermocline.danger,
             plum: Thermocline.plum)
     }
@@ -288,7 +292,7 @@ enum HMTheme {
 
     /// Glass bars with a hairline, ink titles set semibold and tight, lead for the selected tab, text-3 for the rest.
     private static func thermoclineChrome() {
-        let text = UIColor(Thermocline.text), quiet = UIColor(Thermocline.text3), lead = UIColor(HMTheme.thermoclineAccent.color)
+        let text = UIColor(Thermocline.text), quiet = UIColor(Thermocline.text3), lead = UIColor(HMTheme.thermoclineAccent.tint)
         let hairline = UIColor(Thermocline.line), tint = UIColor(Thermocline.bg).withAlphaComponent(0.55)
         let title = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .semibold))
         let large = UIFontMetrics(forTextStyle: .largeTitle).scaledFont(for: .systemFont(ofSize: 34, weight: .semibold))
@@ -370,10 +374,34 @@ enum HMMotion {
 // MARK: - Bot look
 
 extension Bot {
-    static func color(for id: String) -> Color {
+    /// FNV-1a of the bot id: the one stable number behind both themes' bot colors.
+    private static func hash(_ id: String) -> UInt32 {
         var h: UInt32 = 2166136261
         for b in id.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
-        return Color(hue: Double(h % 360) / 360, saturation: 0.65, brightness: 0.46)
+        return h
+    }
+
+    /// Classic: a hue per bot.
+    static func color(for id: String) -> Color {
+        Color(hue: Double(hash(id) % 360) / 360, saturation: 0.65, brightness: 0.46)
+    }
+
+    /// Thermocline's data series in its order: lead (Crown), link, success (Green), spark (Gold), secondary
+    /// (Chestnut), plum, warm (Cheek), each its dynamic token. Deep in Light under paper ink #EBE7DE, bright in Dark
+    /// under ink #13181D; every pair is at least 5.2:1 (contrast.md). Spark's own Light value, #AE6B00, measured
+    /// 3.47:1 under #EBE7DE, and a lightness-only drop to 4.5:1 leaves the sRGB gamut, so the slot uses the Gold
+    /// accent: #AE6B00 -> #875300, Thermocline's macaw gold already lowered for text (5.21:1). Link is the same
+    /// pair as Crown now that Dark's blues follow Light's.
+    static let thermoclineSeries: [Thermocline.Palette.Token] = [
+        Thermocline.Accent.crown.tintToken, Thermocline.Palette.linkToken, Thermocline.Accent.green.tintToken,
+        Thermocline.Accent.gold.tintToken, Thermocline.Accent.chestnut.tintToken, Thermocline.Accent.plum.tintToken,
+        Thermocline.Accent.cheek.tintToken,
+    ]
+
+    /// Thermocline: Classic's hue for the bot (the same hash mod 360) cut into seven equal arcs, one per series
+    /// color, so a bot keeps one color for good and the ids spread across the series.
+    static func thermoclineColor(for id: String) -> Color {
+        thermoclineSeries[Int(hash(id) % 360) * thermoclineSeries.count / 360].color
     }
 }
 
@@ -381,16 +409,19 @@ struct BotAvatar: View {
     let id: String
     let name: String
     var size: CGFloat = 40
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.hmInsideGlow) private var insideGlow
 
     var body: some View {
         ZStack {
             if HMTheme.isThermocline {
-                // Thermocline stays quiet but still tells bots apart: the well takes a low wash of the bot's own hue
-                // and a ring of it, so five bots read as five, not five identical greys.
-                Circle().fill(Thermocline.surface3)
-                Circle().fill(Bot.color(for: id).opacity(0.28))
-                Circle().strokeBorder(Bot.color(for: id).opacity(0.85), lineWidth: 1)
-                Text(initials).font(.system(size: size * 0.36, weight: .semibold)).tracking(0.4).foregroundStyle(Thermocline.text)
+                // A solid disc in the bot's series color with the initials in the measured ink. In Dark the disc,
+                // never the initials, glows faintly in its own color.
+                let fill = Bot.thermoclineColor(for: id)
+                Circle().fill(fill).hmHalo(fill, active: scheme == .dark && !insideGlow)
+                Circle().strokeBorder(Thermocline.lineStrong, lineWidth: 0.5)
+                Text(initials).font(.system(size: size * 0.36, weight: .semibold)).tracking(0.4)
+                    .foregroundStyle(Thermocline.Palette.onAccentToken.color)
             } else {
                 Circle().fill(Bot.color(for: id))
                 Text(initials).font(.system(size: size * 0.4, weight: .semibold, design: .rounded)).foregroundStyle(.white)
@@ -409,14 +440,19 @@ struct BotAvatar: View {
 
 // MARK: - Canvas
 
-/// Dark leaves the palette's canvas untouched. Light retains the two soft blooms and fine grain over paper.
+/// Dark: the palette's canvas with far-off blooms in the accent's tint (`HMDeepSeaBlooms`). Light retains the two
+/// soft blooms and fine grain over paper. `animated: false` holds the dark blooms still (settings thumbnails).
 struct HMDepthField: View {
+    var animated = true
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         Group {
             if scheme == .dark {
-                Thermocline.bg
+                ZStack {
+                    Thermocline.bg
+                    HMDeepSeaBlooms(animated: animated)
+                }
             } else {
                 GeometryReader { geo in
                     let r = max(geo.size.width, geo.size.height)
@@ -435,6 +471,107 @@ struct HMDepthField: View {
         }
         .ignoresSafeArea()
         .accessibilityHidden(true)
+    }
+}
+
+/// Thermocline Dark's deep-sea glow: two or three blooms in the chosen accent's tint, far off and mostly past the
+/// screen's edges, like creatures glowing in the distance. Each peaks at 10% and fades to clear, so the middle of
+/// the screen stays black. They breathe (about 6-10%) and drift a few points on their own slow periods (11-23 s),
+/// redrawn at 15 fps at most: one timeline per canvas, opacity and offset only. Reduce Motion, Reduce Transparency
+/// and still previews hold them at 8%. Renders nothing in Light.
+struct HMDeepSeaBlooms: View {
+    var animated = true
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    /// Center (unit point of the canvas; outside 0...1 is off-screen), radius (share of the longer side), peak (share
+    /// of the 10% ceiling), breathing and drift periods in seconds, and a phase so no two move together.
+    private struct Bloom {
+        let center: UnitPoint, radius: CGFloat, peak: Double, breathe: Double, drift: Double, phase: Double
+    }
+    private static let blooms = [
+        Bloom(center: UnitPoint(x: -0.08, y: 0.84), radius: 0.50, peak: 1.0, breathe: 17, drift: 23, phase: 0),    // deep, bottom-leading
+        Bloom(center: UnitPoint(x: 1.08, y: 0.04), radius: 0.42, peak: 0.7, breathe: 13, drift: 19, phase: 2.1),   // fainter, top-trailing
+        Bloom(center: UnitPoint(x: 1.05, y: 0.50), radius: 0.18, peak: 0.55, breathe: 11, drift: 21, phase: 4.2),  // small and far, mid-right
+    ]
+    static let ceiling = 0.10
+
+    var body: some View {
+        if scheme == .dark {
+            let still = !animated || reduceMotion || reduceTransparency
+            let tint = HMTheme.thermoclineAccent.tint
+            // A soft, roughly Gaussian falloff: no visible rim where the bloom ends.
+            let falloff = Gradient(stops: [.init(color: tint, location: 0), .init(color: tint.opacity(0.78), location: 0.25),
+                                           .init(color: tint.opacity(0.37), location: 0.5), .init(color: tint.opacity(0.11), location: 0.75),
+                                           .init(color: tint.opacity(0), location: 1)])
+            GeometryReader { geo in
+                let side = max(geo.size.width, geo.size.height)
+                TimelineView(.animation(minimumInterval: 1 / 15, paused: still)) { context in
+                    let t = context.date.timeIntervalSinceReferenceDate
+                    ZStack {
+                        ForEach(Self.blooms.indices, id: \.self) { i in
+                            let b = Self.blooms[i]
+                            let breath = still ? 0.8 : 0.8 + 0.2 * sin(2 * .pi * t / b.breathe + b.phase)
+                            RadialGradient(gradient: falloff, center: b.center, startRadius: 0, endRadius: side * b.radius)
+                                .padding(-8)  // drawn past the canvas edges, so drifting never uncovers a strip
+                                .opacity(Self.ceiling * b.peak * breath)
+                                .offset(x: still ? 0 : 5 * sin(2 * .pi * t / b.drift + b.phase),
+                                        y: still ? 0 : 4 * cos(2 * .pi * t / (b.drift * 1.3) + b.phase))
+                        }
+                    }
+                }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+    }
+}
+
+// MARK: - Deep-sea glow
+
+/// Thermocline Dark only: bubbles, primary buttons, the send button, bot avatars and glass cards get a faint halo
+/// in their own color (the accent's tint; a bot's color for its avatar). Never on text, never inside another glow.
+enum HMGlow {
+    static let opacity = 0.10
+    static let radius: CGFloat = 14
+}
+
+private struct HMInsideGlowKey: EnvironmentKey { static let defaultValue = false }
+
+extension EnvironmentValues {
+    /// True inside an element that already glows, so nothing glows inside a glow.
+    var hmInsideGlow: Bool {
+        get { self[HMInsideGlowKey.self] }
+        set { self[HMInsideGlowKey.self] = newValue }
+    }
+}
+
+extension View {
+    /// The halo: a shadow in `color` at 10%, radius 14, no offset. Apply it to a shape or fill, never to text.
+    @ViewBuilder func hmHalo(_ color: Color, active: Bool) -> some View {
+        if active { shadow(color: color.opacity(HMGlow.opacity), radius: HMGlow.radius) } else { self }
+    }
+
+    /// The outgoing bubble's fill. Thermocline Dark adds the halo in the accent's tint behind it; Classic keeps
+    /// its own fill exactly.
+    @ViewBuilder func hmBubble<S: Shape>(_ shape: S) -> some View {
+        if HMTheme.isThermocline {
+            background { HMBubbleFill(shape: shape) }
+        } else {
+            background(HMDesign.bubbleFill, in: shape)
+        }
+    }
+}
+
+private struct HMBubbleFill<S: Shape>: View {
+    let shape: S
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.hmInsideGlow) private var insideGlow
+
+    var body: some View {
+        shape.fill(HMDesign.bubbleFill)
+            .hmHalo(HMTheme.thermoclineAccent.tint, active: scheme == .dark && !insideGlow)
     }
 }
 
@@ -661,11 +798,15 @@ private struct HMGlassModifier<S: InsettableShape>: ViewModifier {
     let shape: S
     let lifted: Bool
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.hmInsideGlow) private var insideGlow
 
     func body(content: Content) -> some View {
         let dark = scheme == .dark
+        // Dark: the card glows faintly in the accent's tint (on its fill, not its text); what sits inside it doesn't.
+        let halo = dark && !insideGlow
         content
-            .background { HMGlassFill(shape: shape) }
+            .environment(\.hmInsideGlow, insideGlow || halo)
+            .background { HMGlassFill(shape: shape).hmHalo(HMTheme.thermoclineAccent.tint, active: halo) }
             .overlay {
                 // Top highlight: a light inner edge that fades by mid-height, like the web glass's inset shadow.
                 shape.inset(by: 0.5).stroke(LinearGradient(colors: [dark ? Thermocline.text.opacity(0.10) : Color.white.opacity(0.75), .clear],
@@ -754,13 +895,14 @@ extension View {
     /// Floating chips.
     func hmCapsule() -> some View { modifier(HMSurface(shape: Capsule(), input: false, flat: HMDesign.panel)) }
 
-    /// Filter menus and similar chips. Thermocline: card fill with a strong hairline, lead-tinted while a
-    /// filter is on. Classic: the system's tertiary fill.
+    /// Filter menus and similar chips. Thermocline: card fill with a strong hairline, tinted with the chosen accent
+    /// while a filter is on. Classic: the system's tertiary fill.
     @ViewBuilder func hmChip(active: Bool = false) -> some View {
         if HMTheme.isThermocline {
-            foregroundStyle(active ? Thermocline.lead : Thermocline.text)
-                .background(active ? Thermocline.lead.opacity(0.12) : HMDesign.card, in: Capsule())
-                .overlay(Capsule().strokeBorder(active ? Thermocline.lead.opacity(0.45) : Thermocline.lineStrong, lineWidth: 0.5))
+            let tint = HMTheme.thermoclineAccent.tint
+            foregroundStyle(active ? tint : Thermocline.text)
+                .background(active ? tint.opacity(0.12) : HMDesign.card, in: Capsule())
+                .overlay(Capsule().strokeBorder(active ? tint.opacity(0.45) : Thermocline.lineStrong, lineWidth: 0.5))
         } else {
             background(Color(.tertiarySystemFill), in: Capsule())
         }
@@ -797,7 +939,7 @@ struct HMSearchField: View {
         .padding(.trailing, query.isEmpty ? HMDesign.medium : 0)
         .frame(minHeight: HMDesign.touch)
         .background(Thermocline.surface2, in: shape)
-        .overlay { shape.strokeBorder(focused ? Thermocline.lead : Thermocline.line, lineWidth: focused ? 1 : 0.5).allowsHitTesting(false) }
+        .overlay { shape.strokeBorder(focused ? HMTheme.thermoclineAccent.tint : Thermocline.line, lineWidth: focused ? 1 : 0.5).allowsHitTesting(false) }
     }
 }
 
@@ -836,25 +978,31 @@ struct HMTag: View {
     }
 }
 
-/// Buttons for empty and error states. Primary: lead fill, on-lead label, a soft lead glow (never on text).
-/// Quiet: a hairline capsule in the text color.
+/// Buttons for empty and error states. Primary: the accent's fill, its on-fill label, a soft glow behind the fill
+/// (never on text): 25% in Light, the 10% deep-sea halo in the tint in Dark. Quiet: a hairline capsule in text.
 struct HMButtonStyle: ButtonStyle {
     enum Kind { case primary, quiet }
     var kind: Kind = .quiet
     @Environment(\.isEnabled) private var enabled
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.hmInsideGlow) private var insideGlow
 
     func makeBody(configuration: Configuration) -> some View {
         let shape = RoundedRectangle(cornerRadius: Thermocline.Radius.sm, style: .continuous)
+        let accent = HMTheme.thermoclineAccent
         configuration.label
             .font(.subheadline.weight(.medium))
             .padding(.horizontal, 16)
             .frame(minHeight: HMDesign.touch)
-            .foregroundStyle(kind == .primary ? HMTheme.thermoclineAccent.onColor : Thermocline.text)
+            .foregroundStyle(kind == .primary ? accent.onFill : Thermocline.text)
             .background {
                 if kind == .primary {
-                    shape.fill(HMTheme.thermoclineAccent.color)
-                        .shadow(color: HMTheme.thermoclineAccent.color.opacity(enabled ? (scheme == .dark ? 0.45 : 0.25) : 0), radius: 10)
+                    if scheme == .dark {
+                        shape.fill(accent.fill).hmHalo(accent.tint, active: enabled && !insideGlow)
+                    } else {
+                        shape.fill(accent.fill)
+                            .shadow(color: accent.tint.opacity(enabled ? 0.25 : 0), radius: 10)
+                    }
                 } else {
                     shape.fill(HMDesign.card.opacity(0.6))
                 }
@@ -930,28 +1078,42 @@ extension View {
             }
         }
     }
-    /// The one prominent action: Thermocline's lead button with on-lead text (white on dark-mode turquoise is
-    /// 1.9:1), Classic's .borderedProminent.
+    /// The one prominent action: Thermocline's primary button (the accent's fill with its on-fill label; white on a
+    /// bright accent fails contrast), Classic's .borderedProminent.
     func hmProminent() -> some View { hmButton(.primary, classic: .prominent) }
+
+    /// A system `.borderedProminent` button kept in both themes. Thermocline fills it with the accent's fill and
+    /// sets the on-fill label; Classic keeps the system look on its accent.
+    @ViewBuilder func hmSystemProminent() -> some View {
+        if HMTheme.isThermocline {
+            buttonStyle(.borderedProminent).tint(HMDesign.accentFill).foregroundStyle(HMDesign.bubbleText)
+        } else {
+            buttonStyle(.borderedProminent).tint(HMDesign.accent)
+        }
+    }
 }
 
-/// Thermocline's send button: a lead disc with an on-lead arrow and a soft lead glow (never on text).
-/// Disabled, it drops to a surface-3 disc with a text-3 arrow.
+/// Thermocline's send button: the accent's fill with an on-fill arrow and a soft glow behind the disc (never on
+/// text): 25% in Light, the 10% deep-sea halo in the tint in Dark. Disabled: a surface-3 disc with a text-3 arrow.
 struct HMSendGlyph: View {
     var enabled: Bool
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.hmInsideGlow) private var insideGlow
     var body: some View {
+        let accent = HMTheme.thermoclineAccent
+        let dark = scheme == .dark
         Image(systemName: "arrow.up.circle.fill").font(.title)
             .symbolRenderingMode(.palette)
-            .foregroundStyle(enabled ? HMTheme.thermoclineAccent.onColor : Thermocline.text3, enabled ? HMTheme.thermoclineAccent.color : Thermocline.surface3)
-            .shadow(color: HMTheme.thermoclineAccent.color.opacity(enabled ? (scheme == .dark ? 0.45 : 0.25) : 0), radius: 9)
+            .foregroundStyle(enabled ? accent.onFill : Thermocline.text3, enabled ? accent.fill : Thermocline.surface3)
+            .shadow(color: accent.tint.opacity(enabled && !(dark && insideGlow) ? (dark ? HMGlow.opacity : 0.25) : 0),
+                    radius: dark ? HMGlow.radius : 9)
     }
 }
 
 // MARK: - Thinking orb
 
-/// The original colorful orb: a blurred spinning gradient with a moving highlight. Always in its own
-/// Classic colors, in every theme (Thermocline used to swap it for a plain dot). Respects Reduce Motion.
+/// The original colorful orb: a blurred spinning gradient with a moving highlight, slow breath and soft glow.
+/// It uses Classic colors in every theme and respects Reduce Motion.
 struct ThinkingOrb: View {
     var size: CGFloat = 18
     @Environment(\.accessibilityReduceMotion) private var reduceMotion

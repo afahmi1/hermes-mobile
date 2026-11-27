@@ -18,7 +18,7 @@ for source in Tests/*Tests.swift; do
 done
 if [ -n "${1:-}" ]; then
   xcrun -sdk iphonesimulator swiftc -parse-as-library -target arm64-apple-ios17.0-simulator \
-    "${lib[@]}" App/Sources/Views/Thermocline.swift App/Sources/Views/DesignSystem.swift \
+    "${lib[@]}" App/Sources/PushRegistration.swift App/Sources/Views/Thermocline.swift App/Sources/Views/DesignSystem.swift \
     App/Sources/Views/ChatMedia.swift Tests/MediaImportTests.swift -o "$out/MediaImport"
   env -u CFFIXED_USER_HOME xcrun simctl spawn "$1" "$out/MediaImport"
 else

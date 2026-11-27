@@ -104,8 +104,8 @@ struct ChatListView: View {
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
                 .sheet(isPresented: $showWhatsNew) { WhatsNewSheet() }
-                // Decided once per newer build and marked seen at once: coming back from a chat can't reopen it.
-                .task { if WhatsNew.takeDue() { showWhatsNew = true } }
+                // Mark seen at presentation so returning to Chats can't reopen the same list.
+                .task { if !showWhatsNew, WhatsNew.takeDue() { showWhatsNew = true } }
                 .sheet(isPresented: $showNew) {
                     NewChatSheet { bot in
                         showNew = false
@@ -342,7 +342,7 @@ struct ChatListView: View {
                         Text(f.chip).font(.subheadline.weight(filter == f ? .semibold : .regular))
                             .foregroundStyle(filter == f ? (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas) : HMDesign.ink)
                             .padding(.horizontal, 12).frame(minHeight: 32)
-                            .background(filter == f ? HMDesign.accent : HMDesign.panel, in: Capsule())
+                            .background(filter == f ? HMDesign.accentFill : HMDesign.panel, in: Capsule())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(f.rawValue)
@@ -362,7 +362,7 @@ struct ChatListView: View {
                         .font(.subheadline.weight(selectedBot == nil ? .regular : .semibold))
                         .foregroundStyle(selectedBot == nil ? HMDesign.ink : (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas))
                         .padding(.horizontal, 12).frame(minHeight: 32)
-                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accent, in: Capsule())
+                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accentFill, in: Capsule())
                     }
                     .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
                 }

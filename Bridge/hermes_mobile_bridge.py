@@ -478,7 +478,13 @@ def _bot_title(profile):
 
 @lru_cache(maxsize=8)
 def _pusher(directory):
-    return bridge_push.Pusher(_devices(directory), title=_bot_title, log=lambda message: log(message))
+    return bridge_push.Pusher(_devices(directory), title=_bot_title, log=lambda message: log(message),
+                              status=push_status_path(directory))
+
+
+def push_status_path(directory=None):
+    """The last APNs answers (no tokens, no secrets), kept for --doctor."""
+    return (directory or STATE_DIR) / "push" / "status.json"
 
 
 def pusher():
@@ -2136,20 +2142,23 @@ class H(BaseHTTPRequestHandler):
         did = self.device_claims["did"]
         d = self.json_body()
         if path == "/m/push/token" and self.command == "POST":
-            token, env, account = d.get("token"), d.get("environment"), d.get("account")
+            token, env, account, topic = d.get("token"), d.get("environment"), d.get("account"), d.get("topic")
             if (not isinstance(token, str) or not bridge_push.TOKEN_RE.fullmatch(token)
                     or env not in bridge_push.HOSTS or not isinstance(account, str)
-                    or not bridge_push.ACCOUNT_RE.fullmatch(account)):
+                    or not bridge_push.ACCOUNT_RE.fullmatch(account)
+                    or (topic is not None and (not isinstance(topic, str) or not bridge_push.TOPIC_RE.fullmatch(topic)))):
                 return self.send(400, {"error": "Bad push registration."})
-            devices().set_push_token(did, token, env, account)
+            # Newer apps name their own bundle ID (the APNs topic); older ones leave it to HERMES_MOBILE_APNS_TOPIC.
+            devices().set_push_token(did, token, env, account, topic)
             return self.send(200, {"ok": True, "enabled": bridge_push.Config.from_env() is not None})
         if path == "/m/push/token" and self.command == "DELETE":
             devices().clear_push_token(did)
             return self.send(200, {"ok": True})
         if path == "/m/push/presence" and self.command == "POST":
-            if not isinstance(d.get("away"), bool):
+            following = d.get("following", True)
+            if not isinstance(d.get("away"), bool) or not isinstance(following, bool):
                 return self.send(400, {"error": "Say whether the app is away."})
-            pusher().presence(did, d["away"])
+            pusher().presence(did, d["away"], following)
             return self.send(200, {"ok": True})
         return self.send(404, {"error": "not found"})
 
@@ -2844,13 +2853,14 @@ class H(BaseHTTPRequestHandler):
             if action == "send-once" or "submission_id" in d:
                 turn = turns.start_primary(pid, home, sid, text, d, d.get("submission_id"), d.get("project_context"),
                                            admissions_dir(), lambda: persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d)),
-                                           restore_send_workspace, d.get("attachments"), d.get("video_analysis_consent") is True)
+                                           restore_send_workspace, d.get("attachments"), d.get("video_analysis_consent") is True,
+                                           device_id=self.device_claims["did"])
                 turn.device_id = turn.device_id or self.device_claims["did"]
                 return self.send(202, turn.summary())
             workspace = persona_scope(pid, sid, prepare_workspace_turn(pid, sid, d))
             try:
                 turn = turns.start_turn(pid, home, sid, text, {k: d.get(k) for k in ("provider", "model", "effort", "reset_model", "reset_effort")},
-                                        workspace=workspace)
+                                        workspace=workspace, device_id=self.device_claims["did"])
             except BaseException:
                 if workspace:
                     try:
@@ -3112,9 +3122,23 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    def _service_state():
+        """The state dir the installed service uses, when this shell doesn't relocate it itself."""
+        if os.environ.get("HERMES_MOBILE_STATE_DIR"):
+            return STATE_DIR
+        import bridge_doctor
+        relocated = bridge_doctor._service_env().get("HERMES_MOBILE_STATE_DIR")
+        return Path(relocated) if relocated else STATE_DIR
+
     if "--doctor" in sys.argv[1:]:
         import bridge_doctor
-        sys.exit(bridge_doctor.report(bridge_doctor.run(HERMES, PORT, profile_ids, profile_home), "--json" in sys.argv))
+        sys.exit(bridge_doctor.report(bridge_doctor.run(HERMES, PORT, profile_ids, profile_home, state_dir=_service_state()),
+                                      "--json" in sys.argv))
+    if sys.argv[1:] == ["--push-test"]:
+        # One-command self-test: a test notification to every phone registered for push, with APNs's answer for each.
+        import bridge_doctor
+        _state = _service_state()
+        sys.exit(bridge_doctor.push_test(_devices(_state), push_status_path(_state), log))
     if sys.argv[1:] == ["--pair-code"]:
         print(devices().offer()["code"])
         sys.exit(0)

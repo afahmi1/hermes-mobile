@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -31,6 +33,163 @@ def _env_has(path: Path, key: str) -> bool:
 
 
 APNS_KEYS = ("HERMES_MOBILE_APNS_KEY_PATH", "HERMES_MOBILE_APNS_KEY_ID", "HERMES_MOBILE_APNS_TEAM_ID")
+APNS_SETTINGS = APNS_KEYS + ("HERMES_MOBILE_APNS_TOPIC", "HERMES_MOBILE_APNS_HOST")
+APPLE_ID_RE = re.compile(r"[A-Z0-9]{10}")  # Key IDs and Team IDs are 10 upper-case letters and digits
+PUSH_FIX = ("Set HERMES_MOBILE_APNS_KEY_PATH, HERMES_MOBILE_APNS_KEY_ID and HERMES_MOBILE_APNS_TEAM_ID, then run "
+            "Bridge/install.sh again (README, Push notifications).")
+# What a failed APNs answer means and what fixes it. Keys are APNs reasons (or the status when there's no reason).
+APNS_FIXES = {
+    "InvalidProviderToken": (FAIL, "APNs refused the signing key: the Key ID, Team ID and .p8 don't belong together.",
+                             "Check HERMES_MOBILE_APNS_KEY_ID (the key's ID) and HERMES_MOBILE_APNS_TEAM_ID (the team that "
+                             "made the key), then run Bridge/install.sh again."),
+    "ExpiredProviderToken": (FAIL, "APNs says the bridge's signed token is too old.",
+                             "Check the Mac's clock (System Settings > General > Date & Time: set automatically)."),
+    "DeviceTokenNotForTopic": (FAIL, "APNs refused the topic: the bundle ID the bridge used isn't the app on the phone.",
+                               "Set HERMES_MOBILE_APNS_TOPIC to the bundle ID of the build on the phone (TestFlight: App "
+                               "Store Connect > the app > App Information) and run Bridge/install.sh, or update the app: "
+                               "newer builds report their own bundle ID."),
+    "TopicDisallowed": (FAIL, "APNs won't let this key push to the app's bundle ID.",
+                        "The key must come from the Apple Developer team that owns the app's bundle ID."),
+    "BadTopic": (FAIL, "APNs refused the topic as malformed.", "Set HERMES_MOBILE_APNS_TOPIC to the app's bundle ID."),
+    "BadDeviceToken": (WARN, "A phone's push token was invalid in both APNs environments and was removed.",
+                       "Open the app on that phone so it registers again."),
+    "Unregistered": (WARN, "A phone's push token is no longer valid (app deleted or notifications reset) and was removed.",
+                     "Open the app on that phone so it registers again."),
+    "TooManyProviderTokenUpdates": (WARN, "APNs saw the bridge's signed token change too often.",
+                                    "Nothing to do: the bridge waits 20 minutes before minting another one."),
+    "transport": (WARN, "The bridge couldn't reach APNs.", "Check the Mac's internet connection; the next reply tries again."),
+}
+
+
+def _clock(at):
+    return time.strftime("%b %d %H:%M", time.localtime(at)) if isinstance(at, (int, float)) else "?"
+
+
+def push_env(env=None, service=None) -> dict:
+    """APNs settings as the bridge service sees them: the shell's when it sets any, else the installed service's."""
+    env = os.environ if env is None else env
+    if any((env.get(k) or "").strip() for k in APNS_KEYS):
+        return {k: env[k] for k in APNS_SETTINGS if env.get(k)}
+    service = _service_env() if service is None else service
+    return {k: service[k] for k in APNS_SETTINGS if service.get(k)}
+
+
+def push_check(env=None, service=None, sign=None) -> tuple[str, str, str]:
+    """(status, detail, fix) for APNs push configuration. Reports what is wrong, never the values."""
+    source = push_env(env, service)
+    have = [k for k in APNS_KEYS if (source.get(k) or "").strip()]
+    if not have:
+        return WARN, "Push notifications are not configured (optional: replies still arrive while the app is open).", PUSH_FIX
+    if len(have) < len(APNS_KEYS):
+        missing = ", ".join(k for k in APNS_KEYS if k not in have)
+        return FAIL, "Push is half configured: %s missing, so push stays off." % missing, PUSH_FIX
+    key = Path(source["HERMES_MOBILE_APNS_KEY_PATH"].strip()).expanduser()
+    if not key.is_file():
+        return FAIL, "Push is configured but the APNs key file isn't there, so push stays off.", \
+            "Put the .p8 back at the configured HERMES_MOBILE_APNS_KEY_PATH, or point the setting at it and reinstall."
+    if not os.access(key, os.R_OK):
+        return FAIL, "The APNs key file is there but this user can't read it, so push fails.", \
+            "Make it yours and private: chown $USER <key> && chmod 600 <key> (the configured HERMES_MOBILE_APNS_KEY_PATH)."
+    bad = [k for k in APNS_KEYS[1:] if not APPLE_ID_RE.fullmatch(source[k].strip())]
+    if bad:
+        return FAIL, "%s isn't a 10-character Apple ID (upper-case letters and digits)." % " and ".join(bad), \
+            "Copy the Key ID from Apple Developer > Keys and the Team ID from Membership details, then reinstall."
+    try:
+        import bridge_push
+        bridge_push.make_jwt(str(key), source["HERMES_MOBILE_APNS_KEY_ID"].strip(),
+                             source["HERMES_MOBILE_APNS_TEAM_ID"].strip(), time.time(), sign or bridge_push.sign_es256)
+    except Exception:
+        return FAIL, "The APNs key file isn't a usable .p8 key (an EC P-256 private key), so push fails.", \
+            "Download a new key from Apple Developer > Keys (APNs ticked) and point HERMES_MOBILE_APNS_KEY_PATH at it."
+    host = (source.get("HERMES_MOBILE_APNS_HOST") or "").strip()
+    if host:
+        return WARN, "Push is configured but goes to a test server (HERMES_MOBILE_APNS_HOST is set), not Apple.", \
+            "Remove it: HERMES_MOBILE_APNS_HOST= Bridge/install.sh"
+    topic = "your setting" if (source.get("HERMES_MOBILE_APNS_TOPIC") or "").strip() else "the default"
+    if os.name == "posix" and key.stat().st_mode & 0o077:
+        return WARN, "Push is configured, but other users on this Mac can read the APNs key.", "chmod 600 <the .p8 file>"
+    return OK, ("Push notifications are configured (key readable and valid; the app reports its own bundle ID, "
+                "older builds use %s)." % topic), ""
+
+
+def push_last_check(state_dir) -> tuple[str, str, str] | None:
+    """(status, detail, fix) from the last APNs answers the bridge kept, or None before the first push."""
+    if state_dir is None:
+        return None
+    try:
+        import bridge_push
+        state = bridge_push.last_result(Path(state_dir) / "push" / "status.json")
+    except Exception:
+        state = None
+    last = (state or {}).get("last")
+    if not isinstance(last, dict):
+        return None
+    if last.get("status") == 200:
+        error = (state or {}).get("last_error")
+        earlier = ""
+        if isinstance(error, dict):
+            earlier = " Earlier error: APNs %s %s at %s." % (error.get("status"), error.get("reason") or "", _clock(error.get("at")))
+        return OK, "Last push delivered at %s (%s).%s" % (_clock(last.get("at")), last.get("env"), earlier), ""
+    reason = last.get("reason") or ("transport" if not last.get("status") else str(last.get("status")))
+    status, detail, fix = APNS_FIXES.get(reason, (WARN, "APNs answered %s %s." % (last.get("status"), reason),
+                                                 "Run --push-test; if it repeats, check Apple's system status."))
+    return status, "%s (APNs %s %s at %s)" % (detail, last.get("status"), reason, _clock(last.get("at"))), fix
+
+
+def push_phones_check(state_dir, configured) -> tuple[str, str, str] | None:
+    """(status, detail, fix) for the phones registered for push. Read-only."""
+    if state_dir is None:
+        return None
+    try:
+        import bridge_devices
+        summary = bridge_devices.push_summary(Path(state_dir) / "devices")
+    except Exception:
+        summary = None
+    if summary is None:
+        return None
+    if not summary["phones"]:
+        return (WARN if configured else OK), "No phone has registered for push yet.", \
+            "Open the app on the phone and allow notifications when it asks (Settings > Notifications > Prometheus)."
+    envs = ", ".join("%s %d" % item for item in sorted(summary["envs"].items()))
+    own = summary["own_topic"]
+    note = "" if own == summary["phones"] else " %d of them use an older app build that doesn't report its bundle ID." % (
+        summary["phones"] - own)
+    return OK, "%d phone(s) registered for push (%s).%s" % (summary["phones"], envs, note), ""
+
+
+def push_test(devices, status_path, log=lambda message: None, env=None, service=None, send=None) -> int:
+    """`--push-test`: one test notification to every phone registered for push, with APNs's answer for each.
+    Uses the installed service's APNs settings when the shell has none. Prints no tokens, IDs or key paths."""
+    import bridge_push
+    status, detail, fix = push_check(env, service)
+    if status == FAIL or (status == WARN and "not configured" in detail):
+        print("✗ %s" % detail)
+        print("  → %s" % fix)
+        return 1
+    config = bridge_push.Config.from_env(push_env(env, service))
+    if config is None:
+        print("✗ Push isn't configured.\n  → %s" % PUSH_FIX)
+        return 1
+    pusher = bridge_push.Pusher(devices, config=lambda: config, log=log, inline=True, status=status_path,
+                                **({"send": send} if send else {}))
+    names = {d["id"]: d["name"] for d in devices.active()}
+    results = pusher.test()
+    if not results:
+        print("✗ No phone has registered for push yet.")
+        print("  → Open the app on the phone and allow notifications, then run --push-test again.")
+        return 1
+    failed = 0
+    for row, code, reason, dropped in results:
+        name = names.get(row["device_id"], "A phone")
+        if code == 200:
+            print("✓ %s (%s): delivered. Look for \"Push notifications from your Mac work.\"" % (name, row["env"]))
+            continue
+        failed += 1
+        meaning = APNS_FIXES.get(reason or ("transport" if not code else ""))
+        print("✗ %s (%s): APNs %s %s%s" % (name, row["env"], code, reason, " (token removed)" if dropped else ""))
+        if meaning:
+            print("  → %s %s" % (meaning[1], meaning[2]))
+    return 1 if failed else 0
 
 
 def _service_env(home: Path | None = None) -> dict:
@@ -56,25 +215,6 @@ def _service_env(home: Path | None = None) -> dict:
     except Exception:
         pass
     return out
-
-
-def push_check(env=None, service=None) -> tuple[str, str, str]:
-    """(status, detail, fix) for APNs push. Reports configured or not, never the values."""
-    env = os.environ if env is None else env
-    source = env if any((env.get(k) or "").strip() for k in APNS_KEYS) else (_service_env() if service is None else service)
-    have = [k for k in APNS_KEYS if (source.get(k) or "").strip()]
-    fix_all = ("Set HERMES_MOBILE_APNS_KEY_PATH, HERMES_MOBILE_APNS_KEY_ID and HERMES_MOBILE_APNS_TEAM_ID, then run "
-               "Bridge/install.sh again (README, Push notifications).")
-    if not have:
-        return WARN, "Push notifications are not configured (optional: replies still arrive while the app is open).", fix_all
-    if len(have) < len(APNS_KEYS):
-        missing = ", ".join(k for k in APNS_KEYS if k not in have)
-        return FAIL, "Push is half configured: %s missing, so push stays off." % missing, fix_all
-    if not Path(source["HERMES_MOBILE_APNS_KEY_PATH"].strip()).expanduser().is_file():
-        return FAIL, "Push is configured but the APNs key file isn't there, so push stays off.", \
-            "Put the .p8 back at the configured HERMES_MOBILE_APNS_KEY_PATH, or point the setting at it and reinstall."
-    topic = "set" if (source.get("HERMES_MOBILE_APNS_TOPIC") or "").strip() else "default"
-    return OK, "Push notifications are configured (key file present, topic %s)." % topic, ""
 
 
 def gateway_check(found: bool, port: int, probe=None) -> tuple[str, str, str]:
@@ -107,7 +247,7 @@ def _tailscale():
     return None
 
 
-def run(hermes_home: Path, port: int, profiles, profile_home) -> list[dict]:
+def run(hermes_home: Path, port: int, profiles, profile_home, state_dir: Path | None = None) -> list[dict]:
     r: list[dict] = []
     system = platform.system()
     root = hermes_home / "hermes-agent"
@@ -223,8 +363,13 @@ def run(hermes_home: Path, port: int, profiles, profile_home) -> list[dict]:
            else "Speech-to-text isn't configured; audio arrives as a file Hermes can't hear.",
            "" if enabled else "hermes config set stt.provider local   (or groq/openai with a key; see Hermes docs, Voice)")
 
-    # 9. Push notifications (optional).
-    _check(r, "push", *push_check())
+    # 9. Push notifications (optional): the settings, the phones registered, and what APNs said last.
+    push = push_check()
+    _check(r, "push", *push)
+    configured = push[0] == OK or "test server" in push[1]
+    for name, extra in (("push-phones", push_phones_check(state_dir, configured)), ("push-last", push_last_check(state_dir))):
+        if extra:
+            _check(r, name, *extra)
     return r
 
 

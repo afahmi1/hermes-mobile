@@ -2,10 +2,11 @@ import SwiftUI
 
 private final class NotificationDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, willFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        #if DEBUG
-        if DemoMode.isOn { return true }
-        #endif
+        // Before launch finishes, so a tap that launched the app still reaches the delegate.
         ReplyNotifier.shared.install()
+        #if DEBUG
+        if DemoMode.isOn { return true }  // fixtures: banners and taps work, nothing registers with APNs
+        #endif
         ReplyNotifier.shared.registerIfAuthorized()
         return true
     }
@@ -88,23 +89,27 @@ struct HermesMobileApp: App {
                 .onAppear { ReplyNotifier.shared.appRef = app }
                 .onChange(of: ReplyNotifier.shared.destination, initial: true) { _, destination in
                     guard let destination else { return }
-                    if destination.open(in: app) { selectedTab = 0 }
-                    // A reply typed into the notification: queue it in that chat. It sends when the Mac answers.
-                    if let text = ReplyNotifier.shared.pendingReply, let ref = app.inboxPath.last {
+                    let notifier = ReplyNotifier.shared
+                    let text = notifier.pendingReply
+                    notifier.pendingReply = nil
+                    notifier.destination = nil
+                    // Never send a notification reply to an old path if its gateway could not be opened.
+                    guard destination.open(in: app) else { return }
+                    selectedTab = 0
+                    if let text, let ref = app.inboxPath.last {
                         let chat = app.chat(for: ref)
                         Task { _ = await chat.enqueue(text, mode: "queue", attachments: []) }
-                        ReplyNotifier.shared.pendingReply = nil
                     }
-                    ReplyNotifier.shared.destination = nil
                 }
         }
         .onChange(of: phase) { old, now in
             if now == .background {
                 backgroundedAt = Date()
                 // Ask iOS for a little time so a live reply or an unsent message can finish going out.
-                ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns || app.hasUnsentMessages)
-                // Always: a run can start after the phone goes away (a queued message, a scheduled retry).
-                PushRegistration.shared.presence(away: true)
+                let following = app.hasLiveRuns || app.hasUnsentMessages
+                ReplyNotifier.shared.left(liveRuns: following)
+                // Tell the bridge even when idle: a run can start after the phone goes away.
+                PushRegistration.shared.presence(away: true, following: following)
             }
             if now == .active {
                 ReplyNotifier.shared.returned()

@@ -261,17 +261,18 @@ final class API: @unchecked Sendable {
 
     // MARK: push
 
-    /// Hand this install's APNs token to the bridge. The grant that signs the request owns the token.
-    /// Returns whether the Mac can actually send pushes (it has an APNs key).
-    @discardableResult
-    func registerPush(token: String, environment: String, account: String) async throws -> Bool {
-        let r = try await json("/m/push/token", method: "POST", body: ["token": token, "environment": environment, "account": account])
-        return r["enabled"] as? Bool ?? false
+    /// Registers this install's APNs token and bundle ID, then returns whether this Mac can send pushes.
+    func registerPush(token: String, environment: String, topic: String?, account: String) async throws -> Bool {
+        var body: [String: Any] = ["token": token, "environment": environment, "account": account]
+        if let topic { body["topic"] = topic }
+        let result = try await json("/m/push/token", method: "POST", body: body)
+        return result["enabled"] as? Bool ?? false
     }
 
-    /// Tell the bridge the app left or returned to the foreground, so it knows when to push.
-    func pushPresence(away: Bool) async throws {
-        _ = try await json("/m/push/presence", method: "POST", body: ["away": away])
+    /// Tell the bridge the app left or returned to the foreground, so it knows when to push. `following` false:
+    /// the app is away and no longer following its runs, so the bridge pushes without a grace window.
+    func pushPresence(away: Bool, following: Bool = true) async throws {
+        _ = try await json("/m/push/presence", method: "POST", body: ["away": away, "following": following])
     }
 
     // MARK: reads

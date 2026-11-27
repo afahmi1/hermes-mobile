@@ -240,7 +240,7 @@ struct ChatScreen: View {
         .sensoryFeedback(.error, trigger: chat.failedTick)
         .task { await chat.load() }
         .task { await chat.loadPalette() }
-        .modifier(VisibleChat(profile: chat.profile, session: chat.sessionId))
+        .modifier(VisibleChat(destination: chat.notificationDestination))
         .task(id: chat.sessionId) { await chat.loadPins() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
@@ -613,7 +613,7 @@ struct ChatScreen: View {
                         }
                             .overlay(alignment: .bottomTrailing) {
                                 Image(systemName: "clock.fill").font(.system(size: 11, weight: .bold))
-                                    .foregroundStyle(.white, HMDesign.accent)
+                                    .foregroundStyle(HMTheme.isThermocline ? HMDesign.bubbleText : .white, HMDesign.accentFill)
                                     .background(Circle().fill(HMDesign.canvas).padding(-1))
                                     .offset(x: 2, y: 2)
                             }
@@ -1442,6 +1442,7 @@ struct MessageRow: View {
                         HStack(alignment: .top, spacing: 4) {
                             if pinned { pinMark }
                             VStack(alignment: .leading, spacing: 8) {
+
                                 let segs = ReplyQuote.segments(item.text)
                                 if segs.filter({ $0.quote != nil }).count > 1 && !userIsLong {
                                     // A reply to several messages: each quote card with its answer under it.
@@ -1559,7 +1560,7 @@ struct MessageRow: View {
                         Text(item.text).textSelection(.enabled)
                             .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
                             .foregroundStyle(HMDesign.bubbleText)
-                            .background(HMDesign.bubbleFill, in: bubbleShape)
+                            .hmBubble(bubbleShape)
                     }
                     // Where the message is: hollow while waiting, filled once Hermes has read it.
                     let stage = item.annotation ?? "sent"
@@ -1925,7 +1926,7 @@ struct PinnedBar: View {
                     VStack(alignment: .leading, spacing: 1) {
                         if HMTheme.isThermocline {
                             Text(pins.count == 1 ? "Pinned" : "Pinned · \(cursor + 1) of \(pins.count)")
-                                .hmLabel(Thermocline.lead)
+                                .hmLabel(HMDesign.accent)
                         } else {
                             Text(pins.count == 1 ? "Pinned message" : "Pinned message \(cursor + 1) of \(pins.count)")
                                 .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
@@ -2764,7 +2765,7 @@ struct QuestionPanel: View {
                          ? "Submit \(answers.count) of \(chat.questions.count)" : "Submit")
                         .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).frame(height: 44)
                 }
-                .buttonStyle(.borderedProminent)
+                .hmSystemProminent()
                 .disabled(answers.isEmpty || chat.answering)
             }
         }
@@ -3055,7 +3056,7 @@ struct FailedTurnCard: View {
                     Button { act { await chat.retryNow(itemID) } } label: {
                         Label("Try again", systemImage: "arrow.clockwise").font(.footnote.weight(.semibold))
                     }
-                    .buttonStyle(.borderedProminent).tint(HMDesign.accent)
+                    .hmSystemProminent()
                     Menu {
                         if let r = reset {
                             Button("When \(r.label) resets · \(r.date.formatted(date: .omitted, time: .shortened))") {
@@ -3089,12 +3090,22 @@ struct FailedTurnCard: View {
 
 /// The chat on screen doesn't need a notification for its own replies; other chats still do.
 struct VisibleChat: ViewModifier {
-    let profile: String
-    let session: String?
-    private var key: String { profile + "|" + (session ?? "") }
+    let destination: ReplyDestination?
+    @State private var onScreen = false
+
     func body(content: Content) -> some View {
         content
-            .onAppear { ReplyNotifier.shared.visibleChat = key }
-            .onDisappear { if ReplyNotifier.shared.visibleChat == key { ReplyNotifier.shared.visibleChat = nil } }
+            .onAppear {
+                onScreen = true
+                ReplyNotifier.shared.watch(destination)
+            }
+            .onDisappear {
+                onScreen = false
+                ReplyNotifier.shared.unwatch(destination)
+            }
+            // A new chat gets its session with the first send.
+            .onChange(of: destination) { _, chat in
+                if onScreen { ReplyNotifier.shared.watch(chat) }
+            }
     }
 }

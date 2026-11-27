@@ -301,8 +301,9 @@ REPLAY_BATCH_FRAMES = 128
 _SSE_ENCODER = json.JSONEncoder(separators=(",", ":"))
 
 
-# Set by the bridge: called outside the turn's lock for events the phone may need a push for.
-PUSH_EVENTS = ("run.completed", "run.failed", "approval.request")
+# Set by the bridge: called outside the turn's lock for events the phone may need a push for
+# (bridge_push.TURN_EVENTS: outcomes, approvals and Hermes's questions, which wait on the person too).
+PUSH_EVENTS = ("run.completed", "run.failed", "approval.request", "clarify.request")
 EVENT_HOOK = None
 
 
@@ -923,13 +924,14 @@ def _admission_lock(key):
         return lock
 
 
-def start_turn(profile, home, sid, text, choice, workspace=None) -> Turn:
+def start_turn(profile, home, sid, text, choice, workspace=None, device_id=None) -> Turn:
     purge()
     with _admission_lock((profile, sid)), TURNS_LOCK:
         busy = [t for t in TURNS.values() if t.sid == sid and t.profile == profile and not t.done]
         if busy:
             raise TurnError("This chat is still working on the last message.", 409)
         turn = Turn(profile, home, sid, text, clean_choice(choice), workspace)
+        turn.device_id = device_id  # before it runs: a reply that ends at once still pushes only to its sender
         TURNS[turn.id] = turn
     asyncio.run_coroutine_threadsafe(_drive(turn), LOOP)
     return turn
@@ -991,7 +993,7 @@ def match_receipt(profile, sid, text, request, directory):
     return {"turn_id": turn_id}
 
 
-def start_primary(profile, home, sid, text, choice, submission, project, directory, prepare, restore_workspace, attachments=None, video_consent=False):
+def start_primary(profile, home, sid, text, choice, submission, project, directory, prepare, restore_workspace, attachments=None, video_consent=False, device_id=None):
     try:
         id = "turn_" + uuid.UUID(str(submission)).hex
     except (TypeError, ValueError):
@@ -1026,6 +1028,7 @@ def start_primary(profile, home, sid, text, choice, submission, project, directo
         ws = prepare()
         turn = Turn(profile, home, sid, text, choice, ws)
         turn.id, turn.submission, turn.journal = id, id[5:], journal
+        turn.device_id = device_id  # before it runs: a reply that ends at once still pushes only to its sender
         try:
             turn.media = transcribe_media(bridge_media.stage(frames, home), home)
             journal.create(turn, digest, _turn_text(turn))
