@@ -57,6 +57,7 @@ enum HMThemeChoice: String, CaseIterable, Identifiable {
         case .oled: "Black"
         }
     }
+    var shortTitle: String { self == .system ? "Auto" : title }
     var detail: String {
         switch self {
         case .system: "Ash at night, Paper by day"
@@ -118,6 +119,11 @@ enum HMTheme {
 
     /// Navigation and tab bars are UIKit: give them the theme too. Called at launch and on every change.
     static func applyChrome() {
+        if #available(iOS 26.0, *) {
+            // iOS 26 draws glass bars, large titles and the soft scroll-edge blur itself. Any custom appearance
+            // turns that blur off (text slid under the title) and an opaque one hid the large title. Leave it alone.
+            return
+        }
         let nav = UINavigationBarAppearance()
         nav.configureWithOpaqueBackground()
         nav.backgroundColor = uiColor(\.canvas)
@@ -232,6 +238,131 @@ struct ThinkingOrb: View {
             .shadow(color: HMDesign.accent.opacity(0.45), radius: size * 0.35)
         }
         .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Thinking indicators
+
+/// How "Hermes is working" looks. Crisp pixels by default: they stay sharp at 16 pt, where a blurred orb smears.
+enum ThinkingStyle: String, CaseIterable, Identifiable {
+    case matrix, sprite, braille, orb
+    static let key = "hm.thinking"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .matrix: "Dot matrix"
+        case .sprite: "Pixel flame"
+        case .braille: "Terminal"
+        case .orb: "Orb"
+        }
+    }
+}
+
+struct ThinkingIndicator: View {
+    var size: CGFloat = 16
+    @AppStorage(ThinkingStyle.key) private var raw = ThinkingStyle.matrix.rawValue
+    var style: ThinkingStyle? = nil
+
+    var body: some View {
+        switch style ?? ThinkingStyle(rawValue: raw) ?? .matrix {
+        case .matrix: DotMatrixLoader(size: size)
+        case .sprite: PixelFlame(size: size + 4)
+        case .braille: BrailleSpinner(size: size)
+        case .orb: ThinkingOrb(size: size)
+        }
+    }
+}
+
+/// A 3×3 grid of square dots; a diagonal wave lights them in turn, like an LED panel thinking.
+struct DotMatrixLoader: View {
+    var size: CGFloat = 16
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 20, paused: reduceMotion)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            Canvas { ctx, box in
+                let cell = box.width / 3, dot = cell * 0.62
+                for row in 0..<3 {
+                    for col in 0..<3 {
+                        let phase = (t * 2.4 - Double(row + col) * 0.45).truncatingRemainder(dividingBy: 2.4)
+                        let lit = reduceMotion ? 0.7 : max(0.18, 1 - abs(phase - 0.6) * 1.1)
+                        let r = CGRect(x: CGFloat(col) * cell + (cell - dot) / 2, y: CGFloat(row) * cell + (cell - dot) / 2,
+                                       width: dot, height: dot)
+                        ctx.fill(Path(roundedRect: r, cornerRadius: dot * 0.22), with: .color(HMDesign.accent.opacity(lit)))
+                    }
+                }
+            }
+            .frame(width: size, height: size)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// An 8×8 pixel-art flame (Prometheus's fire), four frames, nearest-neighbour crisp.
+struct PixelFlame: View {
+    var size: CGFloat = 20
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    // 0 empty, 1 outer (accent), 2 mid (warm), 3 core (light)
+    private static let frames: [[String]] = [
+        ["...1....", "...11...", "..1211..", "..12211.", ".122321.", ".1233321", ".1233321", "..11111."],
+        ["....1...", "...11...", "..1121..", ".112211.", ".1232211", "1123321.", ".1233321", "..11111."],
+        ["...1....", "..11....", "..1211..", ".11221..", ".122321.", "11233321", ".1233321", "..11111."],
+        ["....1...", "...111..", "..1221..", "..12221.", ".1223321", ".1233321", "11233321", ".111111."],
+    ]
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 8, paused: reduceMotion)) { context in
+            let frame = reduceMotion ? 0 : Int(context.date.timeIntervalSinceReferenceDate * 8) % Self.frames.count
+            Canvas { ctx, box in
+                let px = box.width / 8
+                for (y, line) in Self.frames[frame].enumerated() {
+                    for (x, ch) in line.enumerated() where ch != "." {
+                        let color: Color = ch == "1" ? HMDesign.accent : ch == "2" ? Color(red: 1, green: 0.62, blue: 0.3) : Color(red: 1, green: 0.93, blue: 0.75)
+                        ctx.fill(Path(CGRect(x: CGFloat(x) * px, y: CGFloat(y) * px, width: px + 0.3, height: px + 0.3)), with: .color(color))
+                    }
+                }
+            }
+            .frame(width: size, height: size)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// The terminal spinner: braille frames in the monospaced font.
+struct BrailleSpinner: View {
+    var size: CGFloat = 16
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private static let frames = Array("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 12, paused: reduceMotion)) { context in
+            let i = Int(context.date.timeIntervalSinceReferenceDate * 12) % Self.frames.count
+            Text(String(Self.frames[reduceMotion ? 0 : i]))
+                .font(.system(size: size, weight: .bold, design: .monospaced))
+                .foregroundStyle(HMDesign.accent)
+                .frame(width: size, height: size)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Status text with a soft light sweeping across it, so "Working…" reads as alive without a spinner shouting.
+struct ShimmerText: View {
+    let text: String
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let x = reduceMotion ? 0.5 : (t * 0.6).truncatingRemainder(dividingBy: 1.6) - 0.3
+            Text(text).font(.footnote).foregroundStyle(.secondary)
+                .overlay {
+                    LinearGradient(stops: [.init(color: .clear, location: x - 0.18), .init(color: HMDesign.ink.opacity(0.9), location: x),
+                                           .init(color: .clear, location: x + 0.18)], startPoint: .leading, endPoint: .trailing)
+                        .mask(Text(text).font(.footnote))
+                }
+        }
     }
 }
 

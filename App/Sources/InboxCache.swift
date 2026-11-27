@@ -332,6 +332,13 @@ actor InboxDisk {
         return (try? JSONDecoder().decode([ControlReceipt].self, from: data)) ?? []
     }
 
+    func replaceReceipts(_ rows: [ControlReceipt], key: String) throws {
+        guard !forgotten.contains(account(key)) else { return }
+        let url = location(key)
+        if rows.isEmpty { try? FileManager.default.removeItem(at: url); return }
+        try JSONEncoder().encode(Array(rows.suffix(80))).write(to: url, options: Self.protectedWrite)
+    }
+
     func record(_ receipt: ControlReceipt, key: String) throws {
         guard !forgotten.contains(account(key)) else { return }
         let url = location(key)

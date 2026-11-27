@@ -108,8 +108,8 @@ struct ChatScreen: View {
                     }
                     if let s = chat.status {
                         HStack(spacing: 8) {
-                            ThinkingOrb(size: 16)
-                            Text(s).font(.footnote).foregroundStyle(.secondary)
+                            ThinkingIndicator(size: 16)
+                            ShimmerText(text: s)
                             Spacer()
                         }
                         .padding(.horizontal, 16).id("status")
@@ -119,7 +119,7 @@ struct ChatScreen: View {
                 .padding(.vertical, 12)
             }
             .scrollDismissesKeyboard(.interactively)
-            .defaultScrollAnchor(.bottom)
+            .modifier(ReadingPosition(followLatest: $followLatest))
             .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { drag in
                 if drag.translation.height > 12 { followLatest = false }
                 // Swipe left, like iMessage, to see every message's time.
@@ -249,7 +249,9 @@ struct ChatScreen: View {
             chat.outboxWake()
             // Back from the background: show what happened while away, then land on it.
             guard !chat.isRunning else { return }
-            Task { await chat.load(quiet: true); landTick &+= 1 }
+            // Only land on the newest message if that's where you were. Reading higher up stays put.
+            let wasAtBottom = followLatest
+            Task { await chat.load(quiet: true); if wasAtBottom { landTick &+= 1 } }
         }
         .onReceive(NotificationCenter.default.publisher(for: .hermesCopied)) { note in
             let text = note.object as? String ?? "Copied"
@@ -352,7 +354,7 @@ struct ChatScreen: View {
     private var runtimeLabel: String {
         if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
-        let who = ModelName.short(c.model ?? bot?.model ?? "Default model")
+        let who = ModelName.short(c.model ?? bot?.model ?? "Default model").components(separatedBy: " · ").first ?? ""
         if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
         var parts = [who]
         if let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) { parts.append(effort) }
@@ -416,7 +418,7 @@ struct ChatScreen: View {
     }
 
     private func composerField(expanded: Bool) -> some View {
-        ComposerField(text: $chat.draft, placeholder: "Message \(bot?.name ?? "Hermes") · / for commands",
+        ComposerField(text: $chat.draft, placeholder: "Message \(bot?.name ?? "Hermes")",
                       expanded: expanded, onPasteText: chat.absorbPaste, onPasteImage: importPastedImage)
     }
 
@@ -2604,5 +2606,37 @@ struct QuoteCard: View {
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+/// Where the reader is. On iOS 18+ the real scroll position decides "following the newest message": within
+/// 80 pt of the bottom follows, anywhere else holds still, however you got there (drag, flick, scroll-to-top tap).
+/// The list starts at the bottom, but growing content (a streaming reply, an older page) doesn't drag you down.
+struct ReadingPosition: ViewModifier {
+    @Binding var followLatest: Bool
+    /// True while your finger or a flick is moving the list. Growing content alone never stops following.
+    @State private var userScrolling = false
+    @State private var atBottom = true
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.top, for: .sizeChanges)
+                .onScrollGeometryChange(for: Bool.self) { geo in
+                    geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) < 80
+                } action: { _, bottom in
+                    atBottom = bottom
+                    if bottom { followLatest = true }
+                    else if userScrolling { followLatest = false }
+                }
+                .onScrollPhaseChange { _, phase in
+                    userScrolling = phase == .interacting || phase == .decelerating
+                    if userScrolling && !atBottom { followLatest = false }
+                    if phase == .idle && atBottom { followLatest = true }
+                }
+        } else {
+            content.defaultScrollAnchor(.bottom)
+        }
     }
 }

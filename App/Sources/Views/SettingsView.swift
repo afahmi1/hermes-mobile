@@ -27,59 +27,50 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // Where this phone is connected, as one card. Other gateways live one tap in.
                 Section {
-                    if let current = API.shared.baseURL {
-                        GatewayRow(name: SavedGateways.displayName(current), detail: current.absoluteString, isCurrent: true)
-                            .accessibilityElement(children: .combine)
-                            .accessibilityLabel("Current gateway, \(SavedGateways.displayName(current))")
-                    }
-                    ForEach(app.savedGateways.filter { $0 != API.shared.baseURL }, id: \.self) { url in
-                        Button {
-                            do { try app.switchGateway(url) } catch { gatewayError = error.localizedDescription }
-                        } label: {
-                            GatewayRow(name: SavedGateways.displayName(url), detail: url.absoluteString, isCurrent: false)
+                    NavigationLink {
+                        GatewaysPage(addingGateway: $addingGateway, gatewayError: $gatewayError, forgetting: $forgetting)
+                    } label: {
+                        HStack(spacing: 14) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 12, style: .continuous).fill(HMDesign.accent.opacity(0.16))
+                                Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(HMDesign.accent)
+                            }
+                            .frame(width: 44, height: 44)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(API.shared.baseURL.map(SavedGateways.displayName) ?? "Not connected").font(.headline)
+                                HStack(spacing: 6) {
+                                    Circle().fill(app.health?.ok == true ? HMDesign.success : .orange).frame(width: 8, height: 8)
+                                    Text([app.health?.version.map { "Hermes " + $0 }, app.savedGateways.count > 1 ? "\(app.savedGateways.count) gateways" : nil]
+                                        .compactMap { $0 }.joined(separator: " · "))
+                                        .font(.subheadline).foregroundStyle(.secondary)
+                                }
+                            }
                         }
-                        .accessibilityLabel("Switch to gateway \(SavedGateways.displayName(url))")
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button("Remove", systemImage: "trash", role: .destructive) { forgetting = url }
-                        }
+                        .padding(.vertical, 4)
                     }
-                    Button("Add Gateway", systemImage: "plus") { addingGateway = true }
-                    if let gatewayError { Label(gatewayError, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
-                } header: {
-                    Text("Gateways")
-                } footer: {
-                    Text("Chats, files and approvals stay on the gateway you choose.")
                 }
                 AppearanceSection()
-                Section("Hermes server") {
-                    if let caps = capabilities, caps.features.contains("device_grants") {
-                        NavigationLink { DeviceAccessView(capabilities: caps) } label: {
-                            Label("Device access", systemImage: "iphone")
-                        }
-                    }
-                    LabeledContent("Gateway") { ConnectionBadge() }
-                    if let v = app.health?.version { LabeledContent("Hermes", value: v) }
+                Section("Hermes") {
                     NavigationLink { SettingsBotsList() } label: {
-                        LabeledContent("Bots", value: botsSummary)
+                        SettingsRow("Bots", "person.2.fill", .indigo, value: botsSummary)
                     }
                     .accessibilityIdentifier("settings.bots")
-                    .accessibilityHint("Shows every bot and whether it is reachable")
-                }
-                Section {
-                    NavigationLink { DeletionPinView() } label: { Label("Deletion PIN", systemImage: "lock") }
+                    if let caps = capabilities, caps.features.contains("device_grants") {
+                        NavigationLink { DeviceAccessView(capabilities: caps) } label: {
+                            SettingsRow("Devices", "iphone", .blue)
+                        }
+                    }
+                    NavigationLink { DeletionPinView() } label: { SettingsRow("Deletion PIN", "lock.fill", .orange) }
                         .accessibilityIdentifier("settings.deletionPin")
-                        .accessibilityHint("Choose or change the PIN that protects archiving projects and bots")
-                } footer: { Text("Owner only. Each Mac has its own PIN; there is no default.") }
-                ProviderUsageSection()
-                Section {
-                    Text("Chats, bots and model choices live in Hermes on your server, so this phone and the desktop app show the same thing. Away from home, keep Tailscale on.")
-                        .font(.footnote).foregroundStyle(.secondary)
                 }
+                ProviderUsageSection()
                 Section {
                     Button("Sign Out", role: .destructive) { confirmSignOut = true }
                 } footer: {
                     Text("Hermes Mobile \(appVersion)")
+                        .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.top, 8)
                         .accessibilityLabel("App version \(appVersion)")
@@ -132,6 +123,65 @@ struct SettingsView: View {
                 Text("Signing out here clears this phone. You can revoke its grant later on the host.")
             }
         }
+    }
+}
+
+/// A settings row: a small tinted icon tile, the title, and an optional value on the right (like iOS Settings).
+struct SettingsRow: View {
+    let title: String, symbol: String, tint: Color
+    var value: String? = nil
+    init(_ title: String, _ symbol: String, _ tint: Color, value: String? = nil) {
+        self.title = title; self.symbol = symbol; self.tint = tint; self.value = value
+    }
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol).font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                .frame(width: 28, height: 28)
+                .background(tint.gradient, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            Text(title)
+            Spacer(minLength: 8)
+            if let value { Text(value).foregroundStyle(.secondary).lineLimit(1) }
+        }
+    }
+}
+
+/// Every gateway this phone knows: the current one, the others (tap to switch), and Add.
+private struct GatewaysPage: View {
+    @Environment(AppModel.self) private var app
+    @Binding var addingGateway: Bool
+    @Binding var gatewayError: String?
+    @Binding var forgetting: URL?
+
+    var body: some View {
+        Form {
+                Section {
+                    if let current = API.shared.baseURL {
+                        GatewayRow(name: SavedGateways.displayName(current), detail: current.absoluteString, isCurrent: true)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Current gateway, \(SavedGateways.displayName(current))")
+                    }
+                    ForEach(app.savedGateways.filter { $0 != API.shared.baseURL }, id: \.self) { url in
+                        Button {
+                            do { try app.switchGateway(url) } catch { gatewayError = error.localizedDescription }
+                        } label: {
+                            GatewayRow(name: SavedGateways.displayName(url), detail: url.absoluteString, isCurrent: false)
+                        }
+                        .accessibilityLabel("Switch to gateway \(SavedGateways.displayName(url))")
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button("Remove", systemImage: "trash", role: .destructive) { forgetting = url }
+                        }
+                    }
+                    Button("Add Gateway", systemImage: "plus") { addingGateway = true }
+                    if let gatewayError { Label(gatewayError, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
+                } header: {
+                    Text("Gateways")
+                } footer: {
+                    Text("Chats, files and approvals stay on the gateway you choose.")
+                }
+        }
+        .hmCanvas()
+        .navigationTitle("Gateways")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -398,27 +448,29 @@ struct AppearanceSection: View {
     @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeChoice.system.rawValue
     @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
     @AppStorage(HMGlass.key) private var glass = true
+    @AppStorage(ThinkingStyle.key) private var thinkingRaw = ThinkingStyle.matrix.rawValue
 
     var body: some View {
         Section("Appearance") {
-            ForEach(HMThemeChoice.allCases) { theme in
-                Button { themeRaw = theme.rawValue } label: {
-                    HStack(spacing: 12) {
-                        swatch(theme)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(theme.title).foregroundStyle(.primary)
-                            Text(theme.detail).font(.caption).foregroundStyle(.secondary)
+            // Four themes side by side, like the iOS Display settings: the preview is the label.
+            HStack(spacing: 10) {
+                ForEach(HMThemeChoice.allCases) { theme in
+                    Button { themeRaw = theme.rawValue } label: {
+                        VStack(spacing: 6) {
+                            swatch(theme)
+                                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(HMDesign.accent, lineWidth: themeRaw == theme.rawValue ? 2.5 : 0).padding(-3))
+                            Text(theme.shortTitle).font(.caption.weight(themeRaw == theme.rawValue ? .semibold : .regular))
+                                .foregroundStyle(themeRaw == theme.rawValue ? Color.primary : .secondary)
                         }
-                        Spacer()
-                        if themeRaw == theme.rawValue {
-                            Image(systemName: "checkmark").font(.body.weight(.semibold)).foregroundStyle(HMDesign.accent)
-                        }
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(theme.title + ", " + theme.detail)
+                    .accessibilityAddTraits(themeRaw == theme.rawValue ? .isSelected : [])
                 }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(themeRaw == theme.rawValue ? .isSelected : [])
             }
+            .padding(.vertical, 6)
             VStack(alignment: .leading, spacing: 8) {
                 Text("Accent").font(.subheadline)
                 HStack(spacing: 10) {
@@ -438,16 +490,39 @@ struct AppearanceSection: View {
                 }
             }
             .padding(.vertical, 4)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Thinking").font(.subheadline)
+                HStack(spacing: 8) {
+                    ForEach(ThinkingStyle.allCases) { style in
+                        Button { thinkingRaw = style.rawValue } label: {
+                            VStack(spacing: 6) {
+                                ThinkingIndicator(size: 18, style: style).frame(height: 24)
+                                Text(style.title).font(.caption2).lineLimit(1).minimumScaleFactor(0.8)
+                                    .foregroundStyle(thinkingRaw == style.rawValue ? Color.primary : .secondary)
+                            }
+                            .frame(maxWidth: .infinity).padding(.vertical, 8)
+                            .background(thinkingRaw == style.rawValue ? HMDesign.accent.opacity(0.14) : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(thinkingRaw == style.rawValue ? HMDesign.accent : HMDesign.separator, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(style.title + " thinking indicator")
+                        .accessibilityAddTraits(thinkingRaw == style.rawValue ? .isSelected : [])
+                    }
+                }
+            }
+            .padding(.vertical, 4)
             if #available(iOS 26.0, *) {
                 Toggle(isOn: $glass) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Liquid Glass")
-                        Text("Glass message box and controls. Off uses the theme's flat colors.").font(.caption).foregroundStyle(.secondary)
+        
                     }
                 }
             }
         }
-        .sensoryFeedback(.selection, trigger: themeRaw + accentRaw)
+        .sensoryFeedback(.selection, trigger: themeRaw + accentRaw + thinkingRaw)
     }
 
     private func accentFill(_ accent: HMAccent) -> Color {
@@ -459,18 +534,21 @@ struct AppearanceSection: View {
         let palette: HMPalette = theme == .paper ? .paper : theme == .oled ? .oled : .ash
         return ZStack(alignment: .bottomTrailing) {
             RoundedRectangle(cornerRadius: 8).fill(Color(uiColor: UIColor(hex: palette.canvas)))
-            RoundedRectangle(cornerRadius: 4).fill(Color(uiColor: UIColor(hex: palette.surface))).frame(width: 22, height: 12).padding(5)
+            RoundedRectangle(cornerRadius: 4).fill(Color(uiColor: UIColor(hex: palette.surface))).frame(width: 34, height: 14).padding(7)
             Circle().fill(Color(uiColor: UIColor(hex: palette.accent))).frame(width: 7, height: 7).padding(3)
         }
-        .overlay {
+        .overlay(alignment: .trailing) {
+            // Auto: night on the left, day on the right.
             if theme == .system {
-                RoundedRectangle(cornerRadius: 8).fill(Color(uiColor: UIColor(hex: HMPalette.paper.canvas)))
-                    .mask(Rectangle().rotationEffect(.degrees(45)).offset(x: 20, y: 20))
+                GeometryReader { g in
+                    Color(uiColor: UIColor(hex: HMPalette.paper.canvas)).frame(width: g.size.width / 2)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
             }
         }
-        .frame(width: 40, height: 40)
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(HMDesign.separator, lineWidth: 1))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .frame(height: 64).frame(maxWidth: .infinity)
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(HMDesign.separator, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .accessibilityHidden(true)
     }
 }

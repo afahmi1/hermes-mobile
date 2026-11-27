@@ -430,11 +430,20 @@ final class ChatModel {
 
     private func transcriptWithReceipts() -> [ChatItem] {
         var rows = Self.transcript(stored)
+        // A receipt is the phone's note that Hermes took a queued or guiding message. Hermes's own transcript is the
+        // truth: once that message is in it (with its "Guided this reply" label), the receipt is a duplicate and goes.
+        // A receipt older than the loaded pages waits for its page, instead of piling up at the top with no replies.
+        let earliest = rows.compactMap(\.timestamp).min()
+        let delivered = Set(rows.filter { $0.kind == .user }.map { Self.receiptMatchKey($0.text) })
+        var settled: [UUID] = []
         for receipt in receipts.sorted(by: { $0.at < $1.at }) {
             let t = receipt.at.timeIntervalSince1970
+            if delivered.contains(Self.receiptMatchKey(receipt.text)) { settled.append(receipt.id); continue }
+            if hasOlder, let earliest, t < earliest { continue }
             let next = rows.firstIndex { ($0.timestamp ?? 0) > t } ?? rows.endIndex
             rows.insert(receipt.item, at: next)
         }
+        if !settled.isEmpty { forgetReceipts(settled) }
         rows += localNotes.filter { note in !rows.contains { $0.kind == note.kind && $0.text == note.text } }
         return rows
     }
@@ -1120,6 +1129,20 @@ final class ChatModel {
         update(item.id) { $0 = $0.refused(message) }
         Task { await persistOutgoing() }
         return false
+    }
+
+    /// Matching ignores spacing and case: Hermes trims what it stores, and steers arrive wrapped.
+    static func receiptMatchKey(_ text: String) -> String {
+        String(text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(200))
+    }
+
+    /// Drop receipts Hermes's transcript now shows, here and on disk.
+    private func forgetReceipts(_ ids: [UUID]) {
+        let gone = Set(ids)
+        receipts.removeAll { gone.contains($0.id) }
+        guard let key = receiptKey else { return }
+        let keep = receipts
+        Task { try? await InboxDisk.shared.replaceReceipts(keep, key: key) }
     }
 
     private func recordReceipt(_ receipt: ControlReceipt) async {

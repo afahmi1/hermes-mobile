@@ -52,6 +52,16 @@ struct HermesMobileApp: App {
                         NotificationCenter.default.post(name: .hermesForeground, object: nil)
                     }
                 }
+                #if DEBUG
+                .task {
+                    DesignReview.signInIfAsked(app)
+                    if let tab = UserDefaults.standard.string(forKey: "HMReviewTab").flatMap(Int.init) { selectedTab = tab }
+                    if let chat = UserDefaults.standard.string(forKey: "HMReviewChat") {
+                        try? await Task.sleep(for: .seconds(2))
+                        _ = app.open(URL(string: "prometheus://chat/" + chat)!)
+                    }
+                }
+                #endif
                 .onOpenURL { url in
                     if app.open(url) { selectedTab = 0 }
                 }
@@ -188,6 +198,9 @@ struct ConnectionBadge: View {
     var reloadDisabled = false
     /// Inside a chat: the popover offers Reload chat, so the chat needs no separate refresh button.
     var onReload: (() async -> Void)? = nil
+    /// The inbox's gateway pill: a status dot and the gateway's name. Its popover offers "Switch gateway".
+    var pill = false
+    var onSwitch: (() -> Void)? = nil
     @State private var detail = false
     @State private var reloading = false
     @Environment(AppModel.self) private var app
@@ -234,11 +247,16 @@ struct ConnectionBadge: View {
     var body: some View {
         Button { detail.toggle() } label: {
             HStack(spacing: HMDesign.micro) {
-                if compact {
+                if pill {
+                    Circle().fill(state.color).frame(width: 8, height: 8)
+                        .overlay { if reloading { ProgressView().controlSize(.mini) } }
+                    Text(hostName.isEmpty ? "Gateway" : hostName)
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
+                    Image(systemName: "chevron.down").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                } else if compact {
                     // A dot, not a badge: green says all is well without taking the title's room.
                     Circle().fill(state.color).frame(width: 10, height: 10)
                         .overlay(Circle().strokeBorder(.background, lineWidth: 1.5))
-                        .shadow(color: state.color.opacity(0.55), radius: 3)
                         .overlay { if reloading { ProgressView().controlSize(.mini) } }
                 } else {
                     Image(systemName: state.symbol).foregroundStyle(state.color)
@@ -287,6 +305,12 @@ struct ConnectionBadge: View {
                     }
                 }
                 HStack(spacing: 16) {
+                    if let onSwitch {
+                        Button {
+                            detail = false
+                            onSwitch()
+                        } label: { Label("Switch gateway", systemImage: "arrow.left.arrow.right") }
+                    }
                     if let onReload {
                         Button {
                             detail = false

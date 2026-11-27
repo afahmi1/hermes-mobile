@@ -54,6 +54,16 @@ struct ChatListView: View {
 
 
     enum Filter: String, CaseIterable, Identifiable {
+        /// The short chip label (the full name stays for accessibility and the guide).
+        var chip: String {
+            switch self {
+            case .chats: "Inbox"
+            case .desktop: "Apps"
+            case .telegram: "Telegram"
+            case .all: "Everything"
+            case .archived: "Archived"
+            }
+        }
         case chats = "Conversations", desktop = "Hermes apps", telegram = "Telegram", all = "Everything", archived = "Archived"
         var source: String? {
             switch self {
@@ -154,9 +164,9 @@ struct ChatListView: View {
         ToolbarItem(placement: .topBarLeading) {
             if selecting {
                 Button("Cancel") { endSelection() }.disabled(batchBusy)
-            } else {
-                Button("Select") { beginSelection() }.disabled(visibleSessions.isEmpty)
-                    .accessibilityLabel("Select chats")
+            } else if fixedProfile == nil {
+                // Where you are and how it's doing, in one place: status dot + gateway name.
+                ConnectionBadge(pill: true, onSwitch: { showGateways = true })
             }
         }
         ToolbarItem(placement: .topBarTrailing) {
@@ -165,6 +175,16 @@ struct ChatListView: View {
                     .disabled(batchBusy || visibleSessions.isEmpty)
                     .accessibilityLabel("Select all loaded chats")
             } else {
+                Menu {
+                    Button("Select chats", systemImage: "checkmark.circle") { beginSelection() }
+                        .disabled(visibleSessions.isEmpty)
+                    Button("About chat sources", systemImage: "info.circle") { showSourceGuide = true }
+                } label: { Image(systemName: "ellipsis") }
+                .accessibilityLabel("More")
+            }
+        }
+        if !selecting {
+            ToolbarItem(placement: .topBarTrailing) {
                 Button { startNew() } label: { Image(systemName: "square.and.pencil") }
                     .accessibilityLabel("New chat")
             }
@@ -216,36 +236,12 @@ struct ChatListView: View {
 
     @ViewBuilder private var content: some View {
         List {
-            Section {
-                // One quiet strip above the list: where you are, how it is doing, and what is shown.
-                VStack(alignment: .leading, spacing: HMDesign.micro) {
-                    let header = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout())
-                    header {
-                        if let url = API.shared.baseURL {
-                            Button { showGateways = true } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "server.rack").imageScale(.small)
-                                    Text(SavedGateways.displayName(url)).lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
-                                    Image(systemName: "chevron.up.chevron.down").font(.caption2.weight(.semibold))
-                                }
-                                .font(.subheadline.weight(.medium))
-                                .hmTouchTarget()
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(selecting || fixedProfile != nil)
-                            .accessibilityLabel("Choose gateway, current gateway " + SavedGateways.displayName(url))
-                        }
-                        if !typeSize.isAccessibilitySize { Spacer(minLength: 6) }
-                        ConnectionBadge().buttonStyle(.borderless)
-                    }
-                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 8))
-                    layout { filters }
-                    .disabled(selecting)
-                }
+            // One row of controls above the list: what's shown. Tap a chip; no menus to open first.
+            filters
+                .disabled(selecting)
                 .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-            }
-            .listSectionSpacing(.compact)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 6, trailing: 0))
             if let error, !(sessions.isEmpty && results == nil) {
                 // Cached or partial rows stay visible; say what failed and offer the existing refresh.
                 VStack(alignment: .leading, spacing: HMDesign.micro) {
@@ -262,7 +258,13 @@ struct ChatListView: View {
                 ForEach(results, id: \.key) { row($0) }
             } else {
                 ForEach(grouped, id: \.0) { section in
-                    Section(section.0) { ForEach(section.1, id: \.key) { row($0) } }
+                    // The day label is a slim row, not a section header: plain-list headers add a tall gap.
+                    Text(section.0).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 2, trailing: 16))
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(section.1, id: \.key) { row($0) }
                 }
                 if cursor != nil {
                     HStack { Spacer(); ProgressView().accessibilityLabel("Loading more chats"); Spacer() }
@@ -273,6 +275,8 @@ struct ChatListView: View {
             }
         }
         .listStyle(.plain)
+        .environment(\.defaultMinListHeaderHeight, 24)
+        .listSectionSpacing(.compact)
         .safeAreaInset(edge: .bottom, spacing: 0) { if selecting { selectionActions } }
         .overlay {
             if loading && sessions.isEmpty { ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius)) }
@@ -307,25 +311,39 @@ struct ChatListView: View {
         }
     }
 
-    @ViewBuilder private var filters: some View {
-        Menu {
-            Picker("Source", selection: $filter) {
-                ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
-            }
-            Divider()
-            Button("About chat sources", systemImage: "info.circle") { showSourceGuide = true }
-        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease").fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true) }
-        .buttonStyle(.borderless)
-        .accessibilityLabel("Source, " + filter.rawValue)
-        if fixedProfile == nil {
-            Menu {
-                Picker("Bot", selection: $selectedBot) {
-                    Text("All bots").tag(String?.none)
-                    ForEach(app.bots) { bot in Text(bot.name == bot.id ? bot.name : "\(bot.name) · \(bot.id)").tag(Optional(bot.id)) }
+    private var filters: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(Filter.allCases) { f in
+                    Button { withAnimation(.snappy(duration: 0.2)) { filter = f } } label: {
+                        Text(f.chip).font(.subheadline.weight(filter == f ? .semibold : .regular))
+                            .foregroundStyle(filter == f ? HMDesign.canvas : Color.primary)
+                            .padding(.horizontal, 12).frame(height: 32)
+                            .background(filter == f ? HMDesign.accent : HMDesign.panel, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(filter == f ? .isSelected : [])
                 }
-            } label: { filterLabel(selectedBot.map { app.botName($0) } ?? "All bots", symbol: "person.2") }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
+                if fixedProfile == nil, app.bots.count > 1 {
+                    Menu {
+                        Picker("Bot", selection: $selectedBot) {
+                            Text("All bots").tag(String?.none)
+                            ForEach(app.bots) { bot in Text(bot.name == bot.id ? bot.name : "\(bot.name) · \(bot.id)").tag(Optional(bot.id)) }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(selectedBot.map { app.botName($0) } ?? "All bots")
+                            Image(systemName: "chevron.down").font(.caption2.weight(.bold))
+                        }
+                        .font(.subheadline.weight(selectedBot == nil ? .regular : .semibold))
+                        .foregroundStyle(selectedBot == nil ? Color.primary : HMDesign.canvas)
+                        .padding(.horizontal, 12).frame(height: 32)
+                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accent, in: Capsule())
+                    }
+                    .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
+                }
+            }
+            .padding(.horizontal, 16)
         }
     }
 
@@ -357,19 +375,24 @@ struct ChatListView: View {
             .buttonStyle(.plain).disabled(batchBusy)
             .accessibilityAddTraits(selection.contains(s.key) ? .isSelected : [])
         } else {
-            HStack(spacing: 10) {
-                // Bot name is in the row's metadata, so give the text the width at accessibility sizes.
-                // The avatar isn't a button, so it needs no 44-pt touch frame: that padding was dead space.
-                if !typeSize.isAccessibilitySize {
-                    BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
-                        .accessibilityHidden(true)
+            // The whole row opens the chat. No disclosure chevron: every row opens, so it says nothing.
+            Button { navigation.wrappedValue.append(ChatRef(profile: s.profile, sessionId: s.id)) } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    // An avatar only tells you something when the list mixes bots. Five identical "H"s is noise.
+                    if mixedBots && !typeSize.isAccessibilitySize {
+                        BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32)
+                            .padding(.top, 2)
+                            .accessibilityHidden(true)
+                    }
+                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, showBot: mixedBots,
+                               hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
-                NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
-                    SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
-                }
+                .contentShape(Rectangle())
             }
-            // Edge to edge: rows use the screen's width, not an inset card with margins on both sides.
-            .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+            .buttonStyle(RowPress())
+            .listRowBackground(Color.clear)
+            .listRowSeparatorTint(HMDesign.separator)
+            .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
             .swipeActions(edge: .trailing) {
                 Button {
                     requestArchive(s)
@@ -415,6 +438,8 @@ struct ChatListView: View {
     }
 
     private var visibleSessions: [SessionSummary] { results ?? sessions }
+    /// More than one bot in what's on screen: then avatars and bot names earn their space.
+    private var mixedBots: Bool { Set(visibleSessions.prefix(60).map(\.profile)).count > 1 }
 
     private func beginSelection() {
         selecting = true
@@ -728,6 +753,8 @@ struct SessionRow: View {
     let session: SessionSummary
     let botName: String
     var showAvatar = true
+    /// The bot's name in the meta line. Off when every row is the same bot.
+    var showBot = true
     var hasDraft = false
 
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -735,9 +762,12 @@ struct SessionRow: View {
     private var large: Bool { typeSize.isAccessibilitySize }
 
     private var metadata: [String] {
-        var parts = [botName]
-        if !session.sourceLabel.isEmpty { parts.append(session.sourceLabel) }
-        if let m = session.model, !m.isEmpty { parts.append(Self.shortModel(m)) }
+        var parts: [String] = []
+        if showBot { parts.append(botName) }
+        // "Mobile" on every row is noise in your own inbox; other sources (Telegram, desktop, cron) are worth a word.
+        if !session.sourceLabel.isEmpty, session.sourceLabel != "Mobile" { parts.append(session.sourceLabel) }
+        // The model's family and version is what differs between rows; the context size ("1M") doesn't.
+        if let m = session.model, !m.isEmpty { parts.append(ModelName.short(m).components(separatedBy: " · ").first ?? m) }
         return parts
     }
 
@@ -750,7 +780,7 @@ struct SessionRow: View {
                 head {
                     Text(session.displayTitle).font(HMDesign.rowTitle).lineLimit(large ? 4 : 2)
                     if !large { Spacer(minLength: HMDesign.micro) }
-                    Text(session.date, format: relative).font(HMDesign.metadata).foregroundStyle(.secondary)
+                    Text(session.date, format: relative).font(.system(.caption, design: .monospaced)).foregroundStyle(.tertiary)
                         .monospacedDigit().fixedSize(horizontal: true, vertical: false)
                 }
                 if hasDraft {
@@ -763,7 +793,7 @@ struct SessionRow: View {
                 }
                 // One wrapping line, so a long bot or model name never squeezes the title or the pin state.
                 Text(metadata.joined(separator: " · "))
-                    .font(HMDesign.metadata).foregroundStyle(.secondary)
+                    .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
                     .lineLimit(large ? 4 : 2).truncationMode(.middle)
                     .accessibilityLabel(metadata.joined(separator: ", "))
                 if session.pinned == true || session.pinnedMessages > 0 {
@@ -983,5 +1013,13 @@ struct RenameSheetModifier: ViewModifier {
                 if let i = results?.firstIndex(where: { $0.key == target.key }) { results?[i].title = title }
             }
         }
+    }
+}
+
+/// A list row that dims a touch when pressed, like Messages, instead of a gray selection slab.
+struct RowPress: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.opacity(configuration.isPressed ? 0.55 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
