@@ -72,6 +72,7 @@ from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 import bridge_pins  # pinned messages (own SQLite file, stdlib only)
 import bridge_uploads  # resumable uploads for big files (stdlib only)
+import bridge_titles  # title suggestions from Hermes's own generator
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
     TURNS_ERROR = None
@@ -1790,7 +1791,8 @@ class H(BaseHTTPRequestHandler):
                 features.append("file_attachments_v1")
             if turns:
                 features.append("queue_controls_v1")  # GET/POST /m/chat/<bot>/<chat>/queue
-                features.append("resumable_uploads_v1")  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
+                features.append("resumable_uploads_v1")
+                features.append("clarify_v1")  # Hermes's questions answered from the phone: POST /m/turns/<id>/clarify  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
             return self.send(200, {"protocol": 2, "features": features,
                                    "device_id": self.device_claims["did"], "manage_devices": self.owner_ok()})
         if path == "/m/devices" or path.startswith("/m/devices/"):
@@ -2370,7 +2372,7 @@ class H(BaseHTTPRequestHandler):
         try:
             if path == "/m/turns" and self.command == "GET":
                 return self.send(200, {"turns": turns.live_turns()})
-            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval|/queue|/queue-with-runtime|/steer)?$", path)
+            m = re.match(r"^/m/turns/(turn_[0-9a-f]{32})(/events|/stop|/approval|/clarify|/queue|/queue-with-runtime|/steer)?$", path)
             if m:
                 turn = turns.get_turn(m.group(1))
                 if turn is None and self.command == "GET":
@@ -2388,6 +2390,10 @@ class H(BaseHTTPRequestHandler):
                                                           body.get("attachments")))
                 if action == "/stop" and self.command == "POST":
                     turns.stop(turn)
+                    return self.send(200, {"ok": True})
+                if action == "/clarify" and self.command == "POST":
+                    d = self.json_body()
+                    turns.answer_clarify(turn, d.get("answer"), d.get("request_id"), d.get("execution_generation"))
                     return self.send(200, {"ok": True})
                 if action == "/approval" and self.command == "POST":
                     d = self.json_body()
@@ -2454,6 +2460,15 @@ class H(BaseHTTPRequestHandler):
                         offset = -1
                     return self.send(200, bridge_uploads.append(uploads_dir(), up.group(1), offset, self._body or b""))
                 return self.send(405, {"error": "method not allowed"})
+            titled = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/title-suggestion", path)
+            if titled and self.command == "POST":
+                pid, sid = titled.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                title = bridge_titles.suggest(profile_home(pid), session_bodies(pid, sid))
+                if not title:
+                    return self.send(503, {"error": "Couldn't come up with a title right now. Type one instead."})
+                return self.send(200, {"title": title})
             slash = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/slash", path)
             if slash and self.command == "POST":
                 pid, sid = slash.groups()

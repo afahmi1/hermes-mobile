@@ -147,7 +147,7 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     let source: String?
     var createdVia: String? = nil
     let model: String?
-    let title: String?
+    var title: String?
     let preview: String?
     let startedAt: Double?
     let lastActive: Double?
@@ -1112,4 +1112,14 @@ struct QueueState: Equatable {
     func row(_ admission: String) -> Row? { rows.first { $0.id == admission } }
     /// Still waiting its turn (not started, not finished).
     func isWaiting(_ admission: String) -> Bool { row(admission)?.status == "queued" }
+}
+
+/// A question Hermes asked mid-reply. Answered from the phone: tap a choice, or just reply.
+struct ClarifyRequest: Identifiable, Equatable {
+    let id: String
+    let runId: String
+    let generation: Int?
+    let question: String
+    let choices: [String]
+    let multiSelect: Bool
 }

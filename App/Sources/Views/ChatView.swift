@@ -488,6 +488,7 @@ struct ChatScreen: View {
                     chat.draft = "/" + name + " "
                 }
             }
+            if let q = chat.question { QuestionCard(chat: chat, question: q) }
             if chat.queue?.paused == true { QueuePausedBanner(chat: chat) }
             if !chat.outgoing.isEmpty { OutboxTray(chat: chat) }
             draftShelf
@@ -2478,5 +2479,55 @@ struct OutgoingEditor: View {
             .onAppear { text = item.edit ?? item.text }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+/// Hermes asked something mid-reply. Its choices are one tap; anything typed and sent is the answer too.
+struct QuestionCard: View {
+    @Bindable var chat: ChatModel
+    let question: ClarifyRequest
+    @State private var picked = Set<String>()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Hermes is asking", systemImage: "questionmark.bubble.fill")
+                .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
+            Text(question.question).font(.subheadline).textSelection(.enabled)
+            if !question.choices.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(question.choices, id: \.self) { choice in
+                            Button {
+                                if question.multiSelect {
+                                    if picked.contains(choice) { picked.remove(choice) } else { picked.insert(choice) }
+                                } else {
+                                    Task { _ = await chat.answerQuestion(choice) }
+                                }
+                            } label: {
+                                Text(choice).font(.subheadline).lineLimit(2)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .background(picked.contains(choice) ? HMDesign.accent.opacity(0.25) : HMDesign.panel,
+                                                in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(chat.answering)
+                        }
+                    }
+                }
+                if question.multiSelect {
+                    Button("Send \(picked.count) choice\(picked.count == 1 ? "" : "s")") {
+                        let answer = question.choices.filter(picked.contains).joined(separator: ", ")
+                        Task { _ = await chat.answerQuestion(answer) }
+                    }
+                    .buttonStyle(.borderedProminent).disabled(picked.isEmpty || chat.answering)
+                }
+            }
+            Text("Or type your answer below and send.").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 12)
+        .sensoryFeedback(.impact(weight: .light), trigger: question.id)
     }
 }

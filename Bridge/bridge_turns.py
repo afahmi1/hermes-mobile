@@ -334,6 +334,7 @@ class Turn:
         self.submission = None
         self.admission = None
         self.retired = False
+        self.clarify = {}  # pending clarify prompt id -> execution generation
         self.generation = None
         self.client = None
         self.steer_receipts = {}
@@ -707,6 +708,14 @@ async def _drive_connection(turn: Turn):
             if await _recover_gap(c, turn, snapshot):
                 return
             for prompt in snapshot.get("prompts") or []:
+                if (prompt.get("kind") == "clarify" and prompt.get("prompt_id") and turn.generation is not None
+                        and prompt.get("execution_generation") == turn.generation):
+                    turn.clarify[prompt["prompt_id"]] = turn.generation
+                    turn.push("clarify.request", request_id=prompt["prompt_id"], execution_generation=turn.generation,
+                              question=str(prompt.get("question") or "")[:2000],
+                              choices=[str(c)[:300] for c in (prompt.get("choices") or [])][:12],
+                              multi_select=bool(prompt.get("multi_select")))
+                    continue
                 if (prompt.get("kind") == "approval" and prompt.get("prompt_id") and turn.generation is not None
                         and prompt.get("execution_generation") == turn.generation):
                     pid = prompt["prompt_id"]
@@ -801,8 +810,18 @@ async def _drive_connection(turn: Turn):
                 turn.prompts.pop(pid, None)
                 turn.push("approval.resolved", request_id=pid)
             elif t == "clarify.request":
-                turn.push("notice", text="Hermes asked a question it needs answered in the desktop app: "
-                          + str(pl.get("question") or "")[:300])
+                # Answerable from the phone: the question with its choices, answered with clarify.respond.
+                pid, gen = pl.get("prompt_id"), pl.get("execution_generation", turn.generation)
+                if pid:
+                    turn.clarify[pid] = gen
+                    turn.push("clarify.request", request_id=pid, execution_generation=gen,
+                              question=str(pl.get("question") or "")[:2000],
+                              choices=[str(c)[:300] for c in (pl.get("choices") or [])][:12],
+                              multi_select=bool(pl.get("multi_select")))
+            elif t in ("clarify.settled", "clarify.responded", "clarify.resolved"):
+                pid = pl.get("prompt_id")
+                turn.clarify.pop(pid, None)
+                turn.push("clarify.resolved", request_id=pid)
             elif t == "session.usage":
                 _record_runtime(turn, pl.get("usage"))
             elif t == "session.replay_gap":
@@ -1060,6 +1079,32 @@ def stop(turn: Turn):
     return run(_interrupt(turn))
 
 
+async def _answer(turn, prompt_id, answer, generation):
+    async def go(c):
+        res = await _rpc(c, "clarify.respond", session_id=turn.canonical_sid, execution_generation=generation,
+                         prompt_id=prompt_id, answer=answer)
+        turn.clarify.pop(prompt_id, None)
+        turn.push("clarify.resolved", request_id=prompt_id, answer=answer[:500])
+        return res
+    if turn.client is not None:
+        return await go(turn.client)
+    async with connect(turn.home) as c:
+        await _resume(c, turn.canonical_sid)
+        return await go(c)
+
+
+def answer_clarify(turn: Turn, answer, prompt_id=None, generation=None):
+    """Answer Hermes's question. Without an id, answers the one it's waiting on."""
+    if not isinstance(answer, str):
+        raise TurnError("Type an answer.")
+    if not prompt_id:
+        if not turn.clarify:
+            raise TurnError("Hermes isn't waiting on a question.", 409)
+        prompt_id = next(reversed(turn.clarify))
+    gen = generation if generation is not None else turn.clarify.get(prompt_id, turn.generation)
+    return run(_answer(turn, prompt_id, answer.strip()[:4000], gen))
+
+
 def approve(turn: Turn, choice, prompt_id, generation=None):
     if not prompt_id:
         raise TurnError("Missing the approval's id.")
@@ -1193,8 +1238,13 @@ def reload_skills(home, profile):
 
 def follow_up(turn, mode, text, submission=None, choice=None, attachments=None):
     """Queue the next message or steer the running reply. Either may carry files: a queued message sends
-    images natively and files by path; a steer (text-only in Hermes) hands every file over by path."""
+    images natively and files by path; a steer (text-only in Hermes) hands every file over by path.
+    While Hermes is waiting on a question, a text reply is the answer: people just reply, like in any chat."""
     text = text.strip() if isinstance(text, str) else ""
+    if turn.clarify and text and not attachments:
+        answer_clarify(turn, text)
+        return {"status": "steer_accepted" if mode == "steer" else "queued", "turn_id": turn.id,
+                "attachments": 0, "answered": True, "admission_id": None}
     frames = _follow_up_frames(attachments)
     if mode not in ("queue", "steer") or (not text and not frames):
         raise TurnError("Enter a message or attach a file to queue or steer.")

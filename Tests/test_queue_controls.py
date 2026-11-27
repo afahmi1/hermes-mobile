@@ -163,5 +163,40 @@ class QueuedTurnSurvivesGatewayRestart(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class ClarifyFromPhone(unittest.TestCase):
+    def test_answer_goes_to_clarify_respond_with_the_generation(self):
+        t = turns.Turn("default", Path("/tmp"), "s1", "x", {})
+        t.canonical_sid, t.generation = "canon", 4
+        t.clarify["q1"] = 4
+        calls = []
+
+        class C:
+            async def rpc(self, method, **params):
+                calls.append((method, params))
+                return {"status": "resolved", "prompt_id": params["prompt_id"]}
+
+        t.client = C()
+        asyncio.run(turns._answer(t, "q1", "~/journal", 4))
+        self.assertEqual(calls, [("clarify.respond", {"session_id": "canon", "execution_generation": 4,
+                                                      "prompt_id": "q1", "answer": "~/journal"})])
+        self.assertEqual(t.clarify, {})
+        self.assertEqual(t._terminal, None) if hasattr(t, "_terminal") else None
+
+    def test_a_reply_while_hermes_waits_is_the_answer(self):
+        t = turns.Turn("default", Path("/tmp"), "s1", "x", {})
+        t.clarify["q1"] = 2
+        with patch.object(turns, "answer_clarify") as answer:
+            out = turns.follow_up(t, "steer", "  put it in Obsidian  ", "0" * 32)
+        answer.assert_called_once_with(t, "put it in Obsidian")
+        self.assertTrue(out["answered"])
+        self.assertEqual(out["status"], "steer_accepted")
+
+    def test_no_question_pending_is_a_plain_409(self):
+        t = turns.Turn("default", Path("/tmp"), "s1", "x", {})
+        with self.assertRaises(turns.TurnError) as ctx:
+            turns.answer_clarify(t, "hi")
+        self.assertEqual(ctx.exception.code, 409)
+
+
 if __name__ == "__main__":
     unittest.main()

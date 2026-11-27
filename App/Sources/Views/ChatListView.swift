@@ -30,6 +30,7 @@ struct ChatListView: View {
     @State private var showSourceGuide = false
     @State private var draftScopes = Set<String>()
     /// Archiving chats that hold pinned messages asks twice: a dialog naming the pins, then an alert.
+    @State private var renaming: SessionSummary?
     @State private var pinGuard: PinGuard?
     @State private var pinGuardConfirm: PinGuard?
 
@@ -85,6 +86,7 @@ struct ChatListView: View {
         NavigationStack(path: navigation) {
             inboxNavigation
                 .safeAreaInset(edge: .bottom) { QueuedActionsBar() }
+                .modifier(RenameSheetModifier(renaming: $renaming, sessions: $sessions, results: $results))
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
                 .sheet(isPresented: $showNew) {
@@ -393,6 +395,7 @@ struct ChatListView: View {
                 } label: {
                     Label("Select", systemImage: "checkmark.circle")
                 }
+                Button { renaming = s } label: { Label("Rename", systemImage: "pencil") }
                 Button {
                     UIPasteboard.general.string = s.displayTitle
                 } label: {
@@ -890,6 +893,87 @@ struct QueuedActionsBar: View {
             }
             .padding(.bottom, 6)
             .accessibilityHint("Shows changes saved on this phone. They apply when your Mac is reachable.")
+        }
+    }
+}
+
+/// Rename a chat: type a name, or let Hermes suggest one from what the chat is about now.
+struct RenameChatSheet: View {
+    let session: SessionSummary
+    let renamed: (String) -> Void
+    @State private var title = ""
+    @State private var suggesting = false
+    @State private var saving = false
+    @State private var problem: String?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Chat name", text: $title, axis: .vertical).lineLimit(1...3)
+                    Button {
+                        Task { await suggest() }
+                    } label: {
+                        HStack {
+                            Label(suggesting ? "Thinking of a name…" : "Suggest a name", systemImage: "sparkles")
+                            if suggesting { Spacer(); ProgressView() }
+                        }
+                    }
+                    .disabled(suggesting)
+                } footer: {
+                    Text(problem ?? "Suggestions come from Hermes's quick helper model and read what this chat is about now, not just how it started. Tap again for another.")
+                        .foregroundStyle(problem == nil ? Color.secondary : HMDesign.warning)
+                }
+            }
+            .hmCanvas()
+            .navigationTitle("Rename chat")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saving ? "Saving…" : "Save") { Task { await save() } }
+                        .disabled(saving || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onAppear { title = session.displayTitle }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func suggest() async {
+        suggesting = true
+        problem = nil
+        defer { suggesting = false }
+        do { title = try await API.shared.suggestTitle(profile: session.profile, session: session.id) }
+        catch { problem = error.localizedDescription }
+    }
+
+    private func save() async {
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        saving = true
+        defer { saving = false }
+        do {
+            try await API.shared.updateSession(profile: session.profile, session: session.id, fields: ["title": name])
+            renamed(name)
+            dismiss()
+        } catch {
+            problem = ActionQueue.isOffline(error) ? "Your Mac isn't reachable. Try again when it is." : error.localizedDescription
+        }
+    }
+}
+
+struct RenameSheetModifier: ViewModifier {
+    @Binding var renaming: SessionSummary?
+    @Binding var sessions: [SessionSummary]
+    @Binding var results: [SessionSummary]?
+
+    func body(content: Content) -> some View {
+        content.sheet(item: $renaming) { target in
+            RenameChatSheet(session: target) { title in
+                if let i = sessions.firstIndex(where: { $0.key == target.key }) { sessions[i].title = title }
+                if let i = results?.firstIndex(where: { $0.key == target.key }) { results?[i].title = title }
+            }
         }
     }
 }

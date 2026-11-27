@@ -923,10 +923,41 @@ final class ChatModel {
         await enqueue(raw, mode: "queue", attachments: attachments)
     }
 
+    // MARK: Hermes's questions
+
+    /// A question Hermes is waiting on. While it's up, a sent message is the answer.
+    var question: ClarifyRequest?
+    @ObservationIgnored private var answeredQuestions = Set<String>()
+    private(set) var answering = false
+
+    /// Answer the open question. Shows the answer as your own message, like any reply.
+    func answerQuestion(_ raw: String) async -> Bool {
+        let answer = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let q = question, !answer.isEmpty, !answering else { return false }
+        answering = true
+        defer { answering = false }
+        do {
+            try await api.answerQuestion(run: q.runId.isEmpty ? (runId ?? "") : q.runId, requestId: q.id,
+                                         answer: answer, generation: q.generation)
+            answeredQuestions.insert(q.id)
+            if question?.id == q.id { question = nil }
+            var bubble = ChatItem(id: "answer-\(q.id)", kind: .user, text: answer)
+            bubble.contextNote = "Answered: " + String(q.question.prefix(80))
+            if !items.contains(where: { $0.id == bubble.id }) { items.append(bubble) }
+            status = "Working…"
+            return true
+        } catch {
+            self.error = "Couldn't send your answer: " + error.localizedDescription
+            return false
+        }
+    }
+
     /// Queue (Send next) or steer (Guide this reply). Returns true once it is safely on disk.
     func enqueue(_ raw: String, mode: String, attachments: [SendAttachment]) async -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return false }
+        // Hermes is waiting on a question: what you send is the answer, as in any conversation.
+        if question != nil, attachments.isEmpty, !text.isEmpty { return await answerQuestion(text) }
         var pick = mode == "queue" && picked ? choice : RuntimeChoice.botDefault
         if pick.model == nil, pick.effort != nil, let bot = app?.bot(profile) { pick.model = bot.model; pick.provider = bot.provider }
         let item = Outgoing(id: UUID(), mode: mode, text: text, attachments: attachments.isEmpty ? nil : attachments,
@@ -1498,6 +1529,20 @@ final class ChatModel {
             if streamingIndex == nil { status = "Thinking…" }
         case "notice":
             items.append(ChatItem(id: "n-\(UUID().uuidString)", kind: .notice, text: ev.string("text") ?? ""))
+        case "clarify.request":
+            guard let id = ev.string("request_id"), question?.id != id, !answeredQuestions.contains(id) else { break }
+            question = ClarifyRequest(id: id, runId: runId ?? "", generation: ev.raw["execution_generation"] as? Int,
+                                      question: ev.string("question") ?? "Hermes has a question.",
+                                      choices: (ev.raw["choices"] as? [String]) ?? [],
+                                      multiSelect: ev.raw["multi_select"] as? Bool ?? false)
+            status = "Waiting for your answer"
+            notify(.approval, detail: Headline.of(ev.string("question") ?? ""))
+        case "clarify.resolved":
+            if let id = ev.string("request_id"), question?.id == id {
+                answeredQuestions.insert(id)
+                question = nil
+                if status == "Waiting for your answer" { status = "Working…" }
+            }
         case "approval.request":
             let id = ev.string("request_id") ?? UUID().uuidString
             guard !resolvedApprovals.contains(id), approval?.id != id, !waitingApprovals.contains(where: { $0.id == id }) else { break }
@@ -1570,6 +1615,7 @@ final class ChatModel {
             } catch { self.error = "Could not clear this phone’s receipt. The same submission is safe to check again." }
         }
         confirmedPrimary = false
+        question = nil
         closeStreamingBubble()
         isRunning = false
         status = nil

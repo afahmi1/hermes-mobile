@@ -815,6 +815,20 @@ final class API: @unchecked Sendable {
         _ = try await json("/m/turns/\(Self.esc(run))/stop", method: "POST", body: [:])
     }
 
+    /// A title for this chat from what it's about now (Hermes's own generator on its cheap helper model).
+    func suggestTitle(profile: String, session: String) async throws -> String {
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/title-suggestion", method: "POST", body: [:])
+        guard let title = obj["title"] as? String, !title.isEmpty else { throw APIError.badResponse }
+        return title
+    }
+
+    /// Answer a question Hermes asked mid-reply (its clarify tool), the way the desktop does.
+    func answerQuestion(run: String, requestId: String, answer: String, generation: Int?) async throws {
+        var body: [String: Any] = ["request_id": requestId, "answer": answer]
+        if let generation { body["execution_generation"] = generation }
+        _ = try await json("/m/turns/\(Self.esc(run))/clarify", method: "POST", body: body)
+    }
+
     func approve(profile: String, run: String, choice: String, requestId: String?, generation: Int?) async throws {
         var body: [String: Any] = ["choice": choice]
         if let requestId { body["request_id"] = requestId }
