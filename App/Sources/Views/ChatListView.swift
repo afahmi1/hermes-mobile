@@ -773,7 +773,14 @@ struct SessionRow: View {
         if !session.sourceLabel.isEmpty, session.sourceLabel != "Mobile" { parts.append(session.sourceLabel) }
         // The model's family and version is what differs between rows; the context size ("1M") doesn't.
         if let m = session.model, !m.isEmpty { parts.append(ModelName.short(m).components(separatedBy: " · ").first ?? m) }
+        if let cost = session.cost?.rowLabel { parts.append(cost) }
         return parts
+    }
+
+    private var spokenMetadata: String {
+        var parts = metadata
+        if session.cost?.rowLabel != nil, let spoken = session.cost?.spokenLabel { parts[parts.count - 1] = spoken }
+        return parts.joined(separator: ", ")
     }
 
     var body: some View {
@@ -800,7 +807,7 @@ struct SessionRow: View {
                 Text(metadata.joined(separator: " · "))
                     .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2)
                     .lineLimit(large ? 4 : 2).truncationMode(.middle)
-                    .accessibilityLabel(metadata.joined(separator: ", "))
+                    .accessibilityLabel(spokenMetadata)
                 if session.pinned == true || session.pinnedMessages > 0 {
                     let pins = large ? AnyLayout(VStackLayout(alignment: .leading, spacing: HMDesign.micro)) : AnyLayout(HStackLayout(spacing: HMDesign.small))
                     pins {

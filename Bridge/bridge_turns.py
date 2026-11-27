@@ -1261,7 +1261,10 @@ _QUEUE_REFUSALS = {
     "admission_started": (409, "Hermes already started that message, so it can't be changed now."),
     "not_found": (404, "That message is no longer in the queue."),
     "queue_full": (409, "The queue for this chat is full. Wait for a reply to finish."),
-    "unsupported_control": (409, "Hermes on your Mac is too old to change queued messages. Update Hermes."),
+    # Hermes serves edit and guide only for text-only queued messages in an interactive chat. It is a
+    # per-message refusal, not a version check: a message with files can only be removed.
+    "unsupported_control": (409, "Hermes can't edit or guide this message: only text-only messages in a live chat "
+                                 "can be. It runs as sent. Remove it to change it."),
     "session_idle": (409, "Hermes isn't replying right now, so there's nothing to guide. It will run as the next message."),
     "steer_unavailable": (409, "Hermes can't take guidance right now. It stays queued."),
     "stale_generation": (409, "That changed on your Mac a moment ago. Refresh and try again."),

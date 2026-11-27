@@ -77,6 +77,27 @@ def push_check(env=None, service=None) -> tuple[str, str, str]:
     return OK, "Push notifications are configured (key file present, topic %s)." % topic, ""
 
 
+def gateway_check(found: bool, port: int, probe=None) -> tuple[str, str, str]:
+    """(status, detail, fix) for the gateway. A process is not a service: a gateway that was found but
+    doesn't answer /health is still starting (Hermes connects every bot's MCP servers before it listens,
+    which can take minutes) or is stuck, and either way the phone gets 502s. *probe* is injectable for tests."""
+    start = "Start it: hermes gateway run   (or the Hermes desktop app)"
+    if not found:
+        return FAIL, "No running Hermes gateway found.", start
+    if probe is None:
+        def probe(p):
+            with urllib.request.urlopen("http://127.0.0.1:%d/health" % p, timeout=4) as resp:
+                return resp.status == 200
+    try:
+        answers = bool(probe(port))
+    except Exception:
+        answers = False
+    if answers:
+        return OK, "The Hermes gateway is running and answers on 127.0.0.1:%d." % port, ""
+    return (FAIL, "The Hermes gateway process is there but doesn't answer on 127.0.0.1:%d." % port,
+            "It may still be starting: wait a few minutes and run this again. If it stays down: hermes gateway restart")
+
+
 def _tailscale():
     for cand in (shutil.which("tailscale"), "/usr/local/bin/tailscale",
                  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
@@ -138,9 +159,7 @@ def run(hermes_home: Path, port: int, profiles, profile_home) -> list[dict]:
     try:
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
         endpoint = discover_gateway_endpoint(hermes_home)
-        _check(r, "gateway", OK if endpoint else FAIL,
-               "The Hermes gateway is running." if endpoint else "No running Hermes gateway found.",
-               "" if endpoint else "Start it: hermes gateway run   (or the Hermes desktop app)")
+        _check(r, "gateway", *gateway_check(bool(endpoint), int(os.environ.get("HERMES_API_PORT", "8642"))))
     except Exception as exc:
         _check(r, "gateway", FAIL, "No running Hermes gateway found (%s)." % type(exc).__name__,
                "Start it: hermes gateway run   (or the Hermes desktop app)")

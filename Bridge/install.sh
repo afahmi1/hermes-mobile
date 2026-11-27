@@ -202,7 +202,21 @@ sys.exit(0 if a == b else 1)' "$PLIST" "$NEW_PLIST" 2>/dev/null; then
     echo "Service definition new or changed: installing it with bootout and bootstrap."
     cp "$NEW_PLIST" "$PLIST"
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    # bootout returns before launchd has finished unloading the job, and a bootstrap that lands in that
+    # window fails with "Bootstrap failed: 5: Input/output error", leaving the bridge down with no service
+    # loaded. Wait for the job to be gone, then retry the bootstrap a few times.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    _booted=0
+    for _try in 1 2 3 4 5; do
+      if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then _booted=1; break; fi
+      sleep 1
+    done
+    if [[ "$_booted" != 1 ]]; then
+      launchctl bootstrap "gui/$(id -u)" "$PLIST"  # last try, with launchd's own error shown
+    fi
   fi
 fi
 sleep 2
