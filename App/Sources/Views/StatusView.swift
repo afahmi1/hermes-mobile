@@ -5,7 +5,7 @@ import SwiftUI
 struct StatusView: View {
     @Environment(AppModel.self) private var app
     @State private var path = NavigationPath()
-    @State private var jobFilter: JobFilter = .active
+    @State private var jobFilter: JobFilter = .all
     @State private var showAllJobs = false
     @State private var expanded: Set<String> = []
     @State private var gatewayOpen: Bool?
@@ -53,7 +53,8 @@ struct StatusView: View {
                 // `-HMStatusScrollJobs YES` scrolls the cron jobs section to the top for screenshots.
                 guard p != nil, UserDefaults.standard.bool(forKey: "HMStatusScrollJobs") else { return }
                 try? await Task.sleep(for: .seconds(1))
-                proxy.scrollTo("jobs", anchor: .top)
+                if UserDefaults.standard.bool(forKey: "HMStatusScrollEnd") { proxy.scrollTo("jobsEnd", anchor: .bottom) }
+                else { proxy.scrollTo("jobs", anchor: UnitPoint(x: 0.5, y: -0.1)) }
             }
             #endif
             .navigationTitle("Status")
@@ -152,9 +153,11 @@ struct StatusView: View {
     }
 
     /// One compact tile: tinted symbol, value, caption. A single accessibility element.
+    @ScaledMetric(relativeTo: .body) private var iconHeight: CGFloat = 20
+
     private func tile(_ caption: String, _ value: String, _ symbol: String, _ tint: Color, badge: Bool = false) -> some View {
         VStack(spacing: 2) {
-            Image(systemName: symbol).foregroundStyle(tint).imageScale(.medium).accessibilityHidden(true)
+            Image(systemName: symbol).foregroundStyle(tint).imageScale(.medium).frame(height: iconHeight).accessibilityHidden(true)
             HStack(spacing: 3) {
                 Text(value).font(.headline).monospacedDigit().lineLimit(1).minimumScaleFactor(0.6)
                 if badge { NewBadge() }
@@ -230,16 +233,12 @@ struct StatusView: View {
                         Image(systemName: ["removed": "minus.circle.fill", "renamed": "pencil.circle.fill"][e["type"].string ?? ""] ?? "plus.circle.fill")
                             .foregroundStyle(e["type"].string == "removed" ? Color.secondary : e["type"].string == "renamed" ? Color.blue : Color.green)
                             .accessibilityHidden(true)
-                        AdaptiveTitleRow {
-                            VStack(alignment: .leading, spacing: HMDesign.micro) {
-                                Text(e["name"].string ?? "Unnamed").font(HMDesign.rowTitle)
-                                Text([change, e["kind"].string?.capitalized, e["kind"].string == "bot" ? nil : app.botName(e["profile"].string ?? ""),
-                                      e["old_name"].string.map { "was \($0)" }]
-                                        .compactMap { $0 }.joined(separator: " · "))
-                                    .font(HMDesign.metadata).foregroundStyle(.secondary)
-                            }
-                        } trailing: {
-                            RelTime(date: e["at"].date).font(HMDesign.metadata).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: HMDesign.micro) {
+                            Text(e["name"].string ?? "Unnamed").font(HMDesign.rowTitle).lineLimit(1)
+                            (Text([change, e["kind"].string?.capitalized, e["kind"].string == "bot" ? nil : app.botName(e["profile"].string ?? ""),
+                                   e["old_name"].string.map { "was \($0)" }]
+                                .compactMap { $0 }.joined(separator: " · ") + " · ") + RelTime.text(e["at"].date))
+                                .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
                 }
@@ -284,7 +283,7 @@ struct StatusView: View {
             }
             if all.count > StatusJobs.defaultLimit {
                 Button {
-                    withAnimation(.snappy) { showAllJobs.toggle() }
+                    withAnimation(.snappy) { showAllJobs.toggle(); jobFilter = .all }
                 } label: {
                     HStack {
                         Text(showAllJobs ? "Show fewer" : "All jobs · \(all.count)")
@@ -297,9 +296,9 @@ struct StatusView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.tint)
                 .accessibilityHint(showAllJobs ? "Collapses the job list" : "Shows every cron job")
+                .id("jobsEnd")
             }
-        } header: { Text("Cron jobs · \(all.count)") }
-        .id("jobs")
+        } header: { Text("Cron jobs · \(all.filter { !$0["paused"].bool }.count) active").id("jobs") }
     }
 
     @ViewBuilder private func incidents(_ p: JV) -> some View {
@@ -330,10 +329,10 @@ struct StatusView: View {
             Section("Recent runs") {
                 capped("recent", rec, limit: 5) { r in
                     VStack(alignment: .leading, spacing: HMDesign.micro) {
-                        AdaptiveTitleRow {
+                        HStack(spacing: HMDesign.small) {
                             Text(r["name"].string ?? "Unnamed run").font(HMDesign.rowTitle).lineLimit(1)
-                        } trailing: {
-                            StatusPill(text: r["status"].string)
+                            Spacer(minLength: HMDesign.small)
+                            StatusMark(text: r["status"].string)
                         }
                         (Text(app.botName(r["profile"].string ?? "")) + Text(" · ") + RelTime.text(r["claimed_at"].date))
                             .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
@@ -378,16 +377,16 @@ struct StatusView: View {
 
     private func platformRow(_ pl: JV) -> some View {
         VStack(alignment: .leading, spacing: HMDesign.micro) {
-            AdaptiveTitleRow {
-                Text(pl["name"].string ?? "Platform")
-            } trailing: {
+            HStack(spacing: HMDesign.small) {
+                Text(pl["name"].string ?? "Platform").lineLimit(1)
+                Spacer(minLength: HMDesign.small)
                 HStack(spacing: HMDesign.micro) {
                     if pl["needs_attention"].bool {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange).imageScale(.small)
                             .accessibilityLabel("Needs attention")
                     }
-                    StatusPill(text: pl["state"].string)
+                    StatusMark(text: pl["state"].string)
                 }
             }
             if let err = pl["error"].string {
@@ -419,6 +418,17 @@ struct StatusView: View {
 }
 
 // MARK: - Rows
+
+/// Page-local: success states collapse to a small green check; everything else keeps the pill.
+struct StatusMark: View {
+    let text: String?
+    var body: some View {
+        if let t = text, ["ok", "completed", "delivered", "connected", "healthy"].contains(t) {
+            Image(systemName: "checkmark.circle.fill").imageScale(.small).foregroundStyle(HMDesign.success)
+                .accessibilityLabel(t)
+        } else { StatusPill(text: text) }
+    }
+}
 
 struct StatusPill: View {
     let text: String?
@@ -472,15 +482,11 @@ private struct AgentRow: View {
             Image(systemName: ["chat": "bubble.left.and.bubble.right.fill", "subagent": "person.2.fill",
                                "cron": "clock.fill", "phone": "iphone"][kind] ?? "bolt.fill")
                 .foregroundStyle(.tint).frame(width: 24).accessibilityHidden(true)
-            AdaptiveTitleRow {
-                VStack(alignment: .leading, spacing: HMDesign.micro) {
-                    Text(agent["title"].string ?? "Untitled").font(HMDesign.rowTitle).lineLimit(2)
-                    Text([botName, kind == "subagent" ? "subagent" : kind == "cron" ? "cron run" : kind == "phone" ? "from phone" : nil,
-                          agent["model"].string].compactMap { $0 }.joined(separator: " · "))
-                        .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
-                }
-            } trailing: {
-                RelTime(date: agent["started_at"].date).font(HMDesign.metadata).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: HMDesign.micro) {
+                Text(agent["title"].string ?? "Untitled").font(HMDesign.rowTitle).lineLimit(1)
+                (Text([botName, kind == "subagent" ? "subagent" : kind == "cron" ? "cron run" : kind == "phone" ? "from phone" : nil,
+                       agent["model"].string].compactMap { $0 }.joined(separator: " · ") + " · ") + RelTime.text(agent["started_at"].date))
+                    .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(1)
             }
         }
     }
@@ -494,13 +500,11 @@ private struct JobRow: View {
         let failing = StatusJobs.isFailing(job)
         let paused = job["paused"].bool
         VStack(alignment: .leading, spacing: HMDesign.micro) {
-            AdaptiveTitleRow {
-                HStack(spacing: HMDesign.small) {
-                    Text(job["name"].string ?? "Unnamed job").font(HMDesign.rowTitle).lineLimit(1)
-                    if job["new"].bool { NewBadge() }
-                }
-            } trailing: {
-                StatusPill(text: paused ? "paused" : job["last_status"].string)
+            HStack(spacing: HMDesign.small) {
+                Text(job["name"].string ?? "Unnamed job").font(HMDesign.rowTitle).lineLimit(1)
+                if job["new"].bool { NewBadge() }
+                Spacer(minLength: HMDesign.small)
+                StatusMark(text: paused ? "paused" : job["last_status"].string)
             }
             line2
                 .font(HMDesign.metadata).foregroundStyle(.secondary).lineLimit(2)
