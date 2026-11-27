@@ -12,9 +12,18 @@ struct Bot: Codable, Identifiable, Hashable {
     let reachable: Bool
     let front: Bool
     var skills: [String] = []
+    /// Newer bridges: what Hermes tries, in order, when this bot's model can't answer. Nil = not reported.
+    var fallbacks: [Fallback]? = nil
+
+    struct Fallback: Codable, Hashable {
+        let provider: String
+        let model: String
+        /// "plan" (a subscription covers it), "free" or "paid" (billed per call).
+        let kind: String
+    }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, blurb, model, provider, reachable, front, skills
+        case id, name, blurb, model, provider, reachable, front, skills, fallbacks
     }
 
     init(id: String, name: String, blurb: String, model: String, provider: String, reachable: Bool, front: Bool,
@@ -39,6 +48,7 @@ struct Bot: Codable, Identifiable, Hashable {
         reachable = try c.decode(Bool.self, forKey: .reachable)
         front = try c.decode(Bool.self, forKey: .front)
         skills = (try? c.decode([String].self, forKey: .skills)) ?? []
+        fallbacks = try? c.decodeIfPresent([Fallback].self, forKey: .fallbacks)
     }
 }
 
@@ -691,8 +701,11 @@ struct ServedRuntime: Codable, Hashable {
     let policy: Policy?
     let modelsUsed: [Used]?
     let cost: CostSummary?
+    /// Newer bridges: the model that wrote the last real reply, and when (epoch seconds).
+    var lastAnswer: LastAnswer? = nil
 
     struct Policy: Codable, Hashable { let model: String?; let provider: String?; let effort: String? }
+    struct LastAnswer: Codable, Hashable { let model: String; let provider: String?; let at: Double? }
     struct Used: Codable, Hashable {
         let model: String
         let provider: String?
@@ -708,6 +721,14 @@ struct ServedRuntime: Codable, Hashable {
     enum CodingKeys: String, CodingKey {
         case model, provider, policy, cost
         case reasoningTokens = "reasoning_tokens", fallbackActive = "fallback_active", modelsUsed = "models_used"
+        case lastAnswer = "last_answer"
+    }
+
+    /// The last reply came from a different model than the one picked (a fallback when a plan ran out, or
+    /// an older answer from before you switched). Nil when they match or there's nothing to compare.
+    func stand(in picked: String?) -> LastAnswer? {
+        guard let last = lastAnswer, let picked, !picked.isEmpty else { return nil }
+        return ModelName.same(last.model, picked) ? nil : last
     }
 
     /// The session's persisted setting as a picker choice (nil fields = not set on the session).
@@ -1124,6 +1145,17 @@ enum MarkdownBlock: Equatable {
 /// Model ids as people say them: "claude-opus-5-5[1m]" reads "Opus 5.5 · 1M", "deepseek-v4-pro" reads
 /// "DeepSeek V4 Pro", "accounts/fireworks/models/glm-5p1" reads "GLM 5.1". Display only; the id is kept everywhere else.
 enum ModelName {
+    /// Same model, ignoring provider prefixes and context tags: "x-ai/grok-4.7" = "grok-4.7", "claude-opus-5-5[1m]" = "claude-opus-5-5".
+    static func same(_ a: String, _ b: String) -> Bool {
+        func key(_ s: String) -> String {
+            var k = s.lowercased()
+            if let slash = k.lastIndex(of: "/") { k = String(k[k.index(after: slash)...]) }
+            if let br = k.firstIndex(of: "[") { k = String(k[..<br]) }
+            return k.replacingOccurrences(of: ".", with: "-").trimmingCharacters(in: .whitespaces)
+        }
+        return key(a) == key(b)
+    }
+
     private static let upper: Set<String> = ["gpt", "glm", "llm", "ai", "oss", "vl", "moe", "r1", "o1", "o3", "o4"]
     private static let brands: [String: String] = ["deepseek": "DeepSeek", "openai": "OpenAI", "xai": "xAI",
                                                    "qwen": "Qwen", "kimi": "Kimi", "minimax": "MiniMax", "grok": "Grok"]

@@ -38,8 +38,24 @@ struct RuntimeSheet: View {
         let paid = used.filter { $0.kind == "priced" && ($0.usd ?? 0) >= 0.0005 }
         let covered = used.filter { $0.kind == "included" }
         Section {
+            if let last = s.lastAnswer {
+                LabeledContent("Last reply") {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text([ModelName.short(last.model).components(separatedBy: " · ").first ?? last.model, Self.pname(last.provider)]
+                            .filter { !$0.isEmpty }.joined(separator: " · "))
+                            .foregroundStyle(s.stand(in: s.policy?.model) == nil ? HMDesign.ink : HMDesign.caution)
+                        if let at = last.at {
+                            Text(Date(timeIntervalSince1970: at), format: .relative(presentation: .named)).font(.caption2).foregroundStyle(HMDesign.text2)
+                        }
+                    }
+                }
+                if s.stand(in: s.policy?.model) != nil {
+                    Text("Your pick couldn't answer (often a plan limit), so Hermes used a fallback. The next reply tries your pick again.")
+                        .font(.caption).foregroundStyle(HMDesign.caution)
+                }
+            }
             if let pol = s.policy, let m = pol.model, !m.isEmpty {
-                LabeledContent("Answering") {
+                LabeledContent("Next reply") {
                     Text([ModelName.short(m).components(separatedBy: " · ").first ?? m, Self.pname(pol.provider),
                           pol.effort.flatMap { Effort(rawValue: $0)?.label } ?? "Default effort"]
                         .filter { !$0.isEmpty }.joined(separator: " · "))
@@ -60,6 +76,31 @@ struct RuntimeSheet: View {
             Text(s.cost?.unknown == true ? "Some steps ran on a model with no price on record, so they aren't counted."
                  : "From Hermes's usage records, including background helpers like summaries and image reading. The desktop app uses the same model setting.")
         }.hmRows()
+        if let chain = bot?.fallbacks {
+            Section {
+                if chain.isEmpty {
+                    Text("None. If the model can't answer, the reply fails, and you can retry when limits reset.")
+                        .font(.subheadline).foregroundStyle(HMDesign.text2)
+                }
+                ForEach(Array(chain.enumerated()), id: \.offset) { i, f in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("\(i + 1)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary).frame(width: 14)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ModelName.short(f.model).components(separatedBy: " · ").first ?? f.model)
+                            Text(Self.pname(f.provider)).font(.caption).foregroundStyle(HMDesign.text2)
+                        }
+                        Spacer()
+                        Text(f.kind == "plan" ? "Plan" : f.kind == "free" ? "Free" : "Paid per use")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(f.kind == "paid" ? HMDesign.caution : HMDesign.text2)
+                    }
+                }
+            } header: { HMHeader("If this can't answer") } footer: {
+                Text(chain.contains { $0.kind == "paid" }
+                     ? "A paid fallback is billed per use when your pick runs out. Change the order in Hermes on the Mac (fallback_providers)."
+                     : "Tried in order when your pick can't answer, like when a plan runs out. Change it in Hermes on the Mac (fallback_providers).")
+            }.hmRows()
+        }
         if !used.isEmpty {
             Section {
                 ForEach(used, id: \.self) { u in

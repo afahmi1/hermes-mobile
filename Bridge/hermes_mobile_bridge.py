@@ -192,6 +192,42 @@ def _model_default_read(cfg):
     return values.get("default") or values.get("model", ""), values.get("provider", "")
 
 
+# Providers that bill a subscription (a plan), not per call. Anything else with a price is pay-per-use.
+_PLAN_HINTS = ("oauth", "codex", "subscription", "copilot")
+
+
+def fallback_kind(provider, model):
+    """'plan' (a subscription covers it), 'free' (no charge) or 'paid' (billed per call)."""
+    p, m = (provider or "").lower(), (model or "").lower()
+    if m.endswith(":free") or m == "openrouter/free" or p in ("ollama", "lmstudio", "local", "llamacpp"):
+        return "free"
+    if any(h in p for h in _PLAN_HINTS):
+        return "plan"
+    return "paid"
+
+
+def fallback_chain(cfg):
+    """The profile's fallback_providers, in order, each tagged plan/free/paid. None when the key is absent."""
+    return _by_mtime("fallback_chain", cfg, lambda: _fallback_chain_read(cfg))
+
+
+def _fallback_chain_read(cfg):
+    try:
+        import yaml
+        config = yaml.safe_load(cfg.read_text()) or {}
+    except Exception:
+        return None
+    raw = config.get("fallback_providers") if isinstance(config, dict) else None
+    if raw is None:
+        return None
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict) and item.get("provider"):
+            prov, model = str(item.get("provider")), str(item.get("model") or "")
+            out.append({"provider": prov, "model": model, "kind": fallback_kind(prov, model)})
+    return out
+
+
 def fleet_meta():
     """Display names from the fleet list in the main SOUL.md, cached by mtime."""
     return _by_mtime("fleet_meta", HERMES / "SOUL.md", lambda: _fleet_meta_read())
@@ -257,6 +293,7 @@ def bots():
         out.append({"id": pid, "name": name, "blurb": blurb, "model": m or gmodel, "provider": pv or gprov,
                     "reachable": bool(key_for(pid)), "served": pid in served,
                     "front": pid == "default", "managed": False,
+                    "fallbacks": fallback_chain(HERMES / "config.yaml" if pid == "default" else profile_home(pid) / "config.yaml"),
                     "skills": transcript.skill_names(profile_home(pid))})
     return out
 
@@ -1207,6 +1244,16 @@ def session_runtime(pid, sid):
                 "ORDER BY MAX(last_seen) DESC LIMIT 8", (sid,))]
         except sqlite3.Error:
             d["models_used"] = []
+        # Who wrote the last real reply (not a background summary or title). When a plan runs out, Hermes falls
+        # back to another model; this is how the app can say so instead of showing the model you picked.
+        try:
+            r = con.execute(
+                "SELECT model, billing_provider AS provider, MAX(last_seen) AS at FROM session_model_usage "
+                "WHERE session_id=? AND coalesce(task, '')='' GROUP BY model, billing_provider "
+                "ORDER BY at DESC LIMIT 1", (sid,)).fetchone()
+            d["last_answer"] = dict(r) if r and r["model"] else None
+        except sqlite3.Error:
+            d["last_answer"] = None
     finally:
         con.close()
     try:

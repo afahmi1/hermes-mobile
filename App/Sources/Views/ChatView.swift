@@ -346,9 +346,9 @@ struct ChatScreen: View {
         VStack(spacing: 1) {
             Text(bot?.name ?? chat.profile).font(.headline).lineLimit(1)
             HStack(spacing: 3) {
-                if chat.served?.fallbackActive == true {
+                if chat.served?.fallbackActive == true || answeredByOther != nil {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.caution)
-                        .accessibilityLabel("Answered by a fallback model")
+                        .accessibilityLabel("The last reply came from a different model than the one picked")
                 }
                 Text(runtimeLabel).lineLimit(1)
                 Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).imageScale(.small).accessibilityHidden(true)
@@ -358,11 +358,20 @@ struct ChatScreen: View {
     }
 
     /// "Opus 5.5 · High". The provider and raw id live in the model sheet, one tap away.
+    private var answeredByOther: ServedRuntime.LastAnswer? {
+        chat.served?.stand(in: chat.choice.model ?? bot?.model)
+    }
+
     private var runtimeLabel: String {
         if chat.savingRuntime { return "Saving model…" }
         let c = chat.choice
         let who = ModelName.short(c.model ?? bot?.model ?? "Default model").components(separatedBy: " · ").first ?? ""
         if chat.isRunning, chat.runtimeNotice != nil { return "Next · " + who }
+        // A fallback (or an older answer) wrote the last reply: say both, so the header never claims a model
+        // that didn't answer. "Grok 4.7 answered · Opus 5.5 next".
+        if let other = answeredByOther {
+            return (ModelName.short(other.model).components(separatedBy: " · ").first ?? other.model) + " answered · " + who + " next"
+        }
         var parts = [who]
         if let effort = c.effort.flatMap({ Effort(rawValue: $0)?.label }) { parts.append(effort) }
         // What was actually charged, plus "+ plan" when a subscription covered the rest, so the label changes
