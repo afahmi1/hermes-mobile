@@ -24,7 +24,7 @@ struct ChatListView: View {
         })
     }
     @State private var showNew = false
-    @State private var whatsNew: WhatsNewRelease? = nil
+    @State private var showWhatsNew = false
     @State private var selecting = false
     @State private var selection = Set<String>()
     @State private var batchBusy = false
@@ -103,8 +103,9 @@ struct ChatListView: View {
                 .modifier(RenameSheetModifier(renaming: $renaming, sessions: $sessions, results: $results))
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
-                .sheet(item: $whatsNew) { w in WhatsNewSheet(release: w) }
-                .onAppear { if whatsNew == nil { whatsNew = WhatsNew.takeDue() } }
+                .sheet(isPresented: $showWhatsNew) { WhatsNewSheet() }
+                // Mark seen at presentation so returning to Chats can't reopen the same list.
+                .task { if !showWhatsNew, WhatsNew.takeDue() { showWhatsNew = true } }
                 .sheet(isPresented: $showNew) {
                     NewChatSheet { bot in
                         showNew = false

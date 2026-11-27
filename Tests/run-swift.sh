@@ -8,8 +8,7 @@ out=$(mktemp -d "${TMPDIR:-/tmp}/hermes-swift-suites.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 export CFFIXED_USER_HOME="$out/test-home"
 mkdir -p "$CFFIXED_USER_HOME"
-lib=(App/Sources/{API,AppModel,InboxCache,ChatModel,Management,ManagementAPI,Models,Projects,StatusModel,RecentModels,StreamRecovery,Workspaces,MediaStaging,ReplyNotifier}.swift)
-lib+=(App/Sources/Views/WhatsNew.swift)
+lib=(App/Sources/{API,AppModel,InboxCache,ChatModel,Management,ManagementAPI,Models,Projects,StatusModel,RecentModels,StreamRecovery,Workspaces,MediaStaging,ReplyNotifier,Changelog}.swift)
 for source in Tests/*Tests.swift; do
   suite=$(basename "$source" Tests.swift)
   [[ "$suite" == MediaImport ]] && continue

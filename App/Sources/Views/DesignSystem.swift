@@ -1112,20 +1112,20 @@ struct HMSendGlyph: View {
 
 // MARK: - Thinking orb
 
-/// A small living orb for "Hermes is thinking": the accent turning through an angular gradient with Classic's
-/// success green, a drifting highlight, a slow breath and a soft glow. One style in both themes: in Thermocline
-/// `HMDesign.accent` is the chosen accent's tint and `HMDesign.success` Gouldian green. Still under Reduce Motion.
+/// The original colorful orb: a blurred spinning gradient with a moving highlight, slow breath and soft glow.
+/// It uses Classic colors in every theme and respects Reduce Motion.
 struct ThinkingOrb: View {
     var size: CGFloat = 18
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let accent = HMThemeSpec.classic.accent, success = HMThemeSpec.classic.success
         TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             ZStack {
                 Circle()
-                    .fill(AngularGradient(colors: [HMDesign.accent, HMDesign.accent.opacity(0.35), HMDesign.success.opacity(0.7),
-                                                   HMDesign.accent], center: .center, angle: .degrees(t * 90)))
+                    .fill(AngularGradient(colors: [accent, accent.opacity(0.35), success.opacity(0.7), accent],
+                                          center: .center, angle: .degrees(t * 90)))
                     .blur(radius: size * 0.12)
                 Circle()
                     .fill(RadialGradient(colors: [.white.opacity(0.55), .clear],
@@ -1134,7 +1134,7 @@ struct ThinkingOrb: View {
             }
             .frame(width: size, height: size)
             .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
-            .shadow(color: HMDesign.accent.opacity(0.45), radius: size * 0.35)
+            .shadow(color: accent.opacity(0.45), radius: size * 0.35)
         }
         .accessibilityHidden(true)
     }
@@ -1153,7 +1153,7 @@ enum ThinkingStyle: String, CaseIterable, Identifiable {
         case .matrix: "Dot matrix"
         case .sprite: "Pixel flame"
         case .braille: "Terminal"
-        case .orb: "Orb"
+        case .orb: "Color orb"
         }
     }
 }
