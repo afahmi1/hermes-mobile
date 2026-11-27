@@ -579,7 +579,7 @@ struct ChatScreen: View {
                         }
                             .overlay(alignment: .bottomTrailing) {
                                 Image(systemName: "clock.fill").font(.system(size: 11, weight: .bold))
-                                    .foregroundStyle(.white, HMDesign.accent)
+                                    .foregroundStyle(HMTheme.isThermocline ? HMDesign.bubbleText : .white, HMDesign.accentFill)
                                     .background(Circle().fill(HMDesign.canvas).padding(-1))
                                     .offset(x: 2, y: 2)
                             }
@@ -1405,7 +1405,7 @@ struct MessageRow: View {
                                 Text(replySplit.quote == nil ? userText : replySplit.body)
                                     .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
                                     .foregroundStyle(HMDesign.bubbleText)
-                                    .background(HMDesign.bubbleFill, in: bubbleShape)
+                                    .hmBubble(bubbleShape)
                                     .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
                                                                       lineWidth: highlighted ? 2 : 0))
                             }
@@ -1514,7 +1514,7 @@ struct MessageRow: View {
                         Text(item.text).textSelection(.enabled)
                             .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
                             .foregroundStyle(HMDesign.bubbleText)
-                            .background(HMDesign.bubbleFill, in: bubbleShape)
+                            .hmBubble(bubbleShape)
                     }
                     // Where the message is: hollow while waiting, filled once Hermes has read it.
                     let stage = item.annotation ?? "sent"
@@ -1880,7 +1880,7 @@ struct PinnedBar: View {
                     VStack(alignment: .leading, spacing: 1) {
                         if HMTheme.isThermocline {
                             Text(pins.count == 1 ? "Pinned" : "Pinned · \(cursor + 1) of \(pins.count)")
-                                .hmLabel(Thermocline.lead)
+                                .hmLabel(HMDesign.accent)
                         } else {
                             Text(pins.count == 1 ? "Pinned message" : "Pinned message \(cursor + 1) of \(pins.count)")
                                 .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
@@ -2719,7 +2719,7 @@ struct QuestionPanel: View {
                          ? "Submit \(answers.count) of \(chat.questions.count)" : "Submit")
                         .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).frame(height: 44)
                 }
-                .buttonStyle(.borderedProminent)
+                .hmSystemProminent()
                 .disabled(answers.isEmpty || chat.answering)
             }
         }
@@ -3008,7 +3008,7 @@ struct FailedTurnCard: View {
                     Button { act { await chat.retryNow(itemID) } } label: {
                         Label("Try again", systemImage: "arrow.clockwise").font(.footnote.weight(.semibold))
                     }
-                    .buttonStyle(.borderedProminent).tint(HMDesign.accent)
+                    .hmSystemProminent()
                     Menu {
                         if let r = reset {
                             Button("When \(r.label) resets · \(r.date.formatted(date: .omitted, time: .shortened))") {

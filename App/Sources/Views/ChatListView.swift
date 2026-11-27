@@ -338,7 +338,7 @@ struct ChatListView: View {
                         Text(f.chip).font(.subheadline.weight(filter == f ? .semibold : .regular))
                             .foregroundStyle(filter == f ? (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas) : HMDesign.ink)
                             .padding(.horizontal, 12).frame(minHeight: 32)
-                            .background(filter == f ? HMDesign.accent : HMDesign.panel, in: Capsule())
+                            .background(filter == f ? HMDesign.accentFill : HMDesign.panel, in: Capsule())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(f.rawValue)
@@ -358,7 +358,7 @@ struct ChatListView: View {
                         .font(.subheadline.weight(selectedBot == nil ? .regular : .semibold))
                         .foregroundStyle(selectedBot == nil ? HMDesign.ink : (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas))
                         .padding(.horizontal, 12).frame(minHeight: 32)
-                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accent, in: Capsule())
+                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accentFill, in: Capsule())
                     }
                     .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
                 }
