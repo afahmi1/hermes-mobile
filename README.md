@@ -9,12 +9,12 @@ default, an effort level, or "All models". Or type `/model` to open the picker, 
 to switch, `/model reset` for the bot default, and `/effort <level>` to change effort. These commands are never sent to the
 agent. If a reply is running, the change applies to the next message.
 
-The **Projects** tab shows an optional, read-only [project catalog](docs/project-catalog.md) with links to bots and named relative file references.
+The **Projects** tab shows Hermes's own Projects, the ones you make in the desktop app's Projects view. A chat belongs to a project when it runs inside one of the project's folders (the innermost project wins), so each project lists its chats from the phone, the desktop and the CLI. **New chat in <folder>** starts a chat that works in the project's main folder; the Mac resolves the folder, the phone only names the project. These projects are read-only on the phone: rename them or change their folders on the desktop. An optional operator [project catalog](docs/project-catalog.md) can add more, with links to bots and named relative file references.
 
 Chats are built for lifting the useful part out of a reply. The full contract, including a style guide for agents writing to the phone, is in [docs/message-format.md](docs/message-format.md).
 - **Replies** run full width with real Markdown: headings, lists and checkboxes, quotes, GitHub-style callouts, tables, and code blocks with a file or language label, Wrap and Copy. Tapping `inline code` copies it. Long-press any message for Copy, Copy as Markdown, Select Text, Copy Code, Reply with Quote, Edit as New Message, Pin and Share.
 - **Files** a reply hands over with `MEDIA:/path` open in Quick Look (documents, code, audio, video, 3D and AR). Credentials and Hermes config are never served.
-- **Background work** shows as readable cards ("build.py --mesh in plate B", "2 subagent tasks finished · 1 failed"), with the exact command and output a tap away.
+- **Background work** shows as readable cards ("build.py --mesh in plate B", "2 subagent tasks finished · 1 failed"), with the exact command and output a tap away. A finished subagent shows the tokens Hermes recorded for it ("34 calls · 3.7M tokens in · 25k out · 37m03s"). Its cost is left off, because a subscription route's rate-card estimate isn't a charge.
 - **Pinned messages** work like Telegram: a pinned bar, a list of every pin, and a chat with pins asks before it is archived.
 - **Send next and Guide never get lost.** They're saved on the phone before they're sent, and keep one ID across retries
   so a resend never duplicates. A tray above the composer shows where each one is. Tap to edit it while it waits in

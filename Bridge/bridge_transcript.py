@@ -152,6 +152,8 @@ _PROC_LINE = re.compile(r"^- (proc_\w+): exit_code=(-?\d+), reason=(\w+)\n(.*?)(
 # Early warning for one failed subagent while its siblings still run.
 _TASK_EARLY = re.compile(r"^\[ASYNC DELEGATION TASK (FAILED|COMPLETE)[^\]]*task (\d+)/(\d+)\]", re.M)
 _TASK_FIELD = re.compile(r"^(Task|Status|Duration|Error):\s*(.*)$", re.M)
+# The delegation a wall reports on. Hermes keeps each subagent's tokens under this id (async_delegations).
+_DELEGATION = re.compile(r"\b(deleg_[0-9a-f]{6,64})\b")
 _INTERPRETERS = {"python", "python3", "bash", "sh", "zsh", "node", "bun", "deno", "ruby", "perl", "uv", "uvx", "npx",
                  "pnpm", "npm", "yarn", "swift", "go", "cargo", "make", "xcodebuild", "git", "gh", "hermes", "docker"}
 _SKIP_PROGRAMS = {"cd", "mkdir", "export", "source", ".", "set", "sleep", "true", "echo", "cp", "mv", "rm", "env"}
@@ -259,7 +261,7 @@ def activity_details(body):
         items.append({"type": "task", "status": "failed" if failed else "ok", "state": status_word or None,
                       "label": _clip(fields.get("Task") or "Subagent task %s of %s" % (early.group(2), early.group(3)), 160),
                       "duration": _seconds(secs.group(1)) if secs else None, "api_calls": None, "model": None,
-                      "output": _clip(fields.get("Error") or "", 600)})
+                      "output": _clip(fields.get("Error") or "", 600), "index": int(early.group(2)) - 1})
     model = _MODEL.search(body)
     for icon, index, total, goal, status, calls, secs, result in _TASK_BLOCK.findall(body):
         failed = icon == "✗" or status in _FAILED
@@ -267,9 +269,14 @@ def activity_details(body):
                       "state": status, "label": _clip(goal, 160) or "Background task",
                       "duration": _seconds(secs), "api_calls": int(calls) if calls else None,
                       "model": model.group(1) if model else None,
-                      "output": "\n".join(line for line in result.strip().splitlines() if line.strip())[:1200]})
+                      "output": "\n".join(line for line in result.strip().splitlines() if line.strip())[:1200],
+                      "index": int(index) - 1})
     if not items:
         return None
+    delegation = _DELEGATION.search(body.split("\n", 1)[0]) or _DELEGATION.search(body[:2000])
+    for item in items:
+        if item["type"] == "task" and delegation:
+            item["delegation"] = delegation.group(1)
     failed = sum(1 for item in items if item["status"] == "failed")
     stopped = sum(1 for item in items if item["status"] == "stopped")
     procs = [i for i in items if i["type"] == "process"]

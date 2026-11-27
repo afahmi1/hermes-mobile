@@ -75,6 +75,9 @@ class Base(unittest.TestCase):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="catalog-"))).resolve()
         self.enterContext(patch.dict(os.environ))
         os.environ.pop(SETTING, None)
+        # The bridge may already be imported against the real ~/.hermes, whose projects.db would add
+        # Hermes's own Projects to the catalog. These tests are about the operator catalog alone.
+        self.enterContext(patch.object(bridge, "HERMES", self.tmp))
 
     def write(self, doc, name="cat.json", raw=None):
         p = self.tmp / name

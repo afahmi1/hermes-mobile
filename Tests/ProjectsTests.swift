@@ -153,6 +153,20 @@ func run() async {
     keep.reset()
     check(keep.state == .idle && keep.query.isEmpty, "reset")
 
+    // Hermes's own Projects: read-only, folder name and chat count, chats decoded in the row shape
+    let hermes = try! ProjectsSnapshot.decode(Data(#"{"schema_version":1,"configured":true,"roots":[],"projects":[{"id":"hermes-mobile","title":"Hermes Mobile","summary":null,"bot_ids":[],"sources":[],"related_files":[],"managed":false,"hermes":{"folder":"hermes-mobile","folders":2,"chats":1}}]}"#.utf8))
+    let hp = hermes.projects[0]
+    check(hp.hermes?.line == "hermes-mobile · 2 folders · 1 chat", "hermes line, got \(hp.hermes?.line ?? "nil")")
+    check(!hp.managed, "hermes projects are read-only")
+    check(snap.projects[0].hermes == nil, "catalog projects carry no hermes block")
+    let page = try! JSONDecoder().decode(HermesProjectChats.self, from: Data(#"{"data":[{"id":"s1","profile":"default","source":"cli","model":null,"title":"Fix login","preview":null,"started_at":1,"last_active":2,"message_count":4,"archived":false,"ended_at":null}],"can_start":true,"folder":"app"}"#.utf8))
+    check(page.data.map(\.id) == ["s1"] && page.canStart && page.folder == "app", "project chats decode")
+    let junk = try! JSONDecoder().decode(HermesProjectChats.self, from: Data(#"{"data":"nope"}"#.utf8))
+    check(junk.data.isEmpty && !junk.canStart, "a malformed page reads as no chats and no start")
+    let ref = ChatRef(profile: "default", sessionId: nil, startIn: "hermes-mobile")
+    check(ref.startIn == "hermes-mobile", "a new project chat remembers its project")
+    check(ChatRef(profile: "default", sessionId: "s1", startIn: "hermes-mobile").startIn == nil, "an existing chat never restarts in a folder")
+
     print("Projects decoding, failures, references, bot links, search and load-state tests passed")
 }
 
