@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_manage_http as base  # noqa: E402  (its setUpModule builds the synthetic HERMES_HOME and imports the bridge)
-from test_manage_http import PIN, WRONG  # noqa: E402
+from test_manage_http import PIN, WRONG, leaks  # noqa: E402
 
 
 def setUpModule():
@@ -124,8 +124,8 @@ class Build5Flow(base.Base):
         # --- nothing on disk under profiles/, no PIN anywhere in replies or logs ---
         self.assertEqual(self.profiles_snapshot(), snap)
         for raw in self.srv.bodies:
-            self.assertNotIn(PIN.encode(), raw)
-        self.assertNotIn(PIN, self.log.getvalue())
+            self.assertFalse(leaks(PIN, raw), raw)
+        self.assertFalse(leaks(PIN, self.log.getvalue()))
 
 
 if __name__ == "__main__":

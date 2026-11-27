@@ -48,6 +48,8 @@ struct ChatScreen: View {
     /// Which pin the bar shows; tapping the bar jumps to it, then moves to the next older pin (Telegram-style).
     @State private var pinCursor = 0
     @State private var highlighted: String?
+    /// On screen (not just alive under a pushed view): its notifications aren't shown over it.
+    @State private var onScreen = false
 
     private var bot: Bot? { app.bot(chat.profile) }
 
@@ -132,8 +134,16 @@ struct ChatScreen: View {
             .onAppear {
                 if followLatest { land(proxy) }
                 if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) }
+                onScreen = true
+                ReplyNotifier.shared.watch(chat.notificationDestination)
             }
-            .onDisappear { if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) } }
+            .onDisappear {
+                if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) }
+                onScreen = false
+                ReplyNotifier.shared.unwatch(chat.notificationDestination)
+            }
+            // A new chat gets its session with the first send: from then on its notifications are this screen's.
+            .onChange(of: chat.sessionId) { _, _ in if onScreen { ReplyNotifier.shared.watch(chat.notificationDestination) } }
             .task(id: chat.items.isEmpty) { if !chat.items.isEmpty, followLatest { land(proxy) } }
             // A long transcript arriving all at once can leave a lazy list parked below its content (a blank
             // screen until you scroll). Land on the newest message once the first page is in, then again after

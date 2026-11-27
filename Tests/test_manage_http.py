@@ -8,6 +8,7 @@ import importlib
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -23,6 +24,15 @@ BRIDGE_DIR = Path(__file__).resolve().parents[1] / "Bridge"
 sys.path.insert(0, str(BRIDGE_DIR))
 
 PIN, WRONG = "5807", "1111"
+
+
+def leaks(secret, data):
+    """Whether `data` holds the synthetic PIN as its own number or string. Inside a longer run of digits it is not
+    the PIN: a reply's `started_at` of 1795807507.14 (Nov 27 2026, 11:25 PST) contains 5807 too."""
+    pattern = r"(?<![0-9])%s(?![0-9])" % re.escape(secret)
+    return re.search(pattern.encode() if isinstance(data, bytes) else pattern, data) is not None
+
+
 CATALOG = {"schema_version": 1, "roots": [], "projects": [
     {"id": "alpha", "title": "Alpha", "bot_ids": []}, {"id": "beta", "title": "Beta", "bot_ids": []}]}
 ALLOW = {"alpha": ["bot-a"], "beta": ["bot-a"]}
@@ -561,14 +571,14 @@ class LeakTests(Base):
         self.srv.req("POST", "/m/manage/bots/bot-b/archive", {"pin": PIN})
         self.srv.req("POST", "/m/manage/projects/beta/archive", {"pin": "bad"})
         self.srv.req("GET", "/m/manage/archived")
-        self.assertNotIn(PIN, self.log.getvalue())
-        self.assertNotIn(WRONG, self.log.getvalue())
+        self.assertFalse(leaks(PIN, self.log.getvalue()))
+        self.assertFalse(leaks(WRONG, self.log.getvalue()))
         for body in self.srv.bodies:
-            self.assertNotIn(PIN.encode(), body)
-            self.assertNotIn(WRONG.encode(), body)
-        self.assertNotIn(PIN, (self.state / "owner" / "owner_pin.json").read_text())
+            self.assertFalse(leaks(PIN, body), body)
+            self.assertFalse(leaks(WRONG, body), body)
+        self.assertFalse(leaks(PIN, (self.state / "owner" / "owner_pin.json").read_text()))
         for p in (self.state / "manage").iterdir():
-            self.assertNotIn(PIN.encode(), p.read_bytes())
+            self.assertFalse(leaks(PIN, p.read_bytes()))
         self.assertEqual(stat.S_IMODE((self.state / "manage" / "manage.db").stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.state / "manage").stat().st_mode), 0o700)
         self.assertNotIn(PIN, repr(bo.OwnerError("pin_wrong", 403)))
@@ -600,6 +610,17 @@ class CliTests(unittest.TestCase):
         run("--rotate-owner-sessions")
         self.assertGreater(int((home / "mobile" / "owner" / "owner_epoch").read_text()), claims["iat"])
         self.assertEqual(stat.S_IMODE((home / "mobile" / "owner" / "owner_epoch").stat().st_mode), 0o600)
+
+
+class PinLeakCheck(unittest.TestCase):
+    def test_timestamps_are_not_the_pin_but_the_pin_is(self):
+        # The leak checks above failed whenever a timestamp's digits held 5807: all of 1795807000 to 1795807999
+        # (Nov 27 2026, 11:16 to 11:33 PST), and now and then in the fractional seconds.
+        self.assertFalse(leaks(PIN, b'{"started_at": 1795807507.1458619, "age": 0}'))
+        self.assertFalse(leaks(PIN, "2026-11-27 11:18:07 0.958072"))
+        self.assertTrue(leaks(PIN, b'{"pin": "5807"}'))
+        self.assertTrue(leaks(PIN, "set the deletion PIN to 5807."))
+        self.assertTrue(leaks(PIN, "pin=5807&confirm=5807"))
 
 
 if __name__ == "__main__":

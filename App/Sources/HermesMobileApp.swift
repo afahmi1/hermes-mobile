@@ -2,10 +2,11 @@ import SwiftUI
 
 private final class NotificationDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, willFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        #if DEBUG
-        if DemoMode.isOn { return true }
-        #endif
+        // Before launch finishes, so a tap that launched the app still reaches the delegate.
         ReplyNotifier.shared.install()
+        #if DEBUG
+        if DemoMode.isOn { return true }  // fixtures: banners and taps work, nothing registers with APNs
+        #endif
         ReplyNotifier.shared.registerIfAuthorized()
         return true
     }
@@ -95,8 +96,10 @@ struct HermesMobileApp: App {
             if now == .background {
                 backgroundedAt = Date()
                 // Ask iOS for a little time so a live reply or an unsent message can finish going out.
-                ReplyNotifier.shared.left(liveRuns: app.hasLiveRuns || app.hasUnsentMessages)
-                if app.hasLiveRuns { PushRegistration.shared.presence(away: true) }
+                let following = app.hasLiveRuns || app.hasUnsentMessages
+                ReplyNotifier.shared.left(liveRuns: following)
+                // Always tell the bridge: a stream a suspended app left open must not look like someone watching.
+                PushRegistration.shared.presence(away: true, following: following)
             }
             if now == .active {
                 ReplyNotifier.shared.returned()

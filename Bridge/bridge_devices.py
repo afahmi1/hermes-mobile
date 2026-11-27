@@ -22,8 +22,12 @@ class Devices:
                 CREATE TABLE IF NOT EXISTS pairing (digest BLOB PRIMARY KEY, expires INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS push_tokens (
                     device_id TEXT PRIMARY KEY, token TEXT NOT NULL, env TEXT NOT NULL,
-                    account TEXT NOT NULL, updated INTEGER NOT NULL);
+                    account TEXT NOT NULL, updated INTEGER NOT NULL, topic TEXT);
             """)
+            # Registries from before the app reported its bundle ID (the APNs topic) gain the column in place.
+            if "topic" not in {row[1] for row in db.execute("PRAGMA table_info(push_tokens)")}:
+                db.execute("ALTER TABLE push_tokens ADD COLUMN topic TEXT")
+                db.commit()
         if os.name == "posix":
             self.path.chmod(0o600)
 
@@ -84,12 +88,18 @@ class Devices:
             db.execute("DELETE FROM push_tokens WHERE device_id=?", (key,))
             return db.execute("UPDATE devices SET revoked=1 WHERE id=? AND revoked=0", (key,)).rowcount == 1
 
-    def set_push_token(self, key, token, env, account):
-        """One APNs token per device grant. A token that moved to another grant leaves the old one."""
+    def set_push_token(self, key, token, env, account, topic=None):
+        """One APNs token per device grant. A token that moved to another grant leaves the old one. `topic` is the
+        app's own bundle ID as the phone reports it (None from builds that predate it: the bridge's setting applies)."""
         with closing(self.connect()) as db, db:
             db.execute("DELETE FROM push_tokens WHERE token=? AND device_id!=?", (token, key))
-            db.execute("INSERT OR REPLACE INTO push_tokens(device_id,token,env,account,updated) VALUES(?,?,?,?,?)",
-                       (key, token, env, account, int(time.time())))
+            db.execute("INSERT OR REPLACE INTO push_tokens(device_id,token,env,account,updated,topic) VALUES(?,?,?,?,?,?)",
+                       (key, token, env, account, int(time.time()), topic))
+
+    def set_push_env(self, token, env):
+        """APNs accepted this token only in the other environment: remember the one that works."""
+        with closing(self.connect()) as db, db:
+            db.execute("UPDATE push_tokens SET env=? WHERE token=?", (env, token))
 
     def clear_push_token(self, key):
         with closing(self.connect()) as db, db:
@@ -106,7 +116,7 @@ class Devices:
             db.execute("DELETE FROM push_tokens WHERE device_id NOT IN "
                        "(SELECT id FROM devices WHERE revoked=0 AND expires>?)", (time.time(),))
             db.commit()
-            sql = "SELECT device_id,token,env,account FROM push_tokens"
+            sql = "SELECT device_id,token,env,account,topic FROM push_tokens"
             rows = db.execute(sql + (" WHERE device_id=?" if key else ""), (key,) if key else ())
             return [dict(row) for row in rows]
 
@@ -121,6 +131,28 @@ class Devices:
     @staticmethod
     def digest(code):
         return hashlib.sha256(code.encode()).digest()
+
+
+def push_summary(directory: Path):
+    """Read-only count of the phones registered for push on live grants: {"phones", "envs", "own_topic"}, or None
+    when there is no registry. It never writes (no migration, no pruning), so `--doctor` leaves live state alone."""
+    path = Path(directory) / "devices.sqlite3"
+    if not path.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(push_tokens)")}
+            if not columns:
+                return {"phones": 0, "envs": {}, "own_topic": 0}
+            topic = "topic" if "topic" in columns else "NULL"
+            rows = db.execute("SELECT p.env, %s FROM push_tokens p JOIN devices d ON d.id = p.device_id "
+                              "WHERE d.revoked = 0 AND d.expires > ?" % topic, (time.time(),)).fetchall()
+    except sqlite3.Error:
+        return None
+    envs = {}
+    for env, _ in rows:
+        envs[env] = envs.get(env, 0) + 1
+    return {"phones": len(rows), "envs": envs, "own_topic": sum(1 for _, t in rows if t)}
 
 
 class Streams:

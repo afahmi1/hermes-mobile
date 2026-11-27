@@ -1743,7 +1743,7 @@ final class ChatModel {
                                       choices: (ev.raw["choices"] as? [String]) ?? [],
                                       multiSelect: ev.raw["multi_select"] as? Bool ?? false))
             status = "Waiting for your answer"
-            notify(.approval, detail: Headline.of(ev.string("question") ?? ""))
+            notify(.question, detail: Headline.of(ev.string("question") ?? ""))
         case "steer.picked_up", "steer.carried":
             guard let sid = ev.string("submission_id") else { break }
             let read = ev.name == "steer.picked_up"
@@ -1856,12 +1856,18 @@ final class ChatModel {
         guard let app else { return }
         let worked = runStarted.map { Date().timeIntervalSince($0) }
         ReplyNotifier.shared.post(event, bot: app.botName(profile), account: app.inboxAccount, profile: profile,
-                                  session: sessionId, detail: detail, worked: event == .approval ? nil : worked)
-        if event != .approval {
+                                  session: sessionId, detail: detail, worked: event.endsRun ? worked : nil)
+        if event.endsRun {
             // This run is over; if it was the last one, hand the background time back.
             let others = app.hasLiveRuns(excluding: self)
             ReplyNotifier.shared.settled(liveRuns: others)
         }
+    }
+
+    /// This chat's identity in notifications (nil until it has a session on the Mac).
+    var notificationDestination: ReplyDestination? {
+        guard let account = app?.inboxAccount, let sessionId else { return nil }
+        return ReplyDestination(account: account, profile: profile, session: sessionId)
     }
 
     private func fail(_ message: String) {

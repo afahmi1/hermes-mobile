@@ -87,6 +87,37 @@ class Store(unittest.TestCase):
         with self.devices.connect() as db:
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM push_tokens").fetchone()[0])
 
+    def test_phone_reported_topic_is_stored_and_env_can_move(self):
+        self.grant("a")
+        self.devices.set_push_token("a", TOKEN, "production", ACCOUNT, "com.phone.app")
+        self.assertEqual("com.phone.app", self.devices.push_targets("a")[0]["topic"])
+        self.devices.set_push_env(TOKEN, "sandbox")
+        self.assertEqual("sandbox", self.devices.push_targets("a")[0]["env"])
+        self.devices.set_push_token("a", TOKEN, "sandbox", ACCOUNT)  # an older build: no topic, the setting applies
+        self.assertIsNone(self.devices.push_targets("a")[0]["topic"])
+
+    def test_registry_from_before_topics_gains_the_column(self):
+        import sqlite3
+        old = Path(self.dir.name) / "old"
+        old.mkdir()
+        with sqlite3.connect(old / "devices.sqlite3") as db:  # the schema the live bridge has today
+            db.executescript("""
+                CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, issued INTEGER NOT NULL,
+                    expires INTEGER NOT NULL, method TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE pairing (digest BLOB PRIMARY KEY, expires INTEGER NOT NULL);
+                CREATE TABLE push_tokens (device_id TEXT PRIMARY KEY, token TEXT NOT NULL, env TEXT NOT NULL,
+                    account TEXT NOT NULL, updated INTEGER NOT NULL);""")
+            db.execute("INSERT INTO devices VALUES ('a', 'Phone', 0, ?, 'legacy', 0)", (int(time.time()) + 3600,))
+            db.execute("INSERT INTO push_tokens VALUES ('a', ?, 'production', ?, 0)", (TOKEN, ACCOUNT))
+        summary = bridge_devices.push_summary(old)  # read-only: works on the old schema, changes nothing
+        self.assertEqual({"phones": 1, "envs": {"production": 1}, "own_topic": 0}, summary)
+        with sqlite3.connect(old / "devices.sqlite3") as db:
+            self.assertNotIn("topic", {r[1] for r in db.execute("PRAGMA table_info(push_tokens)")})
+        migrated = bridge_devices.Devices(old)
+        self.assertEqual([(TOKEN, None)], [(r["token"], r["topic"]) for r in migrated.push_targets()])
+        migrated.set_push_token("a", TOKEN, "production", ACCOUNT, "com.phone.app")
+        self.assertEqual(1, bridge_devices.push_summary(old)["own_topic"])
+
 
 class Decision(unittest.TestCase):
     def test_rule(self):
@@ -96,6 +127,7 @@ class Decision(unittest.TestCase):
         self.assertFalse(bridge_push.should_push(True, now - 10, now))      # inside the app's own grace window
         self.assertTrue(bridge_push.should_push(True, now - 60, now))       # suspended; socket still open
         self.assertTrue(bridge_push.should_push(False, now - 5, now))
+        self.assertTrue(bridge_push.should_push(True, now, now, grace=0))   # the app said it stopped following
 
 
 class Wire(unittest.TestCase):
@@ -118,6 +150,13 @@ class Wire(unittest.TestCase):
         self.assertEqual("Frost needs your approval", bridge_push.payload("approval.request", "Frost", "a", "p", "s")["aps"]["alert"]["title"])
         failed = bridge_push.payload("run.failed", "Frost", "a", "p", "s")["aps"]["alert"]
         self.assertEqual(("Frost could not finish", "Open the chat for details."), (failed["title"], failed["body"]))
+        asked = bridge_push.payload("clarify.request", "Frost", "a", "p", "s")["aps"]["alert"]
+        self.assertEqual(("Frost has a question", "Open the chat to answer."), (asked["title"], asked["body"]))
+
+    def test_test_payload_opens_no_chat(self):
+        body = bridge_push.payload("push.test", "Prometheus", ACCOUNT, "", "")
+        self.assertEqual({"aps"}, set(body))  # no account/profile/session: a tap only brings the app forward
+        self.assertEqual("Push notifications from your Mac work.", body["aps"]["alert"]["body"])
 
 
 @unittest.skipUnless(shutil.which("openssl"), "openssl needed to make a throwaway key")
@@ -275,11 +314,131 @@ class Delivery(unittest.TestCase):
         self.assertTrue(self.logs)
         self.assertFalse(any(TOKEN in line or "bearer" in line.lower() for line in self.logs))
 
-    def test_expired_provider_token_resets_the_cache(self):
+    def test_expired_provider_token_is_replaced_but_not_within_20_minutes(self):
+        # APNs answers TooManyProviderTokenUpdates to a new token sooner than 20 minutes after the last one, so a
+        # rejected token is reused until then (one bad answer must not mint a token per phone per second).
         self.answer = (403, "ExpiredProviderToken")
         self.pusher.notify(FakeTurn(), "run.completed", {})
         self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual(1, len(self.signs))
+        self.clock[0] += bridge_push.JWT_MIN_INTERVAL + 1
+        self.pusher.notify(FakeTurn(), "run.completed", {})
         self.assertEqual(2, len(self.signs))
+        self.answer = (200, "")
+        self.clock[0] += 60
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual(2, len(self.signs))  # the new token is good: kept for its whole lifetime
+
+    def test_clock_going_backwards_mints_a_new_token(self):
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.clock[0] -= 7200
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual(2, len(self.signs))
+
+    def test_question_pushes_once_per_prompt(self):
+        # Hermes asking a question waits on the person exactly like an approval does.
+        turn = FakeTurn()
+        self.pusher.notify(turn, "clarify.request", {"request_id": "q1"})
+        self.pusher.notify(turn, "clarify.request", {"request_id": "q1"})
+        self.pusher.notify(turn, "approval.request", {"request_id": "q1"})  # a different prompt kind, same id
+        self.assertEqual(["Frost has a question", "Frost needs your approval"],
+                         [s[2]["aps"]["alert"]["title"] for s in self.sent])
+        self.pusher.notify(turn, "run.completed", {})
+        self.assertEqual(3, len(self.sent))  # prompts never use up the turn's outcome push
+
+    def test_repeated_away_report_restarts_the_grace_window(self):
+        # A lost "back in the foreground" left the old timestamp in place, so the next background skipped the
+        # grace window and the push doubled the app's own notification.
+        self.pusher.presence("dev1", True)
+        self.clock[0] += 300
+        self.pusher.presence("dev1", True)
+        self.clock[0] += 10
+        turn = FakeTurn()
+        turn.watchers["dev1"] = 1
+        self.pusher.notify(turn, "run.completed", {})
+        self.assertEqual([], self.sent)
+
+    def test_app_that_stopped_following_is_pushed_at_once(self):
+        # iOS ended the app's background time (or its last live run settled) before the bridge's grace window.
+        self.pusher.presence("dev1", True, following=False)
+        turn = FakeTurn()
+        turn.watchers["dev1"] = 1  # the suspended socket still looks attached
+        self.pusher.notify(turn, "run.completed", {})
+        self.assertEqual(1, len(self.sent))
+        self.pusher.presence("dev1", False)
+        back = FakeTurn()
+        back.watchers["dev1"] = 1
+        self.pusher.notify(back, "run.completed", {})
+        self.assertEqual(1, len(self.sent))
+
+    def test_phone_reported_topic_wins_over_the_setting(self):
+        self.devices.set_push_token("dev1", TOKEN, "sandbox", ACCOUNT, "com.phone.reported")
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual("com.phone.reported", self.sent[-1][1]["apns-topic"])
+        self.devices.set_push_token("dev1", TOKEN, "sandbox", ACCOUNT)  # an older build
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual("com.example.app", self.sent[-1][1]["apns-topic"])
+
+    def test_topic_errors_keep_the_token(self):
+        # A wrong HERMES_MOBILE_APNS_TOPIC is configuration, not a dead phone: dropping erased every token.
+        for reason in ("DeviceTokenNotForTopic", "TopicDisallowed"):
+            self.answer = (400, reason)
+            self.pusher.notify(FakeTurn(), "run.completed", {})
+            self.assertEqual([TOKEN], [r["token"] for r in self.devices.push_targets()], reason)
+        self.assertTrue(any("topic" in line for line in self.logs))
+
+    def test_bad_device_token_tries_the_other_environment_once(self):
+        answers = {"sandbox": (400, "BadDeviceToken"), "production": (200, "")}
+
+        def send(url, headers, body):
+            self.sent.append((url, headers, json.loads(body)))
+            return answers["sandbox" if "sandbox" in url else "production"]
+
+        self.pusher.send = send
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual(["https://api.sandbox.push.apple.com/3/device/" + TOKEN,
+                          "https://api.push.apple.com/3/device/" + TOKEN], [s[0] for s in self.sent])
+        self.assertEqual("production", self.devices.push_targets()[0]["env"])  # remembered
+        self.sent.clear()
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual(1, len(self.sent))
+        answers["production"] = (400, "BadDeviceToken")
+        answers["sandbox"] = (400, "BadDeviceToken")
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual([], self.devices.push_targets())  # refused in both: really dead
+
+    def test_unreadable_bot_list_still_notifies(self):
+        def broken(profile):
+            raise OSError("config.yaml")
+
+        self.pusher.title = broken
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.assertEqual("frostbyte", self.sent[0][2]["aps"]["alert"]["title"])
+
+    def test_status_file_keeps_the_last_answers_without_secrets(self):
+        status = Path(self.dir.name) / "push" / "status.json"
+        self.pusher.status = status
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        self.answer = (403, "InvalidProviderToken")
+        self.pusher.notify(FakeTurn(), "run.failed", {})
+        self.answer = (200, "")
+        self.clock[0] += 5
+        self.pusher.notify(FakeTurn(), "run.completed", {})
+        state = bridge_push.last_result(status)
+        self.assertEqual((200, "run.completed", "sandbox"), (state["last"]["status"], state["last"]["event"], state["last"]["env"]))
+        self.assertEqual((403, "InvalidProviderToken"), (state["last_error"]["status"], state["last_error"]["reason"]))
+        raw = status.read_text()
+        self.assertNotIn(TOKEN, raw)
+        self.assertNotIn("bearer", raw.lower())
+        self.assertEqual(0o600, status.stat().st_mode & 0o777)
+
+    def test_test_push_reaches_every_phone_and_opens_no_chat(self):
+        self.devices.issue({"did": "dev2", "dev": "iPad", "issued": 0, "exp": int(time.time()) + 3600, "method": "local"})
+        self.devices.set_push_token("dev2", "cd" * 32, "production", ACCOUNT)
+        results = self.pusher.test()
+        self.assertEqual([200, 200], [r[1] for r in results])
+        self.assertEqual({bridge_push.TEST_COLLAPSE_ID}, {s[1]["apns-collapse-id"] for s in self.sent})
+        self.assertEqual([{"aps"}, {"aps"}], [set(s[2]) for s in self.sent])
 
 
 class Config(unittest.TestCase):
@@ -295,6 +454,19 @@ class Config(unittest.TestCase):
         self.assertIsNone(bridge_push.Config.from_env({}))
         self.assertIsNone(bridge_push.Config.from_env({"HERMES_MOBILE_APNS_KEY_PATH": "/nope", "HERMES_MOBILE_APNS_KEY_ID": "K",
                                                         "HERMES_MOBILE_APNS_TEAM_ID": "T"}))
+
+    def test_host_override_is_for_a_local_mock_only(self):
+        with tempfile.NamedTemporaryFile() as key:
+            env = {"HERMES_MOBILE_APNS_KEY_PATH": key.name, "HERMES_MOBILE_APNS_KEY_ID": "K", "HERMES_MOBILE_APNS_TEAM_ID": "T"}
+            self.assertEqual("https://api.sandbox.push.apple.com/3/device/" + TOKEN,
+                             bridge_push.Config.from_env(env).url("sandbox", TOKEN))
+            env["HERMES_MOBILE_APNS_HOST"] = "https://localhost:8443/"
+            config = bridge_push.Config.from_env(env)
+            self.assertEqual(["https://localhost:8443/3/device/" + TOKEN] * 2,
+                             [config.url(e, TOKEN) for e in ("sandbox", "production")])
+            env["HERMES_MOBILE_APNS_HOST"] = "http://plain.example"  # never cleartext
+            self.assertEqual("https://api.push.apple.com/3/device/" + TOKEN,
+                             bridge_push.Config.from_env(env).url("production", TOKEN))
 
 
 @unittest.skipUnless(Path("/usr/bin/curl").exists(), "curl needed")
@@ -339,10 +511,27 @@ class TurnHook(unittest.TestCase):
         turn = bridge_turns.Turn("p", Path("."), "s", "hi", {})
         turn.push("message.delta", delta="x")
         turn.push("approval.request", request_id="r")
+        turn.push("clarify.request", request_id="q", question="Which branch?")
+        turn.push("steer.picked_up", submission_id="x")
         turn.push("run.completed", output="done")
-        self.assertEqual(["approval.request", "run.completed"], seen)
+        self.assertEqual(["approval.request", "clarify.request", "run.completed"], seen)
+        self.assertEqual(set(bridge_push.TURN_EVENTS), set(bridge_turns.PUSH_EVENTS))
         bridge_turns.EVENT_HOOK = lambda *a: 1 / 0
         turn.push("run.failed", error="x")  # must not raise
+
+    def test_sender_is_known_before_the_turn_runs(self):
+        # A reply that fails at once (gateway down) used to push before the route set device_id: to every phone.
+        from unittest.mock import patch
+        seen = []
+
+        def scheduled(coro, loop):
+            seen.extend(t.device_id for t in bridge_turns.TURNS.values() if t.sid == "s-sender")
+            coro.close()
+
+        with patch.dict(bridge_turns.TURNS, clear=True), \
+                patch.object(bridge_turns.asyncio, "run_coroutine_threadsafe", side_effect=scheduled):
+            bridge_turns.start_turn("p", Path("."), "s-sender", "hi", {}, device_id="dev9")
+        self.assertEqual(["dev9"], seen)
 
     def test_attach_counts_per_device(self):
         turn = bridge_turns.Turn("p", Path("."), "s", "hi", {})
@@ -371,12 +560,17 @@ class PushRoutes(unittest.TestCase):
         body = {"token": TOKEN, "environment": "sandbox", "account": ACCOUNT}
         self.assertEqual(401, self.request("POST", "/m/push/token", None, body)[0])  # grant auth required
         self.assertEqual(200, self.request("POST", "/m/push/token", phone, body)[0])
-        for bad in ({**body, "token": "nothex"}, {**body, "environment": "dev"}, {**body, "account": ""}, {}):
+        for bad in ({**body, "token": "nothex"}, {**body, "environment": "dev"}, {**body, "account": ""}, {},
+                    {**body, "topic": "not a bundle id"}, {**body, "topic": 7}):
             self.assertEqual(400, self.request("POST", "/m/push/token", phone, bad)[0], bad)
         self.assertEqual(200, self.request("POST", "/m/push/presence", phone, {"away": True})[0])
         self.assertEqual(400, self.request("POST", "/m/push/presence", phone, {"away": "yes"})[0])
+        self.assertEqual(200, self.request("POST", "/m/push/presence", phone, {"away": True, "following": False})[0])
+        self.assertEqual(400, self.request("POST", "/m/push/presence", phone, {"away": True, "following": "no"})[0])
         self.assertIn("push_v1", self.request("GET", "/m/capabilities", phone)[1]["features"])
         self.assertEqual([TOKEN], [r["token"] for r in self.b.devices().push_targets()])
+        self.assertEqual(200, self.request("POST", "/m/push/token", phone, {**body, "topic": "com.phone.app"})[0])
+        self.assertEqual(["com.phone.app"], [r["topic"] for r in self.b.devices().push_targets()])
         self.assertEqual(200, self.request("DELETE", "/m/push/token", phone)[0])
         self.assertEqual([], self.b.devices().push_targets())
         self.request("POST", "/m/push/token", phone, body)

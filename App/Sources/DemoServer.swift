@@ -9,6 +9,8 @@ import Foundation
 /// - `-HMDemoDraft 1` puts a draft in that chat's composer, so the send button shows its live state.
 /// - `-HMDemoLive 1` makes that chat's reply still running on the "Mac": a live tool row and the stop button.
 /// - `-HMDemoApproval 1` (with Live) adds an approval request to the running reply.
+/// - `-HMDemoFinishAfter N` (with Live) finishes that reply N seconds after its stream opens. Send the app to the
+///   background first and the reply notification fires, as it would on a phone.
 enum DemoMode {
     static let origin = URL(string: "https://demo.tail0000.ts.net")!
     static let chatID = "demo-thermocline"
@@ -18,6 +20,18 @@ enum DemoMode {
     static var live: Bool { flag("HMDemoLive") }
     static var approval: Bool { flag("HMDemoApproval") }
     static var draft: Bool { flag("HMDemoDraft") }
+    static var finishAfter: TimeInterval? {
+        let seconds = UserDefaults.standard.double(forKey: "HMDemoFinishAfter")
+        return seconds > 0 ? seconds : nil
+    }
+
+    /// The live reply finished (`-HMDemoFinishAfter`): the Mac no longer lists it, and the transcript has the answer.
+    static var finished: Bool {
+        get { finishedLock.withLock { finishedValue } }
+        set { finishedLock.withLock { finishedValue = newValue } }
+    }
+    private static let finishedLock = NSLock()
+    nonisolated(unsafe) private static var finishedValue = false
 
     private static func flag(_ key: String) -> Bool {
         UserDefaults.standard.bool(forKey: key) || ProcessInfo.processInfo.environment[key] == "1"
@@ -74,7 +88,7 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", let p) where p.count == 3 && p[0] == "pins":
             body = ["pins": p[2] == DemoMode.chatID ? DemoFixtures.pins : [], "limit": 50]
         case ("GET", ["turns"]):
-            body = ["turns": DemoMode.live
+            body = ["turns": DemoMode.live && !DemoMode.finished
                 ? [["turn_id": DemoMode.runID, "profile": "default", "session_id": DemoMode.chatID, "done": false]] : []]
         case ("GET", ["projects"]): body = DemoFixtures.projects
         case ("GET", ["workspaces"]): body = DemoFixtures.workspaceIndex
@@ -117,17 +131,16 @@ final class DemoURLProtocol: URLProtocol {
 
     /// The live reply: replays its numbered events, then keeps the stream open with heartbeats.
     private func stream(after last: Int?) {
-        guard DemoMode.live, let url = request.url,
+        guard DemoMode.live, !DemoMode.finished, let url = request.url,
               let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
                                              headerFields: ["Content-Type": "text/event-stream",
                                                             "X-Hermes-Replay-Epoch": "demo"]) else {
             return respond(404, ["error": "turn not found"])
         }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        for event in DemoFixtures.events() where (event["seq"] as? Int ?? 0) > (last ?? -1) {
-            if let data = try? JSONSerialization.data(withJSONObject: event), let line = String(data: data, encoding: .utf8) {
-                client?.urlProtocol(self, didLoad: Data("data: \(line)\n\n".utf8))
-            }
+        let events = DemoFixtures.events()
+        for event in events where (event["seq"] as? Int ?? 0) > (last ?? -1) {
+            send(event)
         }
         let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -135,6 +148,24 @@ final class DemoURLProtocol: URLProtocol {
         }
         RunLoop.current.add(timer, forMode: .common)
         heartbeat = timer
+        if let seconds = DemoMode.finishAfter {
+            let finish = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in
+                guard let self, !DemoMode.finished else { return }
+                DemoMode.finished = true
+                self.send(["event": "run.completed", "seq": events.count, "turn_id": DemoMode.runID,
+                           "session_id": DemoMode.chatID, "output": DemoFixtures.finalReply,
+                           "runtime": ["model": "claude-opus-5-5", "provider": "anthropic"]])
+                self.heartbeat?.invalidate()
+                self.client?.urlProtocolDidFinishLoading(self)
+            }
+            RunLoop.current.add(finish, forMode: .common)
+        }
+    }
+
+    private func send(_ event: [String: Any]) {
+        if let data = try? JSONSerialization.data(withJSONObject: event), let line = String(data: data, encoding: .utf8) {
+            client?.urlProtocol(self, didLoad: Data("data: \(line)\n\n".utf8))
+        }
     }
 }
 
@@ -273,9 +304,15 @@ enum DemoFixtures {
         if DemoMode.live {
             rows.append(["id": 111, "role": "user", "content": "Run the Swift suites, then push if they pass.",
                          "timestamp": now - 3 * 60])
+            if DemoMode.finished {
+                rows.append(["id": 112, "role": "assistant", "content": finalReply, "timestamp": now - 5])
+            }
         }
         return rows
     }
+
+    /// What the live reply says when `-HMDemoFinishAfter` ends it.
+    static let finalReply = "All 19 Swift suites pass on the iPhone 18 Pro simulator. Pushed four commits to feat/thermocline."
 
     static var pins: [[String: Any]] {
         [

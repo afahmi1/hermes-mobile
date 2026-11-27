@@ -117,6 +117,11 @@ if [[ -n "${HERMES_MOBILE_APNS_KEY_PATH:-}" ]]; then
   fi
   if [[ -z "$TOPIC" && -f "$SRC/../App/Config/Signing.xcconfig" ]]; then
     TOPIC="$(sed -n 's#^[[:space:]]*HERMES_BUNDLE_ID[[:space:]]*=[[:space:]]*\([^[:space:]/]*\).*#\1#p' "$SRC/../App/Config/Signing.xcconfig" | head -1)"
+    # Names, not values. Builds from before the app reported its own bundle ID use this topic; a TestFlight build
+    # signed by another team has a different bundle ID, so set HERMES_MOBILE_APNS_TOPIC for those.
+    if [[ -n "$TOPIC" ]]; then
+      echo "HERMES_MOBILE_APNS_TOPIC taken from App/Config/Signing.xcconfig (HERMES_BUNDLE_ID) for app builds that don't report their own."
+    fi
   fi
 fi
 
