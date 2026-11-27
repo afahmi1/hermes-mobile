@@ -120,6 +120,21 @@ Each of these actions sets a final state, so replaying one that already landed c
 one (for example, a chat gained pins in the meantime), it stays in the bar as "didn't apply" until you cancel it.
 Actions belong to the gateway they were taken on and wait if you switch to another.
 
+## Failed replies: try again now, or when limits reset
+
+When Hermes closes a turn with "Your request was not processed" or "This turn did not complete" (provider error,
+usage limit, dropped connection), the phone shows a card instead of that line:
+
+- **Try again** resends the message that reply was answering (queued if Hermes is busy).
+- **At reset** (or **Later**: 15 min, 1 h, 5 h) asks the Mac to send it at that time. The reset time comes from the
+  provider usage windows on Status: the soonest future reset of a window at 90% or more, or of the chat's own provider.
+
+A scheduled send lives on the Mac in `~/.hermes/mobile/schedule/schedule.db` (0600), so it fires with the phone closed
+and survives a bridge restart. Every 20 s the bridge sends what's due through the same durable send as a phone message,
+keyed by the schedule row's id, so it can't go twice. If the chat is mid-reply or Hermes can't be reached, it tries again
+every 2 minutes and gives up 6 hours past its time (the card shows the reason). Cancel removes it while it's waiting.
+Endpoints: `POST /m/chat/<bot>/<chat>/schedule` `{text, at}`, `/scheduled`, `/unschedule` `{id}` (capability `schedule_v1`).
+
 ## Bridge API
 
 ```

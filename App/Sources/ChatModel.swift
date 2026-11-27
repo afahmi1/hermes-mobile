@@ -1004,6 +1004,49 @@ final class ChatModel {
         await enqueue(raw, mode: "queue", attachments: attachments)
     }
 
+    // MARK: failed replies
+
+    /// Messages the Mac will send later in this chat (bridge `schedule_v1`).
+    var scheduled: [API.ScheduledSend] = []
+
+    static func isFailedTurn(_ text: String) -> Bool {
+        text.hasPrefix("Your request was not processed") || text.hasPrefix("This turn did not complete")
+    }
+
+    /// The person's message a failed reply was answering.
+    func askBefore(_ itemID: String) -> String? {
+        guard let i = items.firstIndex(where: { $0.id == itemID }) else { return nil }
+        return items[..<i].last(where: { $0.kind == .user && !$0.text.isEmpty })?.text
+    }
+
+    func retryNow(_ itemID: String) async {
+        guard let ask = askBefore(itemID) else { error = "Couldn't find the message to resend."; return }
+        if isRunning { _ = await enqueue(ask, mode: "queue", attachments: []) } else { await send(ask) }
+    }
+
+    func retryLater(_ itemID: String, at date: Date, reason: String) async {
+        guard let ask = askBefore(itemID), let sid = sessionId else { error = "Couldn't find the message to resend."; return }
+        do {
+            scheduled = try await api.schedule(profile: profile, session: sid, action: "schedule",
+                                               body: ["text": ask, "at": date.timeIntervalSince1970, "reason": reason])
+        } catch APIError.http(404, _) {
+            error = "Update the bridge on your Mac to schedule a retry."
+        } catch {
+            self.error = "Couldn't reach your Mac to schedule it. Try again in a moment."
+        }
+    }
+
+    func cancelScheduled(_ id: String) async {
+        guard let sid = sessionId else { return }
+        scheduled.removeAll { $0.id == id }
+        scheduled = (try? await api.schedule(profile: profile, session: sid, action: "unschedule", body: ["id": id])) ?? scheduled
+    }
+
+    func refreshScheduled() async {
+        guard let sid = sessionId else { return }  // an older bridge answers 404; nothing shows
+        if let rows = try? await api.schedule(profile: profile, session: sid, action: "scheduled") { scheduled = rows }
+    }
+
     // MARK: thinking
 
     /// Hermes's reasoning for the current reply (streamed), and a counter that moves on every new step.

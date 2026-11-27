@@ -87,6 +87,7 @@ struct ChatScreen: View {
                                         ? { Task { await chat.togglePin(item) } } : nil,
                                    onCompose: { text, replace in compose(text, replace: replace) },
                                    showActions: item.kind == .assistant && !item.streaming,  // every finished reply, like T3
+                                   chat: chat,
                                    showTime: revealTimes || timeMarks.contains(item.id))
                             .id(item.id)
                     }
@@ -1306,6 +1307,8 @@ struct MessageRow: View {
     var onCompose: ((String, Bool) -> Void)?
     /// The last reply of a finished turn shows a small row of actions under it, like T3.
     var showActions = false
+    /// Set by the chat screen: lets a failed reply offer Try again / Try at reset.
+    var chat: ChatModel? = nil
     /// Times show where the conversation pauses (or everywhere while the transcript is swiped left).
     var showTime = true
     @State private var showFull = false
@@ -1432,6 +1435,10 @@ struct MessageRow: View {
             // Replies run full width without a bubble (as in T3 and the desktop app): more of the
             // conversation fits on screen, and code blocks get the whole line.
             VStack(alignment: .leading, spacing: 6) {
+                if ChatModel.isFailedTurn(item.text), let chat {
+                    FailedTurnCard(chat: chat, itemID: item.id, text: item.text,
+                                   isLatest: item.id == chat.items.last(where: { $0.kind == .assistant })?.id)
+                } else {
                 // Long-press selects text (like T3); the menu has Copy, Copy as Markdown and Reply with quote.
                 // Images sit where Hermes put them in the reply when the bridge says where.
                 if let parts = item.parts, !parts.isEmpty {
@@ -1458,6 +1465,7 @@ struct MessageRow: View {
                             .overlay(alignment: .topTrailing) { if pinned { pinMark.offset(x: 2, y: -2) } }
                     }
                     TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .leading)
+                }
                 }
                 if showActions || item.footer != nil {
                     VStack(alignment: .leading, spacing: 0) {
@@ -2944,5 +2952,90 @@ struct ToolStamp: View {
 
     static func span(_ t: Double) -> String {
         t < 1 ? "<1s" : t < 60 ? String(format: "%.1fs", t) : "\(Int(t) / 60)m \(Int(t) % 60)s"
+    }
+}
+
+/// A reply that didn't go through (provider error, usage limit, lost connection): retry now, or have the Mac send
+/// it again later, by default when the provider's usage window resets. The scheduled send lives on the Mac.
+struct FailedTurnCard: View {
+    @Bindable var chat: ChatModel
+    let itemID: String
+    let text: String
+    let isLatest: Bool
+    @Environment(AppModel.self) private var app
+    @State private var busy = false
+
+    /// The soonest future reset among usage windows that are nearly full (or the chat's provider's soonest reset).
+    private var reset: (date: Date, label: String)? {
+        let providers = app.status.payload?["providers"]["providers"].array ?? []
+        let mine = chat.served?.provider
+        var best: (Date, String)?
+        for p in providers {
+            let name = p["provider"].string ?? ""
+            for w in p["usage"]["windows"].array {
+                guard let at = w["resets_at"].date, at > Date() else { continue }
+                let full = (w["used_percent"].double ?? 0) >= 90
+                guard full || (mine != nil && name == mine) else { continue }
+                if best == nil || at < best!.0 { best = (at, ProviderUsageSection.displayName(name)) }
+            }
+        }
+        return best
+    }
+
+    private var waiting: API.ScheduledSend? {
+        guard let ask = chat.askBefore(itemID) else { return nil }
+        return chat.scheduled.first { $0.text == ask }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("That reply didn't go through", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.ink)
+            Text(text.hasPrefix("This turn") ? "Hermes stopped partway. Some steps may already have run."
+                 : "The model didn't answer (often a usage limit or a dropped connection).")
+                .font(.footnote).foregroundStyle(HMDesign.text2)
+            if let w = waiting {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(HMDesign.accent)
+                    (Text("Your Mac sends it again ") + Text(w.due, style: .relative) + Text(w.due < Date() ? " ago" : ""))
+                        .font(.footnote)
+                    Spacer()
+                    Button("Cancel") { Task { await chat.cancelScheduled(w.id) } }.font(.footnote.weight(.semibold))
+                }
+                if let e = w.error { Text(e).font(.caption2).foregroundStyle(.tertiary).lineLimit(2) }
+            } else if isLatest, chat.askBefore(itemID) != nil {
+                HStack(spacing: 8) {
+                    Button { act { await chat.retryNow(itemID) } } label: {
+                        Label("Try again", systemImage: "arrow.clockwise").font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent).tint(HMDesign.accent)
+                    Menu {
+                        if let r = reset {
+                            Button("When \(r.label) resets · \(r.date.formatted(date: .omitted, time: .shortened))") {
+                                act { await chat.retryLater(itemID, at: r.date.addingTimeInterval(60), reason: "limits") }
+                            }
+                        }
+                        Button("In 15 minutes") { act { await chat.retryLater(itemID, at: .now + 900, reason: "later") } }
+                        Button("In 1 hour") { act { await chat.retryLater(itemID, at: .now + 3600, reason: "later") } }
+                        Button("In 5 hours") { act { await chat.retryLater(itemID, at: .now + 5 * 3600, reason: "later") } }
+                    } label: {
+                        Label(reset.map { "At reset · " + $0.date.formatted(date: .omitted, time: .shortened) } ?? "Later",
+                              systemImage: "clock").font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .disabled(busy)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(HMDesign.separator, lineWidth: 0.5))
+        .task(id: itemID) { if isLatest { await chat.refreshScheduled() } }
+    }
+
+    private func act(_ work: @escaping () async -> Void) {
+        busy = true
+        Task { await work(); busy = false }
     }
 }

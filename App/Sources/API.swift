@@ -856,6 +856,17 @@ final class API: @unchecked Sendable {
         return title
     }
 
+    /// Send later from the Mac ("try again when limits reset"). Returns the chat's waiting messages.
+    struct ScheduledSend: Identifiable, Hashable { let id: String; let text: String; let due: Date; let error: String? }
+    func schedule(profile: String, session: String, action: String, body: [String: Any] = [:]) async throws -> [ScheduledSend] {
+        let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/\(action)", method: "POST", body: body)
+        return (obj["waiting"] as? [[String: Any]] ?? []).compactMap { r in
+            guard let id = r["id"] as? String, let due = (r["due"] as? NSNumber)?.doubleValue else { return nil }
+            return ScheduledSend(id: id, text: r["text"] as? String ?? "", due: Date(timeIntervalSince1970: due),
+                                 error: r["error"] as? String)
+        }
+    }
+
     /// Answer a question Hermes asked mid-reply (its clarify tool), the way the desktop does.
     func answerQuestion(run: String, requestId: String, answer: String, generation: Int?) async throws {
         var body: [String: Any] = ["request_id": requestId, "answer": answer]
