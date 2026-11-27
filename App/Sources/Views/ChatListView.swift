@@ -32,6 +32,8 @@ struct ChatListView: View {
     @State private var draftScopes = Set<String>()
     /// Archiving chats that hold pinned messages asks twice: a dialog naming the pins, then an alert.
     @State private var renaming: SessionSummary?
+    @AppStorage(ChatIconStyle.key) private var iconStyle = ChatIconStyle.auto.rawValue
+    @State private var activity: [String: ChatActivity] = [:]
     @State private var pinGuard: PinGuard?
     @State private var pinGuardConfirm: PinGuard?
 
@@ -109,6 +111,7 @@ struct ChatListView: View {
                 .refreshable { await reload() }
                 .task(id: inboxScope) { await restoreInbox() }
                 .task(id: scenePhase) { if scenePhase == .active { await autoRefresh() } }
+                .task(id: scenePhase) { if scenePhase == .active { await watchActivity() } }
                 // Returning from a chat is when a draft may have appeared or been sent.
                 .task(id: [String(navigation.wrappedValue.count), app.inboxAccount ?? ""]) {
                     draftScopes = app.inboxAccount.map(ComposerDisk.shared.scopes) ?? []
@@ -383,13 +386,19 @@ struct ChatListView: View {
             // The whole row opens the chat. No disclosure chevron: every row opens, so it says nothing.
             Button { navigation.wrappedValue.append(ChatRef(profile: s.profile, sessionId: s.id)) } label: {
                 HStack(alignment: .top, spacing: 12) {
-                    // An avatar only tells you something when the list mixes bots. Five identical "H"s is noise.
-                    if mixedBots && !typeSize.isAccessibilitySize {
-                        BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32)
-                            .padding(.top, 2)
-                            .accessibilityHidden(true)
+                    // Bot pictures only tell you something when the list mixes bots. Five identical "H"s is noise.
+                    if !typeSize.isAccessibilitySize {
+                        switch ChatIconStyle(rawValue: iconStyle) ?? .auto {
+                        case .monogram:
+                            ChatMonogram(seed: s.id, title: s.displayTitle, size: 32).padding(.top, 2).accessibilityHidden(true)
+                        case .auto where mixedBots:
+                            BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32).padding(.top, 2).accessibilityHidden(true)
+                        default:
+                            EmptyView()
+                        }
                     }
                     SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, showBot: mixedBots,
+                               activity: activity[s.profile + "|" + s.id],
                                hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
                 .contentShape(Rectangle())
@@ -443,6 +452,37 @@ struct ChatListView: View {
     }
 
     private var visibleSessions: [SessionSummary] { results ?? sessions }
+    /// Every 5 s while the list is on screen: which chats are working, waiting on you, or just finished.
+    /// Phone-started replies come from the bridge's in-memory turn list (cheap); others from Status's running list.
+    private func watchActivity() async {
+        while !Task.isCancelled {
+            var next: [String: ChatActivity] = [:]
+            for a in app.status.payload?["agents"].array ?? [] where a["kind"].string == "chat" {
+                if let sid = a["session_id"].string, let p = a["profile"].string {
+                    next[p + "|" + sid] = .working(since: a["started_at"].date ?? Date())
+                }
+            }
+            if let turns = try? await API.shared.liveTurns() {
+                let seen = ChatSeen.all
+                for t in turns {
+                    let key = t.profile + "|" + t.sessionId
+                    if !t.done {
+                        next[key] = t.waiting != nil ? .input : .working(since: Date(timeIntervalSince1970: t.startedAt ?? Date().timeIntervalSince1970))
+                    } else if let end = t.endedAt, next[key] == nil, end > (seen[key] ?? 0) {
+                        next[key] = .done
+                    }
+                }
+            }
+            for (key, chat) in app.openChats where !chat.questions.isEmpty { next[key] = .input }
+            // A timer never jumps backwards: keep the earliest start seen for a chat that's still working.
+            for (key, value) in next {
+                if case .working(let new) = value, case .working(let old)? = activity[key], old < new { next[key] = .working(since: old) }
+            }
+            if next != activity { withAnimation(.snappy) { activity = next } }
+            try? await Task.sleep(for: .seconds(5))
+        }
+    }
+
     /// More than one bot in what's on screen: then avatars and bot names earn their space.
     private var mixedBots: Bool { Set(visibleSessions.prefix(60).map(\.profile)).count > 1 }
 
@@ -760,11 +800,13 @@ struct SessionRow: View {
     var showAvatar = true
     /// The bot's name in the meta line. Off when every row is the same bot.
     var showBot = true
+    var activity: ChatActivity? = nil
     var hasDraft = false
 
     @Environment(\.dynamicTypeSize) private var typeSize
 
     private var large: Bool { typeSize.isAccessibilitySize }
+    private var isWorking: Bool { if case .working = activity { true } else { false } }
 
     private var metadata: [String] {
         var parts: [String] = []
@@ -790,10 +832,14 @@ struct SessionRow: View {
                 // Title keeps the full width; the time moves below it at accessibility sizes.
                 let head = large ? AnyLayout(VStackLayout(alignment: .leading, spacing: HMDesign.micro)) : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: HMDesign.small))
                 head {
+                    // Working chats dim, like T3: it's busy, nothing to read yet.
                     Text(session.displayTitle).font(HMDesign.rowTitle).lineLimit(large ? 4 : 2)
+                        .foregroundStyle(isWorking ? Color.secondary : Color.primary)
                     if !large { Spacer(minLength: HMDesign.micro) }
+                    if let activity { ActivityBadge(activity: activity) } else {
                     Text(session.date, format: relative).font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2)
                         .monospacedDigit().fixedSize(horizontal: true, vertical: false)
+                    }
                 }
                 if hasDraft {
                     // An unsent message is the most useful line a row can show: it is why you come back.
@@ -1033,5 +1079,102 @@ struct RowPress: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label.opacity(configuration.isPressed ? 0.55 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+/// What sits at the left of each chat row.
+enum ChatIconStyle: String, CaseIterable, Identifiable {
+    case auto, monogram, none
+    static let key = "hm.chatIcons"
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .auto: "Bot, when mixed"
+        case .monogram: "Per chat"
+        case .none: "None"
+        }
+    }
+}
+
+/// A chat's own mark: the first letter of its title on a tint picked from its id, so each chat keeps one look.
+struct ChatMonogram: View {
+    let seed: String
+    let title: String
+    var size: CGFloat = 32
+
+    private static let tints: [Color] = [
+        Color(red: 0.42, green: 0.55, blue: 0.86), Color(red: 0.55, green: 0.72, blue: 0.52), Color(red: 0.86, green: 0.58, blue: 0.36),
+        Color(red: 0.74, green: 0.52, blue: 0.82), Color(red: 0.40, green: 0.72, blue: 0.74), Color(red: 0.86, green: 0.48, blue: 0.52),
+        Color(red: 0.78, green: 0.72, blue: 0.42), Color(red: 0.58, green: 0.60, blue: 0.66),
+    ]
+
+    private var tint: Color {
+        let hash = seed.unicodeScalars.reduce(UInt32(2166136261)) { ($0 ^ $1.value) &* 16777619 }
+        return Self.tints[Int(hash % UInt32(Self.tints.count))]
+    }
+
+    private var letter: String {
+        title.first(where: { $0.isLetter || $0.isNumber }).map { String($0).uppercased() } ?? "#"
+    }
+
+    var body: some View {
+        Text(letter)
+            .font(.system(size: size * 0.46, weight: .semibold, design: .rounded))
+            .foregroundStyle(tint)
+            .frame(width: size, height: size)
+            .background(tint.opacity(0.16), in: RoundedRectangle(cornerRadius: size * 0.3, style: .continuous))
+    }
+}
+
+
+/// The right edge of a chat row while something's happening: Input, a live timer, or Done.
+struct ActivityBadge: View {
+    let activity: ChatActivity
+
+    var body: some View {
+        switch activity {
+        case .input:
+            Label("Input", systemImage: "questionmark.bubble.fill")
+                .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
+        case .working(let since):
+            HStack(spacing: 4) {
+                SpinningDots()
+                TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                    Text(Self.elapsed(ctx.date.timeIntervalSince(since))).monospacedDigit()
+                }
+            }
+            .font(.system(.caption, design: .monospaced).weight(.medium)).foregroundStyle(.blue.opacity(0.85))
+        case .done:
+            Label("Done", systemImage: "checkmark.circle")
+                .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.success)
+        }
+    }
+
+    static func elapsed(_ t: TimeInterval) -> String {
+        let s = max(0, Int(t))
+        return s < 60 ? "\(s)s" : s < 3600 ? "\(s / 60)m \(s % 60)s" : "\(s / 3600)h \(s % 3600 / 60)m"
+    }
+}
+
+/// When each chat was last opened on this phone, so "Done" shows until you've looked.
+enum ChatSeen {
+    private static let key = "hm.chatSeen"
+    static var all: [String: Double] { UserDefaults.standard.dictionary(forKey: key) as? [String: Double] ?? [:] }
+    static func mark(_ chatKey: String) {
+        var d = all
+        d[chatKey] = Date().timeIntervalSince1970
+        if d.count > 400 { d = Dictionary(uniqueKeysWithValues: d.sorted { $0.value > $1.value }.prefix(300).map { ($0.key, $0.value) }) }
+        UserDefaults.standard.set(d, forKey: key)
+    }
+}
+
+/// T3's dashed working ring, turning (iOS 17-safe: a rotation, not a symbol effect).
+struct SpinningDots: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 20, paused: reduceMotion)) { ctx in
+            Image(systemName: "circle.dotted")
+                .rotationEffect(.degrees(reduceMotion ? 0 : ctx.date.timeIntervalSinceReferenceDate * 120))
+        }
     }
 }

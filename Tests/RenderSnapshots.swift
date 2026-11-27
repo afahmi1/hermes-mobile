@@ -100,7 +100,13 @@ enum RenderSnapshots {
         let replyText = ReplyQuote.markdown(ReplyQuote.excerpt("The bridge answers 503 while Hermes restarts, so the phone keeps the archive and sends it again when the gateway is back.")) + "\n\nnice, does that cover pins too?"
         render("user-reply", MessageRow(item: ChatItem(id: "7", kind: .user, text: replyText)), to: dir, dark: true)
         render("quote-chip", QuoteChip(text: "The bridge answers 503 while Hermes restarts, so the phone keeps the archive and sends it again when the gateway is back.", remove: {}).padding(.horizontal, 12), to: dir, dark: true)
-        render("question", QuestionCard(chat: ChatModel(profile: "default", sessionId: nil, app: AppModel()), question: ClarifyRequest(id: "q", runId: "r", generation: 1,
-            question: "Where should the journal folder live?", choices: ["~/Desktop/journal", "Obsidian vault", "iCloud Drive"], multiSelect: false)), to: dir, dark: true)
+        let qchat = ChatModel(profile: "default", sessionId: nil, app: AppModel())
+        qchat.questions = [
+            ClarifyRequest(id: "q1", runId: "r", generation: 1, question: "Chrome has been frozen for 3 hours. Should I force-restart it?",
+                           choices: ["Restart it now (Recommended) — Kill the frozen Chrome and relaunch it with chrome-debug. Your logins stay.",
+                                     "Leave it, I'll do it — I touch nothing. Quit Chrome yourself when you're at the Mac."], multiSelect: false),
+            ClarifyRequest(id: "q2", runId: "r", generation: 1, question: "Where should the journal folder live?",
+                           choices: ["~/Desktop/journal", "Obsidian vault", "iCloud Drive"], multiSelect: false)]
+        render("question", QuestionPanel(chat: qchat, scrolls: false), to: dir, dark: true)
     }
 }

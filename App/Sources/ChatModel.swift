@@ -998,31 +998,46 @@ final class ChatModel {
 
     // MARK: Hermes's questions
 
-    /// A question Hermes is waiting on. While it's up, a sent message is the answer.
-    var question: ClarifyRequest?
+    /// Questions Hermes is waiting on (its clarify tool asks 1 to 5 at once), oldest first.
+    var questions: [ClarifyRequest] = []
+    var question: ClarifyRequest? { questions.first }
     @ObservationIgnored private var answeredQuestions = Set<String>()
     private(set) var answering = false
 
-    /// Answer the open question. Shows the answer as your own message, like any reply.
+    /// Answer the oldest open question (a message typed while Hermes waits).
     func answerQuestion(_ raw: String) async -> Bool {
-        let answer = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let q = question, !answer.isEmpty, !answering else { return false }
+        guard let q = question else { return false }
+        return await answer([q.id: raw])
+    }
+
+    /// Send answers for several questions at once (the question panel's Submit). Each goes as Hermes's own
+    /// clarify answer; whatever went through is shown as your message, whatever failed stays open.
+    func answer(_ answers: [String: String]) async -> Bool {
+        guard !answering else { return false }
         answering = true
         defer { answering = false }
-        do {
-            try await api.answerQuestion(run: q.runId.isEmpty ? (runId ?? "") : q.runId, requestId: q.id,
-                                         answer: answer, generation: q.generation)
-            answeredQuestions.insert(q.id)
-            if question?.id == q.id { question = nil }
-            var bubble = ChatItem(id: "answer-\(q.id)", kind: .user, text: answer)
-            bubble.contextNote = "Answered: " + String(q.question.prefix(80))
-            if !items.contains(where: { $0.id == bubble.id }) { items.append(bubble) }
-            status = "Working…"
-            return true
-        } catch {
-            self.error = "Couldn't send your answer: " + error.localizedDescription
-            return false
+        var sent: [(ClarifyRequest, String)] = []
+        for q in questions {
+            guard let raw = answers[q.id] else { continue }
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            do {
+                try await api.answerQuestion(run: q.runId.isEmpty ? (runId ?? "") : q.runId, requestId: q.id,
+                                             answer: text, generation: q.generation)
+                answeredQuestions.insert(q.id)
+                sent.append((q, text))
+            } catch {
+                self.error = "Couldn't send your answer: " + error.localizedDescription
+            }
         }
+        guard !sent.isEmpty else { return false }
+        questions.removeAll { q in sent.contains { $0.0.id == q.id } }
+        var bubble = ChatItem(id: "answer-\(sent[0].0.id)", kind: .user,
+                              text: sent.count == 1 ? sent[0].1 : sent.map { "\($0.0.question)\n→ \($0.1)" }.joined(separator: "\n\n"))
+        bubble.contextNote = sent.count == 1 ? "Answered: " + String(sent[0].0.question.prefix(80)) : "Answered \(sent.count) questions"
+        if !items.contains(where: { $0.id == bubble.id }) { items.append(bubble) }
+        if questions.isEmpty { status = "Working…" }
+        return sent.count == answers.count
     }
 
     /// Queue (Send next) or steer (Guide this reply). Returns true once it is safely on disk.
@@ -1150,6 +1165,23 @@ final class ChatModel {
         guard let key = receiptKey else { return }
         let keep = receipts
         Task { try? await InboxDisk.shared.replaceReceipts(keep, key: key) }
+    }
+
+    /// A guide or queued message moved on (read by Hermes, or up next). Updates the row in place, no reload.
+    private func markReceipt(wireID: String, stage: String, at: Date?) async {
+        guard let i = receipts.firstIndex(where: { $0.wireID == wireID }), receipts[i].stage != stage else { return }
+        receipts[i].stage = stage
+        if let at { receipts[i].readAt = at }
+        let updated = receipts[i]
+        if let row = items.firstIndex(where: { $0.id == updated.id.uuidString }) { items[row] = updated.item }
+        if let key = receiptKey { try? await InboxDisk.shared.record(updated, key: key) }
+    }
+
+    /// The reply ended: queued messages are next in line now.
+    private func promoteQueuedReceipts() {
+        for r in receipts where r.mode == "queue" && r.stage == nil {
+            Task { await markReceipt(wireID: r.wireID, stage: "next", at: nil) }
+        }
     }
 
     private func recordReceipt(_ receipt: ControlReceipt) async {
@@ -1653,18 +1685,24 @@ final class ChatModel {
         case "notice":
             items.append(ChatItem(id: "n-\(UUID().uuidString)", kind: .notice, text: ev.string("text") ?? ""))
         case "clarify.request":
-            guard let id = ev.string("request_id"), question?.id != id, !answeredQuestions.contains(id) else { break }
-            question = ClarifyRequest(id: id, runId: runId ?? "", generation: ev.raw["execution_generation"] as? Int,
+            guard let id = ev.string("request_id"), !questions.contains(where: { $0.id == id }),
+                  !answeredQuestions.contains(id) else { break }
+            questions.append(ClarifyRequest(id: id, runId: runId ?? "", generation: ev.raw["execution_generation"] as? Int,
                                       question: ev.string("question") ?? "Hermes has a question.",
                                       choices: (ev.raw["choices"] as? [String]) ?? [],
-                                      multiSelect: ev.raw["multi_select"] as? Bool ?? false)
+                                      multiSelect: ev.raw["multi_select"] as? Bool ?? false))
             status = "Waiting for your answer"
             notify(.approval, detail: Headline.of(ev.string("question") ?? ""))
+        case "steer.picked_up", "steer.carried":
+            guard let sid = ev.string("submission_id") else { break }
+            let read = ev.name == "steer.picked_up"
+            let at = (ev.raw["at"] as? Double).map(Date.init(timeIntervalSince1970:))
+            Task { await markReceipt(wireID: sid, stage: read ? "read" : "next", at: at) }
         case "clarify.resolved":
-            if let id = ev.string("request_id"), question?.id == id {
+            if let id = ev.string("request_id"), questions.contains(where: { $0.id == id }) {
                 answeredQuestions.insert(id)
-                question = nil
-                if status == "Waiting for your answer" { status = "Working…" }
+                questions.removeAll { $0.id == id }
+                if questions.isEmpty, status == "Waiting for your answer" { status = "Working…" }
             }
         case "approval.request":
             let id = ev.string("request_id") ?? UUID().uuidString
@@ -1738,7 +1776,8 @@ final class ChatModel {
             } catch { self.error = "Could not clear this phone’s receipt. The same submission is safe to check again." }
         }
         confirmedPrimary = false
-        question = nil
+        questions = []
+        promoteQueuedReceipts()
         closeStreamingBubble()
         isRunning = false
         status = nil

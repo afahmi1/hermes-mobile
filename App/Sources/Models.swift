@@ -709,7 +709,18 @@ struct LiveTurn: Codable, Hashable {
     let profile: String
     let sessionId: String
     let done: Bool
-    enum CodingKeys: String, CodingKey { case profile, done, turnId = "turn_id", sessionId = "session_id" }
+    /// Newer bridges: when it started and finished, and whether Hermes is waiting on you ("question"/"approval").
+    var startedAt: Double? = nil
+    var endedAt: Double? = nil
+    var waiting: String? = nil
+    enum CodingKeys: String, CodingKey {
+        case profile, done, waiting, turnId = "turn_id", sessionId = "session_id", startedAt = "started_at", endedAt = "ended_at"
+    }
+}
+
+/// What a chat is doing, for its row in the list (like T3: Input · 3m 12s · Done).
+enum ChatActivity: Equatable {
+    case input, working(since: Date), done
 }
 
 struct HealthInfo: Codable {

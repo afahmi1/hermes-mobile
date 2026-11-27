@@ -6,10 +6,16 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
+packages:
+  ThinkingOrbs:  # MIT, haplollc/ThinkingOrbs: dotted 3D thinking indicators
+    url: https://github.com/haplollc/ThinkingOrbs
+    exactVersion: 1.1.0
 targets:
   HermesMobile:
     type: application
     platform: iOS
+    dependencies:
+      - package: ThinkingOrbs
     sources:
       - Sources
       - Resources

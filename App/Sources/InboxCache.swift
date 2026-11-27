@@ -26,12 +26,27 @@ struct ControlReceipt: Codable, Identifiable {
     let at: Date
     /// Files that rode along with this follow-up. Absent in receipts saved by older builds.
     var files: Int? = nil
+    /// Where it is now: "sent" (Hermes has it), "read" (a guide Hermes read at a pause), "next" (goes as the next
+    /// message: a queued one after this reply, or a guide the reply finished before reading).
+    var stage: String? = nil
+    var readAt: Date? = nil
+
+    /// The bridge's submission id for this receipt (a UUID without dashes, lowercase).
+    var wireID: String { id.uuidString.replacingOccurrences(of: "-", with: "").lowercased() }
 
     var item: ChatItem {
-        let base = mode == "queue" ? "Sends after this reply" : "Guided this reply"
+        let base: String = switch (mode, stage) {
+        case ("steer", "read"): "Read by Hermes"
+        case ("steer", "next"): "Hermes finished first · sends next"
+        case ("steer", _): "Guiding · Hermes reads it at its next step"
+        case (_, "next"): "Up next"
+        default: "Sends after this reply"
+        }
         let attached = files.map { $0 == 1 ? " · 1 file" : " · \($0) files" } ?? ""
-        return ChatItem(id: id.uuidString, kind: .control, text: text.isEmpty ? "Attachments" : text,
-                        footer: base + ((files ?? 0) > 0 ? attached : ""), timestamp: at.timeIntervalSince1970)
+        var row = ChatItem(id: id.uuidString, kind: .control, text: text.isEmpty ? "Attachments" : text,
+                           footer: base + ((files ?? 0) > 0 ? attached : ""), timestamp: (readAt ?? at).timeIntervalSince1970)
+        row.annotation = stage ?? "sent"
+        return row
     }
 }
 

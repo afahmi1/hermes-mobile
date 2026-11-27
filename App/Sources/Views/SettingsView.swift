@@ -453,7 +453,9 @@ struct AppearanceSection: View {
     @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
     @AppStorage(HMTheme.thermoclineAccentKey) private var thermoclineAccentRaw = Thermocline.Accent.crown.rawValue
     @AppStorage(HMGlass.key) private var glass = true
-    @AppStorage(ThinkingStyle.key) private var thinkingRaw = ThinkingStyle.matrix.rawValue
+    @AppStorage(ThinkingStyle.key) private var thinkingRaw = ThinkingStyle.orbs.rawValue
+    @AppStorage(ChatIconStyle.key) private var iconRaw = ChatIconStyle.auto.rawValue
+    @AppStorage(StatusPulse.key) private var pulse = true
     @Environment(\.dynamicTypeSize) private var typeSize
 
     private var isThermocline: Bool { themeRaw != HMThemeKind.classic.rawValue }
@@ -559,8 +561,12 @@ struct AppearanceSection: View {
                 }
             }
             .padding(.vertical, 4)
+            Picker("Chat icons", selection: $iconRaw) {
+                ForEach(ChatIconStyle.allCases) { Text($0.title).tag($0.rawValue) }
+            }
+            Toggle("Heartbeat strip on Status", isOn: $pulse)
         }.hmRows()
-        .sensoryFeedback(.selection, trigger: [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw, thinkingRaw].joined(separator: "|"))
+        .sensoryFeedback(.selection, trigger: [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw, thinkingRaw, iconRaw].joined(separator: "|"))
     }
 
     private func themeCard(_ kind: HMThemeKind) -> some View {
@@ -614,7 +620,13 @@ struct AppearanceSection: View {
     }
 
     private func classicSwatch(_ theme: HMThemeChoice) -> some View {
-        let palette: HMPalette = theme == .paper ? .paper : theme == .oled ? .oled : .ash
+        let palette: HMPalette = switch theme {
+        case .paper: .paper
+        case .oled: .oled
+        case .phosphor: .phosphor
+        case .ink: .ink
+        default: .ash
+        }
         return ZStack(alignment: .bottomTrailing) {
             RoundedRectangle(cornerRadius: 8).fill(theme == .native ? Color(uiColor: .systemGroupedBackground) : Color(uiColor: UIColor(hex: palette.canvas)))
             RoundedRectangle(cornerRadius: 4).fill(Color(uiColor: UIColor(hex: palette.surface))).frame(width: 22, height: 12).padding(5)

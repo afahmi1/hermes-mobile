@@ -60,6 +60,27 @@ Two things are deliberately **not** automatic:
 The bridge advertises these controls as `queue_controls_v1` in `GET /m/capabilities`. An older bridge still delivers
 queued messages; the phone then hides edit and remove for rows already on the Mac.
 
+## Guide and queue stages (what the phone shows under each one)
+
+| Footer | Meaning | How the phone knows |
+|---|---|---|
+| ◌ Guiding · Hermes reads it at its next step | `session.steer` accepted; sitting in the agent's steer buffer | the steer RPC answered `queued` |
+| ✓ Read by Hermes (time) | the agent drained it at a pause (between tool calls) and wrote it to the transcript as a `display_kind = "steer"` user row | bridge event `steer.picked_up` |
+| ↓ Hermes finished first · sends next | the reply ended before a pause; Hermes sends leftover guidance as the next message | bridge event `steer.carried` |
+| Sends after this reply → ↓ Up next | queued with `prompt.submit`; promoted when the running reply ends | the phone's own run state |
+
+Hermes has no live "steer consumed" event, so the bridge checks `state.db` for the steer row. It does that only while
+a guide is unread, only when the stream shows Hermes moving (a tool starting or text arriving), at most every 1.5 s,
+with one indexed query on this chat (and any continuation it was compressed into). No timers, no polling when idle.
+Once Hermes's own copy of the message is loaded in the chat, the phone drops its receipt row (no duplicates).
+
+## Chat list activity
+
+Each row's right edge shows Input (Hermes asked a question or needs an approval), a live timer with the title dimmed
+(working), or Done (finished since you last opened it). Sources, all already in memory: the bridge's `/m/turns` list
+(`waiting`, `started_at`, `ended_at`), Status's running chats (desktop and Telegram replies), and questions in chats open
+on the phone. The list reads them every 5 s while it is on screen. A chat's "last opened" time is kept on the phone.
+
 ## Big files (videos, screen recordings, long audio)
 
 Files over 8 MB don't ride inside the message. The phone keeps the file in its own upload folder

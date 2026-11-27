@@ -108,7 +108,7 @@ struct ChatScreen: View {
                     }
                     if let s = chat.status {
                         HStack(spacing: 8) {
-                            ThinkingIndicator(size: 16)
+                            ThinkingIndicator(size: 16, activity: s)
                             ShimmerText(text: s)
                             Spacer()
                         }
@@ -137,7 +137,11 @@ struct ChatScreen: View {
             // Land on the newest message after a reload, and when coming back to the chat. A lazy list that
             // gets a whole transcript at once can otherwise sit past its content: a blank screen until you scroll.
             .onChange(of: landTick) { _, _ in land(proxy) }
-            .onAppear { if followLatest { land(proxy) } }
+            .onAppear {
+                if followLatest { land(proxy) }
+                if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) }
+            }
+            .onDisappear { if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) } }
             .task(id: chat.items.isEmpty) { if !chat.items.isEmpty, followLatest { land(proxy) } }
             // A long transcript arriving all at once can leave a lazy list parked below its content (a blank
             // screen until you scroll). Land on the newest message once the first page is in, then again after
@@ -503,7 +507,7 @@ struct ChatScreen: View {
                     chat.draft = "/" + name + " "
                 }
             }
-            if let q = chat.question { QuestionCard(chat: chat, question: q) }
+            if !chat.questions.isEmpty { QuestionPanel(chat: chat) }
             if chat.queue?.paused == true { QueuePausedBanner(chat: chat) }
             if !chat.outgoing.isEmpty { OutboxTray(chat: chat) }
             draftShelf
@@ -1475,12 +1479,18 @@ struct MessageRow: View {
                             .foregroundStyle(HMDesign.bubbleText)
                             .background(HMDesign.bubbleFill, in: bubbleShape)
                     }
+                    // Where the message is: hollow while waiting, filled once Hermes has read it.
+                    let stage = item.annotation ?? "sent"
                     HStack(spacing: 4) {
-                        Image(systemName: (item.footer ?? "").hasPrefix("Guided") ? "arrow.turn.up.right" : "clock")
+                        Image(systemName: stage == "read" ? "checkmark.circle.fill" : stage == "next" ? "arrow.down.circle" : "circle.dotted")
+                            .foregroundStyle(stage == "read" ? HMDesign.success : Color.secondary)
+                            .symbolEffect(.pulse, isActive: stage == "sent")
                         Text(item.footer ?? "Sent")
                         if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
                     }
                     .hmTime(classic: HMDesign.text2)
+                    .contentTransition(.symbolEffect(.replace))
+                    .animation(.snappy, value: stage)
                 }
             }
             .padding(.horizontal, 12)
@@ -2584,60 +2594,139 @@ struct OutgoingEditor: View {
     }
 }
 
-/// Hermes asked something mid-reply. Its choices are one tap; anything typed and sent is the answer too.
-struct QuestionCard: View {
+/// Hermes asked something mid-reply (1 to 5 questions at once). Like T3's input panel: every question in one
+/// scrolling card, each choice as a tappable card (title, then its explanation), "+" for your own answer, one
+/// Submit for all. Collapsible, so you can read the reply above it first. Typing in the message box answers too.
+struct QuestionPanel: View {
     @Bindable var chat: ChatModel
-    let question: ClarifyRequest
-    @State private var picked = Set<String>()
+    /// Off only for snapshot renders (ImageRenderer draws no ScrollView content).
+    var scrolls = true
+    @State private var picks: [String: Set<String>] = [:]
+    @State private var custom: [String: String] = [:]
+    @State private var writing: Set<String> = []
+    @State private var collapsed = false
+
+    private var answers: [String: String] {
+        var out: [String: String] = [:]
+        for q in chat.questions {
+            let own = custom[q.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if writing.contains(q.id), !own.isEmpty { out[q.id] = own; continue }
+            let chosen = q.choices.filter { picks[q.id]?.contains($0) == true }
+            if !chosen.isEmpty { out[q.id] = chosen.map { ClarifyChoice($0).title }.joined(separator: ", ") }
+        }
+        return out
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("Hermes is asking", systemImage: "questionmark.bubble.fill")
-                .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
-            Text(question.question).font(.subheadline).textSelection(.enabled)
-            if !question.choices.isEmpty {
-                // Stacked, full width: choices are often paths or sentences, and each is an easy tap.
-                VStack(alignment: .leading, spacing: 6) {
-                        ForEach(question.choices, id: \.self) { choice in
-                            Button {
-                                if question.multiSelect {
-                                    if picked.contains(choice) { picked.remove(choice) } else { picked.insert(choice) }
-                                } else {
-                                    Task { _ = await chat.answerQuestion(choice) }
-                                }
-                            } label: {
-                                HStack {
-                                    Text(choice).font(.subheadline).lineLimit(3).multilineTextAlignment(.leading)
-                                    Spacer(minLength: 8)
-                                    Image(systemName: question.multiSelect ? (picked.contains(choice) ? "checkmark.circle.fill" : "circle")
-                                                                           : "arrow.up.circle")
-                                        .foregroundStyle(HMDesign.accent)
-                                }
-                                .padding(.horizontal, 12).padding(.vertical, 10)
-                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                                .background(picked.contains(choice) ? HMDesign.accent.opacity(0.25) : HMDesign.panel,
-                                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(chat.answering)
-                        }
-                }
-                if question.multiSelect {
-                    Button("Send \(picked.count) choice\(picked.count == 1 ? "" : "s")") {
-                        let answer = question.choices.filter(picked.contains).joined(separator: ", ")
-                        Task { _ = await chat.answerQuestion(answer) }
+            Button { withAnimation(.snappy) { collapsed.toggle() } } label: {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("INPUT NEEDED").font(.caption2.weight(.semibold)).tracking(0.6).foregroundStyle(HMDesign.accent)
+                        Text(chat.questions.count == 1 ? "Hermes has a question" : "Fill in \(chat.questions.count) answers")
+                            .font(.headline).foregroundStyle(.primary)
                     }
-                    .buttonStyle(.borderedProminent).disabled(picked.isEmpty || chat.answering)
+                    Spacer()
+                    Image(systemName: "chevron.down").rotationEffect(.degrees(collapsed ? 180 : 0)).foregroundStyle(.secondary)
                 }
+                .contentShape(Rectangle())
             }
-            Text("Or type your answer below and send.").font(.caption).foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+            if !collapsed {
+                let list = VStack(alignment: .leading, spacing: 18) {
+                    ForEach(Array(chat.questions.enumerated()), id: \.element.id) { index, q in
+                        questionView(q, number: chat.questions.count > 1 ? index + 1 : nil)
+                    }
+                }
+                if scrolls {
+                    ScrollView { list }.frame(maxHeight: 360).scrollBounceBehavior(.basedOnSize)
+                } else { list }
+                Button {
+                    let now = answers
+                    Task { if await chat.answer(now) { picks = [:]; custom = [:]; writing = [] } }
+                } label: {
+                    Text(chat.answering ? "Sending…" : answers.count < chat.questions.count && chat.questions.count > 1
+                         ? "Submit \(answers.count) of \(chat.questions.count)" : "Submit")
+                        .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).frame(height: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(answers.isEmpty || chat.answering)
+            }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(HMDesign.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(14)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(HMDesign.separator, lineWidth: 1))
         .padding(.horizontal, 12)
-        .sensoryFeedback(.impact(weight: .light), trigger: question.id)
+        .sensoryFeedback(.impact(weight: .light), trigger: chat.questions.count)
+    }
+
+    @ViewBuilder private func questionView(_ q: ClarifyRequest, number: Int?) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if let number { Text("\(number).").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary) }
+                Text(q.question).font(.subheadline).textSelection(.enabled)
+            }
+            ForEach(q.choices, id: \.self) { raw in
+                let choice = ClarifyChoice(raw)
+                let on = picks[q.id]?.contains(raw) == true && !writing.contains(q.id)
+                Button {
+                    writing.remove(q.id)
+                    var set = picks[q.id] ?? []
+                    if q.multiSelect { if set.contains(raw) { set.remove(raw) } else { set.insert(raw) } }
+                    else { set = set.contains(raw) ? [] : [raw] }
+                    picks[q.id] = set
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(choice.title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let detail = choice.detail {
+                            Text(detail).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(on ? HMDesign.accent.opacity(0.14) : Color.clear, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(on ? HMDesign.accent : HMDesign.separator, lineWidth: on ? 1.5 : 1))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(chat.answering)
+            }
+            if writing.contains(q.id) || q.choices.isEmpty {
+                TextField("Your answer", text: Binding(get: { custom[q.id] ?? "" }, set: { custom[q.id] = $0 }), axis: .vertical)
+                    .lineLimit(1...5)
+                    .padding(12)
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(HMDesign.accent, lineWidth: 1.5))
+                    .onAppear { writing.insert(q.id) }
+            } else {
+                Button { writing.insert(q.id) } label: {
+                    Label("Write my own", systemImage: "plus").font(.subheadline).foregroundStyle(.secondary)
+                        .frame(minHeight: 36)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+/// A choice as Hermes writes it ("Restart it now (Recommended) — Kill the frozen Chrome and…"): a short title and
+/// the explanation under it. Plain choices stay a title.
+struct ClarifyChoice {
+    let title: String
+    let detail: String?
+    init(_ raw: String) {
+        for sep in [" — ", " – ", " - ", ": ", "\n"] {
+            if let r = raw.range(of: sep), raw.distance(from: raw.startIndex, to: r.lowerBound) <= 70 {
+                title = String(raw[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+                let rest = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                detail = rest.isEmpty ? nil : rest
+                return
+            }
+        }
+        title = raw
+        detail = nil
     }
 }
 
