@@ -33,8 +33,16 @@ enum UsageWords {
         return text
     }
 
-    static func severity(_ used: Double) -> Color {
-        used >= 95 ? HMDesign.danger : used >= 80 ? HMDesign.warning : HMDesign.accent
+    /// The bar's fill. Thermocline: lead, then the gold spark from 80% (a fill, once per screen; `spark: false`
+    /// gives the warm finch cheek instead), then the beak red from 95%.
+    static func severity(_ used: Double, spark: Bool = true) -> Color {
+        used >= 95 ? HMDesign.danger : used >= 80 ? (spark ? HMDesign.warning : HMDesign.caution) : HMDesign.accent
+    }
+
+    /// The "% used" figure. Thermocline never sets copy in gold or dark-mode beak red: warm from 80%, text at 95%+.
+    static func textColor(_ used: Double) -> Color {
+        guard HMTheme.isThermocline else { return severity(used) }
+        return used >= 95 ? HMDesign.ink : used >= 80 ? HMDesign.warningText : HMDesign.text2
     }
 
     /// The one line a provider row needs: its tightest limit, or what Hermes has used.
@@ -75,7 +83,7 @@ struct ProviderUsageSection: View {
                 }
             }
         } header: {
-            Text("Provider usage")
+            HMHeader("Provider usage")
         } footer: {
             if data?["refreshing"].bool == true {
                 Text("Updating provider readings…")
@@ -110,13 +118,13 @@ struct ProviderUsageSection: View {
                 Text(Self.displayName(name)).font(HMDesign.rowTitle)
                 if let headline = UsageWords.headline(provider) {
                     Text(headline).font(HMDesign.metadata.weight(.medium))
-                        .foregroundStyle(provider["usage"]["windows"].array.contains { ($0["used_percent"].double ?? 0) >= 80 } ? HMDesign.warning : .secondary)
+                        .foregroundStyle(provider["usage"]["windows"].array.contains { ($0["used_percent"].double ?? 0) >= 80 } ? HMDesign.warningText : .secondary)
                 }
                 if let calls = local["calls"].int {
-                    Text("\(UsageWords.compact(calls)) requests from Hermes\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                    Text("\(UsageWords.compact(calls)) requests from Hermes\(modelSuffix(name))").font(HMDesign.data).foregroundStyle(HMDesign.text2)
                 } else {
                     let count = provider["credentials"].array.count
-                    Text("\(count) key\(count == 1 ? "" : "s") set up\(modelSuffix(name))").font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                    Text("\(count) key\(count == 1 ? "" : "s") set up\(modelSuffix(name))").font(HMDesign.data).foregroundStyle(HMDesign.text2)
                 }
                 if provider["is_default"].bool {
                     Label("Default provider", systemImage: "checkmark.circle").font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
@@ -126,6 +134,13 @@ struct ProviderUsageSection: View {
         }
     }
 }
+
+#if DEBUG
+extension ProviderUsageSection {
+    /// Screenshot QA (debug builds only): one provider's detail screen, opened by `-HMOpenProvider <name>`.
+    static func debugDetail(_ name: String) -> some View { ProviderUsageDetail(name: name) }
+}
+#endif
 
 enum ProviderModels {
     /// The Mac's front-door profile; it owns the shared provider credentials.
@@ -158,7 +173,7 @@ private struct ProviderUsageDetail: View {
                     if let scope { Task { await app.catalogStore.refresh(scope) } }
                 }
                 .disabled(state.isRefreshing || scope == nil)
-            } header: { Text("Available models") } footer: {
+            } header: { HMHeader("Available models") } footer: {
                 VStack(alignment: .leading, spacing: 2) {
                     if state.catalog != nil || state.lastError != nil { Text(state.caption(now: Date())) }
                     Text("From Hermes’s model catalog (default profile)")
@@ -170,6 +185,7 @@ private struct ProviderUsageDetail: View {
     var body: some View {
         let inventory = app.status.payload?["providers"]
         let provider = inventory?["providers"].array.first { $0["provider"].string == name }
+        ScrollViewReader { proxy in
         List {
             if let provider {
                 let local = provider["local_usage"]
@@ -186,7 +202,7 @@ private struct ProviderUsageDetail: View {
                     } else {
                         Text("Hermes hasn't used this provider yet.")
                     }
-                } header: { Text("What Hermes used") } footer: {
+                } header: { HMHeader("What Hermes used") } footer: {
                     if let coverage = inventory?["ledger"], let read = coverage["profiles_read"].int {
                         let missing = coverage["profiles_unavailable"].int ?? 0
                         Text("All time, across \(read) bot\(read == 1 ? "" : "s")" + (missing > 0 ? ". \(missing) couldn't be read." : "."))
@@ -196,6 +212,7 @@ private struct ProviderUsageDetail: View {
                 if !provider["historical_only"].bool {
                     Section(header: HMHeader("Your account")) {
                         LabeledContent("Keys set up", value: provider["credentials"].array.count.formatted())
+                            .id("providerAccount")
                         if let plan = usage["plan"].string { LabeledContent("Plan", value: plan) }
                         if let count = usage["key_count"].int {
                             LabeledContent("Keys reporting", value: "\(usage["keys_reporting"].int ?? 0) of \(count)")
@@ -216,18 +233,23 @@ private struct ProviderUsageDetail: View {
                             LabeledContent("Balance", value: left.formatted(.currency(code: balance["currency"].string ?? "USD")))
                             if let label = balance["label"].string { Text(label).font(.footnote).foregroundStyle(HMDesign.text2) }
                         }
-                        ForEach(Array(usage["windows"].array.enumerated()), id: \.offset) { _, w in
+                        // Gold is the screen's one spark: only the first window between 80% and 95% gets it.
+                        let windows = usage["windows"].array
+                        let sparkIndex = windows.firstIndex { (80..<95).contains($0["used_percent"].double ?? 0) }
+                        ForEach(Array(windows.enumerated()), id: \.offset) { index, w in
                             if let percent = w["used_percent"].double {
                                 let used = max(0, min(100, percent))
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
+                                VStack(alignment: .leading, spacing: HMTheme.isThermocline ? 8 : 6) {
+                                    HStack(alignment: .firstTextBaseline) {
                                         Text(UsageWords.windowTitle(w["label"].string))
                                         Spacer()
-                                        Text("\(Int(used.rounded()))% used").font(HMDesign.number(13)).foregroundStyle(UsageWords.severity(used))
+                                        Text("\(Int(used.rounded()))% used")
+                                            .font(HMTheme.isThermocline ? HMDesign.number(.footnote, weight: .medium) : HMDesign.number(.body))
+                                            .foregroundStyle(UsageWords.textColor(used))
                                     }
-                                    HMBar(fraction: used / 100, tint: UsageWords.severity(used)).accessibilityHidden(true)
+                                    HMBar(fraction: used / 100, tint: UsageWords.severity(used, spark: index == sparkIndex)).accessibilityHidden(true)
                                     Text(UsageWords.windowDetail(used: used, resets: w["resets_at"].date))
-                                        .font(.caption).foregroundStyle(HMDesign.text2)
+                                        .font(HMTheme.isThermocline ? HMDesign.data : .caption).foregroundStyle(HMDesign.text2)
                                 }
                                 .padding(.vertical, 2)
                                 .accessibilityElement(children: .combine)
@@ -252,6 +274,13 @@ private struct ProviderUsageDetail: View {
         .hmCanvas()
         .navigationTitle(ProviderUsageSection.displayName(name))
         .navigationBarTitleDisplayMode(.inline)
+        #if DEBUG
+        .task(id: provider != nil) {
+            guard DemoMode.isOn, provider != nil, UserDefaults.standard.bool(forKey: "HMUsageScrollAccount") else { return }
+            try? await Task.sleep(for: .seconds(1))
+            if !Task.isCancelled { proxy.scrollTo("providerAccount", anchor: .top) }
+        }
+        #endif
         .refreshable {
             async let status: Void = app.status.refresh(force: true, app: app)
             if let scope { await app.catalogStore.refresh(scope) }
@@ -265,6 +294,7 @@ private struct ProviderUsageDetail: View {
                 try? await Task.sleep(for: .seconds(3))
                 if !Task.isCancelled { await app.status.refresh(app: app) }
             }
+        }
         }
     }
 }

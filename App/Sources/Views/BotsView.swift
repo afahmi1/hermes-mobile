@@ -11,16 +11,16 @@ struct BotsView: View {
                     VStack(alignment: .leading, spacing: HMDesign.small) {
                         Label(e, systemImage: "wifi.exclamationmark").foregroundStyle(HMDesign.text2)
                         Button("Try again") { Task { await app.refreshBots() } }.hmTouchTarget()
-                    }
+                    }.hmRows()
                 } else if !app.botsLoaded {
                     HStack { Spacer(); ProgressView("Loading bots…"); Spacer() }.listRowBackground(Color.clear)
                 } else if app.bots.isEmpty {
-                    Text("No bots reported. Pull to refresh.").foregroundStyle(HMDesign.text2)
+                    Text("No bots reported. Pull to refresh.").foregroundStyle(HMDesign.text2).hmRows()
                 }
                 ForEach(app.bots) { bot in
                     NavigationLink(value: bot) { BotRow(bot: bot) }
                         .disabled(!bot.reachable)
-                }
+                }.hmRows()
                 ManagePersonasSection()  // build5 manage hook
             }
             .hmCanvas()
@@ -43,19 +43,24 @@ struct BotRow: View {
                     Text(bot.name).font(HMDesign.rowTitle)
                 } trailing: {
                     if bot.front {
-                        Text("Front door").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(.tint.opacity(0.18), in: Capsule())
+                        if HMTheme.isThermocline {
+                            HMTag(text: "Front door")
+                        } else {
+                            Text("Front door").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(.tint.opacity(0.18), in: Capsule())
+                        }
                     }
                 }
                 if !bot.blurb.isEmpty { Text(bot.blurb).font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(2) }
-                Text("\(bot.model) · \(bot.provider)").font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(2)
+                Text("\(bot.model) · \(bot.provider)").font(HMDesign.data)
+                    .foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2).lineLimit(2)
                 if !bot.skills.isEmpty {
                     Text(bot.skills.prefix(4).joined(separator: ", ") + (bot.skills.count > 4 ? " +\(bot.skills.count - 4)" : ""))
-                        .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(1)
+                        .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2).lineLimit(1)
                 }
                 if !bot.reachable {
                     Label("No API key. Not reachable.", systemImage: "exclamationmark.triangle.fill")
-                        .font(HMDesign.metadata).foregroundStyle(HMDesign.danger)
+                        .font(HMDesign.metadata).hmProblem(HMDesign.text2)
                 }
             }
         }
@@ -91,7 +96,7 @@ struct BotDetailView: View {
                     .accessibilityLabel("Add a note to \(name)")
                 }
             } header: {
-                Text("Skills")
+                HMHeader("Skills")
             } footer: {
                 Text(skills.isEmpty
                      ? "Teach \(bot.name) with /learn in a chat, or write a skill here. Hermes stores it on your Mac."
@@ -169,7 +174,7 @@ private struct SkillEditorSheet: View {
         NavigationStack {
             Form {
                 if editor.appending {
-                    Section { Text(editor.name).font(.body.weight(.semibold)) } header: { Text("Skill") }.hmRows()
+                    Section { Text(editor.name).font(.body.weight(.semibold)) } header: { HMHeader("Skill") }.hmRows()
                     Section(header: HMHeader("Note to append")) {
                         TextField("What should this skill also say?", text: $bodyText, axis: .vertical)
                             .lineLimit(4...10)
@@ -188,7 +193,7 @@ private struct SkillEditorSheet: View {
                             .lineLimit(5...12)
                     }.hmRows()
                 }
-                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(HMDesign.danger) }
+                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).hmProblem() }
             }
             .hmCanvas()
             .navigationTitle(editor.appending ? "Add a note" : "New skill")

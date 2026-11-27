@@ -103,7 +103,7 @@ struct ChatScreen: View {
                         }
                         .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14))
+                        .hmPanel(radius: 14, classicStyle: .circular)
                         .padding(.horizontal, 12)
                     }
                     if let s = chat.status {
@@ -124,9 +124,9 @@ struct ChatScreen: View {
                 if drag.translation.height > 12 { followLatest = false }
                 // Swipe left, like iMessage, to see every message's time.
                 let sideways = drag.translation.width < -40 && abs(drag.translation.width) > abs(drag.translation.height) * 1.5
-                if sideways != revealTimes { withAnimation(Thermocline.Motion.standard) { revealTimes = sideways } }
+                if sideways != revealTimes { withAnimation(HMMotion.standard) { revealTimes = sideways } }
             }.onEnded { _ in
-                if revealTimes { withAnimation(Thermocline.Motion.standard) { revealTimes = false } }
+                if revealTimes { withAnimation(HMMotion.standard) { revealTimes = false } }
             })
             .onChange(of: chat.textRevision) { _, _ in
                 if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -156,10 +156,18 @@ struct ChatScreen: View {
                         followLatest = true
                         proxy.scrollTo("bottom", anchor: .bottom)
                     } label: {
-                        Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
-                            .padding(.horizontal, HMDesign.medium).frame(minHeight: HMDesign.touch)
-                            .background(.regularMaterial, in: Capsule())
-                            .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+                        Group {
+                            if HMTheme.isThermocline {
+                                Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
+                                    .padding(.horizontal, HMDesign.medium).frame(minHeight: HMDesign.touch)
+                                    .hmGlass(Capsule())
+                            } else {
+                                Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
+                                    .padding(.horizontal, HMDesign.medium).frame(minHeight: HMDesign.touch)
+                                    .background(.regularMaterial, in: Capsule())
+                                    .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+                            }
+                        }
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(HMDesign.accent)
@@ -253,10 +261,10 @@ struct ChatScreen: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .hermesCopied)) { note in
             let text = note.object as? String ?? "Copied"
-            withAnimation(Thermocline.Motion.standard) { toast = text }
+            withAnimation(HMMotion.standard) { toast = text }
             Task {
                 try? await Task.sleep(for: .seconds(1.3))
-                if toast == text { withAnimation(Thermocline.Motion.standard) { toast = nil } }
+                if toast == text { withAnimation(HMMotion.standard) { toast = nil } }
             }
         }
         .overlay(alignment: .top) {
@@ -413,7 +421,9 @@ struct ChatScreen: View {
     }
 
     private func composerField(expanded: Bool) -> some View {
-        ComposerField(text: $chat.draft, placeholder: "Message \(bot?.name ?? "Hermes") · / for commands",
+        let name = bot?.name ?? "Hermes"
+        let prompt = HMTheme.isThermocline ? "Message \(name)" : "Message \(name) · / for commands"
+        return ComposerField(text: $chat.draft, placeholder: prompt,
                       expanded: expanded, onPasteText: chat.absorbPaste, onPasteImage: importPastedImage)
     }
 
@@ -536,8 +546,12 @@ struct ChatScreen: View {
                     .accessibilityLabel("Stop reply")
                     // While Hermes replies, Send queues the message for right after this reply.
                     // Touch and hold to guide the current reply instead.
+                    let canQueue = !(preparingMedia || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     Button { followUp("queue") } label: {
-                        Image(systemName: "arrow.up.circle.fill").font(.title)
+                        Group {
+                            if HMTheme.isThermocline { HMSendGlyph(enabled: canQueue) }
+                            else { Image(systemName: "arrow.up.circle.fill").font(.title) }
+                        }
                             .overlay(alignment: .bottomTrailing) {
                                 Image(systemName: "clock.fill").font(.system(size: 11, weight: .bold))
                                     .foregroundStyle(.white, HMDesign.accent)
@@ -554,10 +568,16 @@ struct ChatScreen: View {
                     .accessibilityLabel("Queue message")
                     .accessibilityHint("Sends it right after the current reply. Touch and hold to guide this reply instead.")
                 } else {
+                    let canSend = !(preparingMedia || chat.savingRuntime || chat.slashBusy
+                                    || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     Button { send() } label: {
-                        Image(systemName: "arrow.up.circle.fill").font(.title).hmTouchTarget()
+                        Group {
+                            if HMTheme.isThermocline { HMSendGlyph(enabled: canSend) }
+                            else { Image(systemName: "arrow.up.circle.fill").font(.title) }
+                        }
+                        .hmTouchTarget()
                     }
-                    .disabled(preparingMedia || chat.savingRuntime || chat.slashBusy || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
+                    .disabled(!canSend)
                     .accessibilityLabel("Send message")
                 }
             }
@@ -1159,7 +1179,12 @@ final class PasteTextView: UITextView {
         super.init(frame: frame, textContainer: textContainer)
         placeholderLabel.font = .preferredFont(forTextStyle: .body)
         placeholderLabel.adjustsFontForContentSizeCategory = true
-        placeholderLabel.textColor = .placeholderText
+        if HMTheme.isThermocline {
+            textColor = UIColor(Thermocline.text)
+            placeholderLabel.textColor = UIColor(Thermocline.text3)
+        } else {
+            placeholderLabel.textColor = .placeholderText
+        }
         placeholderLabel.numberOfLines = 1
         addSubview(placeholderLabel)
     }
@@ -1285,6 +1310,11 @@ struct MessageRow: View {
         return String(head.prefix(600)) + "…"
     }
 
+    /// The outgoing bubble: Thermocline's 18 pt continuous corners; Classic keeps its 20 pt shape.
+    private var bubbleShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: HMDesign.messageRadius, style: HMTheme.isThermocline ? .continuous : .circular)
+    }
+
     private var pinMark: some View {
         Image(systemName: "pin.fill").font(.caption2).foregroundStyle(HMDesign.accent)
             .rotationEffect(.degrees(45))
@@ -1306,14 +1336,14 @@ struct MessageRow: View {
                             Text(userText)
                                 .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
                                 .foregroundStyle(HMDesign.bubbleText)
-                                .background(HMDesign.bubbleFill, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
-                                .overlay(RoundedRectangle(cornerRadius: HMDesign.messageRadius)
-                                    .strokeBorder(HMDesign.accent, lineWidth: highlighted ? 2 : 0))
+                                .background(HMDesign.bubbleFill, in: bubbleShape)
+                                .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
+                                                                  lineWidth: highlighted ? 2 : 0))
                                 .contextMenu { messageMenu }
                         }
                     }
                     if userIsLong {
-                        Button(showFull ? "Show less" : "Show full message") { withAnimation(Thermocline.Motion.standard) { showFull.toggle() } }
+                        Button(showFull ? "Show less" : "Show full message") { withAnimation(HMMotion.standard) { showFull.toggle() } }
                             .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.text2)
                             .frame(minHeight: HMDesign.touch)
                     }
@@ -1325,7 +1355,7 @@ struct MessageRow: View {
                             if note != nil, showTime, item.timestamp != nil { Text("·") }
                             if showTime, let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
                         }
-                        .font(.caption2).foregroundStyle(HMDesign.text2)
+                        .hmTime(classic: HMDesign.text2)
                     }
                 }
             }
@@ -1365,12 +1395,12 @@ struct MessageRow: View {
                                 .accessibilityLabel("Share reply")
                                 Spacer(minLength: 0)
                                 if let ts = item.timestamp {
-                                    Text(Date(timeIntervalSince1970: ts), style: .time).font(.caption2).foregroundStyle(HMDesign.text3)
+                                    Text(Date(timeIntervalSince1970: ts), style: .time).hmTime(classic: HMDesign.text3)
                                 }
                             }
                         }
                         if let f = item.footer {
-                            Label(f, systemImage: "cpu").font(.caption).foregroundStyle(HMDesign.text2)
+                            Label(f, systemImage: "cpu").font(HMTheme.isThermocline ? HMType.meta : .caption).foregroundStyle(HMDesign.text2)
                                 .accessibilityLabel("Answered by \(f)")
                         }
                     }
@@ -1378,7 +1408,7 @@ struct MessageRow: View {
                 }
                 if showTime, !(showActions && !item.text.isEmpty), let ts = item.timestamp {
                     Text(Date(timeIntervalSince1970: ts), style: .time)
-                        .font(.caption2).foregroundStyle(HMDesign.text3)
+                        .hmTime(classic: HMDesign.text3)
                         .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
@@ -1395,14 +1425,14 @@ struct MessageRow: View {
                         Text(item.text).textSelection(.enabled)
                             .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
                             .foregroundStyle(HMDesign.bubbleText)
-                            .background(HMDesign.bubbleFill, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
+                            .background(HMDesign.bubbleFill, in: bubbleShape)
                     }
                     HStack(spacing: 4) {
                         Image(systemName: (item.footer ?? "").hasPrefix("Guided") ? "arrow.turn.up.right" : "clock")
                         Text(item.footer ?? "Sent")
                         if let ts = item.timestamp { Text(Date(timeIntervalSince1970: ts), style: .time) }
                     }
-                    .font(.caption2).foregroundStyle(HMDesign.text2)
+                    .hmTime(classic: HMDesign.text2)
                 }
             }
             .padding(.horizontal, 12)
@@ -1424,7 +1454,7 @@ struct MessageRow: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(ToolLanguage.title(row))
                                         .font(.caption)
-                                        .foregroundStyle(row.state == "failed" ? HMDesign.danger : HMDesign.ink)
+                                        .foregroundStyle(row.state == "failed" ? HMDesign.dangerText : HMDesign.ink)
                                     if !row.result.isEmpty {
                                         Text(row.result).font(.caption2.monospaced()).foregroundStyle(HMDesign.text2).lineLimit(3)
                                     }
@@ -1437,7 +1467,7 @@ struct MessageRow: View {
                 }.frame(maxWidth: .infinity, alignment: .leading)
             } label: {
                 Label(Self.toolLabel(item), systemImage: "wrench.and.screwdriver")
-                    .font(.subheadline)
+                    .font(HMTheme.isThermocline ? HMType.data : .subheadline)
             }
             .foregroundStyle(HMDesign.text2)
             .padding(.horizontal, 18)
@@ -1453,7 +1483,8 @@ struct MessageRow: View {
             } label: {
                 Label(item.text, systemImage: item.failed ? "exclamationmark.triangle" : "arrow.triangle.branch")
                     .font(.subheadline)
-                    .foregroundStyle(item.failed ? HMDesign.danger : HMDesign.text2)
+                    .labelStyle(HMTintedIconLabel(icon: item.failed ? HMDesign.danger : HMDesign.text2))
+                    .foregroundStyle(item.failed ? HMDesign.dangerText : HMDesign.text2)
                     .strikethrough(item.failed, color: HMDesign.danger)
             }
             .padding(.horizontal, 18)
@@ -1461,7 +1492,8 @@ struct MessageRow: View {
             Label(item.text, systemImage: "info.circle")
                 .font(.caption).foregroundStyle(HMDesign.text2)
                 .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(Color(.tertiarySystemFill).opacity(0.6), in: Capsule())
+                .background(HMTheme.isThermocline ? HMDesign.card.opacity(0.7) : Color(.tertiarySystemFill).opacity(0.6), in: Capsule())
+                .overlay { if HMTheme.isThermocline { Capsule().strokeBorder(Thermocline.line, lineWidth: 0.5) } }
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 24)
         }
@@ -1484,7 +1516,13 @@ struct ApprovalSheet: View {
                 if let error { Label(error, systemImage: "exclamationmark.triangle") }
                 Section {
                     ForEach(req.choices, id: \.self) { c in
-                        Button(role: c == "deny" ? .destructive : nil) { answer(c) } label: { Text(label(c)) }
+                        Button(role: c == "deny" ? .destructive : nil) { answer(c) } label: {
+                            if HMTheme.isThermocline && c == "deny" {
+                                Label(label(c), systemImage: "xmark.circle").hmProblem()
+                            } else {
+                                Text(label(c))
+                            }
+                        }
                     }
                 }.hmRows()
             }
@@ -1614,8 +1652,19 @@ private struct SlashMenu: View {
                 }
             }
             .frame(maxHeight: 240)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .modifier(SlashMenuSurface())
             .padding(.horizontal, 12)
+        }
+    }
+}
+
+/// The slash menu floats over the transcript: glass in Thermocline, material in Classic.
+private struct SlashMenuSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        if HMTheme.isThermocline {
+            content.hmGlass(RoundedRectangle(cornerRadius: Thermocline.Radius.md, style: .continuous))
+        } else {
+            content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
         }
     }
 }
@@ -1701,8 +1750,13 @@ struct PinnedBar: View {
                 HStack(spacing: 10) {
                     PinTicks(count: pins.count, current: cursor)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(pins.count == 1 ? "Pinned message" : "Pinned message \(cursor + 1) of \(pins.count)")
-                            .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                        if HMTheme.isThermocline {
+                            Text(pins.count == 1 ? "Pinned" : "Pinned · \(cursor + 1) of \(pins.count)")
+                                .hmLabel(Thermocline.lead)
+                        } else {
+                            Text(pins.count == 1 ? "Pinned message" : "Pinned message \(cursor + 1) of \(pins.count)")
+                                .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                        }
                         Text(pin.excerpt).font(.footnote).lineLimit(1).foregroundStyle(HMDesign.ink)
                     }
                     Spacer(minLength: 0)
@@ -1826,14 +1880,14 @@ struct ActivityCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Button { withAnimation(Thermocline.Motion.standard) { expanded.toggle() } } label: {
+            Button { withAnimation(HMMotion.standard) { expanded.toggle() } } label: {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     StatusGlyph(status: worst)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(item.text).font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.ink)
                             .multilineTextAlignment(.leading).lineLimit(expanded ? nil : 2)
                         if let ts = item.timestamp {
-                            Text(Date(timeIntervalSince1970: ts), style: .time).font(.caption2).foregroundStyle(HMDesign.text2)
+                            Text(Date(timeIntervalSince1970: ts), style: .time).hmTime(classic: HMDesign.text2)
                         }
                     }
                     Spacer(minLength: 4)
@@ -1858,9 +1912,10 @@ struct ActivityCard: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(worst == "failed" ? HMDesign.danger.opacity(0.35) : HMDesign.separator.opacity(0.4), lineWidth: 0.5))
+        .hmPanel(radius: 14)
+        .overlay(RoundedRectangle(cornerRadius: HMTheme.isThermocline ? Thermocline.Radius.md : 14, style: .continuous)
+            .strokeBorder(worst == "failed" ? HMDesign.danger.opacity(HMTheme.isThermocline ? 0.5 : 0.35)
+                          : HMTheme.isThermocline ? .clear : HMDesign.separator.opacity(0.4), lineWidth: 0.5))
         .accessibilityElement(children: .contain)
     }
 
@@ -1878,11 +1933,11 @@ struct ActivityCard: View {
                         .lineLimit(expanded ? 4 : 1)
                     Spacer(minLength: 4)
                     if !expanded, !entry.meta.isEmpty {
-                        Text(entry.meta).font(.caption2).foregroundStyle(entry.failed ? HMDesign.danger : HMDesign.text2).lineLimit(1)
+                        Text(entry.meta).font(.caption2).foregroundStyle(entry.failed ? HMDesign.dangerText : HMDesign.text2).lineLimit(1)
                     }
                 }
                 if expanded {
-                    if !entry.meta.isEmpty { Text(entry.meta).font(.caption).foregroundStyle(entry.failed ? HMDesign.danger : HMDesign.text2) }
+                    if !entry.meta.isEmpty { Text(entry.meta).font(.caption).foregroundStyle(entry.failed ? HMDesign.dangerText : HMDesign.text2) }
                     if let command = entry.command, !command.isEmpty {
                         CodeBlockView(language: "shell", code: command, foldAfter: 8, title: "command")
                     }
@@ -1932,7 +1987,7 @@ struct TranscriptFile: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(ref.name).font(.subheadline.weight(.medium)).lineLimit(1).truncationMode(.middle)
                     Text(failed ?? Self.kind(for: ref.name)).font(.caption2)
-                        .foregroundStyle(failed == nil ? HMDesign.text2 : HMDesign.danger).lineLimit(1)
+                        .foregroundStyle(failed == nil ? HMDesign.text2 : HMDesign.dangerText).lineLimit(1)
                 }
                 Spacer(minLength: 6)
                 if loading { ProgressView().controlSize(.small) }
@@ -1940,7 +1995,7 @@ struct TranscriptFile: View {
             }
             .padding(.horizontal, 12).padding(.vertical, 9)
             .frame(maxWidth: 300, alignment: .leading)
-            .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .hmPanel(radius: 12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2189,9 +2244,13 @@ struct CommandsSheet: View {
                 HStack(spacing: 6) {
                     Text("/" + skill.name).font(.callout.monospaced().weight(.medium))
                     if !skill.category.isEmpty, category == nil {
-                        Text(skill.category).font(.caption2).foregroundStyle(HMDesign.text2)
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Color(.tertiarySystemFill), in: Capsule())
+                        if HMTheme.isThermocline {
+                            HMTag(text: skill.category)
+                        } else {
+                            Text(skill.category).font(.caption2).foregroundStyle(HMDesign.text2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Color(.tertiarySystemFill), in: Capsule())
+                        }
                     }
                 }
                 if !skill.description.isEmpty {
@@ -2204,10 +2263,16 @@ struct CommandsSheet: View {
 
     private func chip(_ title: String, count: Int, on: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text("\(title) \(count)").font(.caption.weight(on ? .semibold : .regular))
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(on ? HMDesign.accent.opacity(0.18) : Color(.tertiarySystemFill), in: Capsule())
-                .foregroundStyle(on ? HMDesign.accent : .primary)
+            if HMTheme.isThermocline {
+                Text("\(title) \(count)").font(.caption.weight(on ? .semibold : .regular))
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .hmChip(active: on)
+            } else {
+                Text("\(title) \(count)").font(.caption.weight(on ? .semibold : .regular))
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(on ? HMDesign.accent.opacity(0.18) : Color(.tertiarySystemFill), in: Capsule())
+                    .foregroundStyle(on ? HMDesign.accent : .primary)
+            }
         }
         .buttonStyle(.plain)
     }
@@ -2249,14 +2314,24 @@ struct CopiedToast: View {
     let text: String
 
     var body: some View {
-        Label(text, systemImage: "checkmark.circle.fill")
-            .font(.footnote.weight(.semibold))
-            .padding(.horizontal, 14).padding(.vertical, 8)
-            .background(.regularMaterial, in: Capsule())
-            .overlay(Capsule().strokeBorder(HMDesign.separator.opacity(0.5), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
-            .transition(.move(edge: .top).combined(with: .opacity))
-            .accessibilityAddTraits(.isStaticText)
+        if HMTheme.isThermocline {
+            Label(text, systemImage: "checkmark.circle.fill")
+                .font(.footnote.weight(.semibold))
+                .labelStyle(HMTintedIconLabel(icon: Thermocline.success))
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .hmGlass(Capsule())
+                .transition(.offset(y: -8).combined(with: .opacity))
+                .accessibilityAddTraits(.isStaticText)
+        } else {
+            Label(text, systemImage: "checkmark.circle.fill")
+                .font(.footnote.weight(.semibold))
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(.regularMaterial, in: Capsule())
+                .overlay(Capsule().strokeBorder(HMDesign.separator.opacity(0.5), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .accessibilityAddTraits(.isStaticText)
+        }
     }
 }
 
@@ -2281,7 +2356,11 @@ struct DaySeparator: View {
     var body: some View {
         HStack(spacing: 10) {
             Rectangle().fill(HMDesign.separator).frame(height: 0.5)
-            Text(label).font(.caption2.weight(.semibold)).foregroundStyle(HMDesign.text2).fixedSize()
+            if HMTheme.isThermocline {
+                Text(label).hmLabel().fixedSize()
+            } else {
+                Text(label).font(.caption2.weight(.semibold)).foregroundStyle(HMDesign.text2).fixedSize()
+            }
             Rectangle().fill(HMDesign.separator).frame(height: 0.5)
         }
         .padding(.horizontal, 24).padding(.vertical, 6)
@@ -2333,13 +2412,13 @@ struct OutboxTray: View {
         .sheet(item: $editing) { item in
             OutgoingEditor(item: item) { text in Task { await chat.editOutgoing(item.id, text: text) } }
         }
-        .animation(.spring(duration: 0.3), value: chat.outgoing)
+        .animation(HMMotion.large, value: chat.outgoing)
     }
 
     private func status(_ item: Outgoing, position: Int) -> (String, String, Color) {
         switch item.phase {
         case .needsYou(let problem):
-            return ("exclamationmark.triangle.fill", "Didn't send: \(problem). Tap to edit.", HMDesign.warning)
+            return ("exclamationmark.triangle.fill", "Didn't send: \(problem). Tap to edit.", HMDesign.warningText)
         case .editPending:
             return ("pencil.circle", "Edit saved · applies as soon as your Mac answers", .secondary)
         case .onMac:
@@ -2403,7 +2482,7 @@ struct QueuePausedBanner: View {
         let waiting = chat.queue?.rows.filter { $0.status == "queued" }.count ?? 0
         VStack(alignment: .leading, spacing: 8) {
             Label("Hermes restarted mid-reply", systemImage: "arrow.clockwise.circle.fill")
-                .font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.warning)
+                .font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.warningText)
             Text("The reply to “\(String((chat.queue?.lost?.text ?? "your message").prefix(80)))” was cut off. "
                  + "\(waiting) message\(waiting == 1 ? " is" : "s are") waiting behind it.")
                 .font(.caption).foregroundStyle(HMDesign.text2)
@@ -2411,7 +2490,7 @@ struct QueuePausedBanner: View {
                 Button { working = true; Task { await chat.continueQueue(); working = false } } label: {
                     Text(working ? "Continuing…" : "Continue").font(.subheadline.weight(.semibold))
                 }
-                .buttonStyle(.borderedProminent).disabled(working)
+                .hmProminent().disabled(working)
                 if let lost = chat.queue?.lost?.text, !lost.isEmpty {
                     Button("Copy cut-off message") { Clipboard.copy(lost, what: "Copied") }.font(.subheadline)
                 }
@@ -2419,7 +2498,7 @@ struct QueuePausedBanner: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(HMDesign.warning.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background((HMTheme.isThermocline ? HMDesign.caution : HMDesign.warning).opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .padding(.horizontal, 12)
     }
 }

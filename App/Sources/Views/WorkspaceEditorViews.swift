@@ -80,7 +80,7 @@ struct BotAssignmentView: View {
                     .accessibilityHint("Double tap to \(on ? "remove from" : "assign to") this project")
                     .accessibilityAddTraits(on ? .isSelected : [])
                 }
-            } header: { Text("Eligible bots") } footer: {
+            } header: { HMHeader("Eligible bots") } footer: {
                 Text("Choose which bots can work in this project, then tap Save.")
             }.hmRows()
         }
@@ -93,7 +93,7 @@ struct BotAssignmentView: View {
                     }
                     .accessibilityElement(children: .combine)
                 }
-            } header: { Text("Not available") } footer: {
+            } header: { HMHeader("Not available") } footer: {
                 Text("These stay assigned and come back if the bot is available again.")
             }.hmRows()
         }
@@ -219,7 +219,7 @@ struct WorkspaceFileView: View {
                 ContentUnavailableView {
                     Label("File unavailable", systemImage: "exclamationmark.triangle")
                 } description: { Text(f.message) } actions: {
-                    Button("Try again") { Task { await editor.load() } }.buttonStyle(.borderedProminent)
+                    Button("Try again") { Task { await editor.load() } }.hmButton(.quiet, classic: .prominent)
                 }
             case .loaded:
                 VStack(alignment: .leading, spacing: 10) {
@@ -310,7 +310,7 @@ struct NewFileSheet: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("newfile.name")
-                } header: { Text("File name") } footer: {
+                } header: { HMHeader("File name") } footer: {
                     Text("Ends in .md, .txt, .csv or .json. Up to 4 files, 8192 bytes each.")
                 }.hmRows()
                 Section {
@@ -322,7 +322,7 @@ struct NewFileSheet: View {
                         .accessibilityIdentifier("newfile.editor")
                         .accessibilityLabel("File contents")
                     ByteCounter(bytes: editor.bytes, limit: WorkspaceLimits.fileBytes)
-                } header: { Text("Contents") } footer: {
+                } header: { HMHeader("Contents") } footer: {
                     if let p = editor.problem { Text(p).foregroundStyle(HMDesign.danger) }
                     else if let c = editor.conflict, c == .duplicate { Text(WorkspacesFailure.duplicate.message).foregroundStyle(HMDesign.danger) }
                     else if let c = editor.conflict, c == .stale { Text(WorkspacesFailure.conflict.message).foregroundStyle(HMDesign.danger) }

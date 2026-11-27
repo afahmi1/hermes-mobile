@@ -41,15 +41,18 @@ enum InlineMarkdown {
                let url = URL(string: "\(copyScheme)://inline?t=\(encoded)") {
                 out[run.range].link = url
             }
-            out[run.range].font = .system(.subheadline, design: .monospaced)
-            out[run.range].backgroundColor = Color(.tertiarySystemFill)
-            out[run.range].foregroundColor = codeTint
+            out[run.range].font = HMTheme.isThermocline ? HMType.mono(.subheadline) : .system(.subheadline, design: .monospaced)
+            out[run.range].backgroundColor = HMTheme.isThermocline ? Thermocline.surface3 : Color(.tertiarySystemFill)
+            out[run.range].foregroundColor = HMTheme.isThermocline ? HMDesign.link : codeTint
             out[run.range].underlineStyle = nil
         }
         for run in out.runs {
             if let link = run.link, link.scheme?.hasPrefix("http") == true { out[run.range].link = phoneURL(link) }
         }
         linkify(&out)
+        if HMTheme.isThermocline {
+            for run in out.runs where run.link != nil { out[run.range].foregroundColor = HMDesign.link }
+        }
         return out
     }
 
@@ -144,7 +147,8 @@ struct MarkdownText: View {
             Text(InlineMarkdown.attributed(s)).fixedSize(horizontal: false, vertical: true)
         case .heading(let level, let s):
             Text(InlineMarkdown.attributed(s))
-                .font(level == 1 ? .title3.weight(.bold) : level == 2 ? .headline : .subheadline.weight(.semibold))
+                .font(level == 1 ? .title3.weight(HMTheme.isThermocline ? .semibold : .bold) : level == 2 ? .headline : .subheadline.weight(.semibold))
+                .tracking(HMTheme.isThermocline ? -0.3 : 0)
                 .padding(.top, level <= 2 ? 4 : 0)
                 .accessibilityAddTraits(.isHeader)
         case .list(let items):
@@ -190,7 +194,6 @@ struct CodeBlockView: View {
     @State private var expanded = false
     @State private var wrap = false
     @Environment(\.dynamicTypeSize) private var typeSize
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var lines: [Substring] { code.split(separator: "\n", omittingEmptySubsequences: false) }
     private var label: String { file ?? title ?? MarkdownBlock.languageName(language) }
@@ -206,14 +209,15 @@ struct CodeBlockView: View {
             layout {
                 HStack(spacing: HMDesign.micro) {
                     Label(label, systemImage: file != nil ? "doc.text" : "chevron.left.forwardslash.chevron.right")
-                        .font(.caption.weight(.medium)).foregroundStyle(HMDesign.text2)
+                        .font(HMTheme.isThermocline ? HMType.meta.weight(.medium) : .caption.weight(.medium))
+                        .foregroundStyle(HMDesign.text2)
                         .lineLimit(typeSize.isAccessibilitySize ? 2 : 1).truncationMode(.middle)
                     if streaming { ProgressView().controlSize(.mini).accessibilityLabel("Receiving code") }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, HMDesign.medium)
                 HStack(spacing: 0) {
-                    Button { withAnimation(reduceMotion ? nil : .snappy) { wrap.toggle() } } label: {
+                    Button { withAnimation(HMMotion.standard) { wrap.toggle() } } label: {
                         Image(systemName: "text.alignleft").font(.footnote).hmTouchTarget()
                     }
                     .buttonStyle(.plain)
@@ -231,16 +235,19 @@ struct CodeBlockView: View {
                 }
             }
             .padding(.top, typeSize.isAccessibilitySize ? HMDesign.small : 0)
-            .background(Color(uiColor: .tertiarySystemFill))
+            .background(HMTheme.isThermocline ? Thermocline.surface1 : Color(uiColor: .tertiarySystemFill))
+            .overlay(alignment: .bottom) {
+                if HMTheme.isThermocline { Rectangle().fill(Thermocline.line).frame(height: 0.5) }
+            }
             Group {
                 if wrap {
-                    Text(shown).font(.system(.footnote, design: .monospaced))
+                    Text(shown).font(HMTheme.isThermocline ? HMType.data : .system(.footnote, design: .monospaced))
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(12)
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        Text(shown).font(.system(.footnote, design: .monospaced))
+                        Text(shown).font(HMTheme.isThermocline ? HMType.data : .system(.footnote, design: .monospaced))
                             .fixedSize(horizontal: true, vertical: true)
                             .padding(12)
                     }
@@ -255,16 +262,17 @@ struct CodeBlockView: View {
             }
             if lines.count > foldAfter + 4 {
                 Button(expanded ? "Show less" : "Show all \(lines.count) lines") {
-                    withAnimation(Thermocline.Motion.standard) { expanded.toggle() }
+                    withAnimation(HMMotion.standard) { expanded.toggle() }
                 }
                 .font(.caption.weight(.semibold))
                 .frame(maxWidth: .infinity, minHeight: HMDesign.touch)
-                .background(Color(.tertiarySystemFill).opacity(0.6))
+                .background(HMTheme.isThermocline ? Thermocline.surface1 : Color(.tertiarySystemFill).opacity(0.6))
             }
         }
-        .background(HMDesign.panel)
-        .clipShape(RoundedRectangle(cornerRadius: HMDesign.panelRadius))
-        .overlay(RoundedRectangle(cornerRadius: HMDesign.panelRadius).strokeBorder(HMDesign.separator.opacity(0.5), lineWidth: 0.5))
+        .background(HMTheme.isThermocline ? Thermocline.surface3 : HMDesign.panel)
+        .clipShape(RoundedRectangle(cornerRadius: HMDesign.panelRadius, style: HMTheme.isThermocline ? .continuous : .circular))
+        .overlay(RoundedRectangle(cornerRadius: HMDesign.panelRadius, style: HMTheme.isThermocline ? .continuous : .circular)
+            .strokeBorder(HMTheme.isThermocline ? Thermocline.lineStrong : HMDesign.separator.opacity(0.5), lineWidth: 0.5))
     }
 
     private func copy() {
@@ -272,10 +280,10 @@ struct CodeBlockView: View {
         var text = code
         while text.hasSuffix("\n") { text.removeLast() }
         Clipboard.copy(text, what: "Copied code")
-        withAnimation(Thermocline.Motion.standard) { copied = true }
+        withAnimation(HMMotion.standard) { copied = true }
         Task {
             try? await Task.sleep(for: .seconds(1.2))
-            withAnimation(Thermocline.Motion.standard) { copied = false }
+            withAnimation(HMMotion.standard) { copied = false }
         }
     }
 }
@@ -287,7 +295,7 @@ struct CalloutView: View {
 
     private var style: (title: String, icon: String, color: Color) {
         switch kind {
-        case "tip": ("Tip", "lightbulb.fill", HMDesign.success)
+        case "tip": ("Tip", "lightbulb.fill", HMTheme.isThermocline ? HMDesign.success : .green)
         case "important": ("Important", "exclamationmark.bubble.fill", HMDesign.plum)
         case "warning": ("Warning", "exclamationmark.triangle.fill", HMDesign.caution)
         case "caution": ("Caution", "octagon.fill", HMDesign.danger)
@@ -307,7 +315,12 @@ struct CalloutView: View {
         }
         .padding(HMDesign.medium)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(s.color.opacity(0.08), in: RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+        .background(HMTheme.isThermocline ? HMDesign.panel : s.color.opacity(0.08), in: RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+        .overlay(alignment: .leading) {
+            if HMTheme.isThermocline {
+                Capsule().fill(s.color).frame(width: 2).padding(.vertical, HMDesign.small)
+            }
+        }
     }
 
     private struct CalloutLabelStyle: LabelStyle {

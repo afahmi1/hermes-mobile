@@ -45,9 +45,9 @@ struct SettingsView: View {
                         }
                     }
                     Button("Add Gateway", systemImage: "plus") { addingGateway = true }
-                    if let gatewayError { Label(gatewayError, systemImage: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.danger) }
+                    if let gatewayError { Label(gatewayError, systemImage: "exclamationmark.triangle.fill").hmProblem() }
                 } header: {
-                    Text("Gateways")
+                    HMHeader("Gateways")
                 } footer: {
                     Text("Chats, files and approvals stay on the gateway you choose.")
                 }.hmRows()
@@ -150,7 +150,7 @@ private struct GatewayRow: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: HMDesign.micro) {
                 Text(name).font(HMDesign.rowTitle).foregroundStyle(HMDesign.ink)
-                Text(detail).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                Text(detail).font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.link : HMDesign.text2)
                     .lineLimit(2).truncationMode(.middle)
                 if isCurrent {
                     Label {
@@ -204,7 +204,7 @@ private struct DeviceAccessView: View {
 
     var body: some View {
         Form {
-            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.danger) }
+            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").hmProblem() }
             if capabilities.manageDevices {
                 Section(header: HMHeader("Signed-in devices")) {
                     ForEach(devices) { device in
@@ -304,7 +304,7 @@ struct GatewayDestinationsView: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: HMDesign.micro) {
                                     Text(SavedGateways.displayName(url)).font(HMDesign.rowTitle)
-                                    Text(url.absoluteString).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                                    Text(url.absoluteString).font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.link : HMDesign.text2)
                                 }
                                 Spacer()
                                 if url == API.shared.baseURL {
@@ -314,7 +314,7 @@ struct GatewayDestinationsView: View {
                         }
                     }
                     Button("Add gateway", systemImage: "plus") { adding = true }
-                } header: { Text("Switch gateway") } footer: { Text("Chats, files and approvals stay on the gateway you choose.") }.hmRows()
+                } header: { HMHeader("Switch gateway") } footer: { Text("Chats, files and approvals stay on the gateway you choose.") }.hmRows()
                 if app.savedGateways.count > 1 {
                     Section {
                         HStack {
@@ -348,13 +348,12 @@ struct GatewayDestinationsView: View {
                                     }
                                 }
                             } header: {
-                                Text(url.absoluteString.replacingOccurrences(of: "https://", with: ""))
-                                    .textCase(nil)
+                                HMHeader(url.absoluteString.replacingOccurrences(of: "https://", with: ""), uppercase: false)
                             }.hmRows()
                         }
                     }
                 }
-                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(HMDesign.danger) }
+                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").hmProblem() }
             }
             .hmCanvas()
             .navigationTitle("Gateways")
@@ -393,30 +392,243 @@ struct GatewayDestinationsView: View {
     }
 }
 
-/// Appearance: theme (Thermocline or Classic) and mode (System, Light, Dark).
+/// Appearance: Theme (Thermocline or Classic), then that theme's own options. Every visual choice shows itself
+/// in a small preview instead of a bare name, applies at once, and marks the current value.
 struct AppearanceSection: View {
     @AppStorage(HMTheme.themeKey) private var themeRaw = HMThemeKind.thermocline.rawValue
     @AppStorage(HMTheme.modeKey) private var modeRaw = HMMode.system.rawValue
+    @AppStorage(HMTheme.classicKey) private var classicRaw = HMThemeChoice.native.rawValue
+    @AppStorage(HMTheme.accentKey) private var accentRaw = HMAccent.theme.rawValue
+    @AppStorage(HMTheme.thermoclineAccentKey) private var thermoclineAccentRaw = Thermocline.Accent.crown.rawValue
     @AppStorage(HMGlass.key) private var glass = true
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    private var isThermocline: Bool { themeRaw != HMThemeKind.classic.rawValue }
 
     var body: some View {
         Section(header: HMHeader("Appearance")) {
-            Picker("Theme", selection: $themeRaw) {
-                ForEach(HMThemeKind.allCases) { Text($0.title).tag($0.rawValue) }
+            let stack = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 12)) : AnyLayout(HStackLayout(alignment: .top, spacing: 12))
+            stack {
+                ForEach(HMThemeKind.allCases) { themeCard($0) }
             }
-            Text((HMThemeKind(rawValue: themeRaw) ?? .thermocline).detail).font(.caption).foregroundStyle(HMDesign.text2)
-            Picker("Mode", selection: $modeRaw) {
-                ForEach(HMMode.allCases) { Text($0.title).tag($0.rawValue) }
-            }
-            if themeRaw == HMThemeKind.classic.rawValue, #available(iOS 26.0, *) {
-                Toggle(isOn: $glass) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Liquid Glass")
-                        Text("Glass message box and controls. Off uses flat colors.").font(.caption).foregroundStyle(HMDesign.text2)
+            .padding(.vertical, 6)
+            if isThermocline {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Mode").font(.subheadline)
+                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
+                    layout { ForEach(HMMode.allCases) { modeTile($0) } }
+                }
+                .padding(.vertical, 4)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Accent").font(.subheadline)
+                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10)) : AnyLayout(HStackLayout(spacing: 4))
+                    layout {
+                        ForEach(Thermocline.Accent.allCases) { accent in
+                            Button { thermoclineAccentRaw = accent.rawValue } label: {
+                                AccentSwatch(accent: accent, selected: thermoclineAccentRaw == accent.rawValue)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            } else {
+                // Classic: Build 31's own looks, accents and Liquid Glass, unchanged.
+                ForEach(HMThemeChoice.allCases) { theme in
+                    Button { classicRaw = theme.rawValue } label: {
+                        HStack(spacing: 12) {
+                            classicSwatch(theme)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(theme.title).foregroundStyle(.primary)
+                                Text(theme.detail).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if classicRaw == theme.rawValue {
+                                Image(systemName: "checkmark").font(.body.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(classicRaw == theme.rawValue ? .isSelected : [])
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Accent").font(.subheadline)
+                    HStack(spacing: 10) {
+                        ForEach(HMAccent.allCases) { accent in
+                            Button { accentRaw = accent.rawValue } label: {
+                                Circle()
+                                    .fill(accentFill(accent))
+                                    .frame(width: 26, height: 26)
+                                    .overlay(Circle().strokeBorder(Color(uiColor: HMTheme.classicUIColor(\.ink)).opacity(accentRaw == accent.rawValue ? 0.9 : 0), lineWidth: 2).padding(-4))
+                                    .frame(width: 36, height: 36)
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(accent.title + " accent")
+                            .accessibilityAddTraits(accentRaw == accent.rawValue ? .isSelected : [])
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+                if #available(iOS 26.0, *) {
+                    Toggle(isOn: $glass) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Liquid Glass")
+                            Text("Glass message box and controls. Off uses the theme's flat colors.").font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
         }.hmRows()
-        .sensoryFeedback(.selection, trigger: themeRaw + modeRaw)
+        .sensoryFeedback(.selection, trigger: [themeRaw, modeRaw, classicRaw, accentRaw, thermoclineAccentRaw].joined())
+    }
+
+    private func themeCard(_ kind: HMThemeKind) -> some View {
+        let selected = (kind == .thermocline) == isThermocline
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        return Button { themeRaw = kind.rawValue } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                ThemePreview(kind: kind)
+                    .frame(height: 78)
+                    .clipShape(shape)
+                    .overlay(shape.strokeBorder(selected ? HMDesign.accent : HMDesign.separator, lineWidth: selected ? 2 : 0.5))
+                HStack(spacing: 4) {
+                    Text(kind.title).font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.ink)
+                    Spacer(minLength: 0)
+                    if selected { Image(systemName: "checkmark.circle.fill").foregroundStyle(HMDesign.accent).accessibilityHidden(true) }
+                }
+                Text(kind.detail).font(.caption).foregroundStyle(HMDesign.text2).fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(kind.title) theme. \(kind.detail)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private func modeTile(_ mode: HMMode) -> some View {
+        let selected = modeRaw == mode.rawValue
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        return Button { modeRaw = mode.rawValue } label: {
+            VStack(spacing: 6) {
+                ModePreview(mode: mode)
+                    .frame(height: 46)
+                    .clipShape(shape)
+                    .overlay(shape.strokeBorder(selected ? HMDesign.accent : HMDesign.separator, lineWidth: selected ? 2 : 0.5))
+                Text(mode.title).font(.caption.weight(selected ? .semibold : .regular))
+                    .foregroundStyle(selected ? HMDesign.ink : HMDesign.text2).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(mode.title + " mode")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private func accentFill(_ accent: HMAccent) -> Color {
+        guard let pair = accent.hex else { return HMTheme.classicColor(\.accent) }
+        return Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(hex: pair.1) : UIColor(hex: pair.0) })
+    }
+
+    private func classicSwatch(_ theme: HMThemeChoice) -> some View {
+        let palette: HMPalette = theme == .paper ? .paper : theme == .oled ? .oled : .ash
+        return ZStack(alignment: .bottomTrailing) {
+            RoundedRectangle(cornerRadius: 8).fill(theme == .native ? Color(uiColor: .systemGroupedBackground) : Color(uiColor: UIColor(hex: palette.canvas)))
+            RoundedRectangle(cornerRadius: 4).fill(Color(uiColor: UIColor(hex: palette.surface))).frame(width: 22, height: 12).padding(5)
+            Circle().fill(theme == .native ? Color.accentColor : Color(uiColor: UIColor(hex: palette.accent))).frame(width: 7, height: 7).padding(3)
+        }
+        .overlay {
+            if theme == .system {
+                RoundedRectangle(cornerRadius: 8).fill(Color(uiColor: UIColor(hex: HMPalette.paper.canvas)))
+                    .mask(Rectangle().rotationEffect(.degrees(45)).offset(x: 20, y: 20))
+            }
+        }
+        .frame(width: 40, height: 40)
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color(uiColor: HMTheme.classicUIColor(\.separator)), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .accessibilityHidden(true)
+    }
+}
+
+/// A theme in miniature: its canvas, a card with two lines of text and an outgoing bubble.
+private struct ThemePreview: View {
+    let kind: HMThemeKind
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if kind == .thermocline {
+                HMDepthField()
+                VStack(alignment: .leading, spacing: 5) {
+                    Capsule().fill(Thermocline.text.opacity(0.75)).frame(width: 44, height: 4)
+                    Capsule().fill(Thermocline.text3.opacity(0.6)).frame(width: 30, height: 3)
+                }
+                .padding(8)
+                .frame(width: 70, alignment: .leading)
+                .hmGlass(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .padding(10)
+                Capsule().fill(HMTheme.thermoclineAccent.color).frame(width: 34, height: 12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(10)
+            } else {
+                HMTheme.classicChoice == .native ? Color(uiColor: .systemGroupedBackground) : HMTheme.classicColor(\.canvas)
+                VStack(alignment: .leading, spacing: 5) {
+                    Capsule().fill(Color(uiColor: HMTheme.classicUIColor(\.ink)).opacity(0.75)).frame(width: 44, height: 4)
+                    Capsule().fill(Color(uiColor: .secondaryLabel)).frame(width: 30, height: 3)
+                }
+                .padding(8)
+                .frame(width: 70, alignment: .leading)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .padding(10)
+                Capsule().fill(HMTheme.classicChoice == .native ? HMTheme.nativeAccent : HMTheme.classicColor(\.accent)).frame(width: 34, height: 12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(10)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Thermocline in one mode: paper or ink with a card and a lead dot. Match iPhone shows both, split.
+private struct ModePreview: View {
+    let mode: HMMode
+
+    var body: some View {
+        Group {
+            switch mode {
+            case .light: scene.environment(\.colorScheme, .light)
+            case .dark: scene.environment(\.colorScheme, .dark)
+            case .system:
+                ZStack {
+                    scene.environment(\.colorScheme, .light)
+                    scene.environment(\.colorScheme, .dark)
+                        .mask {
+                            GeometryReader { geometry in
+                                let w = geometry.size.width, h = geometry.size.height
+                                Path { p in
+                                    p.move(to: CGPoint(x: w * 0.68, y: 0))
+                                    p.addLine(to: CGPoint(x: w, y: 0))
+                                    p.addLine(to: CGPoint(x: w, y: h))
+                                    p.addLine(to: CGPoint(x: w * 0.32, y: h))
+                                    p.closeSubpath()
+                                }
+                            }
+                        }
+                }
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var scene: some View {
+        ZStack(alignment: .bottomLeading) {
+            Thermocline.bg
+            RoundedRectangle(cornerRadius: 5, style: .continuous).fill(HMDesign.card)
+                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Thermocline.line, lineWidth: 0.5))
+                .frame(width: 38, height: 18).padding(8)
+            Circle().fill(HMTheme.thermoclineAccent.color).frame(width: 9, height: 9)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(8)
+        }
     }
 }

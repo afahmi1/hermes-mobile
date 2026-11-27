@@ -141,7 +141,7 @@ struct ChatListView: View {
             // Large title only on the real top-level inbox, not a bot's inbox or while selecting.
             .navigationBarTitleDisplayMode(fixedProfile == nil && !selecting ? .large : .inline)
             .navigationDestination(for: ChatRef.self) { ChatView(ref: $0) }
-            .searchable(text: $query, prompt: "Search chats")
+            .hmSearchable($query, prompt: "Search chats")
             .task(id: [query] + inboxScope) { await runSearch() }
             .toolbar { inboxToolbar }
             .onChange(of: inboxScope) { _, _ in endSelection() }
@@ -236,6 +236,9 @@ struct ChatListView: View {
                         if !typeSize.isAccessibilitySize { Spacer(minLength: 6) }
                         ConnectionBadge().buttonStyle(.borderless)
                     }
+                    if HMTheme.isThermocline {
+                        HMSearchField(prompt: "Search chats", query: $query).disabled(selecting)
+                    }
                     let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0)) : AnyLayout(HStackLayout(spacing: 8))
                     layout { filters }
                     .disabled(selecting)
@@ -253,11 +256,19 @@ struct ChatListView: View {
                         .buttonStyle(.borderless)
                         .hmTouchTarget()
                         .disabled(loading)
-                }.foregroundStyle(HMDesign.text2)
+                }.foregroundStyle(HMDesign.text2).hmRows()
             }
             if let results {
-                if results.isEmpty { ContentUnavailableView.search(text: query.trimmingCharacters(in: .whitespaces)) }
-                ForEach(results, id: \.key) { row($0) }
+                if results.isEmpty {
+                    if HMTheme.isThermocline {
+                        HMUnavailable(title: "No results for “\(query.trimmingCharacters(in: .whitespaces))”", symbol: "magnifyingglass",
+                                      message: "Check the spelling or try another word.")
+                            .listRowBackground(Color.clear)
+                    } else {
+                        ContentUnavailableView.search(text: query.trimmingCharacters(in: .whitespaces))
+                    }
+                }
+                ForEach(results, id: \.key) { row($0) }.hmRows()
             } else {
                 ForEach(grouped, id: \.0) { section in
                     Section(header: HMHeader(section.0)) { ForEach(section.1, id: \.key) { row($0) } }.hmRows()
@@ -273,7 +284,13 @@ struct ChatListView: View {
         .listStyle(.insetGrouped)
         .safeAreaInset(edge: .bottom, spacing: 0) { if selecting { selectionActions } }
         .overlay {
-            if loading && sessions.isEmpty { ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius)) }
+            if loading && sessions.isEmpty {
+                if HMTheme.isThermocline {
+                    ProgressView("Loading chats…").padding().hmGlass(RoundedRectangle(cornerRadius: HMDesign.panelRadius, style: .continuous))
+                } else {
+                    ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+                }
+            }
         }
     }
 
@@ -286,27 +303,15 @@ struct ChatListView: View {
         case .all: (title, detail, symbol) = ("Nothing here yet", "Chats and automated runs show up here once Hermes records them.", "tray")
         case .chats: (title, detail, symbol) = ("No chats yet", "Start a chat, or choose another source from the filter above.", "bubble.left")
         }
-        return ContentUnavailableView {
-            if HMTheme.isThermocline {
-                HorizonEyeMark().frame(width: 64, height: 64).accessibilityHidden(true)
-                Text(title).font(.title2.bold())
-            } else {
-                Label(title, systemImage: symbol)
-            }
-        } description: {
-            Text(detail)
-        } actions: {
-            if filter != .archived { Button("New chat") { startNew() } }
+        // The first-run inbox carries the Horizon-eye mark; filtered views keep a quiet symbol.
+        return HMUnavailable(title: title, symbol: symbol, message: detail, mark: filter == .chats) {
+            if filter != .archived { Button("New chat") { startNew() }.hmButton(.primary) }
         }
     }
 
     private func failureState(_ message: String) -> some View {
-        ContentUnavailableView {
-            Label("Can't load chats", systemImage: "wifi.exclamationmark")
-        } description: {
-            Text(message)
-        } actions: {
-            Button("Try again") { Task { await reload() } }.disabled(loading)
+        HMUnavailable(title: "Can't load chats", symbol: "wifi.exclamationmark", message: message) {
+            Button("Try again") { Task { await reload() } }.disabled(loading).hmButton(.quiet)
         }
     }
 
@@ -317,7 +322,7 @@ struct ChatListView: View {
             }
             Divider()
             Button("About chat sources", systemImage: "info.circle") { showSourceGuide = true }
-        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease").fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true) }
+        } label: { filterLabel(filter.rawValue, symbol: "line.3.horizontal.decrease", active: filter != .chats).fixedSize(horizontal: !typeSize.isAccessibilitySize, vertical: true) }
         .buttonStyle(.borderless)
         .accessibilityLabel("Source, " + filter.rawValue)
         if fixedProfile == nil {
@@ -326,22 +331,24 @@ struct ChatListView: View {
                     Text("All bots").tag(String?.none)
                     ForEach(app.bots) { bot in Text(bot.name == bot.id ? bot.name : "\(bot.name) · \(bot.id)").tag(Optional(bot.id)) }
                 }
-            } label: { filterLabel(selectedBot.map { app.botName($0) } ?? "All bots", symbol: "person.2") }
+            } label: { filterLabel(selectedBot.map { app.botName($0) } ?? "All bots", symbol: "person.2", active: selectedBot != nil) }
             .buttonStyle(.borderless)
             .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
         }
     }
 
-    private func filterLabel(_ title: String, symbol: String) -> some View {
+    /// A filter menu's chip. `active` marks a filter that narrows the list (lead-tinted in Thermocline).
+    private func filterLabel(_ title: String, symbol: String, active: Bool = false) -> some View {
         HStack(spacing: 5) {
             Image(systemName: symbol).imageScale(.small)
             Text(title).lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
-            Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(HMDesign.text2)
+            Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                .foregroundStyle(active && HMTheme.isThermocline ? HMDesign.accent : HMDesign.text2)
         }
         .font(.subheadline.weight(.medium))
         .foregroundStyle(HMDesign.ink)
         .padding(.horizontal, HMDesign.medium).padding(.vertical, 7)
-        .background(Color(.tertiarySystemFill), in: Capsule())
+        .hmChip(active: active)
         .hmTouchTarget()
     }
 
@@ -744,7 +751,7 @@ struct SessionRow: View {
                 head {
                     Text(session.displayTitle).font(HMDesign.rowTitle).lineLimit(large ? 4 : 2)
                     if !large { Spacer(minLength: HMDesign.micro) }
-                    Text(session.date, format: relative).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                    Text(session.date, format: relative).font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2)
                         .monospacedDigit().fixedSize(horizontal: true, vertical: false)
                 }
                 if hasDraft {
@@ -757,7 +764,7 @@ struct SessionRow: View {
                 }
                 // One wrapping line, so a long bot or model name never squeezes the title or the pin state.
                 Text(metadata.joined(separator: " · "))
-                    .font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                    .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2)
                     .lineLimit(large ? 4 : 2).truncationMode(.middle)
                     .accessibilityLabel(metadata.joined(separator: ", "))
                 if session.pinned == true || session.pinnedMessages > 0 {
@@ -877,11 +884,11 @@ struct QueuedActionsBar: View {
             let stuck = mine.filter { $0.problem != nil }
             Menu {
                 ForEach(mine) { action in
-                    Section(header: HMHeader(action.problem.map { "Didn't apply: " + $0 } ?? "Waiting")) {
+                    Section(action.problem.map { "Didn't apply: " + $0 } ?? "Waiting") {
                         Button(role: .destructive) { queue.discard(action.id) } label: {
                             Label("Cancel: " + action.summary, systemImage: "xmark")
                         }
-                    }.hmRows()
+                    }
                 }
                 Button { queue.wake() } label: { Label("Try now", systemImage: "arrow.clockwise") }
             } label: {
@@ -889,7 +896,7 @@ struct QueuedActionsBar: View {
                                     : "\(stuck.count) change\(stuck.count == 1 ? "" : "s") didn't apply",
                       systemImage: stuck.isEmpty ? "icloud.and.arrow.up" : "exclamationmark.triangle")
                     .font(.footnote.weight(.medium))
-                    .foregroundStyle(stuck.isEmpty ? HMDesign.text2 : HMDesign.warning)
+                    .foregroundStyle(stuck.isEmpty ? HMDesign.text2 : HMDesign.warningText)
                     .padding(.horizontal, 14).padding(.vertical, 8)
                     .hmCapsule()
             }

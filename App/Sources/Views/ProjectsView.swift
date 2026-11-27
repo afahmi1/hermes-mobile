@@ -55,27 +55,39 @@ struct ProjectsView: View {
         case .notConfigured:
             panel("Projects aren't set up", "folder.badge.questionmark",
                   "Projects are turned off on your Mac's Hermes bridge. Turn them on there, then check again.") {
-                Button("Check again") { Task { await model.load() } }.buttonStyle(.bordered)
+                Button("Check again") { Task { await model.load() } }.hmButton(.quiet, classic: .bordered)
             }
         case .empty:
             panel("No projects yet", "folder", "The catalog on your Mac is empty. Add a project there, then check again.") {
-                Button("Check again") { Task { await model.load() } }.buttonStyle(.bordered)
+                Button("Check again") { Task { await model.load() } }.hmButton(.quiet, classic: .bordered)
             }
         case .failed(let failure):
             panel(failure.title, failure.isUpgrade ? "arrow.down.app" : "exclamationmark.triangle", failure.message) {
-                Button("Try again") { Task { await model.load() } }.buttonStyle(.bordered)
+                Button("Try again") { Task { await model.load() } }.hmButton(.quiet, classic: .bordered)
             }
         case .loaded(let snapshot):
             let shown = snapshot.filtered(model.query)
             List {
+                if HMTheme.isThermocline {
+                    HMSearchField(prompt: "Search projects", query: Bindable(model).query)
+                        .listRowInsets(EdgeInsets()).listRowBackground(Color.clear).listRowSeparator(.hidden)
+                }
                 ForEach(shown) { project in
                     NavigationLink(value: Selection(id: project.id)) { ProjectRow(project: project, bots: app.bots) }
-                }
+                }.hmRows()
             }
             .overlay {
-                if shown.isEmpty { ContentUnavailableView.search(text: model.query) }
+                if shown.isEmpty {
+                    if HMTheme.isThermocline {
+                        HMUnavailable(title: "No results for “\(model.query)”", symbol: "magnifyingglass",
+                                      message: "Check the spelling or try another word.")
+                            .allowsHitTesting(false)
+                    } else {
+                        ContentUnavailableView.search(text: model.query)
+                    }
+                }
             }
-            .searchable(text: Bindable(model).query, prompt: "Search projects")
+            .hmSearchable(Bindable(model).query, prompt: "Search projects")
             .refreshable { await model.load() }
         }
     }
@@ -87,14 +99,8 @@ struct ProjectsView: View {
     private func panel<Actions: View>(_ title: String, _ symbol: String, _ message: String,
                                       @ViewBuilder actions: () -> Actions) -> some View {
         ScrollView {
-            ContentUnavailableView {
-                Label(title, systemImage: symbol)
-            } description: {
-                Text(message)
-            } actions: {
-                actions()
-            }
-            .frame(maxWidth: .infinity, minHeight: 360)
+            HMUnavailable(title: title, symbol: symbol, message: message) { actions() }
+                .frame(maxWidth: .infinity, minHeight: 360)
         }
         .refreshable { await model.load() }
     }
@@ -111,7 +117,7 @@ private struct ProjectRow: View {
                 Text(summary).font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(2)
             }
             Label(botLine, systemImage: project.botIds.isEmpty ? "person.crop.circle.badge.questionmark" : "person.2")
-                .font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(2)
+                .font(HMDesign.data).foregroundStyle(HMTheme.isThermocline ? HMDesign.text3 : HMDesign.text2).lineLimit(2)
         }
         .padding(.vertical, HMDesign.micro)
         .accessibilityElement(children: .combine)
@@ -183,7 +189,7 @@ struct ProjectDetailView: View {
                 ForEach(Array(project.sources.enumerated()), id: \.offset) { _, s in
                     VStack(alignment: .leading, spacing: HMDesign.micro) {
                         Text(s.source)
-                        Text(s.provider).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                        Text(s.provider).font(HMDesign.data).foregroundStyle(HMDesign.text2)
                     }
                     .accessibilityElement(children: .combine)
                 }
@@ -197,14 +203,14 @@ struct ProjectDetailView: View {
                         VStack(alignment: .leading, spacing: HMDesign.micro) {
                             Text(ref.path).font(.callout.monospaced()).foregroundStyle(HMDesign.ink)
                             Text(ref.rootName + (ref.kind == .vault ? " · vault" : ref.kind == .repo ? " · repo" : ""))
-                                .font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
+                                .font(HMDesign.data).foregroundStyle(HMDesign.text2)
                         }
                     }
                     .accessibilityLabel("\(ref.path) in \(ref.rootName)")
                     .accessibilityHint("Shows what this reference is and lets you copy its path")
                 }
             } header: {
-                Text("Related files")
+                HMHeader("Related files")
             } footer: {
                 if refs.hidden > 0 { Text("\(refs.hidden) \(refs.hidden == 1 ? "reference is" : "references are") hidden because \(refs.hidden == 1 ? "it isn't" : "they aren't") a safe relative path in a known root.") }
             }.hmRows()

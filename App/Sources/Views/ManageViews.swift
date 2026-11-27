@@ -109,6 +109,11 @@ struct ManageProjectsToolbar: ViewModifier {
                 }
             }
             .sheet(isPresented: $adding) { AddProjectView(onCreated: { announceChange() }) }
+            #if DEBUG
+            .task {
+                if DemoMode.isOn && UserDefaults.standard.bool(forKey: "HMOpenProjectEditor") { adding = true }
+            }
+            #endif
             .sheet(isPresented: $showArchived) { ArchivedView() }
             .onReceive(NotificationCenter.default.publisher(for: .manageChanged)) { _ in Task { await reload() } }
     }
@@ -137,7 +142,7 @@ struct AddProjectView: View {
                         .autocorrectionDisabled()
                         .accessibilityIdentifier("manage.project.id")
                     field(.id)
-                } header: { Text("ID") } footer: {
+                } header: { HMHeader("ID") } footer: {
                     Text(model.effectiveID.isEmpty ? "The ID is made from the title." : "ID: \(model.effectiveID)")
                         .accessibilityIdentifier("manage.project.slug")
                 }.hmRows()
@@ -241,7 +246,7 @@ struct ManageProjectSection: View {
             }
             .accessibilityIdentifier("manage.archiveProject")
             .accessibilityHint("Asks for your deletion PIN, then hides the project. You can restore it later")
-        } header: { Text("Manage") }.hmRows()
+        } header: { HMHeader("Manage") }.hmRows()
         .sheet(isPresented: $editing) { EditProjectView(project: project, onSaved: { announceChange() }) }
         .sheet(isPresented: $archiving) {
             let id = project.id
@@ -280,7 +285,7 @@ struct ArchivedView: View {
             ContentUnavailableView {
                 Label("Can't load the archive", systemImage: "exclamationmark.triangle")
             } description: { Text(f.message) } actions: {
-                Button("Try again") { Task { await model.load() } }.buttonStyle(.borderedProminent)
+                Button("Try again") { Task { await model.load() } }.hmButton(.quiet, classic: .prominent)
             }
         case .loaded(let info):
             if info.isEmpty {
@@ -362,7 +367,7 @@ struct AddBotView: View {
                         .frame(minHeight: 120)
                         .accessibilityIdentifier("manage.bot.persona")
                         .accessibilityLabel("Persona")
-                } header: { Text("Persona") } footer: {
+                } header: { HMHeader("Persona") } footer: {
                     let over = model.personaBytes > ManageLimits.personaBytes
                     Text("\(model.personaBytes) / \(ManageLimits.personaBytes) bytes")
                         .foregroundStyle(over ? HMDesign.danger : .secondary)
@@ -383,7 +388,7 @@ struct AddBotView: View {
                         }
                         .accessibilityIdentifier("manage.bot.host")
                     }
-                } header: { Text("Runs on") }.hmRows()
+                } header: { HMHeader("Runs on") }.hmRows()
                 if model.failure != nil { Section { ManageErrorLabel(failure: model.failure) }.hmRows() }
             }
             .hmCanvas()
@@ -467,7 +472,7 @@ struct PersonaDetailView: View {
                 }
                 .accessibilityIdentifier("manage.archiveBot")
                 .accessibilityHint("Asks for your deletion PIN, then hides this bot. You can restore it later")
-            } header: { Text("Manage") }.hmRows()
+            } header: { HMHeader("Manage") }.hmRows()
         }
         .hmCanvas()
         .navigationTitle(persona.name)

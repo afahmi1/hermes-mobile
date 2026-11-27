@@ -38,7 +38,7 @@ struct RuntimeSheet: View {
                 }
                 Section {
                     effortStrip
-                } header: { Text("Effort") } footer: {
+                } header: { HMHeader("Effort") } footer: {
                     if !reasoningSupported { Text("This model uses its own reasoning settings.") }
                     else if !reasoningKnown { Text("Hermes hasn’t reported reasoning support for this model. Default uses its own settings.") }
                 }.hmRows()
@@ -59,7 +59,7 @@ struct RuntimeSheet: View {
                     }
                     .disabled(catalogState.isRefreshing)
                     if loading { HStack { ProgressView(); Text("Loading models…").foregroundStyle(HMDesign.text2) } }
-                } header: { Text("Provider") } footer: {
+                } header: { HMHeader("Provider") } footer: {
                     if provider == nil, let bot { Text("Uses \(bot.name)'s own setting: \(bot.model) · \(bot.provider).") }
                     if !loading { Text(catalogState.caption(now: Date())) }
                 }.hmRows()
@@ -106,7 +106,7 @@ struct RuntimeSheet: View {
                             LabeledContent("Model", value: m)
                             if let p = pol.provider, !p.isEmpty { LabeledContent("Provider", value: p) }
                             LabeledContent("Effort", value: pol.effort.flatMap { Effort(rawValue: $0)?.label } ?? "Default")
-                        } header: { Text("Saved on this chat in Hermes") } footer: {
+                        } header: { HMHeader("Saved on this chat in Hermes") } footer: {
                             Text("The desktop app shows and uses the same setting.")
                         }.hmRows()
                     }
@@ -120,7 +120,7 @@ struct RuntimeSheet: View {
                                     Text(cost.includedApiUsd >= 0.01 ? "≈ \(CostSummary.money(cost.includedApiUsd)) at API prices" : "Included")
                                 }
                             }
-                        } header: { Text("This chat") } footer: {
+                        } header: { HMHeader("This chat") } footer: {
                             Text(cost.unknown ? "Some steps ran on a model with no price on record, so they aren't counted."
                                  : "From Hermes's usage records, including background helpers like summaries and image reading.")
                         }.hmRows()
@@ -223,7 +223,7 @@ struct RuntimeSheet: View {
     private func chip(_ value: String?, _ label: String) -> some View {
         let on = effort == value
         return Button {
-            withAnimation(Thermocline.Motion.standard) { effort = value }
+            withAnimation(HMMotion.standard) { effort = value }
         } label: {
             Text(label).font(.subheadline.weight(on ? .semibold : .regular))
                 .padding(.horizontal, 12).padding(.vertical, 7)

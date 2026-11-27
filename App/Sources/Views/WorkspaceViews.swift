@@ -98,7 +98,7 @@ struct WorkspaceView: View {
             ContentUnavailableView {
                 Label("Workspace unavailable", systemImage: "exclamationmark.triangle")
             } description: { Text(f.message) } actions: {
-                Button("Try again") { Task { await model.load() } }.buttonStyle(.borderedProminent)
+                Button("Try again") { Task { await model.load() } }.hmButton(.quiet, classic: .prominent)
             }
         case .loaded:
             switch tab {
@@ -148,7 +148,7 @@ struct WorkspaceView: View {
                         if model.detail.editable { Button("Remove", role: .destructive) { pendingDelete = file } }
                     }
                 }
-            } header: { Text("Files (\(model.detail.files.count)/\(WorkspaceLimits.maxFiles))") } footer: {
+            } header: { HMHeader("Files (\(model.detail.files.count)/\(WorkspaceLimits.maxFiles))") } footer: {
                 Text(".txt, .md, .csv or .json; UTF-8, up to 8192 bytes each.")
             }.hmRows()
         }
@@ -175,7 +175,7 @@ struct WorkspaceView: View {
                     }
                 } label: { Label("Start chat", systemImage: "square.and.pencil") }
                     .disabled(model.selectedBot == nil)
-            } header: { Text("New chat") } footer: {
+            } header: { HMHeader("New chat") } footer: {
                 Text(bots.isEmpty ? "No reachable bot is enabled for this project." : "Starting a chat opens a real session with the bot you choose.")
             }.hmRows()
             Section(header: HMHeader("Chats")) {
@@ -228,7 +228,7 @@ struct WorkspaceView: View {
                     NavigationLink { ArtifactListView(title: bot.name, profile: bot.id, session: nil, project: scope.projectID) } label: { Text(bot.name) }
                 }
             } header: {
-                Text("Bot library")
+                HMHeader("Bot library")
             } footer: {
                 Text("Files this bot made in this project only. Other projects' files are never shown here.")
             }.hmRows()
