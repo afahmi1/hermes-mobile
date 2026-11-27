@@ -86,10 +86,20 @@ struct HermesMobileApp: App {
                     if app.open(url) { selectedTab = 0 }
                 }
                 .onChange(of: app.gatewaySession) { _, _ in PushRegistration.shared.sync() }
+                .onAppear { ReplyNotifier.shared.appRef = app }
                 .onChange(of: ReplyNotifier.shared.destination, initial: true) { _, destination in
                     guard let destination else { return }
-                    if destination.open(in: app) { selectedTab = 0 }
-                    ReplyNotifier.shared.destination = nil
+                    let notifier = ReplyNotifier.shared
+                    let text = notifier.pendingReply
+                    notifier.pendingReply = nil
+                    notifier.destination = nil
+                    // Never send a notification reply to an old path if its gateway could not be opened.
+                    guard destination.open(in: app) else { return }
+                    selectedTab = 0
+                    if let text, let ref = app.inboxPath.last {
+                        let chat = app.chat(for: ref)
+                        Task { _ = await chat.enqueue(text, mode: "queue", attachments: []) }
+                    }
                 }
         }
         .onChange(of: phase) { old, now in
@@ -98,7 +108,7 @@ struct HermesMobileApp: App {
                 // Ask iOS for a little time so a live reply or an unsent message can finish going out.
                 let following = app.hasLiveRuns || app.hasUnsentMessages
                 ReplyNotifier.shared.left(liveRuns: following)
-                // Always tell the bridge: a stream a suspended app left open must not look like someone watching.
+                // Tell the bridge even when idle: a run can start after the phone goes away.
                 PushRegistration.shared.presence(away: true, following: following)
             }
             if now == .active {

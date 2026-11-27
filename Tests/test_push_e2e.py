@@ -243,6 +243,7 @@ class PushEndToEnd(unittest.TestCase):
         self.assertEqual(bridge_push.collapse_id(ACCOUNT, "default", "e2e-away"), h["apns-collapse-id"])
         self.verify_jwt(h["authorization"])
         self.assertEqual({"aps": {"alert": {"title": "Hermes", "body": "Your reply is ready."}, "sound": "default",
+                                  "category": "reply",
                                   "thread-id": bridge_push.destination_identifier(ACCOUNT, "default", "e2e-away")},
                           "account": ACCOUNT, "profile": "default", "session": "e2e-away"}, json.loads(r["body"]))
 

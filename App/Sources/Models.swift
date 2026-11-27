@@ -204,7 +204,7 @@ struct SessionSummary: Codable, Identifiable, Hashable {
     var sourceLabel: String {
         if createdVia == "mobile_bridge" { return "Mobile" }
         switch source ?? "" {
-        case "local": return "Local"
+        case "local": return "Desktop app"  // Hermes records the desktop app's own chats as "local"
         case "desktop": return "Desktop"
         case "gui": return "Hermes app"
         case "api_server": return "API"
@@ -698,7 +698,12 @@ struct ServedRuntime: Codable, Hashable {
         let provider: String?
         let calls: Int?
         let reasoningTokens: Int?
-        enum CodingKeys: String, CodingKey { case model, provider, calls, reasoningTokens = "reasoning_tokens" }
+        /// Newer bridges: what this model cost. kind = "priced" (usd paid), "included" (a plan; api_usd is the
+        /// API-price equivalent) or "unknown".
+        var usd: Double? = nil
+        var apiUsd: Double? = nil
+        var kind: String? = nil
+        enum CodingKeys: String, CodingKey { case model, provider, calls, usd, kind, reasoningTokens = "reasoning_tokens", apiUsd = "api_usd" }
     }
     enum CodingKeys: String, CodingKey {
         case model, provider, policy, cost

@@ -78,6 +78,7 @@ enum ThinkingLines {
         "following the white rabbit's logs",
         "spinning yarn out of static",
         "who left this candle burning",
+        "the targeting of the slop cannon will be televised",
     ]
 
     /// Same seed, same line: stable across redraws, changes when the tick or the 9 s window changes.

@@ -1210,7 +1210,14 @@ def session_runtime(pid, sid):
     finally:
         con.close()
     try:
-        d["cost"] = cost_summary(cost_ledger(pid, sid).values())
+        ledger = cost_ledger(pid, sid)
+        d["cost"] = cost_summary(ledger.values())
+        # Each model's own money: what was paid, or what a plan covered (API-price equivalent), and how.
+        for u in d.get("models_used") or []:
+            e = ledger.get((u.get("model"), u.get("provider") or ""))
+            if e:
+                u.update(usd=round(e["usd"], 6), api_usd=round(e["api_usd"], 6), kind=e["kind"],
+                         input=e["input"], output=e["output"])
     except Exception:
         log("cost ledger read failed")
     return d

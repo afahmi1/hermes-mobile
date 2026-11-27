@@ -74,6 +74,11 @@ The bridge doesn't reload itself. Every machine that runs one must be restarted 
      When only the code changed, it restarts in place (`launchctl kickstart` / `systemctl restart`).
    * Windows: `git pull`, then `powershell -ExecutionPolicy Bypass -File Windows\Install-HermesMobile.ps1`. Or
      restart the task: `Stop-ScheduledTask HermesMobileBridge; Start-ScheduledTask HermesMobileBridge`.
+     Hands-off (for an agent over SSH): unpack the new `Bridge`, `Status` and `Windows` folders into
+     `%LOCALAPPDATA%\HermesMobileCompanion.staged`, then run `Windows\Update-HermesMobile.ps1 -Staged <that folder>` as a
+     one-shot scheduled task (`New-ScheduledTaskPrincipal -LogonType S4U`). It waits until Hermes is idle, swaps the copy
+     in, restarts both tasks, checks `/m/ping` (rolling back if the new bridge doesn't answer), runs the doctor, and
+     logs to `%LOCALAPPDATA%\hermes\mobile\update.log`.
 3. **Check it's the new code and healthy:** run the doctor (all ✓), then confirm the phone reconnects (the status
    dot goes green, and a chat loads).
 4. **Do it on every machine.** A phone signed in to several gateways talks to each machine's own bridge.

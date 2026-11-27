@@ -74,7 +74,7 @@ def payload(event, bot, account, profile, session):
         return {"aps": {"alert": {"title": title.format(bot=bot), "body": body}, "sound": "default",
                         "thread-id": TEST_COLLAPSE_ID}}
     return {"aps": {"alert": {"title": title.format(bot=bot), "body": body}, "sound": "default",
-                    "thread-id": destination_identifier(account, profile, session)},
+                    "category": "reply", "thread-id": destination_identifier(account, profile, session)},
             "account": account, "profile": profile, "session": session}
 
 

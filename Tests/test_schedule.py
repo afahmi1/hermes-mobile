@@ -38,6 +38,15 @@ class ScheduleStore(unittest.TestCase):
         self.s.tick(boom, now=1000 + bs.GIVE_UP_AFTER + 1)
         self.assertEqual(self.s.list("default", "s1", include_done=True)[0]["status"], "failed")
 
+    def test_concurrent_ticks_send_once(self):
+        import threading
+        row = self.s.add("default", "s1", "x", 100, now=50)
+        other, sent = bs.Schedule(self.dir), []
+        ts = [threading.Thread(target=lambda st=st: st.tick(sent.append, now=200)) for st in (self.s, other) * 3]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual([r["id"] for r in sent], [row["id"]])
+
     def test_cancel_and_limits(self):
         row = self.s.add("default", "s1", "x", 1000, now=900)
         self.assertFalse(self.s.cancel("default", "other", row["id"]))

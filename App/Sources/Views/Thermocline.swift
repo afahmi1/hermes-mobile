@@ -36,6 +36,9 @@ public enum Thermocline {
         public static let onAccentToken = Token(light: 0xEBE7DE, dark: 0x13181D)
         public static let chestnutToken = Token(light: 0x693D24, dark: 0xD0986A)
         public static let plumToken = Token(light: 0x6C3D6B, dark: 0xB985B7)
+        /// Links follow Light's deep blue in Dark too, lifted for text: #186377 at OKLCH L 0.68 (hue 220 and chroma
+        /// kept) is #5FA4B9, 7.5:1 on black. It replaces the sky-lit wing #6FB3D0.
+        public static let linkToken = Token(light: 0x186377, dark: 0x5FA4B9)
         /// Thermocline's dark canvas: true black (default) or zayd.wtf's ash. Read when a color resolves, so a
         /// switch repaints at once. Only the four neutral steps change; text and accents keep their measured values.
         static let darkCanvasKey = "thermoclineDarkCanvas"
@@ -78,9 +81,11 @@ public enum Thermocline {
     public static let text       = Palette.textToken.color
     public static let text2      = Palette.make(light: 0x474047, dark: 0xB5AEA5)
     public static let text3      = Palette.text3Token.color
+    /// Crown's tint: text, icons and marks. Filled controls use `Accent.crown.fill`.
     public static let lead       = Accent.crown.color
+    /// Text on Crown's fill (`Accent.crown.fill`), not on `lead`.
     public static let onLead     = Accent.crown.onColor
-    public static let link       = Palette.make(light: 0x186377, dark: 0x6FB3D0)
+    public static let link       = Palette.linkToken.color
     public static let macawMid   = Palette.make(light: 0x2D8591, dark: 0x37949D)
     /// Macaw gold. Once per view.
     public static let spark      = Accent.crown.spark
@@ -120,10 +125,14 @@ public enum Thermocline {
             case .green: return "Gouldian finch green back"
             }
         }
-        public var token: Palette.Token {
+        /// Text, links, icons, toggles, `.tint`, marks and glows. In Dark, Crown and Wing follow Light's deep blues,
+        /// lifted only in OKLCH lightness (hue and chroma kept) so they read as text: #186377 -> #5FA4B9 (L 0.68,
+        /// 7.5:1 on black, 6.5:1 on #151515) and #02516A -> #6EAFCB (L 0.72). They replace v1.1's turquoise #6BCDC2
+        /// and sky #6FB3D0. The other accents are unchanged.
+        public var tintToken: Palette.Token {
             switch self {
-            case .crown: return .init(light: 0x186377, dark: 0x6BCDC2)
-            case .wing: return .init(light: 0x02516A, dark: 0x6FB3D0)
+            case .crown: return .init(light: 0x186377, dark: 0x5FA4B9)
+            case .wing: return .init(light: 0x02516A, dark: 0x6EAFCB)
             case .gold: return .init(light: 0x875300, dark: 0xF4B21F)
             case .cheek: return .init(light: 0xA73B00, dark: 0xED732D)
             case .chestnut: return Palette.chestnutToken
@@ -131,18 +140,44 @@ public enum Thermocline {
             case .green: return .init(light: 0x4B6801, dark: 0xA3C54F)
             }
         }
+        /// Bubbles, primary buttons, selected chips, the send button and swatches. Crown and Wing fill with Light's
+        /// deep ocean blue in both modes; every other accent fills with its tint.
+        public var fillToken: Palette.Token {
+            switch self {
+            case .crown: return .init(light: 0x186377, dark: 0x186377)
+            case .wing: return .init(light: 0x02516A, dark: 0x02516A)
+            default: return tintToken
+            }
+        }
+        /// Text and glyphs on `fill`: paper ink on the deep blues in both modes (5.5:1 Crown, 7.1:1 Wing), the
+        /// measured on-accent ink on the rest.
+        public var onFillToken: Palette.Token {
+            switch self {
+            case .crown, .wing: return .init(light: 0xEBE7DE, dark: 0xEBE7DE)
+            default: return Palette.onAccentToken
+            }
+        }
+        /// v1.1's single token; now the tint.
+        public var token: Palette.Token { tintToken }
         public var sparkToken: Palette.Token {
             self == .gold ? .init(light: 0x18887F, dark: 0x6BCDC2) : .init(light: 0xAE6B00, dark: 0xF4B21F)
         }
         /// Secondary is chestnut, unless the accent is chestnut; then plum.
         public var secondary: Color { (self == .chestnut ? Palette.plumToken : Palette.chestnutToken).color }
         /// Dynamic (system appearance; watchOS always dark).
-        public var color: Color { token.color }
-        public var onColor: Color { Palette.onAccentToken.color }
+        public var tint: Color { tintToken.color }
+        public var fill: Color { fillToken.color }
+        public var onFill: Color { onFillToken.color }
+        /// v1.1 names: `color` is the tint, `onColor` the text on `fill`. Never pair them with each other.
+        public var color: Color { tint }
+        public var onColor: Color { onFill }
         public var spark: Color { sparkToken.color }
         /// Explicit-scheme resolvers for previews, thumbnails and watchOS light.
-        public func color(for scheme: ColorScheme) -> Color { token.color(for: scheme) }
-        public func onColor(for scheme: ColorScheme) -> Color { Palette.onAccentToken.color(for: scheme) }
+        public func tint(for scheme: ColorScheme) -> Color { tintToken.color(for: scheme) }
+        public func fill(for scheme: ColorScheme) -> Color { fillToken.color(for: scheme) }
+        public func onFill(for scheme: ColorScheme) -> Color { onFillToken.color(for: scheme) }
+        public func color(for scheme: ColorScheme) -> Color { tint(for: scheme) }
+        public func onColor(for scheme: ColorScheme) -> Color { onFill(for: scheme) }
         public func spark(for scheme: ColorScheme) -> Color { sparkToken.color(for: scheme) }
         public func secondary(for scheme: ColorScheme) -> Color {
             (self == .chestnut ? Palette.plumToken : Palette.chestnutToken).color(for: scheme)
@@ -327,7 +362,7 @@ public struct HorizonEyeMark: View {
 
 // MARK: - Previews: theme thumbnail, mode thumbnail, accent swatch
 
-/// Mini scene: canvas, card, accent bubble, resolved for an explicit scheme.
+/// Mini scene: canvas, card, accent bubble, resolved for an explicit scheme. The bubble is the accent's fill.
 private struct ThermoclineMiniScene: View {
     let accent: Thermocline.Accent
     let scheme: ColorScheme
@@ -342,7 +377,7 @@ private struct ThermoclineMiniScene: View {
                 .frame(width: 30, height: 14)
                 .offset(x: 5, y: 6)
             Capsule()
-                .fill(accent.color(for: scheme))
+                .fill(accent.fill(for: scheme))
                 .frame(width: 24, height: 10)
                 .offset(x: 27, y: 24)
         }
@@ -406,6 +441,7 @@ public struct ModeThumbnail: View {
 
 /// 28pt accent circle inside a 44x44 rectangular hit area. Wrap in a Button at the call site.
 /// Selection: text-color ring plus checkmark (never color alone); exposes the selected trait.
+/// The circle is the accent's fill, the checkmark its on-fill ink.
 public struct AccentSwatch: View {
     public var accent: Thermocline.Accent
     public var selected: Bool
@@ -413,13 +449,13 @@ public struct AccentSwatch: View {
     public init(accent: Thermocline.Accent, selected: Bool) { self.accent = accent; self.selected = selected }
     public var body: some View {
         ZStack {
-            Circle().fill(accent.color(for: scheme)).frame(width: 28, height: 28)
+            Circle().fill(accent.fill(for: scheme)).frame(width: 28, height: 28)
             if selected {
                 Circle().strokeBorder(Thermocline.Palette.textToken.color(for: scheme), lineWidth: 2)
                     .frame(width: 36, height: 36)
                 Image(systemName: "checkmark")
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(accent.onColor(for: scheme))
+                    .foregroundStyle(accent.onFill(for: scheme))
             }
         }
         .frame(width: 44, height: 44)

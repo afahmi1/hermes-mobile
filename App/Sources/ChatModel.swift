@@ -54,6 +54,9 @@ struct PastedText: Identifiable, Equatable, Codable {
     var text: String
     /// A reply quote: shown as a compact "Replying to" chip, sent as a Markdown quote ahead of the message.
     var quote: Bool? = nil
+    /// Replying to several messages: your words for this quote (the newest quote's words are the main box).
+    /// A quote whose `text` is empty is a plain segment left behind when its pill was removed.
+    var answer: String? = nil
     var isQuote: Bool { quote == true }
 }
 
@@ -68,6 +71,32 @@ enum ReplyQuote {
         let body = lines.dropFirst(head.count).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !quote.isEmpty, !body.isEmpty else { return (nil, text) }
         return (quote, body)
+    }
+
+    /// Every quote in a sent message with the words under it, in order: [(quote, body)]. A body before the first
+    /// quote has quote nil. Lets a reply to three messages show three quote cards, each with its answer.
+    static func segments(_ text: String) -> [(quote: String?, body: String)] {
+        var out: [(String?, String)] = []
+        var quote: [String] = [], body: [String] = []
+        var inQuote = false
+        func flush() {
+            let q = quote.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            let b = body.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !q.isEmpty || !b.isEmpty { out.append((q.isEmpty ? nil : q, b)) }
+            quote = []; body = []
+        }
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix(">") {
+                if !inQuote && (!quote.isEmpty || !body.isEmpty) { flush() }
+                inQuote = true
+                quote.append(line.dropFirst().trimmingCharacters(in: .whitespaces))
+            } else {
+                inQuote = false
+                body.append(String(line))
+            }
+        }
+        flush()
+        return out
     }
 
     /// What goes on the wire: a short Markdown quote Hermes reads as "this is what I'm replying to".
@@ -220,19 +249,75 @@ final class ChatModel {
 
     /// What the next send actually delivers: the draft plus every pasted chunk.
     var combinedDraft: String {
-        let quote = pastedTexts.first(where: \.isQuote).map { ReplyQuote.markdown($0.text) }
+        let quotes = pastedTexts.filter(\.isQuote)
         let extra = pastedTexts.filter { !$0.isQuote }.map(\.text).joined(separator: "\n\n")
         let body = extra.isEmpty ? draft : draft.isEmpty ? extra : draft + "\n\n" + extra
-        guard let quote else { return body }
-        return body.isEmpty ? quote : quote + "\n\n" + body
+        guard !quotes.isEmpty else { return body }
+        // > quote 1, your words for it, > quote 2, …, the newest quote, then the main box.
+        var parts: [String] = []
+        for (i, q) in quotes.enumerated() {
+            if !q.text.isEmpty { parts.append(ReplyQuote.markdown(q.text)) }
+            let words = (i == quotes.count - 1 ? body : (q.answer ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !words.isEmpty { parts.append(words) }
+        }
+        return parts.joined(separator: "\n\n")
     }
 
-    /// Reply to a message: one quote chip at a time (a new one replaces the old).
+    /// Reply to a message. Replying to another one keeps the first: what you typed becomes your answer to the
+    /// previous quote, and the box starts your answer to the new one.
     func setReplyQuote(_ raw: String) {
         let excerpt = ReplyQuote.excerpt(raw)
         guard !excerpt.isEmpty else { return }
+        if pastedTexts.contains(where: { $0.isQuote && $0.text == excerpt }) { return }
+        if let last = pastedTexts.lastIndex(where: \.isQuote) {
+            let typed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !typed.isEmpty {
+                let had = pastedTexts[last].answer ?? ""
+                pastedTexts[last].answer = had.isEmpty ? typed : had + "\n\n" + typed
+                draft = ""
+            }
+        }
+        let at = (pastedTexts.lastIndex(where: \.isQuote).map { $0 + 1 }) ?? 0
+        pastedTexts.insert(PastedText(text: excerpt, quote: true), at: at)
+    }
+
+    /// Remove a reply pill. Only the quote goes: the words you wrote for it stay where they were.
+    func removeReplyQuote(_ id: UUID) {
+        let quotes = pastedTexts.filter(\.isQuote)
+        guard let i = quotes.firstIndex(where: { $0.id == id }), let at = pastedTexts.firstIndex(where: { $0.id == id }) else { return }
+        let words = (quotes[i].answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if i == quotes.count - 1 {
+            // The newest quote: its words are the main box, which now answers the quote before it (or nothing).
+            pastedTexts.remove(at: at)
+            // The quote that is newest now answers through the box: pull its words (and any plain segments
+            // that ended up last) down into the box, in order.
+            while let prev = pastedTexts.lastIndex(where: \.isQuote) {
+                let carried = (pastedTexts[prev].answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                pastedTexts[prev].answer = nil
+                if !carried.isEmpty { draft = draft.isEmpty ? carried : carried + "\n\n" + draft }
+                guard pastedTexts[prev].text.isEmpty else { break }
+                pastedTexts.remove(at: prev)
+            }
+        } else if words.isEmpty {
+            pastedTexts.remove(at: at)
+        } else {
+            pastedTexts[at].text = ""  // keep the words as a plain segment in place
+        }
+    }
+
+    /// "Edit as New Message" on a reply to several messages: every quote back as a pill with its words.
+    func restoreReplies(from text: String) -> Bool {
+        let segs = ReplyQuote.segments(text)
+        guard segs.contains(where: { $0.quote != nil }) else { return false }
         pastedTexts.removeAll(where: \.isQuote)
-        pastedTexts.insert(PastedText(text: excerpt, quote: true), at: 0)
+        var restored: [PastedText] = []
+        for (i, seg) in segs.enumerated() {
+            let last = i == segs.count - 1
+            restored.append(PastedText(text: seg.quote ?? "", quote: true, answer: last || seg.body.isEmpty ? nil : seg.body))
+            if last { draft = seg.body }
+        }
+        pastedTexts.insert(contentsOf: restored, at: 0)
+        return true
     }
     private var transcriptKey: String? {
         sessionId.flatMap { app?.inboxKey(profile: profile, filter: "transcript/" + $0) }

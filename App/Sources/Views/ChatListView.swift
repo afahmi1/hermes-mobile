@@ -24,6 +24,7 @@ struct ChatListView: View {
         })
     }
     @State private var showNew = false
+    @State private var whatsNew: WhatsNewRelease? = nil
     @State private var selecting = false
     @State private var selection = Set<String>()
     @State private var batchBusy = false
@@ -102,6 +103,8 @@ struct ChatListView: View {
                 .modifier(RenameSheetModifier(renaming: $renaming, sessions: $sessions, results: $results))
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
+                .sheet(item: $whatsNew, onDismiss: { if let w = whatsNew { WhatsNew.markSeen(w) } }) { w in WhatsNewSheet(release: w) }
+                .onAppear { if whatsNew == nil { whatsNew = WhatsNew.due() } }
                 .sheet(isPresented: $showNew) {
                     NewChatSheet { bot in
                         showNew = false
@@ -338,7 +341,7 @@ struct ChatListView: View {
                         Text(f.chip).font(.subheadline.weight(filter == f ? .semibold : .regular))
                             .foregroundStyle(filter == f ? (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas) : HMDesign.ink)
                             .padding(.horizontal, 12).frame(minHeight: 32)
-                            .background(filter == f ? HMDesign.accent : HMDesign.panel, in: Capsule())
+                            .background(filter == f ? HMDesign.accentFill : HMDesign.panel, in: Capsule())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(f.rawValue)
@@ -358,7 +361,7 @@ struct ChatListView: View {
                         .font(.subheadline.weight(selectedBot == nil ? .regular : .semibold))
                         .foregroundStyle(selectedBot == nil ? HMDesign.ink : (HMTheme.isThermocline ? HMDesign.bubbleText : HMDesign.canvas))
                         .padding(.horizontal, 12).frame(minHeight: 32)
-                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accent, in: Capsule())
+                        .background(selectedBot == nil ? HMDesign.panel : HMDesign.accentFill, in: Capsule())
                     }
                     .accessibilityLabel("Bot, " + (selectedBot.map { app.botName($0) } ?? "All bots"))
                 }
@@ -390,7 +393,18 @@ struct ChatListView: View {
                     if !typeSize.isAccessibilitySize {
                         switch ChatIconStyle(rawValue: iconStyle) ?? .auto {
                         case .monogram:
-                            ChatMonogram(seed: s.id, title: s.displayTitle, size: 32).padding(.top, 2).accessibilityHidden(true)
+                            // The chat's own letter, with its bot as a small colored corner badge when bots are mixed.
+                            ChatMonogram(seed: s.id, title: s.displayTitle, size: 32)
+                                .overlay(alignment: .bottomTrailing) {
+                                    if mixedBots {
+                                        BotAvatar(id: s.profile, name: app.botName(s.profile), size: 15)
+                                            .overlay(Circle().strokeBorder(HMDesign.canvas, lineWidth: 1.5))
+                                            .offset(x: 3, y: 3)
+                                    }
+                                }
+                                .padding(.top, 2).accessibilityHidden(true)
+                        case .bot:
+                            BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32).padding(.top, 2).accessibilityHidden(true)
                         case .auto where mixedBots:
                             BotAvatar(id: s.profile, name: app.botName(s.profile), size: 32).padding(.top, 2).accessibilityHidden(true)
                         default:
@@ -1084,13 +1098,14 @@ struct RowPress: ButtonStyle {
 
 /// What sits at the left of each chat row.
 enum ChatIconStyle: String, CaseIterable, Identifiable {
-    case auto, monogram, none
+    case auto, bot, monogram, none
     static let key = "hm.chatIcons"
     var id: String { rawValue }
     var title: String {
         switch self {
         case .auto: "Bot, when mixed"
-        case .monogram: "Per chat"
+        case .bot: "Every bot"
+        case .monogram: "Per chat + bot"
         case .none: "None"
         }
     }

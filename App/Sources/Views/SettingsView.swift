@@ -24,10 +24,14 @@ struct SettingsView: View {
         return "\(app.bots.filter(\.reachable).count) of \(app.bots.count) reachable"
     }
 
+    @State private var showWhatsNew = false
     var body: some View {
         NavigationStack {
             Form {
                 // Where this phone is connected, as one card. Other gateways live one tap in.
+                Section {
+                    Button("What's new") { showWhatsNew = true }
+                }.hmRows()
                 Section {
                     NavigationLink {
                         GatewaysPage(addingGateway: $addingGateway, gatewayError: $gatewayError, forgetting: $forgetting)
@@ -78,8 +82,12 @@ struct SettingsView: View {
                         .accessibilityLabel("App version \(appVersion)")
                 }.hmRows()
             }
+            #if DEBUG
+            .modifier(SettingsScrollHook())
+            #endif
             .hmCanvas()
             .navigationTitle("Settings")
+            .sheet(isPresented: $showWhatsNew) { if let w = WhatsNew.current { WhatsNewSheet(release: w) } }
             .sheet(isPresented: $addingGateway) { SignInView(adding: true) }
             .task(id: app.inboxAccount) {
                 capabilities = nil
@@ -127,6 +135,26 @@ struct SettingsView: View {
         }
     }
 }
+
+#if DEBUG
+/// Screenshot QA (debug builds only): `-HMSettingsScroll thinking` scrolls Settings to the thinking styles at launch.
+private struct SettingsScrollHook: ViewModifier {
+    private let target = UserDefaults.standard.string(forKey: "HMSettingsScroll")
+
+    func body(content: Content) -> some View {
+        if let target {
+            ScrollViewReader { proxy in
+                content.task {
+                    try? await Task.sleep(for: .milliseconds(700))
+                    proxy.scrollTo("hm.settings." + target, anchor: .center)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+#endif
 
 /// A settings row: a small tinted icon tile, the title, and an optional value on the right (like iOS Settings).
 struct SettingsRow: View {
@@ -570,6 +598,7 @@ struct AppearanceSection: View {
                 }
             }
             .padding(.vertical, 4)
+            .id("hm.settings.thinking")
             Picker("While Hermes works", selection: $wordsRaw) {
                 ForEach(ThinkingWords.allCases) { Text($0.title).tag($0.rawValue) }
             }
@@ -668,7 +697,8 @@ private struct ThemePreview: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             if kind == .thermocline {
-                HMDepthField()
+                // Held still: a list row never runs the canvas timeline.
+                HMDepthField(animated: false)
                 VStack(alignment: .leading, spacing: 5) {
                     Capsule().fill(Thermocline.text.opacity(0.75)).frame(width: 44, height: 4)
                     Capsule().fill(Thermocline.text3.opacity(0.6)).frame(width: 30, height: 3)
@@ -677,7 +707,7 @@ private struct ThemePreview: View {
                 .frame(width: 70, alignment: .leading)
                 .hmGlass(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .padding(10)
-                Capsule().fill(HMTheme.thermoclineAccent.color).frame(width: 34, height: 12)
+                Capsule().fill(HMTheme.thermoclineAccent.fill).frame(width: 34, height: 12)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing).padding(10)
             } else {
                 HMTheme.classicChoice == .native ? Color(uiColor: .systemGroupedBackground) : HMTheme.classicColor(\.canvas)
@@ -731,10 +761,11 @@ private struct ModePreview: View {
     private var scene: some View {
         ZStack(alignment: .bottomLeading) {
             Thermocline.bg
+            HMDeepSeaBlooms(animated: false)  // Dark only: the far-off glow, held still.
             RoundedRectangle(cornerRadius: 5, style: .continuous).fill(HMDesign.card)
                 .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Thermocline.line, lineWidth: 0.5))
                 .frame(width: 38, height: 18).padding(8)
-            Circle().fill(HMTheme.thermoclineAccent.color).frame(width: 9, height: 9)
+            Circle().fill(HMTheme.thermoclineAccent.fill).frame(width: 9, height: 9)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(8)
         }
     }

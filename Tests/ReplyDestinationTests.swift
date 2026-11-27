@@ -30,12 +30,13 @@ func run() async {
 
     // In the foreground only the chat on screen keeps its notifications to itself.
     let other = ReplyDestination(account: real.account, profile: "frostbyte", session: "another-chat")
-    check(!ForegroundPolicy.shows(real, watching: real), "the chat on screen gets no banner")
-    check(ForegroundPolicy.shows(other, watching: real), "another chat's reply shows while you read this one")
-    check(ForegroundPolicy.shows(real, watching: nil), "no chat on screen (inbox, Status): shown")
-    check(ForegroundPolicy.shows(nil, watching: real), "a push without a chat (--push-test): shown")
+    check(!ForegroundPolicy.shows(real, visibleChat: real), "the chat on screen gets no banner")
+    check(ForegroundPolicy.shows(other, visibleChat: real), "another chat's reply shows while you read this one")
+    check(ForegroundPolicy.shows(real, visibleChat: nil), "no chat on screen (inbox, Status): shown")
+    check(ForegroundPolicy.shows(nil, visibleChat: real), "a push without a chat (--push-test): shown")
     let elsewhere = ReplyDestination(account: "another-gateway", profile: "frostbyte", session: real.session)
-    check(ForegroundPolicy.shows(elsewhere, watching: real), "the same chat id on another gateway is another chat")
+    check(ForegroundPolicy.shows(elsewhere, visibleChat: real), "the same chat id on another gateway is another chat")
+    check(ForegroundPolicy.shows(real, visibleChat: real, away: true), "a reply to the last visible chat still shows while away")
 
     // What each notification says. Generic events use the bridge's words (bridge_push.COPY).
     check(ReplyEvent.question.title(bot: "Frost") == "Frost has a question", "question title")
@@ -53,9 +54,9 @@ func run() async {
     notifier.watch(real)
     notifier.watch(other)
     notifier.unwatch(real)
-    check(notifier.watching == other, "the chat that appeared last stays watched")
+    check(notifier.visibleChat == other, "the chat that appeared last stays visible")
     notifier.unwatch(other)
-    check(notifier.watching == nil, "leaving clears it")
+    check(notifier.visibleChat == nil, "leaving clears it")
     print("Reply destination, foreground policy and notification copy tests passed")
 }
 

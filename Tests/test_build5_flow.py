@@ -6,13 +6,14 @@ fail-closed paths: no auth, ordinary (non-owner) token, missing PIN, wrong PIN. 
 """
 import json
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_manage_http as base  # noqa: E402  (its setUpModule builds the synthetic HERMES_HOME and imports the bridge)
-from test_manage_http import PIN, WRONG, leaks  # noqa: E402
+from test_manage_http import PIN, WRONG  # noqa: E402
 
 
 def setUpModule():
@@ -123,9 +124,10 @@ class Build5Flow(base.Base):
 
         # --- nothing on disk under profiles/, no PIN anywhere in replies or logs ---
         self.assertEqual(self.profiles_snapshot(), snap)
+        # As a token, not a substring: a short PIN can occur inside a float timestamp ("1795807013.58...").
         for raw in self.srv.bodies:
-            self.assertFalse(leaks(PIN, raw), raw)
-        self.assertFalse(leaks(PIN, self.log.getvalue()))
+            self.assertIsNone(re.search(rb"(?<![\d.])" + PIN.encode() + rb"(?![\d.])", raw), raw[:200])
+        self.assertNotIn(PIN, self.log.getvalue())
 
 
 if __name__ == "__main__":

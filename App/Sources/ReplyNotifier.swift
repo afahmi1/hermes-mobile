@@ -77,9 +77,8 @@ enum ReplyEvent {
 /// reply; anything else (another chat, a "Try again when limits reset" send, a reply from another device's chat)
 /// would otherwise vanish without a trace, because the app suppressed every banner in the foreground.
 enum ForegroundPolicy {
-    static func shows(_ notification: ReplyDestination?, watching: ReplyDestination?) -> Bool {
-        guard let notification, let watching else { return true }
-        return notification != watching
+    static func shows(_ notification: ReplyDestination?, visibleChat: ReplyDestination?, away: Bool = false) -> Bool {
+        away || notification == nil || notification != visibleChat
     }
 }
 
@@ -104,14 +103,24 @@ import Observation
 final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = ReplyNotifier()
     var destination: ReplyDestination?
-    /// The chat on screen. Its notifications aren't shown over it, and opening it clears the ones it had.
-    @ObservationIgnored private(set) var watching: ReplyDestination?
+    /// Text typed into a notification's Reply action, consumed by the app when it opens that chat.
+    var pendingReply: String?
 
     private var grace: UIBackgroundTaskIdentifier = .invalid
     private(set) var away = false
     private var asked = false
+    weak var appRef: AppModel?
+    /// The chat on screen, scoped to its gateway. It shows its own replies; other chats still notify.
+    private(set) var visibleChat: ReplyDestination?
 
-    func install() { UNUserNotificationCenter.current().delegate = self }
+    func install() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        // Long-press a notification to type a reply. It queues like any other send and goes when the Mac answers.
+        let reply = UNTextInputNotificationAction(identifier: "reply", title: "Reply", options: [],
+                                                   textInputButtonTitle: "Send", textInputPlaceholder: "Reply…")
+        center.setNotificationCategories([UNNotificationCategory(identifier: "reply", actions: [reply], intentIdentifiers: [])])
+    }
 
     /// Ask at the first send, when the reason is obvious, and never again.
     func askOnce() {
@@ -139,7 +148,7 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         grace = UIApplication.shared.beginBackgroundTask(withName: "Follow reply") { [weak self] in
             // iOS calls this on the main thread just before it suspends the app. The task must end here, and
             // from now on only the Mac can tell the person, so it hears about it first.
-            MainActor.assumeIsolated { self?.stopFollowing() }
+            MainActor.assumeIsolated { self?.stopFollowing(expiring: true) }
         }
     }
 
@@ -153,10 +162,17 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// The app is about to stop following its runs: a queued follow-up or a run it didn't hear end is the
     /// bridge's to announce now, not in thirty-five seconds.
-    private func stopFollowing() {
+    private func stopFollowing(expiring: Bool = false) {
         guard grace != .invalid else { return }
-        if away { PushRegistration.shared.stoppedFollowing() }
-        endGrace()
+        defer { endGrace() }
+        guard away else { return }
+        PushRegistration.shared.stoppedFollowing()
+        // iOS is about to suspend the app while Hermes still works. Without push, this is the last chance to alert.
+        guard expiring, let app = appRef else { return }
+        for (_, chat) in app.openChats where chat.isRunning {
+            post(.reply, bot: app.botName(chat.profile), account: app.inboxAccount, profile: chat.profile,
+                 session: chat.sessionId, detail: "Hermes is still working. Open the app to see the reply.")
+        }
     }
 
     private func endGrace() {
@@ -169,8 +185,9 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
               detail: String? = nil, worked: TimeInterval? = nil) {
-        guard away, let account, let session else { return }
+        guard let account, let session else { return }
         let chat = ReplyDestination(account: account, profile: profile, session: session)
+        guard ForegroundPolicy.shows(chat, visibleChat: visibleChat, away: away) else { return }
         let content = UNMutableNotificationContent()
         content.title = event.title(bot: bot, worked: worked)
         // One readable sentence of what happened. iOS hides the body on a locked phone unless the person
@@ -178,6 +195,7 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.body = detail.flatMap { $0.isEmpty ? nil : $0 } ?? event.fallback
         content.sound = .default
         content.threadIdentifier = chat.identifier
+        content.categoryIdentifier = "reply"
         content.userInfo = chat.userInfo
 
         // One notification per chat: a newer event replaces the older one instead of stacking.
@@ -187,13 +205,13 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// A chat came on screen (nil: one without a session yet).
     func watch(_ chat: ReplyDestination?) {
-        watching = chat
+        visibleChat = chat
         if let chat { clearDelivered(chat) }
     }
 
     /// A chat left the screen. Another may have appeared first, so only its own claim is dropped.
     func unwatch(_ chat: ReplyDestination?) {
-        if watching == chat { watching = nil }
+        if visibleChat == chat { visibleChat = nil }
     }
 
     /// Opening a chat answers its notifications: take them out of Notification Center. Local ones use the
@@ -209,14 +227,19 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         guard let chat = ReplyDestination(userInfo: response.notification.request.content.userInfo) else { return }
-        await MainActor.run { self.destination = chat }
+        let text = response.actionIdentifier == "reply" ? (response as? UNTextInputNotificationResponse)?.userText : nil
+        let reply = text.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        await MainActor.run {
+            self.pendingReply = reply
+            self.destination = chat
+        }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
                                             willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         let chat = ReplyDestination(userInfo: notification.request.content.userInfo)
-        let watching = await MainActor.run { self.watching }
-        return ForegroundPolicy.shows(chat, watching: watching) ? [.banner, .list, .sound] : []
+        let visibleChat = await MainActor.run { self.visibleChat }
+        return ForegroundPolicy.shows(chat, visibleChat: visibleChat) ? [.banner, .list, .sound] : []
     }
 }
 #else
@@ -228,7 +251,7 @@ final class ReplyNotifier {
     static let shared = ReplyNotifier()
     typealias Event = ReplyEvent
     var away = false
-    private(set) var watching: ReplyDestination?
+    private(set) var visibleChat: ReplyDestination?
     func install() {}
     func askOnce() {}
     func registerIfAuthorized() {}
@@ -237,8 +260,8 @@ final class ReplyNotifier {
     func settled(liveRuns: Bool) {}
     func post(_ event: Event, bot: String, account: String?, profile: String, session: String?,
               detail: String? = nil, worked: TimeInterval? = nil) {}
-    func watch(_ chat: ReplyDestination?) { watching = chat }
-    func unwatch(_ chat: ReplyDestination?) { if watching == chat { watching = nil } }
+    func watch(_ chat: ReplyDestination?) { visibleChat = chat }
+    func unwatch(_ chat: ReplyDestination?) { if visibleChat == chat { visibleChat = nil } }
 }
 #endif
 
