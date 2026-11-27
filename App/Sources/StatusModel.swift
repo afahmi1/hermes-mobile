@@ -1,5 +1,9 @@
 import Foundation
 import Observation
+#if DEBUG && canImport(UIKit)
+import UIKit
+import SwiftUI
+#endif
 
 /// A lenient view over JSON from the Mac's status dashboard. The dashboard discovers bots, cron jobs and
 /// running agents fresh on every call and may grow new fields; reading through this wrapper means a new
@@ -41,6 +45,40 @@ struct JV: Hashable {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
     }()
     private static let isoPlain = ISO8601DateFormatter()
+}
+
+/// Which cron jobs the Status page shows first. Pure, so it is tested without the UI.
+enum StatusJobs {
+    static let defaultLimit = 5
+
+    static func isFailing(_ job: JV) -> Bool {
+        (job["failure_streak"].int ?? 0) > 0 || ["failed", "error"].contains(job["last_status"].string ?? "")
+    }
+
+    /// Every job, most relevant first: failing, then overdue, then soonest `next_run_at` (no next run last),
+    /// and paused jobs that are not failing at the end. Equal jobs keep the order the Mac sent them in.
+    static func ranked(_ jobs: [JV], now: Date = Date()) -> [JV] {
+        func key(_ j: JV) -> (Int, Int, Date) {
+            let failing = isFailing(j)
+            let paused = j["paused"].bool && !failing
+            let next = j["next_run_at"].date
+            let overdue = next.map { $0 < now } ?? false
+            return (paused ? 2 : failing ? 0 : 1, overdue ? 0 : 1, next ?? .distantFuture)
+        }
+        return jobs.enumerated().map { (index: $0.offset, job: $0.element, key: key($0.element)) }
+            .sorted { a, b in
+                if a.key.0 != b.key.0 { return a.key.0 < b.key.0 }
+                if a.key.1 != b.key.1 { return a.key.1 < b.key.1 }
+                if a.key.2 != b.key.2 { return a.key.2 < b.key.2 }
+                return a.index < b.index
+            }
+            .map(\.job)
+    }
+
+    /// The jobs worth a row up front: at most `limit`, never a paused job unless it is failing.
+    static func top(_ jobs: [JV], limit: Int = defaultLimit, now: Date = Date()) -> [JV] {
+        Array(ranked(jobs.filter { !$0["paused"].bool || isFailing($0) }, now: now).prefix(max(0, limit)))
+    }
 }
 
 /// The Mac's status, polled by the app. Fast while the Status tab is open, slow otherwise, so the tab
@@ -96,11 +134,30 @@ final class StatusModel {
             updatedAt = Date()
             error = nil
             noticeChanges(p, app: app)
+            #if DEBUG && canImport(UIKit)
+            Self.debugShowStatus(app: app)
+            #endif
         } catch {
             guard refreshID == id, !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
     }
+
+    #if DEBUG && canImport(UIKit)
+    private static var didShowStatus = false
+    /// Screenshot QA (debug builds only): `-HMStatusTab YES` shows the real StatusView full screen with no taps.
+    private static func debugShowStatus(app: AppModel) {
+        guard !didShowStatus, UserDefaults.standard.bool(forKey: "HMStatusTab"),
+              let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
+              let root = scene.windows.first(where: \.isKeyWindow)?.rootViewController else { return }
+        didShowStatus = true
+        var top = root
+        while let next = top.presentedViewController { top = next }
+        let host = UIHostingController(rootView: StatusView().environment(app))
+        host.modalPresentationStyle = .fullScreen
+        top.present(host, animated: false)
+    }
+    #endif
 
     func markSeen() {
         if let newest = newestEventAt, newest > (seenEventsUntil ?? .distantPast) { seenEventsUntil = newest }
