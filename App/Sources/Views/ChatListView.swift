@@ -84,6 +84,7 @@ struct ChatListView: View {
     var body: some View {
         NavigationStack(path: navigation) {
             inboxNavigation
+                .safeAreaInset(edge: .bottom) { QueuedActionsBar() }
                 .sheet(isPresented: $showSourceGuide) { SourceGuideView() }
                 .sheet(isPresented: $showGateways) { GatewayDestinationsView() }
                 .sheet(isPresented: $showNew) {
@@ -465,10 +466,25 @@ struct ChatListView: View {
             if !query.isEmpty { await runSearch() }
         } catch APIError.http(404, _) {
             await setFlag(s, "archived", true)
+        } catch where ActionQueue.isOffline(error) {
+            guard destination == app.gatewaySession else { return }
+            await queueFlags([s], ["archived": true], confirmPins: confirmPins)
         } catch {
             guard destination == app.gatewaySession else { return }
             self.error = error.localizedDescription
         }
+    }
+
+    /// The Mac can't be reached: save the change on this phone, show it now, send it when the Mac answers.
+    private func queueFlags(_ targets: [SessionSummary], _ fields: [String: Bool], confirmPins: Bool = false) async {
+        guard let account = API.shared.accountID else { return }
+        for (pid, rows) in Dictionary(grouping: targets, by: \.profile) {
+            let action = QueuedAction(account: account, kind: .flags, profile: pid, ids: rows.map(\.id), fields: fields,
+                                      confirmPins: confirmPins)
+            _ = await ActionQueue.shared.perform(action)
+        }
+        for row in targets { for (flag, value) in fields { apply(flag, value, to: row.key) } }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     private func batch(_ fields: [String: Bool], only: [SessionSummary]? = nil, confirmPins: Bool = false) async {
@@ -498,6 +514,9 @@ struct ChatListView: View {
                         do { try await api.updateSession(profile: pid, session: row.id, fields: fields) }
                         catch { failures.insert(row.key) }
                     }
+                } catch where ActionQueue.isOffline(error) {
+                    // Offline: these go out when the Mac answers. Not failures.
+                    await queueFlags(Array(chunk), fields, confirmPins: confirmPins)
                 } catch { failures.formUnion(chunk.map(\.key)) }
             }
         }
@@ -666,6 +685,9 @@ struct ChatListView: View {
             // and lose the reader's position; the periodic refresh reconciles with the gateway.
             apply(flag, value, to: s.key)
             if !query.isEmpty { await runSearch() }
+        } catch where ActionQueue.isOffline(error) {
+            guard destination == app.gatewaySession else { return }
+            await queueFlags([s], [flag: value])
         } catch {
             guard destination == app.gatewaySession else { return }
             self.error = error.localizedDescription
@@ -836,6 +858,38 @@ private struct SourceGuideView: View {
             .navigationTitle("Chats, explained")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+}
+
+/// "2 changes waiting for your Mac": actions taken offline, sent in order when the Mac answers.
+struct QueuedActionsBar: View {
+    private var queue = ActionQueue.shared
+
+    var body: some View {
+        let mine = queue.mine
+        if !mine.isEmpty {
+            let stuck = mine.filter { $0.problem != nil }
+            Menu {
+                ForEach(mine) { action in
+                    Section(action.problem.map { "Didn't apply: " + $0 } ?? "Waiting") {
+                        Button(role: .destructive) { queue.discard(action.id) } label: {
+                            Label("Cancel: " + action.summary, systemImage: "xmark")
+                        }
+                    }
+                }
+                Button { queue.wake() } label: { Label("Try now", systemImage: "arrow.clockwise") }
+            } label: {
+                Label(stuck.isEmpty ? "\(mine.count) change\(mine.count == 1 ? "" : "s") waiting for your Mac"
+                                    : "\(stuck.count) change\(stuck.count == 1 ? "" : "s") didn't apply",
+                      systemImage: stuck.isEmpty ? "icloud.and.arrow.up" : "exclamationmark.triangle")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(stuck.isEmpty ? Color.secondary : HMDesign.warning)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .hmCapsule()
+            }
+            .padding(.bottom, 6)
+            .accessibilityHint("Shows changes saved on this phone. They apply when your Mac is reachable.")
         }
     }
 }

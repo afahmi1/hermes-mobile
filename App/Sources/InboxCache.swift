@@ -78,6 +78,50 @@ struct Outgoing: Codable, Identifiable, Equatable {
 
     var onMac: Bool { admission != nil }
     var label: String { text.isEmpty ? "\(files) attachment\(files == 1 ? "" : "s")" : text }
+
+    /// The one place that says what state a waiting message is in. Every screen and decision reads this,
+    /// never the raw fields, so a new field can't create a state nobody handles.
+    enum Phase: Equatable {
+        case onPhone            // saved here, never tried
+        case retrying           // tried, no answer yet: may or may not be on the Mac
+        case needsYou(String)   // the bridge refused it; the person decides
+        case onMac(String)      // in Hermes's queue under this admission
+        case editPending(String) // an edit waits until the original's place is confirmed
+    }
+
+    var phase: Phase {
+        if let problem { return .needsYou(problem) }
+        if let edit, attempts > 0 || admission != nil { return .editPending(edit) }
+        if let admission { return .onMac(admission) }
+        return attempts > 0 ? .retrying : .onPhone
+    }
+
+    /// Transitions. Each returns the next value; nothing else mutates these fields.
+    func attempted() -> Outgoing { var o = self; o.attempts += 1; return o }
+    func accepted(admission: String, files: Int) -> Outgoing {
+        var o = self; o.admission = admission; o.attachments = nil; o.files = files; o.problem = nil; return o
+    }
+    func refused(_ reason: String) -> Outgoing { var o = self; o.problem = reason.isEmpty ? "Hermes refused this message." : reason; return o }
+    /// An edit: instant while it never left the phone, otherwise held until the Mac confirms where it is.
+    func edited(_ text: String) -> Outgoing {
+        var o = self
+        switch phase {
+        case .onPhone, .needsYou:
+            o.text = text; o.problem = nil; o.edit = nil
+        case .retrying, .onMac, .editPending:
+            o.edit = text
+        }
+        return o
+    }
+    func editApplied(admission: String) -> Outgoing {
+        var o = self; o.text = edit ?? text; o.edit = nil; o.admission = admission; return o
+    }
+    /// A steer whose reply ended becomes the next message, and says so.
+    func demotedToQueue(note: String) -> Outgoing {
+        var o = self
+        if o.mode == "steer" { o.mode = "queue"; o.note = note }
+        return o
+    }
 }
 
 actor InboxDisk {
@@ -396,5 +440,161 @@ final class ComposerDisk {
     func forget(_ account: String) {
         if let db = databases.removeValue(forKey: account) { sqlite3_close(db) }
         try? FileManager.default.removeItem(at: root.appendingPathComponent(account))
+    }
+}
+
+// MARK: - Queued actions
+
+/// A chat action taken while the Mac couldn't be reached: archive, pin, flags, pinned messages. Every one sets a
+/// final state ("archived = true"), so sending it twice changes nothing, and they can be replayed safely in order.
+struct QueuedAction: Codable, Identifiable, Equatable {
+    enum Kind: String, Codable { case flags, pinMessage, unpinMessage }
+    var id = UUID()
+    let account: String
+    let kind: Kind
+    let profile: String
+    var ids: [String] = []
+    var fields: [String: Bool] = [:]
+    var confirmPins = false
+    var session: String? = nil
+    var message: Int? = nil
+    var created = Date()
+    var attempts = 0
+    var problem: String? = nil
+
+    var summary: String {
+        switch kind {
+        case .flags:
+            let what = fields.map { key, on in
+                switch key {
+                case "archived": return on ? "Archive" : "Unarchive"
+                case "pinned": return on ? "Pin" : "Unpin"
+                default: return (on ? "Set " : "Clear ") + key
+                }
+            }.sorted().joined(separator: ", ")
+            return ids.count == 1 ? what + " chat" : what + " \(ids.count) chats"
+        case .pinMessage: return "Pin a message"
+        case .unpinMessage: return "Unpin a message"
+        }
+    }
+}
+
+/// Saved to disk the moment an action is queued; replayed oldest first whenever the Mac answers again.
+@MainActor @Observable
+final class ActionQueue {
+    static let shared = ActionQueue()
+    private(set) var pending: [QueuedAction] = []
+    private var running = false
+    private var retry: Task<Void, Never>?
+    private var delay: Double = 2
+
+    private var file: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("HermesOutbox").appendingPathComponent("actions.json")
+    }
+
+    init() {
+        if let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode([QueuedAction].self, from: data) {
+            pending = saved
+        }
+    }
+
+    /// Waiting actions for the signed-in gateway (another gateway's actions stay put for when you switch back).
+    var mine: [QueuedAction] { pending.filter { $0.account == API.shared.accountID } }
+
+    private func save() {
+        let dir = file.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var d = dir
+        try? d.setResourceValues(values)
+        if pending.isEmpty { try? FileManager.default.removeItem(at: file); return }
+        #if os(macOS)
+        try? JSONEncoder().encode(pending).write(to: file, options: .atomic)
+        #else
+        try? JSONEncoder().encode(pending).write(to: file, options: [.atomic, .completeFileProtection])
+        #endif
+    }
+
+    /// True when the error means "couldn't reach the Mac", as opposed to the Mac saying no.
+    static func isOffline(_ error: Error) -> Bool {
+        if error is URLError { return true }
+        if case APIError.http(let code, _) = error { return code == 0 || code == 502 || code == 503 || code == 504 }
+        return false
+    }
+
+    /// Run an action now; if the Mac can't be reached, save it and return `.queued`.
+    enum Outcome { case done, queued, failed(Error) }
+    func perform(_ action: QueuedAction) async -> Outcome {
+        do {
+            try await Self.send(action)
+            return .done
+        } catch where Self.isOffline(error) {
+            pending.append(action)
+            save()
+            schedule()
+            return .queued
+        } catch {
+            return .failed(error)
+        }
+    }
+
+    static func send(_ action: QueuedAction) async throws {
+        let api = API.shared
+        guard api.accountID == action.account else { throw APIError.notSignedIn }
+        switch action.kind {
+        case .flags:
+            do {
+                let result = try await api.updateSessions(profile: action.profile, ids: action.ids, fields: action.fields,
+                                                          confirmPins: action.confirmPins)
+                if let first = result.errors.values.first, result.updated.isEmpty { throw APIError.http(409, first) }
+            } catch APIError.http(404, _) {
+                for id in action.ids { try await api.updateSession(profile: action.profile, session: id, fields: action.fields) }
+            }
+        case .pinMessage:
+            _ = try await api.pin(profile: action.profile, session: action.session ?? "", message: action.message ?? 0)
+        case .unpinMessage:
+            _ = try await api.unpin(profile: action.profile, session: action.session ?? "", message: action.message ?? 0)
+        }
+    }
+
+    /// Replay everything waiting for this gateway, oldest first. Stops at the first one the Mac can't take yet.
+    func flush() async {
+        guard !running else { return }
+        running = true
+        defer { running = false; schedule() }
+        for action in mine where action.problem == nil {
+            do {
+                try await Self.send(action)
+                pending.removeAll { $0.id == action.id }
+                save()
+                delay = 2
+            } catch where Self.isOffline(error) {
+                if let i = pending.firstIndex(where: { $0.id == action.id }) { pending[i].attempts += 1 }
+                save()
+                return
+            } catch {
+                if let i = pending.firstIndex(where: { $0.id == action.id }) { pending[i].problem = error.localizedDescription }
+                save()
+            }
+        }
+    }
+
+    func discard(_ id: UUID) { pending.removeAll { $0.id == id }; save() }
+
+    /// Wake now (app foreground, network back); otherwise back off quietly up to 30 s.
+    func wake() { delay = 2; Task { await flush() } }
+
+    private func schedule() {
+        retry?.cancel()
+        guard mine.contains(where: { $0.problem == nil }) else { return }
+        let wait = delay
+        delay = min(30, delay * 2)
+        retry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled else { return }
+            await self?.flush()
+        }
     }
 }

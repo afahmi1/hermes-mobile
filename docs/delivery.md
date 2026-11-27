@@ -60,6 +60,18 @@ Two things are deliberately **not** automatic:
 The bridge advertises these controls as `queue_controls_v1` in `GET /m/capabilities`. An older bridge still delivers
 queued messages; the phone then hides edit and remove for rows already on the Mac.
 
+## Chat actions (archive, pin, flags)
+
+Archive, unarchive, pinning a chat and pinning or unpinning a message work offline too. When the Mac can't be
+reached (no route, timeout, or the bridge or Tailscale Serve answering 502/503/504), the action is saved to
+`HermesOutbox/actions.json` on the phone and the list updates right away. A bar at the bottom of the chat list says
+"N changes waiting for your Mac". The phone sends them oldest first when the app comes back, when the network
+changes, or after a quiet backoff (2 s, doubling to 30 s).
+
+Each of these actions sets a final state, so replaying one that already landed changes nothing. If the Mac refuses
+one (for example, a chat gained pins in the meantime), it stays in the bar as "didn't apply" until you cancel it.
+Actions belong to the gateway they were taken on and wait if you switch to another.
+
 ## Bridge API
 
 ```

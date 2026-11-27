@@ -43,6 +43,7 @@ struct HermesMobileApp: App {
                     // New network path: old sockets are bound to the old interface. Reconnect and send what's waiting.
                     Task {
                         await API.shared.refreshConnections()
+                        ActionQueue.shared.wake()
                         app.resumeLiveRuns()
                         NotificationCenter.default.post(name: .hermesForeground, object: nil)
                     }
@@ -77,6 +78,7 @@ struct HermesMobileApp: App {
                         // longer, iOS and Tailscale have likely dropped them: start fresh, all at once.
                         if away >= 10 { await API.shared.refreshConnections() }
                         StreamRoutes.shared.nudge()
+                        ActionQueue.shared.wake()
                         app.resumeLiveRuns()
                         NotificationCenter.default.post(name: .hermesForeground, object: nil)
                         await app.refreshHealth()

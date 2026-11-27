@@ -277,6 +277,7 @@ final class ChatModel {
                     let paging = HistoryPaging.first(count: msgs.count, hasMore: page.hasMore, nextOffset: page.nextOffset)
                     historyOffset = paging.offset
                     hasOlder = paging.hasOlder
+                    fillsScreen = true
                 }
                 lastPage = msgs
                 items = transcriptWithReceipts()
@@ -308,10 +309,30 @@ final class ChatModel {
                 return
             }
         }
+        await fillScreen()
         let runtimeDue = !quiet || lastRuntimeRead.map { Date().timeIntervalSince($0) >= 30 } != false
         async let runtime: Void = runtimeDue ? refreshServed() : ()
         if resumeLive { await reattach() }
         await runtime
+    }
+
+    /// One long turn can be 100+ tool rows, so a fixed first page may hold a single "Worked 20m" card and no
+    /// conversation. After a fresh first page, quietly load earlier pages until there's a screenful of real
+    /// messages (yours and Hermes's answers), at most five pages.
+    private var fillsScreen = false
+    private func fillScreen() async {
+        guard fillsScreen else { return }
+        fillsScreen = false
+        func conversation() -> Int {
+            items.filter { $0.kind == .user || ($0.kind == .assistant && !$0.text.isEmpty) }.count
+        }
+        var pages = 0
+        while hasOlder, pages < 5, conversation() < 10 {
+            let before = stored.count
+            await loadOlder()
+            pages += 1
+            if stored.count == before { break }
+        }
     }
 
     func loadOlder() async {
@@ -563,6 +584,13 @@ final class ChatModel {
                 : try await api.pin(profile: profile, session: sid, message: mid)
             guard sessionId == sid else { return }
             pins = latest
+        } catch where ActionQueue.isOffline(error) {
+            guard let account = API.shared.accountID else { return }
+            let unpinning = isPinned(item)
+            _ = await ActionQueue.shared.perform(QueuedAction(account: account, kind: unpinning ? .unpinMessage : .pinMessage,
+                                                              profile: profile, session: sid, message: mid))
+            if unpinning { pins.removeAll { $0.messageId == mid } }
+            self.error = unpinning ? nil : "Saved. It's pinned as soon as your Mac answers."
         } catch {
             self.error = error.localizedDescription
         }
@@ -573,6 +601,11 @@ final class ChatModel {
         do {
             let latest = try await api.unpin(profile: profile, session: sid, message: pin.messageId)
             if sessionId == sid { pins = latest }
+        } catch where ActionQueue.isOffline(error) {
+            guard let account = API.shared.accountID else { return }
+            _ = await ActionQueue.shared.perform(QueuedAction(account: account, kind: .unpinMessage, profile: profile,
+                                                              session: sid, message: pin.messageId))
+            pins.removeAll { $0.messageId == pin.messageId }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -818,6 +851,23 @@ final class ChatModel {
 
     var acceptsFollowUp: Bool { isRunning && runId != nil && !sendingFollowUp && !savingRuntime }
 
+    // MARK: Run phase
+
+    /// What this chat is doing, derived from the flags that used to be checked in ad-hoc combinations.
+    enum RunPhase: Equatable {
+        case idle                // nothing running; a new message can start
+        case starting            // a reply is starting or a send awaits confirmation: no run id yet
+        case replying(String)    // a reply is running under this run id
+        case busy                // a slash command or a returning send owns the chat
+    }
+
+    var runPhase: RunPhase {
+        if slashBusy || returningSend { return .busy }
+        if isRunning, let runId { return .replying(runId) }
+        if isRunning || pendingSend != nil { return .starting }
+        return .idle
+    }
+
     // MARK: Outbox: Send next and Guide, durable on this phone until Hermes has them
 
     /// Messages waiting to go, oldest first. Saved to disk before any network call.
@@ -894,30 +944,36 @@ final class ChatModel {
         guard sendKey != nil else { return }
         for item in outgoing {
             guard let current = outgoing.first(where: { $0.id == item.id }) else { continue }
-            if current.problem != nil { return }          // keep order: the person decides on this one first
-            if current.onMac {
-                if let edit = current.edit { await applyEdit(current, text: edit) }
+            switch current.phase {
+            case .needsYou:
+                return                                      // keep order: the person decides on this one first
+            case .onMac:
                 continue
+            case .editPending(let text) where current.onMac:
+                await applyEdit(current, text: text)
+                continue
+            case .onPhone, .retrying, .editPending:
+                break
             }
-            if isRunning, let run = runId, !savingRuntime {
+            switch runPhase {
+            case .replying(let run) where !savingRuntime:
                 guard await deliverFollowUp(current, run: run) else { return }
-            } else if !isRunning, pendingSend == nil, !slashBusy, !returningSend {
-                // Nothing running: a queued message is simply the next message, and a steer whose reply
-                // already ended goes the same way. Same UUID, so a copy that already landed is not repeated.
-                var next = current
-                if next.mode == "steer" { next.note = "The reply it was meant to guide had finished, so it went as a new message." }
+            case .idle:
+                // Nothing running: a queued message is simply the next message, and a steer whose reply already
+                // ended goes the same way. Same UUID, so a copy that already landed is not repeated.
+                var next = current.demotedToQueue(note: "The reply it was meant to guide had finished, so it went as a new message.")
                 if let edit = next.edit { next.text = edit }
                 await sendQueued(next)
-                return                                     // the rest wait for this new reply
-            } else {
-                return                                     // a reply is starting: wait for its run id
+                return                                      // the rest wait for this new reply
+            case .replying, .starting, .busy:
+                return                                      // wait for a run id or for the chat to be free
             }
         }
     }
 
     /// One follow-up to the running reply. False stops the pump (offline, or the person must decide).
     private func deliverFollowUp(_ item: Outgoing, run: String) async -> Bool {
-        update(item.id) { $0.attempts += 1 }
+        update(item.id) { $0 = $0.attempted() }
         let text = item.edit ?? item.text
         do {
             // The original words with the original ID: if a lost acknowledgment means the Mac already has it,
@@ -932,7 +988,7 @@ final class ChatModel {
                 await recordReceipt(ControlReceipt(id: item.id, mode: "steer", text: item.text, at: Date(), files: accepted))
             } else {
                 // Hermes has it now (state.db). Files are no longer needed on the phone.
-                update(item.id) { $0.admission = admission ?? "turn:" + run; $0.attachments = nil; $0.files = accepted }
+                update(item.id) { $0 = $0.accepted(admission: admission ?? "turn:" + run, files: accepted) }
                 if item.edit != nil, let now = outgoing.first(where: { $0.id == item.id }) { await applyEdit(now, text: text) }
             }
             await persistOutgoing()
@@ -944,7 +1000,7 @@ final class ChatModel {
             if code == 409, !message.contains("no longer") && !message.contains("not started") && !message.contains("Refresh") {
                 return refuse(item, message)
             }
-            update(item.id) { if $0.mode == "steer" { $0.mode = "queue"; $0.note = "The reply had finished, so this goes as the next message." } }
+            update(item.id) { $0 = $0.demotedToQueue(note: "The reply had finished, so this goes as the next message.") }
             await persistOutgoing()
             if isRunning, runId == run { runId = nil; isRunning = false; status = nil }
             pumpAgain = true
@@ -962,7 +1018,7 @@ final class ChatModel {
     }
 
     private func refuse(_ item: Outgoing, _ message: String) -> Bool {
-        update(item.id) { $0.problem = message.isEmpty ? "Hermes refused this message." : message }
+        update(item.id) { $0 = $0.refused(message) }
         Task { await persistOutgoing() }
         return false
     }
@@ -1055,16 +1111,12 @@ final class ChatModel {
         guard !text.isEmpty, let item = outgoing.first(where: { $0.id == id }) else { return }
         if item.onMac {
             await applyEdit(item, text: text)
-        } else if item.attempts == 0 || item.problem != nil {
-            update(id) { $0.text = text; $0.problem = nil; $0.edit = nil }
-            await persistOutgoing()
-            await pump()
-        } else {
-            // It may already be on the Mac (a lost acknowledgment). Confirm with the same ID, then edit there.
-            update(id) { $0.edit = text }
-            await persistOutgoing()
-            await pump()
+            return
         }
+        // On the phone it's instant; if it may already be on the Mac, the edit waits for the original's place.
+        update(id) { $0 = $0.edited(text) }
+        await persistOutgoing()
+        await pump()
     }
 
     private func applyEdit(_ item: Outgoing, text: String) async {
@@ -1077,7 +1129,7 @@ final class ChatModel {
         do {
             let (newAdmission, state) = try await api.queueAction(profile: profile, session: sid, admission: adm,
                                                                   action: "edit", text: text, submission: UUID())
-            update(item.id) { $0.text = text; $0.edit = nil; $0.admission = newAdmission ?? adm }
+            update(item.id) { var o = $0; o.edit = text; $0 = o.editApplied(admission: newAdmission ?? adm) }
             if let state { queue = state }
             await persistOutgoing()
         } catch APIError.http(409, let message) where message.contains("already started") {
@@ -1223,9 +1275,27 @@ final class ChatModel {
     }
 
     /// Re-attach after the app comes back: the run kept going on the Mac.
+    /// Called when the app comes back and when the network changes. A stream that hasn't heard even a heartbeat
+    /// in 20 s is a socket iOS froze while the app was away: replace it now instead of waiting out its timeout.
     func resumeIfNeeded() {
-        if isRunning, runId != nil, streamTask == nil { follow() }
+        guard isRunning, runId != nil else { return }
+        if let task = streamTask, Date().timeIntervalSince(streamHeard) > 20 {
+            task.cancel()
+            streamTask = nil
+        }
+        if streamTask == nil { follow() }
+        // A short switch can still leave a frozen socket. Check once more after one heartbeat window.
+        watchdog?.cancel()
+        watchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(21))
+            guard !Task.isCancelled, let self, self.isRunning, let task = self.streamTask,
+                  Date().timeIntervalSince(self.streamHeard) > 20 else { return }
+            task.cancel()
+            self.streamTask = nil
+            self.follow()
+        }
     }
+    @ObservationIgnored private var watchdog: Task<Void, Never>?
 
     /// A pruned replay has no reliable prefix for the current assistant bubble. Refresh from
     /// Hermes, retain older loaded pages when they overlap, and wait for a complete response
@@ -1273,9 +1343,18 @@ final class ChatModel {
         runId = nil
     }
 
+    /// When the live stream last heard from the bridge (an event or its ~15 s heartbeat).
+    @ObservationIgnored private var streamHeard = Date.distantPast
+    @ObservationIgnored private var streamGeneration = 0
+    /// What the reply was doing before a reconnect, so the status line can go back to it.
+    @ObservationIgnored private var workingStatus: String?
+
     private func follow() {
         guard let run = runId, streamTask == nil else { return }
         let account = app?.inboxAccount
+        streamGeneration &+= 1
+        let generation = streamGeneration
+        streamHeard = Date()
         streamTask = Task { [weak self] in
             guard let self else { return }
             var finished = false
@@ -1292,6 +1371,15 @@ final class ChatModel {
                     for try await ev in api.events(profile: profile, run: run, after: recovery.lastSequence,
                                                           epoch: recovery.epoch, routeRevision: network.revision) {
                         guard !Task.isCancelled, runId == run, account == app?.inboxAccount else { break }
+                        streamHeard = Date()
+                        if ev.name == "stream.open" || ev.name == "stream.alive" {
+                            // Connected again: say what the reply is doing, not "Reconnecting…" until text arrives.
+                            if ev.name == "stream.open" { recovery.connected() }
+                            if status == "Reconnecting…" || status?.hasPrefix("Offline") == true {
+                                status = workingStatus ?? "Working…"
+                            }
+                            continue
+                        }
                         if ev.name == "stream.checkpoint" {
                             finished = try await restoreCheckpoint(ev, run: run)
                             if finished { break }
@@ -1307,6 +1395,7 @@ final class ChatModel {
                         if handle(ev) { finished = true; break }
                     }
                 } catch is StreamRouteChanged {
+                    if status != "Reconnecting…" { workingStatus = status }
                     status = "Reconnecting…"
                     continue
                 } catch APIError.http(let code, _) where code == 404 || code == 401 {
@@ -1320,11 +1409,13 @@ final class ChatModel {
                 if !finished && !Task.isCancelled {
                     if StreamRoutes.shared.state.offline { continue }
                     guard let delay = recovery.retryDelay() else { break }
+                    if status != "Reconnecting…" { workingStatus = status }
                     status = "Reconnecting…"
                     await StreamRoutes.shared.waitForRetry(after: network.revision, seconds: delay)
                 }
             }
-            streamTask = nil
+            // A replaced stream must not clear its replacement.
+            if streamGeneration == generation { streamTask = nil }
             if !Task.isCancelled, runId == run, account == app?.inboxAccount {
                 await finishRun(gaveUp: !finished)
             }
