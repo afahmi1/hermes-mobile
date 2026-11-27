@@ -1547,20 +1547,23 @@ def timeline_page(raw):
     return timeline_bytes(json.loads(raw)["data"])
 
 
-def resume_target(db, path, session_id):
-    """The newest session in a compression lineage (where the chat continues). Hermes moved this from
-    SessionDB.resolve_resume_session_id to its storage interface (lineage.resolve_resume_target); use whichever
-    the installed Hermes has, so the bridge keeps working across the update."""
-    old = getattr(db, "resolve_resume_session_id", None)  # the slimmed SessionDB raises AttributeError -> None
-    if callable(old):
-        return old(session_id)
-    try:
-        from persistence_assembly import open_persistence_reader
-        with open_persistence_reader(Path(path)) as store:
-            return store.lineage.resolve_resume_target(session_id) or session_id
-    except Exception as exc:
-        log("resume target lookup failed (%s); reading the chat as named" % type(exc).__name__)
-        return session_id
+def resume_target(db, session_id, path=None):
+    """The session a resume should read: a compacted or continued chat resolves to its live descendant.
+
+    Installed Hermes releases dropped SessionDB.resolve_resume_session_id (hermes_state is a deprecated shim).
+    Use it when present; else the storage interface's read-only lineage lookup on the same state.db;
+    else the id as given. Read-only throughout; never raises for a missing API."""
+    resolve = getattr(db, "resolve_resume_session_id", None)
+    if callable(resolve):
+        return resolve(session_id) or session_id
+    if path is not None:
+        try:
+            from persistence_assembly import open_persistence_reader
+            with open_persistence_reader(Path(path)) as reader:
+                return str(reader.lineage.resolve_resume_target(session_id) or session_id)
+        except Exception:
+            pass
+    return session_id
 
 
 def session_bodies(pid, session_id):
@@ -1575,7 +1578,7 @@ def session_bodies(pid, session_id):
     with closing(SessionDB(path, read_only=True)) as db:
         if not db.get_session(session_id):
             return []
-        active = resume_target(db, path, session_id)
+        active = resume_target(db, session_id, path)
         rows = db.get_messages(active, limit=1000, offset=0, latest=True,
                                include_compacted=True, include_ancestors=True)
         out = []
@@ -1596,7 +1599,7 @@ def native_timeline_page(pid, session_id, limit, offset, latest):
     with closing(SessionDB(path, read_only=True)) as db:
         if not db.get_session(session_id):
             return None
-        active = resume_target(db, path, session_id)
+        active = resume_target(db, session_id, path)
         # One extra raw row tells the phone whether another page exists. Projected pages are shorter
         # (hidden tool rows are dropped), so the phone cannot infer this from the row count.
         probe = None if limit is None else limit + 1
