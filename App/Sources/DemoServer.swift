@@ -83,7 +83,11 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", ["manage", "bots"]): body = DemoFixtures.manageBots
         case ("GET", ["manage", "archived"]): body = ["projects": [Any](), "bots": [Any]()]
         case ("GET", ["manage", "pin"]): body = ["configured": true]
-        case ("GET", ["capabilities"]): body = ["features": ["device_grants"], "device_id": "dev_demo", "manage_devices": true]
+        case ("GET", ["capabilities"]):
+            body = ["features": ["device_grants", "restart_v1"], "device_id": "dev_demo", "manage_devices": true, "can_restart": true]
+        case ("POST", ["restart"]):
+            body = ["ok": true, "target": "hermes", "mode": "when_idle",
+                    "message": "Hermes will restart as soon as nothing is running. Replies in progress finish first."]
         case ("GET", ["devices"]):
             body = ["devices": [["id": "dev_demo", "name": "iPhone", "method": "password",
                                  "expires": Date().addingTimeInterval(150 * 86400).timeIntervalSince1970]]]

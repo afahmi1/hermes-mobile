@@ -764,9 +764,18 @@ struct BridgeCapabilities: Decodable {
     let features: [String]
     let deviceID: String
     let manageDevices: Bool
+    /// Owner phones may restart Hermes and the bridge (`POST /m/restart`). Older bridges don't send it.
+    var canRestart: Bool? = nil
+    var restartable: Bool { features.contains("restart_v1") && canRestart == true }
     enum CodingKeys: String, CodingKey {
-        case features, deviceID = "device_id", manageDevices = "manage_devices"
+        case features, deviceID = "device_id", manageDevices = "manage_devices", canRestart = "can_restart"
     }
+}
+
+/// What the bridge said it will do after a restart request.
+struct RestartResult: Decodable {
+    let mode: String?
+    let message: String?
 }
 
 struct DeviceGrant: Decodable, Identifiable {

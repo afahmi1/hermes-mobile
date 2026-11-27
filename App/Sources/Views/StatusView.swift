@@ -11,6 +11,7 @@ struct StatusView: View {
     @State private var gatewayOpen: Bool?
     @State private var tokensOpen = false
     @AppStorage(StatusPulse.key) private var pulse = true
+    @State private var restartAllowed = false
     @Environment(\.dynamicTypeSize) private var typeSize
     #if DEBUG
     // Screenshot QA (debug builds only): `-HMOpenProvider anthropic` opens that provider's usage screen.
@@ -50,10 +51,13 @@ struct StatusView: View {
                 } else if status.error == nil {
                     HStack { Spacer(); ProgressView("Loading status…"); Spacer() }.listRowBackground(Color.clear)
                 }
+                // Outside the payload: a stuck or crashed Hermes is exactly when the status dashboard is gone.
+                if restartAllowed { RestartSection() }
             }
             .listStyle(.insetGrouped)
             .listSectionSpacing(.compact)
             .hmCanvas()
+            .task { restartAllowed = (try? await API.shared.capabilities())?.restartable ?? false }
             #if DEBUG
             .task(id: p != nil) {
                 // `-HMStatusScrollJobs YES` scrolls the cron jobs section to the top for screenshots.
@@ -689,5 +693,75 @@ struct HeartbeatStrip: View {
         .padding(.vertical, 2)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Connection over the last \(beats.count) checks, \(beats.filter { !$0.ok }.count) missed")
+    }
+}
+
+// MARK: - Restart
+
+/// Restart Hermes or the phone's connection on the Mac without touching the Mac. Owner phones only.
+struct RestartSection: View {
+    @Environment(AppModel.self) private var app
+    @State private var asking: Target?
+    @State private var busy = false
+    @State private var note: String?
+    @State private var error: String?
+
+    enum Target: String, Identifiable { case hermes, bridge; var id: String { rawValue } }
+
+    var body: some View {
+        Section(header: HMHeader("Restart"), footer: footer) {
+            Button { asking = .hermes } label: {
+                Label("Restart Hermes", systemImage: "arrow.clockwise.circle")
+            }
+            .disabled(busy)
+            Button { asking = .bridge } label: {
+                Label("Restart phone connection", systemImage: "antenna.radiowaves.left.and.right")
+            }
+            .disabled(busy)
+            if let note { Label(note, systemImage: "checkmark.circle").font(HMDesign.metadata).foregroundStyle(HMDesign.text2) }
+            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(HMDesign.metadata).hmProblem() }
+        }
+        .hmRows()
+        .confirmationDialog("Restart Hermes?", isPresented: dialog(.hermes), titleVisibility: .visible) {
+            Button("Restart when replies finish") { go(.hermes, now: false) }
+            Button("Restart now, stop replies", role: .destructive) { go(.hermes, now: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Use this when Hermes is stuck or after changing its settings. Waiting lets running replies and sub-agents finish first.")
+        }
+        .confirmationDialog("Restart the phone connection?", isPresented: dialog(.bridge), titleVisibility: .visible) {
+            Button("Restart connection") { go(.bridge, now: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The bridge on your Mac restarts and the app reconnects in a few seconds. Hermes and its replies keep running.")
+        }
+    }
+
+    private var footer: some View {
+        Text("Hermes restarts on its own after a crash. Use these if it seems stuck.")
+    }
+
+    private func dialog(_ t: Target) -> Binding<Bool> {
+        Binding(get: { asking == t }, set: { if !$0 { asking = nil } })
+    }
+
+    private func go(_ target: Target, now: Bool) {
+        asking = nil
+        busy = true
+        note = nil
+        error = nil
+        Task {
+            defer { busy = false }
+            do {
+                let result = try await API.shared.restart(target.rawValue, now: now)
+                note = result.message ?? "Restarting."
+                for wait in [3, 5, 10] {
+                    try? await Task.sleep(for: .seconds(wait))
+                    await app.refreshHealth()
+                }
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
     }
 }

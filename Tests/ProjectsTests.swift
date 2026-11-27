@@ -167,6 +167,15 @@ func run() async {
     check(ref.startIn == "hermes-mobile", "a new project chat remembers its project")
     check(ChatRef(profile: "default", sessionId: "s1", startIn: "hermes-mobile").startIn == nil, "an existing chat never restarts in a folder")
 
+    let caps = try! JSONDecoder().decode(BridgeCapabilities.self, from: Data(#"{"protocol":2,"features":["restart_v1"],"device_id":"d","manage_devices":true,"can_restart":true}"#.utf8))
+    check(caps.restartable, "an owner phone on a restart_v1 bridge may restart")
+    let olderBridge = try! JSONDecoder().decode(BridgeCapabilities.self, from: Data(#"{"features":["push_v1"],"device_id":"d","manage_devices":true}"#.utf8))
+    check(!olderBridge.restartable, "an older bridge hides restart")
+    let guest = try! JSONDecoder().decode(BridgeCapabilities.self, from: Data(#"{"features":["restart_v1"],"device_id":"d","manage_devices":false,"can_restart":false}"#.utf8))
+    check(!guest.restartable, "a non-owner phone hides restart")
+    let said = try! JSONDecoder().decode(RestartResult.self, from: Data(#"{"ok":true,"target":"hermes","mode":"when_idle","message":"Hermes will restart"}"#.utf8))
+    check(said.mode == "when_idle" && said.message == "Hermes will restart", "restart answer decodes")
+
     print("Projects decoding, failures, references, bot links, search and load-state tests passed")
 }
 

@@ -225,6 +225,13 @@ final class API: @unchecked Sendable {
         try await get("/m/capabilities", as: BridgeCapabilities.self)
     }
 
+    /// `target` is "hermes" (the gateway) or "bridge" (this phone's connection on the Mac). For Hermes, `now`
+    /// interrupts running replies; otherwise it restarts once nothing is running.
+    func restart(_ target: String, now: Bool = false) async throws -> RestartResult {
+        let r = try request("/m/restart", method: "POST", body: ["target": target, "now": now])
+        return try JSONDecoder().decode(RestartResult.self, from: try await send(r))
+    }
+
     func devices() async throws -> [DeviceGrant] {
         struct Response: Decodable { let devices: [DeviceGrant] }
         return try await get("/m/devices", as: Response.self).devices
