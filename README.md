@@ -173,7 +173,7 @@ text file or an archive. Files keep their original bytes and media type; the bri
 agent the local path, so Hermes decides which tool reads them. Attachments share a 4 MiB total budget per message by
 default (`HERMES_MOBILE_MEDIA_MAX_BYTES`, up to 8 MiB). A single video from Files opens the same clip-or-frames review as a video from Photos.
 
-Images the desktop already attached (`[Image attached at: …]` or a `MEDIA:` line) show in the chat when the file is still under your Hermes home. Tool runs open into what they did: the skill that loaded, the command, the delegate's goal, and a failed delegate reads as failed. A background task that is still going shows **Will resume when N background tasks finish**.
+What you attach comes back as something you can open, from either side. Photos and files sent from the phone show under the name you picked, images dropped into the desktop composer show on the phone, a long paste opens from its **Pasted N lines** message, and a voice note keeps its words and plays. Files are served from your Hermes home and the desktop app's composer folders only; one that's since been deleted leaves its name (📎 plan.pdf). Tool runs open into what they did: the skill that loaded, the command, the delegate's goal, and a failed delegate reads as failed. A background task that is still going shows **Will resume when N background tasks finish**.
 
 ### Push notifications (optional)
 
