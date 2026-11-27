@@ -2501,7 +2501,7 @@ struct OutboxTray: View {
         .onTapGesture { if canEdit(item) { editing = item } }
         .contextMenu {
             if canEdit(item) { Button { editing = item } label: { Label("Edit", systemImage: "pencil") } }
-            if item.mode == "queue", chat.isRunning, item.problem == nil {
+            if item.mode == "queue", chat.isRunning, item.problem == nil, chat.allows(.steer, item) {
                 Button { Task { await chat.guideNow(item.id) } } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
             }
             Button { Task { await chat.removeOutgoing(item.id, toComposer: true) } } label: {
@@ -2517,7 +2517,7 @@ struct OutboxTray: View {
 
     /// A steer that may already have reached the running reply can't be taken back, so it can't be edited.
     private func canEdit(_ item: Outgoing) -> Bool {
-        !(item.mode == "steer" && item.attempts > 0 && item.problem == nil)
+        !(item.mode == "steer" && item.attempts > 0 && item.problem == nil) && chat.allows(.edit, item)
     }
 }
 

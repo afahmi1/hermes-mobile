@@ -110,6 +110,21 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 409)
         self.assertIn("already started", str(ctx.exception))
 
+    def test_a_message_with_files_is_not_called_an_old_hermes(self):
+        """unsupported_control is Hermes refusing this row (files, or a background worker), not a version check."""
+        client = FakeClient([snap(RUNNING, QUEUED)],
+                            {"prompt.steer_queued": turns.TurnError("prompt.steer_queued: unsupported_control")})
+        with self.assertRaises(turns.TurnError) as ctx:
+            self._act(client, "a2", "steer")
+        self.assertEqual(ctx.exception.code, 409)
+        self.assertNotIn("too old", str(ctx.exception))
+        self.assertIn("text-only", str(ctx.exception))
+
+    def test_a_row_hermes_lists_no_controls_for_can_only_be_cancelled(self):
+        row = dict(QUEUED, controls=[])
+        r = turns.public_pending(snap(row))["pending"][0]
+        self.assertEqual((r["can_edit"], r["can_steer"], r["can_cancel"]), (False, False, True))
+
     def test_unknown_admission_is_404(self):
         client = FakeClient([snap(RUNNING)], {})
         with self.assertRaises(turns.TurnError) as ctx:

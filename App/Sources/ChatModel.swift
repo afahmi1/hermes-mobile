@@ -1226,12 +1226,33 @@ final class ChatModel {
 
     // MARK: Changing a queued message
 
+    /// What a waiting message can still do. On the phone everything is local. Once it's in Hermes's
+    /// queue, Hermes decides: it only edits or guides text-only messages, so one carrying files can
+    /// only be removed. Before the queue has been read, files alone decide it.
+    func allows(_ control: QueueControl, _ item: Outgoing) -> Bool {
+        guard item.onMac, let adm = item.admission, !adm.hasPrefix("turn:") else { return true }
+        if let row = queue?.row(adm) {
+            switch control {
+            case .edit: return row.canEdit
+            case .steer: return row.canSteer
+            }
+        }
+        return item.files == 0
+    }
+
+    enum QueueControl { case edit, steer }
+
+
     /// Edit a message that is still waiting. On the phone it is a local change; on the Mac it uses
     /// Hermes's replace_queued (a new admission at the back of the queue). Too late once it started.
     func editOutgoing(_ id: UUID, text raw: String) async {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let item = outgoing.first(where: { $0.id == id }) else { return }
         if item.onMac {
+            guard allows(.edit, item) else {
+                error = Self.filesLocked
+                return
+            }
             await applyEdit(item, text: text)
             return
         }
@@ -1264,6 +1285,12 @@ final class ChatModel {
             await persistOutgoing()
             error = "That message already left the queue. Your edit is in the message box."
             draft = draft.isEmpty ? text : text + "\n\n" + draft
+        } catch APIError.http(let code, let message) where (400..<500).contains(code) {
+            // Hermes answered and said no. Retrying won't change that, so drop the pending edit.
+            update(item.id) { $0.edit = nil }
+            await persistOutgoing()
+            error = message.isEmpty ? Self.filesLocked : message
+            await refreshQueue()
         } catch {
             update(item.id) { $0.edit = text }   // offline: applied when the connection is back
             await persistOutgoing()
@@ -1329,12 +1356,19 @@ final class ChatModel {
     func guideNow(_ id: UUID) async {
         guard let item = outgoing.first(where: { $0.id == id }) else { return }
         if item.onMac, let adm = item.admission, !adm.hasPrefix("turn:"), let sid = sessionId {
+            guard allows(.steer, item) else {
+                error = Self.filesLocked
+                return
+            }
             do {
                 _ = try await api.queueAction(profile: profile, session: sid, admission: adm, action: "steer")
                 outgoing.removeAll { $0.id == id }
                 await persistOutgoing()
                 await recordReceipt(ControlReceipt(id: item.id, mode: "steer", text: item.text, at: Date(), files: item.files))
-            } catch { self.error = error.localizedDescription }
+            } catch {
+                self.error = error.localizedDescription
+                await refreshQueue()
+            }
         } else if !item.onMac {
             update(id) { $0.mode = "steer"; $0.note = nil }
             await persistOutgoing()
@@ -1351,6 +1385,8 @@ final class ChatModel {
             await load(quiet: true)
         } catch { self.error = error.localizedDescription }
     }
+
+    static let filesLocked = "Hermes can't edit or guide this message: only text-only messages in a live chat can be. It runs as sent. Remove it to change it."
 
     private(set) var sendingFollowUp = false
     func stop() async {
