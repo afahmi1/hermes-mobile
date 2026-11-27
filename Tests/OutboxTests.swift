@@ -56,6 +56,17 @@ import CryptoKit
         let decoded = try JSONDecoder().decode(SendAttachment.self, from: json)
         precondition(decoded == file)
         try? FileManager.default.removeItem(at: file.fileURL!)
-        print("Outbox phases, edits, refusals, steer demotion, disk round trip and big-file attachments passed")
+        // Reply quotes: excerpt, wire format, and splitting a sent message back into quote + body.
+        let ex = ReplyQuote.excerpt("Line one\n\n\n  Line two  \n" + String(repeating: "x", count: 400))
+        precondition(ex.hasPrefix("Line one\nLine two\n") && ex.hasSuffix("…") && ex.count <= 321)
+        let wire = ReplyQuote.markdown("a\nb") + "\n\nmy answer"
+        precondition(wire == "> a\n> b\n\nmy answer")
+        let parts = ReplyQuote.split(wire)
+        precondition(parts.quote == "a\nb" && parts.body == "my answer")
+        precondition(ReplyQuote.split("> only a quote").quote == nil)
+        precondition(ReplyQuote.split("no quote here").quote == nil)
+        let legacy = try JSONDecoder().decode(PastedText.self, from: Data(#"{"id":"\#(UUID().uuidString)","text":"t"}"#.utf8))
+        precondition(!legacy.isQuote, "drafts saved by older builds still load")
+        print("Outbox phases, edits, refusals, steer demotion, disk round trip, big-file attachments and reply quotes passed")
     }
 }

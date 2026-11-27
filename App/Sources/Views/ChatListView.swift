@@ -272,7 +272,7 @@ struct ChatListView: View {
                 }
             }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
         .safeAreaInset(edge: .bottom, spacing: 0) { if selecting { selectionActions } }
         .overlay {
             if loading && sessions.isEmpty { ProgressView("Loading chats…").padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius)) }
@@ -357,17 +357,19 @@ struct ChatListView: View {
             .buttonStyle(.plain).disabled(batchBusy)
             .accessibilityAddTraits(selection.contains(s.key) ? .isSelected : [])
         } else {
-            HStack(spacing: HMDesign.medium) {
+            HStack(spacing: 10) {
                 // Bot name is in the row's metadata, so give the text the width at accessibility sizes.
+                // The avatar isn't a button, so it needs no 44-pt touch frame: that padding was dead space.
                 if !typeSize.isAccessibilitySize {
                     BotAvatar(id: s.profile, name: app.botName(s.profile), size: 38)
-                        .frame(width: HMDesign.touch, height: HMDesign.touch)
                         .accessibilityHidden(true)
                 }
                 NavigationLink(value: ChatRef(profile: s.profile, sessionId: s.id)) {
                     SessionRow(session: s, botName: app.botName(s.profile), showAvatar: false, hasDraft: draftScopes.contains(s.profile + "|session/" + s.id))
                 }
             }
+            // Edge to edge: rows use the screen's width, not an inset card with margins on both sides.
+            .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
             .swipeActions(edge: .trailing) {
                 Button {
                     requestArchive(s)
@@ -463,6 +465,10 @@ struct ChatListView: View {
                 pinGuard = PinGuard(targets: [fresh], batch: false)
                 return
             }
+            if result.unreachable.contains(s.id) {
+                await queueFlags([s], ["archived": true], confirmPins: confirmPins)
+                return
+            }
             if let problem = result.errors[s.id] { self.error = problem; return }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             apply("archived", true, to: s.key)
@@ -510,7 +516,9 @@ struct ChatListView: View {
                                                                 confirmPins: confirmPins)
                     heldForPins += response.heldForPins.count
                     let updated = Set(response.updated)
-                    failures.formUnion(chunk.filter { !updated.contains($0.id) }.map(\.key))
+                    let later = Set(response.unreachable)
+                    if !later.isEmpty { await queueFlags(chunk.filter { later.contains($0.id) }, fields, confirmPins: confirmPins) }
+                    failures.formUnion(chunk.filter { !updated.contains($0.id) && !later.contains($0.id) }.map(\.key))
                 } catch APIError.http(404, _) {
                     for row in chunk {
                         guard gateway == app.gatewaySession else { return }

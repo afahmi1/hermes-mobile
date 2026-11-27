@@ -47,6 +47,35 @@ struct ApprovalRequest: Identifiable, Hashable {
 struct PastedText: Identifiable, Equatable, Codable {
     var id = UUID()
     var text: String
+    /// A reply quote: shown as a compact "Replying to" chip, sent as a Markdown quote ahead of the message.
+    var quote: Bool? = nil
+    var isQuote: Bool { quote == true }
+}
+
+/// Reply quotes in sent text: the leading `> ` lines of a message, shown as a small card above it.
+enum ReplyQuote {
+    static func split(_ text: String) -> (quote: String?, body: String) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let head = lines.prefix { $0.hasPrefix(">") }
+        guard !head.isEmpty, head.count < lines.count else { return (nil, text) }
+        let quote = head.map { $0.dropFirst().trimmingCharacters(in: .whitespaces) }.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = lines.dropFirst(head.count).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !quote.isEmpty, !body.isEmpty else { return (nil, text) }
+        return (quote, body)
+    }
+
+    /// What goes on the wire: a short Markdown quote Hermes reads as "this is what I'm replying to".
+    static func markdown(_ excerpt: String) -> String {
+        excerpt.split(separator: "\n", omittingEmptySubsequences: false).map { "> " + $0 }.joined(separator: "\n")
+    }
+
+    /// One readable excerpt: plain text, collapsed blank lines, capped.
+    static func excerpt(_ raw: String, limit: Int = 320) -> String {
+        let lines = raw.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let joined = lines.joined(separator: "\n")
+        return joined.count > limit ? String(joined.prefix(limit)).trimmingCharacters(in: .whitespaces) + "…" : joined
+    }
 }
 /// One chat: its transcript (from Hermes), its live run, and its model/provider/effort choice.
 @MainActor @Observable
@@ -180,9 +209,19 @@ final class ChatModel {
 
     /// What the next send actually delivers: the draft plus every pasted chunk.
     var combinedDraft: String {
-        let extra = pastedTexts.map(\.text).joined(separator: "\n\n")
-        guard !extra.isEmpty else { return draft }
-        return draft.isEmpty ? extra : draft + "\n\n" + extra
+        let quote = pastedTexts.first(where: \.isQuote).map { ReplyQuote.markdown($0.text) }
+        let extra = pastedTexts.filter { !$0.isQuote }.map(\.text).joined(separator: "\n\n")
+        let body = extra.isEmpty ? draft : draft.isEmpty ? extra : draft + "\n\n" + extra
+        guard let quote else { return body }
+        return body.isEmpty ? quote : quote + "\n\n" + body
+    }
+
+    /// Reply to a message: one quote chip at a time (a new one replaces the old).
+    func setReplyQuote(_ raw: String) {
+        let excerpt = ReplyQuote.excerpt(raw)
+        guard !excerpt.isEmpty else { return }
+        pastedTexts.removeAll(where: \.isQuote)
+        pastedTexts.insert(PastedText(text: excerpt, quote: true), at: 0)
     }
     private var transcriptKey: String? {
         sessionId.flatMap { app?.inboxKey(profile: profile, filter: "transcript/" + $0) }
@@ -540,8 +579,26 @@ final class ChatModel {
 
     /// `projectContext` is a project ID only when the person switched context on for this send from a
     /// project scope; follow-ups (queue / steer) never carry it.
+    /// The bot's commands and every skill. Shown at once from the last copy this phone saw, then refreshed;
+    /// retried while the Mac is reconnecting, so a chat opened mid-reconnect doesn't stay on the short built-in list.
     func loadPalette() async {
-        guard let page = try? await api.commandPalette(profile: profile), app != nil else { return }
+        let cacheKey = "\(api.accountID ?? "-")|\(profile)"
+        if skillDetails.isEmpty, let saved = PaletteCache.load(cacheKey) { apply(saved) }
+        var wait: UInt64 = 1
+        for _ in 0..<6 {
+            if let page = try? await api.commandPalette(profile: profile) {
+                guard app != nil else { return }
+                apply(page)
+                PaletteCache.save(page, key: cacheKey)
+                return
+            }
+            if Task.isCancelled { return }
+            try? await Task.sleep(for: .seconds(wait))
+            wait = min(wait * 2, 15)
+        }
+    }
+
+    private func apply(_ page: CommandPalette) {
         if !page.commands.isEmpty { slashCommands = page.commands }
         skillCommands = page.skills
         skillDetails = page.skillDetails ?? page.skills.map { SkillInfo(name: $0) }

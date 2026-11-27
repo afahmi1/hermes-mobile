@@ -988,6 +988,9 @@ def search_sessions(q, archived=False, limit=40, profile=None, source=None, pref
     out.sort(key=lambda s: s.get("last_active") or 0, reverse=True)
     return with_mobile_origins(out[:limit])
 
+UNREACHABLE = "Hermes is restarting; this will retry."
+
+
 def set_session_flags(pid, ids, fields):
     """Apply one flag patch to many sessions of one profile, bounded and parallel.
 
@@ -998,10 +1001,12 @@ def set_session_flags(pid, ids, fields):
     def patch(sid):
         try:
             status, data = gw("PATCH", pid, "/api/sessions/" + sid, fields)
-        except (OSError, http.client.HTTPException) as exc:
-            return sid, type(exc).__name__
+        except (OSError, http.client.HTTPException):
+            return sid, UNREACHABLE  # the gateway is restarting or down: the phone keeps it and retries
         if status == 200:
             return sid, None
+        if status in (502, 503, 504):
+            return sid, UNREACHABLE
         message = data.get("error") if isinstance(data, dict) else None
         return sid, str(message or ("HTTP %d" % status))[:160]
 
@@ -1927,9 +1932,15 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             log("session flags failed: %s: %s" % (type(e).__name__, e))
             return self.send(502, {"error": "Hermes could not update those chats."})
+        unreachable = [sid for sid, why in errors.items() if why == UNREACHABLE]
+        if unreachable and not updated:
+            # Nothing landed because the gateway is down (a restart): a 503 tells the phone to keep these
+            # on its own disk and send them again when Hermes answers, instead of showing a refusal.
+            return self.send(503, {"error": UNREACHABLE, "unreachable": unreachable, "updated": [], "errors": errors})
         for sid, n in held.items():
             errors[sid] = "has %d pinned message%s" % (n, "" if n == 1 else "s")
-        return self.send(200, {"updated": updated, "errors": errors, **({"pins": held} if held else {})})
+        return self.send(200, {"updated": updated, "errors": errors, **({"unreachable": unreachable} if unreachable else {}),
+                               **({"pins": held} if held else {})})
 
     def pins_route(self, path):
         """GET/DELETE /m/pins/<bot>/<chat>, POST it with {message_id}, DELETE /m/pins/<bot>/<chat>/<message id>."""

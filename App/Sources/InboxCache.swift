@@ -617,6 +617,9 @@ final class ActionQueue {
             do {
                 let result = try await api.updateSessions(profile: action.profile, ids: action.ids, fields: action.fields,
                                                           confirmPins: action.confirmPins)
+                // Some chats missed because Hermes was restarting: keep the whole action and send it again
+                // (archiving an archived chat is harmless).
+                if !result.unreachable.isEmpty { throw APIError.http(503, "Hermes is restarting") }
                 if let first = result.errors.values.first, result.updated.isEmpty { throw APIError.http(409, first) }
             } catch APIError.http(404, _) {
                 for id in action.ids { try await api.updateSession(profile: action.profile, session: id, fields: action.fields) }

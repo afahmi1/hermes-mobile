@@ -421,10 +421,15 @@ struct ChatScreen: View {
     }
 
     @ViewBuilder private var draftShelf: some View {
-        if !chat.pastedTexts.isEmpty {
+        if let quote = chat.pastedTexts.first(where: \.isQuote) {
+            QuoteChip(text: quote.text) { chat.removePastedText(quote.id) }
+                .padding(.horizontal, 12)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+        if chat.pastedTexts.contains(where: { !$0.isQuote }) {
             ScrollView(.horizontal) {
                 HStack {
-                    ForEach(chat.pastedTexts) { chunk in
+                    ForEach(chat.pastedTexts.filter { !$0.isQuote }) { chunk in
                         PasteChip(text: Binding(get: { chat.pastedTexts.first { $0.id == chunk.id }?.text ?? "" },
                                                set: { value in
                                 if let index = chat.pastedTexts.firstIndex(where: { $0.id == chunk.id }) { chat.pastedTexts[index].text = value }
@@ -621,6 +626,21 @@ struct ChatScreen: View {
 
     /// Quote prepends to the draft; Edit replaces it (asking nothing: the old draft is one Undo away in the field).
     private func compose(_ text: String, replace: Bool) {
+        // A reply quote becomes a compact chip, not raw "> " lines in the box.
+        if !replace, text.hasPrefix("> ") {
+            let raw = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.hasPrefix("> ") ? String($0.dropFirst(2)) : String($0) }.joined(separator: "\n")
+            chat.setReplyQuote(raw)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
+        if replace, case let (quote?, body) = ReplyQuote.split(text) {
+            // Editing a sent reply: its quote goes back into the chip, the words into the box.
+            chat.setReplyQuote(quote)
+            chat.draft = body
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
         chat.draft = replace || chat.draft.isEmpty ? text : text + chat.draft
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
@@ -1265,8 +1285,9 @@ struct MessageRow: View {
     }
 
     private var quoted: String {
-        let clipped = item.text.count > 600 ? String(item.text.prefix(600)) + "…" : item.text
-        return clipped.split(separator: "\n", omittingEmptySubsequences: false).map { "> " + $0 }.joined(separator: "\n") + "\n\n"
+        // Plain words, not Markdown syntax: the chip and the quote Hermes gets both read cleanly.
+        let source = item.kind == .assistant ? MarkdownBlock.plainText(item.text) : (ReplyQuote.split(item.text).body)
+        return ReplyQuote.markdown(ReplyQuote.excerpt(source)) + "\n\n"
     }
 
     @ViewBuilder private var messageMenu: some View {
@@ -1302,6 +1323,7 @@ struct MessageRow: View {
     }
 
     /// Long pastes fold to their first lines so one message never fills the screen.
+    private var replySplit: (quote: String?, body: String) { ReplyQuote.split(item.text) }
     private var userIsLong: Bool { item.text.count > 700 || item.text.reduce(0) { $1 == "\n" ? $0 + 1 : $0 } > 14 }
     private var userText: String {
         guard userIsLong, !showFull else { return item.text }
@@ -1327,12 +1349,15 @@ struct MessageRow: View {
                     if !item.text.isEmpty {
                         HStack(alignment: .top, spacing: 4) {
                             if pinned { pinMark }
-                            Text(userText)
+                            VStack(alignment: .leading, spacing: 8) {
+                            if let q = replySplit.quote { QuoteCard(text: q) }
+                            Text(replySplit.quote == nil ? userText : replySplit.body)
                                 .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
                                 .foregroundStyle(.primary)
                                 .background(HMDesign.selectedFill, in: RoundedRectangle(cornerRadius: HMDesign.messageRadius))
                                 .overlay(RoundedRectangle(cornerRadius: HMDesign.messageRadius)
                                     .strokeBorder(HMDesign.accent, lineWidth: highlighted ? 2 : 0))
+                            }
                                 .contextMenu { messageMenu }
                         }
                     }
@@ -2494,8 +2519,8 @@ struct QuestionCard: View {
                 .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.accent)
             Text(question.question).font(.subheadline).textSelection(.enabled)
             if !question.choices.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
+                // Stacked, full width: choices are often paths or sentences, and each is an easy tap.
+                VStack(alignment: .leading, spacing: 6) {
                         ForEach(question.choices, id: \.self) { choice in
                             Button {
                                 if question.multiSelect {
@@ -2504,15 +2529,22 @@ struct QuestionCard: View {
                                     Task { _ = await chat.answerQuestion(choice) }
                                 }
                             } label: {
-                                Text(choice).font(.subheadline).lineLimit(2)
-                                    .padding(.horizontal, 12).padding(.vertical, 8)
-                                    .background(picked.contains(choice) ? HMDesign.accent.opacity(0.25) : HMDesign.panel,
-                                                in: Capsule())
+                                HStack {
+                                    Text(choice).font(.subheadline).lineLimit(3).multilineTextAlignment(.leading)
+                                    Spacer(minLength: 8)
+                                    Image(systemName: question.multiSelect ? (picked.contains(choice) ? "checkmark.circle.fill" : "circle")
+                                                                           : "arrow.up.circle")
+                                        .foregroundStyle(HMDesign.accent)
+                                }
+                                .padding(.horizontal, 12).padding(.vertical, 10)
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                .background(picked.contains(choice) ? HMDesign.accent.opacity(0.25) : HMDesign.panel,
+                                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                             .disabled(chat.answering)
                         }
-                    }
                 }
                 if question.multiSelect {
                     Button("Send \(picked.count) choice\(picked.count == 1 ? "" : "s")") {
@@ -2529,5 +2561,48 @@ struct QuestionCard: View {
         .background(HMDesign.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .padding(.horizontal, 12)
         .sensoryFeedback(.impact(weight: .light), trigger: question.id)
+    }
+}
+
+/// The message you're replying to, above the message box: accent bar, two lines, remove button.
+struct QuoteChip: View {
+    let text: String
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            RoundedRectangle(cornerRadius: 1.5).fill(HMDesign.accent).frame(width: 3)
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Replying to", systemImage: "arrowshape.turn.up.left.fill")
+                    .font(.caption2.weight(.semibold)).foregroundStyle(HMDesign.accent)
+                Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill").font(.body).foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove reply quote")
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.leading, 10).padding(.vertical, 6).padding(.trailing, 2)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+/// A quoted message inside a sent bubble: small, muted, three lines at most.
+struct QuoteCard: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 1.5).fill(HMDesign.accent.opacity(0.7)).frame(width: 3)
+            Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(3)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }

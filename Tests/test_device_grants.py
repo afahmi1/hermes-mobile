@@ -78,6 +78,15 @@ class DeviceGrantTests(unittest.TestCase):
         self.assertEqual((code, data), (200, {"updated": ["one", "two"], "errors": {}}))
         apply_flags.assert_called_once_with("default", ["one", "two"], {"archived": True})
 
+    def test_archive_while_the_gateway_restarts_answers_503_over_http(self):
+        # The bridge is up, Hermes's gateway isn't (a restart): the phone must see "try later", not a refusal.
+        with patch.object(self.b, "profile_ids", return_value=["default"]), patch.object(self.b, "key_for", return_value="key"), \
+                patch.object(self.b, "gw", side_effect=ConnectionRefusedError()), patch.object(self.b, "pin_store", return_value=None):
+            code, data = self.request("POST", "/m/sessions/flags", self.pair(),
+                                      {"profile": "default", "ids": ["one"], "fields": {"archived": True}})
+        self.assertEqual(code, 503)
+        self.assertEqual(data["unreachable"], ["one"])
+
     def test_one_time_pairing_concurrent_exchange_and_privileges(self):
         offer = self.request("POST", "/m/devices/pair-code", self.owner)[1]
         with ThreadPoolExecutor(2) as pool:

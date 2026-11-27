@@ -80,6 +80,15 @@ For videos the app also offers **Send the original video file**: the recording e
 
 ## Chat actions (archive, pin, flags)
 
+**While Hermes restarts.** The bridge stays up when the gateway restarts, so it answers the phone. If it can't
+reach the gateway to change a chat (connection refused, or the gateway answering 502/503/504), it answers
+**503** with `{"unreachable": [ids]}` instead of a 200 with per-chat errors. The phone treats 503 as "Mac not
+reachable": the action goes to its saved queue (the "N changes waiting for your Mac" bar), shows as done in the
+list, and is sent again when Hermes answers (retry from 2 s, backing off to 30 s, plus on launch and on return to
+the app). For a partial outage the 200 lists `unreachable` and the phone queues just those chats. Re-sending is safe:
+archiving an archived chat changes nothing.
+
+
 Archive, unarchive, pinning a chat and pinning or unpinning a message work offline too. When the Mac can't be
 reached (no route, timeout, or the bridge or Tailscale Serve answering 502/503/504), the action is saved to
 `HermesOutbox/actions.json` on the phone and the list updates right away. A bar at the bottom of the chat list says

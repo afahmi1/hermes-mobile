@@ -473,7 +473,8 @@ final class API: @unchecked Sendable {
         }
         guard (200..<300).contains(http.statusCode) else { throw APIError.http(http.statusCode, Self.errorText(data)) }
         return SessionFlagResult(updated: d["updated"] as? [String] ?? [],
-                                 errors: d["errors"] as? [String: String] ?? [:], heldForPins: held)
+                                 errors: d["errors"] as? [String: String] ?? [:], heldForPins: held,
+                                 unreachable: d["unreachable"] as? [String] ?? [])
     }
 
     // MARK: pinned messages

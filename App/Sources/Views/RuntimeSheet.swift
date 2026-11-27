@@ -47,7 +47,9 @@ struct RuntimeSheet: View {
                 Section {
                     Picker("Provider", selection: $provider) {
                         Text("Bot default").tag(String?.none)
-                        ForEach(catalog?.usable ?? []) { p in Text(p.name).tag(Optional(p.slug)) }
+                        ForEach(catalog?.usable ?? []) { p in
+                            Text(p.isSubscription ? "\(p.name) · subscription" : "\(p.name) · pay per use").tag(Optional(p.slug))
+                        }
                     }
                     .pickerStyle(.menu)
                     .disabled(loading)
@@ -62,6 +64,18 @@ struct RuntimeSheet: View {
                 } header: { Text("Provider") } footer: {
                     if provider == nil, let bot { Text("Uses \(bot.name)'s own setting: \(bot.model) · \(bot.provider).") }
                     if !loading { Text(catalogState.caption(now: Date())) }
+                }
+
+                if let provider, let model, let twin = catalog?.subscriptionTwin(of: model, on: provider) {
+                    Section {
+                        Button {
+                            withAnimation { self.provider = twin.provider.slug; self.model = twin.model }
+                        } label: {
+                            Label("Use \(ModelName.short(twin.model)) on your \(twin.provider.name) subscription", systemImage: "checkmark.seal")
+                        }
+                    } footer: {
+                        Text("This model is pay per use here. Your subscription has it, already paid for.")
+                    }
                 }
 
                 if let p = selectedProvider {
