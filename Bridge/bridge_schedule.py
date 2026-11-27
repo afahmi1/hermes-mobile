@@ -119,10 +119,19 @@ class Schedule:
                 db.execute("UPDATE scheduled SET next_try=?, error=? WHERE id=?",
                            (now + RETRY_AFTER, str(error)[:300], row["id"]))
 
+    def _claim(self, row, now):
+        """Take a due row for this tick only (pushes its next try out), so two ticks can't both send it."""
+        with self.lock, self._db() as db:
+            return db.execute("UPDATE scheduled SET next_try=? WHERE id=? AND status='waiting' AND next_try<=?",
+                              (now + RETRY_AFTER, row["id"], now)).rowcount == 1
+
     def tick(self, send, busy=lambda profile, session: False, now=None):
         """Send everything due. `send(row)` starts the turn (raises on failure); `busy` defers a chat mid-reply."""
+        now = time.time() if now is None else now
         done = 0
         for row in self.due(now):
+            if not self._claim(row, now):
+                continue
             if busy(row["profile"], row["session"]):
                 self.postpone(row, "Hermes was still replying in this chat.", now)
                 continue

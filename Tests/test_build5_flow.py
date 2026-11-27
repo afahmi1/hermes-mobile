@@ -6,6 +6,7 @@ fail-closed paths: no auth, ordinary (non-owner) token, missing PIN, wrong PIN. 
 """
 import json
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -123,8 +124,9 @@ class Build5Flow(base.Base):
 
         # --- nothing on disk under profiles/, no PIN anywhere in replies or logs ---
         self.assertEqual(self.profiles_snapshot(), snap)
+        # As a token, not a substring: a short PIN can occur inside a float timestamp ("1795807013.58...").
         for raw in self.srv.bodies:
-            self.assertNotIn(PIN.encode(), raw)
+            self.assertIsNone(re.search(rb"(?<![\d.])" + PIN.encode() + rb"(?![\d.])", raw), raw[:200])
         self.assertNotIn(PIN, self.log.getvalue())
 
 
