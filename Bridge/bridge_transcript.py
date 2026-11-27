@@ -36,6 +36,18 @@ _TASK = re.compile(r"^---\s*([✓✗⚠])\s*TASK\s+\d+/\d+:?\s*(.*?)\s*\(status=
 _IMAGE_AT = re.compile(r"\[Image attached at:\s*([^\]\n]+?)\s*\]")
 _MEDIA = re.compile(r"(?m)^[ \t]*MEDIA:\s*(\"[^\"]+\"|\S+)\s*$")
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\((?:file://)?(/[^)\s]+)\)")
+# The bridge's own hand-off notes (bridge_turns._media_notes): files, clips, audio, and images sent with a steer.
+# One line each, ending in a JSON-quoted path. The person never typed them, so the whole note goes.
+_BRIDGE_NOTE = re.compile(r"(?m)^[ \t]*The user (?:attached|sent) (?:an image|a file|a video clip|an audio file)\b"
+                          r"(?: named (\"(?:[^\"\\\n]|\\.)*\"))?[^\n]*?"
+                          r"Local file path: (\"(?:[^\"\\\n]|\\.)*\")[ \t]*$")
+# Older desktop builds stored the model's image part after the text: a base64 data URL nobody should read.
+_INLINE_DATA_PART = re.compile(r'\{"type":\s*"image_url",\s*"image_url":\s*\{"url":\s*"data:[^"]*"\s*(?:,[^{}]*)?\}\s*\}')
+# Hermes's voice-note format: the transcript stays as the person's words, the recording becomes playable.
+_AUDIO_NOTE = re.compile(r"\[User sent audio: ([^\]\n]+)\]")
+# The CLI and desktop collapse a long paste into a file. The marker stays (it becomes a "Pasted N lines" note);
+# the file is offered so the paste can actually be read on the phone.
+_PASTE_NOTE = re.compile(r"\[Pasted text #\d+: \d+ lines? → ([^\]\n]+)\]")
 _FAILED = ("failed", "error", "cancelled", "canceled", "interrupted", "timeout", "stalled", "rejected")
 _FALLBACK = [
     {"name": "learn", "description": "Learn a reusable skill from what you describe, a URL, or this chat",
@@ -427,8 +439,35 @@ def safe_file(raw, roots):
     return None
 
 
+def desktop_attachment_roots():
+    """Where the Hermes desktop app keeps what you attach in its composer, on each OS. Your own messages may
+    show files from here on the phone (images you dropped in, long pastes), like the Hermes home."""
+    home = Path.home()
+    bases = [home / "Library" / "Application Support" / "Hermes", home / ".config" / "Hermes"]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        bases.append(Path(appdata) / "Hermes")
+    return [base / name for base in bases for name in ("composer-images", "composer-pastes")]
+
+
 def _digest(path):
     return hashlib.sha256(str(path).encode()).hexdigest()
+
+
+def _json_path(raw):
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _marker_paths(text):
+    """Every path an attachment marker in this text names (what _refs would offer), in order."""
+    text = text or ""
+    paths = _IMAGE_AT.findall(text) + _MEDIA.findall(text) + _MD_IMAGE.findall(text)
+    paths += [p for p in (_json_path(raw) for _, raw in _BRIDGE_NOTE.findall(text)) if p]
+    return paths + _AUDIO_NOTE.findall(text) + _PASTE_NOTE.findall(text)
 
 
 def _refs(text, roots):
@@ -436,19 +475,36 @@ def _refs(text, roots):
     found = []
     seen = set()
 
-    def take(raw):
-        path = safe_file(raw, roots)
-        if path is None or path in seen:
-            return raw if path is None else ""
+    def take(raw, keep=None, gone="", label=None):
+        # `keep` is the text a marker leaves when its file can't be offered; `gone` what it leaves when it can.
+        path = safe_file(raw, roots) if raw else None
+        if path is None:
+            return raw if keep is None else keep
+        if path in seen:
+            return gone
         seen.add(path)
         if len(found) < 6:
-            found.append({"name": path.name, "digest": _digest(path),
+            shown = label.strip() if isinstance(label, str) and label.strip() and "/" not in label and "\\" not in label else path.name
+            if Path(shown).suffix.lower() != path.suffix.lower():
+                # The phone opens it by this name, so the extension must be the file's (a HEIC staged as JPEG).
+                shown = (Path(shown).stem or path.stem) + path.suffix
+            found.append({"name": shown.strip()[:120], "digest": _digest(path),
                           "kind": "image" if path.suffix.lower() in IMAGE_EXT else "file"})
-        return ""
+        return gone
 
-    cleaned = _IMAGE_AT.sub(lambda m: take(m.group(1)), text or "")
+    def gone_note(m):
+        name = _json_path(m.group(1)) if m.group(1) else None
+        return "📎 " + name if name else ""
+
+    cleaned = _INLINE_DATA_PART.sub("", text or "")
+    cleaned = _IMAGE_AT.sub(lambda m: take(m.group(1)), cleaned)
     cleaned = _MEDIA.sub(lambda m: take(m.group(1)), cleaned)
     cleaned = _MD_IMAGE.sub(lambda m: take(m.group(1)), cleaned)
+    # A hand-off note is never the person's words: it goes whether or not the file is still there.
+    cleaned = _BRIDGE_NOTE.sub(lambda m: take(_json_path(m.group(2)), keep=gone_note(m),
+                                              label=_json_path(m.group(1)) if m.group(1) else None), cleaned)
+    cleaned = _AUDIO_NOTE.sub(lambda m: take(m.group(1).strip(), keep=""), cleaned)
+    cleaned = _PASTE_NOTE.sub(lambda m: take(m.group(1).strip(), keep=m.group(0), gone=m.group(0)), cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, found
 
@@ -464,7 +520,7 @@ def file_for_digest(texts, digest, roots, assistant_roots=()):
     for entry in texts:
         role, text = entry if isinstance(entry, tuple) else ("user", entry)
         allowed = list(roots) + (list(assistant_roots) if role == "assistant" else [])
-        for match in _IMAGE_AT.findall(text or "") + _MEDIA.findall(text or "") + _MD_IMAGE.findall(text or ""):
+        for match in _marker_paths(text):
             path = safe_file(match, allowed)
             if path is not None and _digest(path) == digest:
                 return path

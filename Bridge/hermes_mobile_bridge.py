@@ -1560,6 +1560,12 @@ def admissions_dir():
     return Path(override) if override else STATE_DIR / "admissions"
 
 
+def user_media_roots():
+    """Where your own messages may point the phone at files: the Hermes home, plus the desktop app's composer
+    folders (an image dropped into the desktop composer is saved there, not under the Hermes home)."""
+    return [HERMES, *transcript.desktop_attachment_roots()]
+
+
 def assistant_media_roots():
     """Where Hermes's own replies may point a phone at files: the Mac user's home (secrets excluded by
     bridge_transcript). HERMES_MOBILE_REPLY_FILES=hermes keeps replies inside the Hermes home only."""
@@ -1570,7 +1576,7 @@ def assistant_media_roots():
 
 def project_timeline_message(message):
     """One mobile timeline row. Reasoning and unbounded tool bodies stay on the Mac."""
-    return transcript.project_timeline_message(message, [HERMES], assistant_media_roots())
+    return transcript.project_timeline_message(message, user_media_roots(), assistant_media_roots())
 
 
 def timeline_bytes(messages, has_more=None, next_offset=None):
@@ -2457,9 +2463,9 @@ class H(BaseHTTPRequestHandler):
                     return self.send(404, {"error": "unknown bot"})
                 if by_path:
                     # A path Hermes wrote in a reply, tapped on the phone. Same guards as attachments.
-                    found = transcript.file_for_path(session_bodies(pid, sid), q.get("path") or "", [HERMES], assistant_media_roots())
+                    found = transcript.file_for_path(session_bodies(pid, sid), q.get("path") or "", user_media_roots(), assistant_media_roots())
                 else:
-                    found = transcript.file_for_digest(session_bodies(pid, sid), preview.group(3), [HERMES], assistant_media_roots())
+                    found = transcript.file_for_digest(session_bodies(pid, sid), preview.group(3), user_media_roots(), assistant_media_roots())
                 if found is None:
                     return self.send(404, {"error": "That file is not in this chat."})
                 types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
