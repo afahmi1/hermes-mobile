@@ -1404,12 +1404,19 @@ final class ChatModel {
         } catch APIError.http(let code, let message) where code == 404 || code == 409 {
             // The reply ended (or this bridge restarted) between the tap and the request. Never an error to
             // the person: the message waits for the next safe moment and goes as the next message.
-            if code == 409, !message.contains("no longer") && !message.contains("Refresh") {
+            if code == 409, !message.contains("no longer") && !message.contains("Refresh") && !message.contains("next turn") {
                 return refuse(item, message)
             }
             update(item.id) { $0 = $0.demotedToQueue(note: "The reply had finished, so this goes as the next message.") }
             await persistOutgoing()
-            if isRunning, runId == run { runId = nil; isRunning = false; status = nil }
+            // Only the Mac knows whether the reply really ended. If it did, end it properly here (saves the reply,
+            // settles the send, reloads); never just drop the run, which left the chat frozen as "replying".
+            if isRunning, runId == run,
+               let live = try? await api.liveTurns(), !live.contains(where: { $0.turnId == run && !$0.done }) {
+                streamTask?.cancel()
+                streamTask = nil
+                await finishRun(gaveUp: false)
+            }
             pumpAgain = true
             return false
         } catch APIError.http(let code, let message) where [400, 413, 415, 422].contains(code) {
@@ -1834,11 +1841,20 @@ final class ChatModel {
     /// When the live stream last heard from the bridge (an event or its ~15 s heartbeat).
     @ObservationIgnored private var streamHeard = Date.distantPast
     @ObservationIgnored private var streamGeneration = 0
+    @ObservationIgnored private var streamRun: String?
     /// What the reply was doing before a reconnect, so the status line can go back to it.
     @ObservationIgnored private var workingStatus: String?
 
     private func follow() {
-        guard let run = runId, streamTask == nil else { return }
+        guard let run = runId else { return }
+        if streamTask != nil {
+            if streamRun == run { return }
+            // A stream still open for an earlier run must not block following this one (it would leave the chat
+            // "replying" with nothing listening until some other event woke it).
+            streamTask?.cancel()
+            streamTask = nil
+        }
+        streamRun = run
         let account = app?.inboxAccount
         streamGeneration &+= 1
         let generation = streamGeneration

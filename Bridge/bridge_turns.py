@@ -1448,8 +1448,11 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
                 raise TurnError("Submission ID already used for another steer.", 409)
             return await asyncio.shield(prior[1])
     client = turn.client
-    if turn.done or client is None:
+    if turn.done:
         raise TurnError("This turn is no longer accepting input. Refresh the conversation.", 409)
+    if client is None:
+        # Reconnecting to the gateway mid-reply: the turn is alive. A 503 makes the phone retry, not end the reply.
+        raise TurnError("Reconnecting to Hermes. Your message is saved and goes in a moment.", 503)
     if mode == "steer":
         if turn.generation is None:
             raise TurnError("The gateway has not started this turn yet.", 409)

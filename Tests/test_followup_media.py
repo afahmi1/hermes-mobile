@@ -105,6 +105,18 @@ class FollowUpMediaTests(unittest.IsolatedAsyncioTestCase):
                 await engine._follow_up(turn, "queue", "again", request, {}, [])
         self.assertEqual(rpc.await_count, 1, "Hermes's ledger was asked instead of the bridge's memory")
 
+    async def test_a_reconnecting_turn_is_not_called_finished(self):
+        # While the bridge reconnects to the gateway the turn is alive: 503 (retry), never 409 (ended).
+        turn = self.turn()
+        turn.client = None
+        with self.assertRaises(engine.TurnError) as e:
+            await engine._follow_up(turn, "steer", "turn left", uuid4().hex, None, [])
+        self.assertEqual(e.exception.code, 503)
+        turn.done = True
+        with self.assertRaises(engine.TurnError) as e:
+            await engine._follow_up(turn, "steer", "turn left", uuid4().hex, None, [])
+        self.assertEqual(e.exception.code, 409)
+
     async def test_a_failed_guide_can_be_retried_under_the_same_id(self):
         turn = self.turn()
         steer = uuid4().hex

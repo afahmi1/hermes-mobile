@@ -210,11 +210,11 @@ struct ChatScreen: View {
                 if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) }
             }
             .onDisappear { if let sid = chat.sessionId { ChatSeen.mark(chat.profile + "|" + sid) } }
-            .task(id: chat.items.isEmpty) { if !chat.items.isEmpty, followLatest { land(proxy) } }
             // A long transcript arriving all at once can leave a lazy list parked below its content (a blank
-            // screen until you scroll). Land on the newest message once the first page is in, then again after
-            // the rows have measured themselves.
-            .task(id: chat.items.isEmpty) {
+            // screen until you scroll). Land on the newest message once a page is in, then again after the rows
+            // have measured themselves. Keyed on the newest row, not on "empty": the cached copy shown at open is
+            // replaced by the fresh page (different row heights) without the list ever being empty in between.
+            .task(id: chat.items.last?.id) {
                 guard !chat.items.isEmpty, followLatest else { return }
                 proxy.scrollTo("bottom", anchor: .bottom)
                 try? await Task.sleep(for: .milliseconds(150))
@@ -3308,6 +3308,8 @@ struct ReadingPosition: ViewModifier {
     @State private var userScrolling = false
     @State private var atBottom = true
     @State private var lastRescue = Date.distantPast
+    @State private var latestGap: CGFloat = 0
+    @State private var rescueQueued = false
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
@@ -3323,9 +3325,20 @@ struct ReadingPosition: ViewModifier {
                     if bottom { if !followLatest { followLatest = true } }
                     else if userScrolling { followLatest = false }
                     // Far below the content with nobody scrolling: a lazy list that measured short. Never a reading spot.
-                    if gap < -120, !userScrolling, Date().timeIntervalSince(lastRescue) > 1 {
-                        lastRescue = Date()
-                        pastEnd()
+                    latestGap = gap
+                    if gap < -120, !userScrolling {
+                        if Date().timeIntervalSince(lastRescue) > 1 {
+                            lastRescue = Date()
+                            pastEnd()
+                        } else if !rescueQueued {
+                            // Throttled, and the geometry may never change again: look once more shortly.
+                            rescueQueued = true
+                            Task { @MainActor in
+                                try? await Task.sleep(for: .seconds(1.05))
+                                rescueQueued = false
+                                if latestGap < -120, !userScrolling { lastRescue = Date(); pastEnd() }
+                            }
+                        }
                     }
                 }
                 .onScrollPhaseChange { _, phase in
