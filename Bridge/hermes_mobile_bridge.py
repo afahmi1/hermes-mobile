@@ -70,6 +70,7 @@ import bridge_restart
 import bridge_devices
 import bridge_push
 import bridge_receipts
+from bridge_agent_status import with_phone_turns
 from bridge_process import pid_alive
 import bridge_owner, bridge_manage  # owner PIN/epoch and the managed overlay (stdlib only)
 import bridge_pins  # pinned messages (own SQLite file, stdlib only)
@@ -419,22 +420,7 @@ def status_payload(refresh_providers=False):
         d = json.loads(raw)
     finally:
         c.close()
-    if turns is not None:
-        agents = d.setdefault("agents", [])
-        for t in turns.live_turns():
-            if t["done"]:
-                continue
-            same = next((a for a in agents if a.get("profile") == t["profile"]
-                         and a.get("session_id") == t["session_id"]), None)
-            if same:
-                same["kind"] = "phone"  # the gateway's own lease for this turn
-            else:
-                agents.append({"kind": "phone", "profile": t["profile"], "session_id": t["session_id"],
-                               "title": "Reply started from the phone", "age_s": t["age"]})
-                for b in d.get("bots") or []:
-                    if b.get("id") == t["profile"]:
-                        b["running"] = (b.get("running") or 0) + 1
-    return d
+    return with_phone_turns(d, turns.live_turns(), profile_home) if turns is not None else d
 
 
 # ---------- auth ----------

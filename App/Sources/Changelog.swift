@@ -34,12 +34,13 @@ enum WhatsNew {
     static let releases: [WhatsNewRelease] = [
         WhatsNewRelease(build: 58, items: [
             WhatsNewItem(symbol: "clock", text: "Hold Send to schedule a message for later or at reset"),
+            WhatsNewItem(symbol: "bubble.left.and.bubble.right", text: "Status: chat names, models, and each subagent’s parent"),
         ]),
         WhatsNewRelease(build: 57, items: [
             WhatsNewItem(symbol: "arrow.triangle.branch", text: "Branch from any message: hold it, then Branch from Here"),
             WhatsNewItem(symbol: "puzzlepiece.extension", text: "Add-ons: browse and install skills, plugins and MCP servers"),
             WhatsNewItem(symbol: "checkmark.shield", text: "Hermes scans every skill before it installs; you approve"),
-            WhatsNewItem(symbol: "bubble.left.and.text.bubble.right", text: "Queued and guiding messages stay in the chat until Hermes shows them"),
+            WhatsNewItem(symbol: "bubble.left.and.text.bubble.right", text: "Queued and guiding messages stay put until Hermes shows them"),
             WhatsNewItem(symbol: "bolt.horizontal.circle", text: "A blip on the Mac no longer freezes a reply in progress"),
         ]),
         WhatsNewRelease(build: 56, items: [

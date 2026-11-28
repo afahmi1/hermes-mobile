@@ -594,17 +594,44 @@ private struct RelTime: View {
 private struct AgentRow: View {
     let agent: JV
     let botName: String
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    private var kind: String { agent["kind"].string ?? "" }
+    private var source: String? {
+        if let label = agent["source_label"].string { return label }
+        if kind == "phone" { return "Phone" }
+        if kind == "cron" { return "Cron" }
+        let raw = agent["source"].string ?? agent["surface"].string
+        switch raw {
+        case "local", "gui", "desktop": return "Desktop"
+        case "bluebubbles", "imessage": return "iMessage"
+        case "tui", "cli", "oneshot": return "CLI"
+        default: return raw?.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
     var body: some View {
-        let kind = agent["kind"].string ?? ""
         HStack(alignment: .firstTextBaseline, spacing: HMDesign.medium) {
             Image(systemName: ["chat": "bubble.left.and.bubble.right.fill", "subagent": "person.2.fill",
                                "cron": "clock.fill", "phone": "iphone"][kind] ?? "bolt.fill")
                 .foregroundStyle(.tint).frame(width: 24).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: HMDesign.micro) {
-                Text(agent["title"].string ?? "Untitled").font(HMDesign.rowTitle).lineLimit(1)
-                (Text([botName, kind == "subagent" ? "subagent" : kind == "cron" ? "cron run" : kind == "phone" ? "from phone" : nil,
-                       agent["model"].string].compactMap { $0 }.joined(separator: " · ")) + RelTime.suffix(agent["started_at"].date))
-                    .font(HMDesign.data).foregroundStyle(HMDesign.text2).lineLimit(1)
+                Text(agent["title"].string ?? (kind == "subagent" ? "Delegated task" : "Running chat"))
+                    .font(HMDesign.rowTitle).lineLimit(2)
+                (Text([agent["model"].string.map(SessionRow.shortModel), kind == "subagent" ? nil : source, botName]
+                    .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")) + RelTime.suffix(agent["started_at"].date))
+                    .font(HMDesign.data).foregroundStyle(HMDesign.text2).lineLimit(typeSize.isAccessibilitySize ? nil : 2)
+                if kind == "subagent" {
+                    let layout = typeSize.isAccessibilitySize
+                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: HMDesign.micro))
+                        : AnyLayout(HStackLayout(spacing: HMDesign.small))
+                    layout {
+                        StatusPill(text: "subagent", label: "Subagent")
+                        if let title = agent["parent_title"].string {
+                            Text("in \(title)").font(HMDesign.metadata).foregroundStyle(HMDesign.text2).lineLimit(2)
+                        }
+                    }
+                }
             }
         }
     }

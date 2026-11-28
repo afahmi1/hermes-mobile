@@ -220,11 +220,17 @@ function render(){
 
   // running now (agents)
   const AG = s.agents||[];
-  const kindTag = {chat:"chat", subagent:"subagent", cron:"cron"};
   $("agentCount").textContent = AG.length ? `· ${AG.length}` : "";
-  $("agents").innerHTML = AG.length ? `<div class="tbl-wrap"><table><tbody>${AG.map(a=>`<tr>
-      <td><div class="name">${esc(a.title||"—")}</div><div class="meta"><span class="tag">${esc(a.profile)}</span><span class="tag">${esc(kindTag[a.kind]||a.kind)}</span>${a.model?esc(a.model):""}${a.source?` · ${esc(a.source)}`:""}</div></td>
-      <td class="nowrap">${statusPill(a.kind==="cron"?(a.status||"running"):"running")}<div class="meta">started ${rel(a.started_at)}</div>${a.pid_alive===false?' <span class="pill bad">dead pid</span>':""}</td></tr>`).join("")}</tbody></table></div>`
+  $("agents").innerHTML = AG.length ? `<div class="tbl-wrap"><table><tbody>${AG.map(a=>{
+    const subagent = a.kind === "subagent";
+    const model = a.model?.split("/").pop().replace(/\[.*$/, "");
+    const source = a.source_label || a.source || (a.kind === "cron" ? "Cron" : a.kind === "phone" ? "Phone" : "");
+    const details = [model, subagent ? null : source, a.profile].filter(Boolean).map(esc).join(" · ");
+    return `<tr>
+      <td><div class="name">${esc(a.title || (subagent ? "Delegated task" : "Running chat"))}</div><div class="meta">${details}</div>
+        ${subagent ? `<div class="meta"><span class="tag">Subagent</span>${a.parent_title ? `in ${esc(a.parent_title)}` : ""}</div>` : ""}</td>
+      <td class="nowrap">${statusPill(a.kind==="cron"?(a.status||"running"):"running")}<div class="meta">started ${rel(a.started_at)}</div>${a.pid_alive===false?' <span class="pill bad">dead pid</span>':""}</td></tr>`;
+    }).join("")}</tbody></table></div>`
     : `<div class="empty">Nothing running right now.</div>`;
 
   // bots
