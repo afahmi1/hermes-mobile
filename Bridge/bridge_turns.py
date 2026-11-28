@@ -1004,7 +1004,7 @@ async def _drive_connection(turn: Turn):
             elif t == "thinking.delta" and pl.get("text"):
                 turn.push("status", text=pl.get("text"))
             elif t in ("tool.start", "tool.started"):
-                turn.push("tool.started", tool_name=_tool_name(pl), preview=str(pl.get("preview") or "")[:200])
+                turn.push("tool.started", tool_name=_tool_name(pl), preview=_live_preview(pl)[:200])
                 await asyncio.to_thread(check_steers, turn)  # a new step began: guidance sent earlier was read
             elif t in ("tool.complete", "tool.completed"):
                 preview = pl.get("preview") if isinstance(pl.get("preview"), str) else ""
@@ -1510,6 +1510,22 @@ def check_steers(turn, force=False):
         if hit is not None:
             del turn.unread_steers[sid]
             turn.push("steer.picked_up", submission_id=sid, at=hit)
+
+
+def _live_preview(pl):
+    """Hermes's preview for a starting tool, or ours when it has none: a skill edit lists its operations, which
+    Hermes's single-key preview can't show ("Skills · created x; updated x/references/y.md")."""
+    preview = str(pl.get("preview") or "")
+    if preview.strip() or _tool_name(pl) != "skill_manage":
+        return preview
+    args = pl.get("args") if pl.get("args") is not None else pl.get("arguments", pl.get("input"))
+    if isinstance(args, dict):
+        args = json.dumps(args)
+    try:
+        import bridge_transcript
+        return bridge_transcript._arg_preview(args) if isinstance(args, str) else ""
+    except Exception:
+        return ""
 
 
 def follow_up(turn, mode, text, submission=None, choice=None, attachments=None):

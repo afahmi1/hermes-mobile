@@ -35,6 +35,11 @@ struct ChatScreen: View {
     /// Off for every send; switched back off after each one.
     @State private var includeProjectContext = false
     @State private var followLatest = true
+    /// Points above the newest message (from `ReadingPosition`), and how many rows arrived while you were up there.
+    @State private var distanceFromLatest: CGFloat = 0
+    @State private var unseenSinceAway = 0
+    /// The Latest button appears only once you're clearly reading back, never for a nudge at the bottom.
+    private let latestThreshold: CGFloat = 280
     @Environment(\.scenePhase) private var scenePhase
     @State private var showRuntime = false
     @State private var sendTick = 0
@@ -59,12 +64,18 @@ struct ChatScreen: View {
     @State private var pinCursor = 0
     @State private var highlighted: String?
     @State private var makingProject = false
+    /// Find in chat: open, the words, the hits (oldest first) and which one is shown.
+    @State private var finding = UserDefaults.standard.string(forKey: "HMDemoFind") != nil
     @State private var makeProjectError: String?
 
     private var bot: Bot? { app.bot(chat.profile) }
 
     @ViewBuilder private var makeProjectMenu: some View {
         Menu {
+            Button { withAnimation(HMMotion.standard) { finding = true } } label: {
+                Label("Search in chat", systemImage: "magnifyingglass")
+            }
+            .disabled(chat.sessionId == nil)
             Button {
                 Task { await makeProject() }
             } label: {
@@ -165,14 +176,20 @@ struct ChatScreen: View {
                         ThinkingStatus(chat: chat, status: s)
                         .padding(.horizontal, 16).id("status")
                     }
-                    Color.clear.frame(height: 4).id("bottom")
+                    Color.clear.frame(height: 1).id("bottom")
                 }
-                .padding(.vertical, 12)
+                // Tight at the bottom: the newest line (or the thinking row) sits just above the composer.
+                .padding(.top, 12).padding(.bottom, 4)
             }
             .scrollDismissesKeyboard(.interactively)
-            .modifier(ReadingPosition(followLatest: $followLatest))
+            .modifier(ReadingPosition(followLatest: $followLatest, distance: $distanceFromLatest,
+                                      pastEnd: { land(proxy) }))
+            .modifier(LatestControl(distance: distanceFromLatest, threshold: latestThreshold, count: chat.items.count,
+                                    unseen: $unseenSinceAway) {
+                followLatest = true
+                withAnimation(HMMotion.standard) { proxy.scrollTo("bottom", anchor: .bottom) }
+            })
             .simultaneousGesture(DragGesture(minimumDistance: 12).onChanged { drag in
-                if drag.translation.height > 12 { followLatest = false }
                 // Swipe left, like iMessage, to see every message's time.
                 let sideways = drag.translation.width < -40 && abs(drag.translation.width) > abs(drag.translation.height) * 1.5
                 if sideways != revealTimes { withAnimation(HMMotion.standard) { revealTimes = sideways } }
@@ -205,34 +222,12 @@ struct ChatScreen: View {
                 try? await Task.sleep(for: .milliseconds(450))
                 if followLatest { proxy.scrollTo("bottom", anchor: .bottom) }
             }
-            .overlay(alignment: .bottomTrailing) {
-                if !followLatest {
-                    Button {
-                        followLatest = true
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    } label: {
-                        Group {
-                            if HMTheme.isThermocline {
-                                Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
-                                    .padding(.horizontal, HMDesign.medium).frame(minHeight: HMDesign.touch)
-                                    .hmGlass(Capsule())
-                            } else {
-                                Label("Latest", systemImage: "arrow.down").font(.footnote.weight(.semibold))
-                                    .padding(.horizontal, HMDesign.medium).frame(minHeight: HMDesign.touch)
-                                    .background(.regularMaterial, in: Capsule())
-                                    .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(HMDesign.accent)
-                    .accessibilityLabel("Jump to latest message")
-                    .padding(.trailing, 12).padding(.bottom, 6)
-                }
-            }
             .overlay { if chat.isLoading { ProgressView("Loading messages…") } }
             .safeAreaInset(edge: .top, spacing: 0) {
-                if !chat.pins.isEmpty {
+                if finding {
+                    FindBar(chat: chat, open: $finding) { itemID in await reveal(itemID, proxy: proxy) }
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                } else if !chat.pins.isEmpty {
                     PinnedBar(pins: chat.pins, cursor: min(pinCursor, chat.pins.count - 1)) {
                         let pin = chat.pins[min(pinCursor, chat.pins.count - 1)]
                         pinCursor = (pinCursor + 1) % chat.pins.count
@@ -839,17 +834,25 @@ struct ChatScreen: View {
 
     /// Scrolls to a pinned message, loading earlier pages if needed, and flashes it.
     private func jump(to pin: MessagePin, proxy: ScrollViewProxy) {
-        followLatest = false
         Task {
-            guard await chat.reveal(pin) else {
+            if !(await reveal(pin.itemID, proxy: proxy)) {
                 chat.error = "That pinned message is no longer in this chat's history. Its text is kept in Pinned."
-                return
             }
-            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) { proxy.scrollTo(pin.itemID, anchor: .center) }
-            highlighted = pin.itemID
-            try? await Task.sleep(for: .seconds(1.6))
-            if highlighted == pin.itemID { withAnimation { highlighted = nil } }
         }
+    }
+
+    /// Load earlier pages until a stored message is here, scroll it to the middle and flash it. False when it's gone.
+    @discardableResult
+    private func reveal(_ itemID: String, proxy: ScrollViewProxy) async -> Bool {
+        followLatest = false
+        guard await chat.reveal(itemID: itemID) else { return false }
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) { proxy.scrollTo(itemID, anchor: .center) }
+        highlighted = itemID
+        Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            if highlighted == itemID { withAnimation { highlighted = nil } }
+        }
+        return true
     }
 
     private func openCamera() {
@@ -1999,6 +2002,7 @@ private enum ToolLanguage {
         let preview = display(row.preview)
         switch row.name {
         case "skill_view": return preview.isEmpty ? "Loaded a skill" : "Loaded skill · \(preview)"
+        case "skill_manage": return preview.isEmpty ? "Updated skills" : "Skills · \(preview)"
         case "terminal", "execute_code": return preview.isEmpty ? "Ran a command" : "Ran · \(preview)"
         case "read_file", "search_files", "list_files": return preview.isEmpty ? "Explored files" : "Explored · \(preview)"
         case "web_search", "web_extract": return preview.isEmpty ? "Searched" : "Searched · \(preview)"
@@ -2022,6 +2026,7 @@ private enum ToolLanguage {
         add("search", "searches", n(["web_search", "web_extract", "x_search"]))
         add("subagent", "subagents", n(["delegate_task"]))
         add("skill", "skills", n(["skill_view"]))
+        add("skill edit", "skill edits", n(["skill_manage"]))
         let shown = counts.sorted { $0.2 > $1.2 }.prefix(2)
         var parts = shown.map { "\($0.2) \($0.2 == 1 ? $0.0 : $0.1)" }
         let rest = rows.count - shown.reduce(0) { $0 + $1.2 }
@@ -3289,21 +3294,33 @@ struct QuoteCard: View {
 /// The list starts at the bottom, but growing content (a streaming reply, an older page) doesn't drag you down.
 struct ReadingPosition: ViewModifier {
     @Binding var followLatest: Bool
+    /// How far above the newest message the view is, in points (0 at the bottom). Drives the Latest button.
+    @Binding var distance: CGFloat
+    /// The list parked itself past its last row (a blank screen): land again.
+    var pastEnd: () -> Void = {}
     /// True while your finger or a flick is moving the list. Growing content alone never stops following.
     @State private var userScrolling = false
     @State private var atBottom = true
+    @State private var lastRescue = Date.distantPast
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
             content
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
                 .defaultScrollAnchor(.top, for: .sizeChanges)
-                .onScrollGeometryChange(for: Bool.self) { geo in
-                    geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) < 80
-                } action: { _, bottom in
-                    atBottom = bottom
-                    if bottom { followLatest = true }
+                .onScrollGeometryChange(for: CGFloat.self) { geo in
+                    geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height)
+                } action: { _, gap in
+                    distance = max(0, gap)
+                    let bottom = gap < 80
+                    if bottom != atBottom { atBottom = bottom }
+                    if bottom { if !followLatest { followLatest = true } }
                     else if userScrolling { followLatest = false }
+                    // Far below the content with nobody scrolling: a lazy list that measured short. Never a reading spot.
+                    if gap < -120, !userScrolling, Date().timeIntervalSince(lastRescue) > 1 {
+                        lastRescue = Date()
+                        pastEnd()
+                    }
                 }
                 .onScrollPhaseChange { _, phase in
                     userScrolling = phase == .interacting || phase == .decelerating
@@ -3502,5 +3519,238 @@ struct VisibleChat: ViewModifier {
             .onChange(of: destination) { _, chat in
                 if onScreen { ReplyNotifier.shared.watch(chat) }
             }
+    }
+}
+
+
+/// Jump back to the newest message: a small glass circle, translucent so the words behind it stay readable,
+/// shown only while you're reading back. A dot and a count say when new messages arrived meanwhile.
+private struct LatestButton: View {
+    let unseen: Int
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(unseen > 0 ? HMDesign.accent : HMDesign.text2)
+                .frame(width: 36, height: 36)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(HMDesign.text2.opacity(0.25), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+                .opacity(0.88)
+                .overlay(alignment: .topTrailing) {
+                    if unseen > 0 {
+                        Text(unseen > 99 ? "99+" : "\(unseen)")
+                            .font(.system(size: 10, weight: .bold).monospacedDigit())
+                            .foregroundStyle(HMDesign.bubbleText)
+                            .padding(.horizontal, 4).frame(minWidth: 16, minHeight: 16)
+                            .background(HMDesign.accent, in: Capsule())
+                            .offset(x: 4, y: -4)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .frame(width: HMDesign.touch, height: HMDesign.touch)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .animation(.snappy, value: unseen)
+        .accessibilityLabel(unseen > 0 ? "Jump to latest, \(unseen) new" : "Jump to latest message")
+    }
+}
+
+/// The Latest button and its "new" count, kept out of the chat's body (one modifier chain that long is more than
+/// the type checker will solve in reasonable time).
+private struct LatestControl: ViewModifier {
+    let distance: CGFloat
+    let threshold: CGFloat
+    let count: Int
+    @Binding var unseen: Int
+    let jump: () -> Void
+
+    func body(content: Content) -> some View {
+        let away = distance > threshold
+        content
+            .onChange(of: count) { old, new in
+                // Count what arrives while you're reading further up.
+                if new > old, away { unseen += new - old }
+            }
+            .onChange(of: away) { _, isAway in if !isAway { unseen = 0 } }
+            .overlay(alignment: .bottomTrailing) {
+                if away {
+                    LatestButton(unseen: unseen) { unseen = 0; jump() }
+                        .padding(.trailing, 14).padding(.bottom, 10)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
+            }
+            .animation(HMMotion.standard, value: away)
+    }
+}
+
+
+/// Find in this chat, like find-on-page: type, see "3 of 17", step older and newer, or open every match.
+/// Searches the whole history on the Mac (not just loaded pages); jumping to an old match loads back to it.
+private struct FindBar: View {
+    let chat: ChatModel
+    @Binding var open: Bool
+    let reveal: (String) async -> Bool
+    @State private var query = UserDefaults.standard.string(forKey: "HMDemoFind") ?? ""
+    @State private var result: ChatSearchResult?
+    @State private var index = 0
+    @State private var busy = false
+    @State private var failed: String?
+    @State private var showList = false
+    @FocusState private var focused: Bool
+
+    private var hits: [ChatSearchHit] { result?.results ?? [] }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(HMDesign.text2).font(.subheadline)
+                    TextField("Search this chat", text: $query)
+                        .focused($focused)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                        .onSubmit { step(-1) }
+                    if busy { ProgressView().controlSize(.mini) }
+                    else if !query.isEmpty {
+                        Button { query = ""; result = nil } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.plain).foregroundStyle(HMDesign.text2)
+                            .accessibilityLabel("Clear search")
+                    }
+                }
+                .padding(.horizontal, 10).frame(minHeight: 36)
+                .background(HMDesign.card, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                Text(countLabel).font(.caption.monospacedDigit()).foregroundStyle(HMDesign.text2)
+                    .frame(minWidth: 44)
+                    .onTapGesture { if !hits.isEmpty { showList = true } }
+                Button { step(-1) } label: { Image(systemName: "chevron.up") }
+                    .disabled(hits.isEmpty).accessibilityLabel("Older match")
+                    .frame(width: 32, height: HMDesign.touch)
+                Button { step(1) } label: { Image(systemName: "chevron.down") }
+                    .disabled(hits.isEmpty).accessibilityLabel("Newer match")
+                    .frame(width: 32, height: HMDesign.touch)
+                Button("Done") { close() }.font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(HMDesign.accent)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            if let failed {
+                Text(failed).font(.caption).foregroundStyle(HMDesign.text2)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 14).padding(.bottom, 6)
+            } else if let hit = hits[safe: index] {
+                Button { showList = true } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: hit.role == "user" ? "person.fill" : "sparkle").font(.caption2)
+                        Text(hit.attributed).font(.caption).lineLimit(1)
+                        Spacer(minLength: 0)
+                        Image(systemName: "list.bullet").font(.caption2)
+                    }
+                    .foregroundStyle(HMDesign.text2)
+                    .padding(.horizontal, 14).padding(.bottom, 6)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Show all matches")
+            }
+            Divider()
+        }
+        .background(.bar)
+        .onAppear { focused = true }
+        .task(id: query) { await search() }
+        .sheet(isPresented: $showList) {
+            FindList(query: query, result: result, current: index) { pick in
+                showList = false
+                go(to: pick)
+            }
+            .presentationDetents([.medium, .large])
+        }
+    }
+
+    private var countLabel: String {
+        guard let result, query.count >= 2 else { return "" }
+        if result.total == 0 { return "None" }
+        return "\(index + 1) of \(result.total)\(result.truncated ? "+" : "")"
+    }
+
+    private func search() async {
+        failed = nil
+        let words = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard words.count >= 2, let sid = chat.sessionId else { result = nil; return }
+        try? await Task.sleep(for: .milliseconds(250))   // typing: wait for a pause
+        guard !Task.isCancelled else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            let found = try await API.shared.searchChat(profile: chat.profile, session: sid, query: words)
+            guard !Task.isCancelled else { return }
+            result = found
+            // Start at the newest match, like find on a page you're at the bottom of.
+            if !found.results.isEmpty { go(to: found.results.count - 1) }
+        } catch {
+            guard !Task.isCancelled else { return }
+            failed = "Couldn't search: your Mac may be offline. \(error.localizedDescription)"
+        }
+    }
+
+    /// -1 older, +1 newer; wraps around.
+    private func step(_ by: Int) {
+        guard !hits.isEmpty else { return }
+        go(to: (index + by + hits.count) % hits.count)
+    }
+
+    private func go(to n: Int) {
+        guard let hit = hits[safe: n] else { return }
+        index = n
+        Task {
+            if !(await reveal(hit.itemID)) { failed = "That match is no longer in this chat's loaded history." }
+        }
+    }
+
+    private func close() {
+        focused = false
+        withAnimation(HMMotion.standard) { open = false }
+    }
+}
+
+/// Every match in one list: who said it, when, and the words around it.
+private struct FindList: View {
+    let query: String
+    let result: ChatSearchResult?
+    let current: Int
+    let pick: (Int) -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let result, result.truncated {
+                    Text("Showing the first \(result.results.count) of \(result.total). Search more precisely to see the rest.")
+                        .font(.caption).foregroundStyle(HMDesign.text2)
+                }
+                ForEach(Array((result?.results ?? []).enumerated()).reversed(), id: \.element.id) { n, hit in
+                    Button { pick(n) } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(hit.role == "user" ? "You" : "Hermes").font(.caption.weight(.semibold))
+                                Spacer()
+                                if let ts = hit.timestamp {
+                                    Text(Date(timeIntervalSince1970: ts), format: .dateTime.month(.abbreviated).day().hour().minute())
+                                        .font(.caption2).foregroundStyle(HMDesign.text2)
+                                }
+                            }
+                            Text(hit.attributed).font(.subheadline).lineLimit(3)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(n == current ? HMDesign.accent.opacity(0.12) : nil)
+                }
+            }
+            .navigationTitle(result.map { "\($0.total) match\($0.total == 1 ? "" : "es")" } ?? "Matches")
+            .navigationBarTitleDisplayMode(.inline)
+        }
     }
 }

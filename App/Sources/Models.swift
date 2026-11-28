@@ -1283,3 +1283,41 @@ struct ClarifyRequest: Identifiable, Equatable {
     let choices: [String]
     let multiSelect: Bool
 }
+
+
+/// One match from searching a chat (bridge `GET /m/chat/<bot>/<chat>/search`).
+struct ChatSearchHit: Decodable, Identifiable, Hashable {
+    let messageId: Int
+    let role: String
+    let timestamp: Double?
+    let snippet: String
+    /// Where the match sits in `snippet` (characters), to bold it.
+    let offset: Int
+    let length: Int
+    var id: Int { messageId }
+    var itemID: String { String(messageId) }
+    enum CodingKeys: String, CodingKey { case role, timestamp, snippet, offset, length; case messageId = "message_id" }
+
+    /// The snippet with the match in bold.
+    var attributed: AttributedString {
+        var out = AttributedString(snippet)
+        let chars = Array(snippet)
+        guard offset >= 0, length > 0, offset + length <= chars.count else { return out }
+        let lower = out.index(out.startIndex, offsetByCharacters: offset)
+        let upper = out.index(lower, offsetByCharacters: length)
+        out[lower..<upper].inlinePresentationIntent = .stronglyEmphasized
+        return out
+    }
+}
+
+struct ChatSearchResult: Decodable {
+    let query: String
+    let results: [ChatSearchHit]
+    let total: Int
+    let truncated: Bool
+}
+
+extension Array {
+    /// The element at `index`, or nil past either end.
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
+}

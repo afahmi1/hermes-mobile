@@ -58,6 +58,13 @@ enum SentPreviews {
         return existing(entry)
     }
 
+    /// A message that took a new submission id keeps its photos.
+    static func rekey(from old: String, to new: String) {
+        update { entries in
+            for i in entries.indices where entries[i].send == old { entries[i].send = new }
+        }
+    }
+
     /// A send made before its chat had an id: file it under the chat once it has one.
     static func adopt(send: String, session: String) {
         update { entries in

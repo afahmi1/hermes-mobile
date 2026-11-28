@@ -32,6 +32,13 @@ enum WhatsNew {
 
     /// Newest first. Add a release at the top for each build that changes something you'd notice.
     static let releases: [WhatsNewRelease] = [
+        WhatsNewRelease(build: 56, items: [
+            WhatsNewItem(symbol: "magnifyingglass", text: "Search inside any chat: whole history, jump between matches"),
+            WhatsNewItem(symbol: "arrow.down.circle", text: "Latest button: small, see-through, only when you've scrolled up"),
+            WhatsNewItem(symbol: "text.line.first.and.arrowtriangle.forward", text: "Thinking line is one clean line; the sprite keeps its size"),
+            WhatsNewItem(symbol: "exclamationmark.arrow.circlepath", text: "A message moved from the queue to guide is never lost"),
+            WhatsNewItem(symbol: "book.closed", text: "Skill edits show what changed in the tool cards"),
+        ]),
         WhatsNewRelease(build: 55, items: [
             WhatsNewItem(symbol: "photo.on.rectangle", text: "Your photos stay in the message you sent, with upload progress"),
             WhatsNewItem(symbol: "square.stack.3d.up", text: "Over 10 photos go as messages of 10, so Hermes sees every one"),
@@ -117,6 +124,8 @@ enum WhatsNew {
 
     /// Marks seen here, not at dismiss, so returning to Chats can't reopen it.
     static func takeDue(build: Int = currentBuild, defaults: UserDefaults = .standard) -> Bool {
+        // Screenshot runs (`-HMNoWhatsNew 1`) never show it, so a capture shows the screen asked for.
+        if defaults.bool(forKey: "HMNoWhatsNew") { return false }
         guard let release = release(forBuild: build, in: releases) else { return false }
         return takeDue(release, defaults: defaults)
     }

@@ -747,6 +747,53 @@ def _ro(pid):
     return con
 
 
+SEARCH_MAX_RESULTS = 500
+
+
+def search_chat(pid, sid, query):
+    """Every message in one chat whose shown text contains `query` (case and accent insensitive), oldest first, with
+    a snippet around the first hit. Matches what the phone shows: hand-off notes, file paths and image markers are
+    stripped first (bridge_transcript), so searching "photo" doesn't hit every attachment note."""
+    import unicodedata
+    def fold(s):
+        return "".join(c for c in unicodedata.normalize("NFKD", s.casefold()) if not unicodedata.combining(c))
+    needle = fold(query)
+    if len(needle) < 2:
+        return {"query": query, "results": [], "total": 0, "truncated": False}
+    con = _ro(pid)
+    if con is None:
+        return {"query": query, "results": [], "total": 0, "truncated": False}
+    results, total = [], 0
+    try:
+        # A coarse SQL filter on the first word (LIKE is ASCII case-insensitive), then the exact test on shown text.
+        coarse = "%" + needle.split()[0].replace("%", "").replace("_", "") + "%"
+        rows = con.execute("SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
+                           "AND role IN ('user','assistant') AND content LIKE ? ORDER BY id", (sid, coarse)).fetchall()
+        for row in rows:
+            try:
+                shown = transcript.project_timeline_message(dict(row)).get("content") or ""
+            except Exception:
+                shown = row["content"] or ""
+            # Images the reply shows inline read as a marker in a snippet, never as a file path.
+            flat = " ".join(transcript._MEDIA.sub(" [image] ", str(shown)).split())
+            folded = fold(flat)
+            at = folded.find(needle)
+            if at < 0:
+                continue
+            total += 1
+            if len(results) >= SEARCH_MAX_RESULTS:
+                continue
+            start = max(0, at - 50)
+            snippet = ("…" if start else "") + flat[start:at + len(needle) + 90] + ("…" if at + len(needle) + 90 < len(flat) else "")
+            results.append({"message_id": row["id"], "role": row["role"], "timestamp": row["timestamp"],
+                            "snippet": snippet, "offset": at - start + (1 if start else 0), "length": len(needle)})
+    except sqlite3.Error as e:
+        log("search failed: %s" % type(e).__name__)
+    finally:
+        con.close()
+    return {"query": query, "results": results, "total": total, "truncated": total > len(results)}
+
+
 def _cursor_decode(raw):
     try:
         value = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))) if raw else {}
@@ -2976,6 +3023,17 @@ class H(BaseHTTPRequestHandler):
                 if not action and self.command == "GET":
                     return self.send(200, turn.summary())
                 return self.send(405, {"error": "method not allowed"})
+            found = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/search", path)
+            if found:
+                if self.command != "GET":
+                    return self.send(405, {"error": "method not allowed"})
+                pid, sid = found.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                if not _WS_SID.fullmatch(sid):
+                    return self.send(400, {"error": "Bad chat id."})
+                query = (q.get("q") or "").strip()
+                return self.send(200, search_chat(pid, sid, query))
             preview = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/media/([0-9a-f]{64})", path)
             by_path = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/file", path)
             if preview or by_path:

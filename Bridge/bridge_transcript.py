@@ -143,11 +143,39 @@ def _arg_preview(raw):
             if len(tasks) > 3:
                 text += " · %d tasks" % len(tasks)
             return text[:180]
+    skills = _skill_ops(data)
+    if skills:
+        return skills
     for key in _ARG_KEYS:
         val = data.get(key)
         if isinstance(val, str) and val.strip():
             return _clip(val, 160)
     return ""
+
+
+_SKILL_VERBS = {"create": "created", "patch": "updated", "write_file": "wrote", "remove_file": "removed",
+                "delete": "deleted", "edit": "updated"}
+
+
+def _skill_ops(data):
+    """What a skill_manage call did, readable: "created hermes-mobile-app; updated hermes-mobile-app/references/x.md".
+    Hermes takes a list of operations (or one action on older builds), so the plain-key preview found nothing."""
+    ops = data.get("operations")
+    if not isinstance(ops, list):
+        ops = [data] if isinstance(data.get("action"), str) and isinstance(data.get("name"), str) else []
+    parts = []
+    for op in ops[:3]:
+        if not isinstance(op, dict) or not isinstance(op.get("action"), str) or not isinstance(op.get("name"), str):
+            continue
+        verb = _SKILL_VERBS.get(op["action"], op["action"].replace("_", " "))
+        target = op["name"] + ("/" + op["file_path"] if isinstance(op.get("file_path"), str) and op["file_path"] else "")
+        parts.append("%s %s" % (verb, target))
+    if not parts:
+        return ""
+    text = "; ".join(parts)
+    if len(ops) > 3:
+        text += " · %d changes" % len(ops)
+    return _clip(text, 180)
 
 
 def _tool_calls(calls):
