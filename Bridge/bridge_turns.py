@@ -70,12 +70,43 @@ async def connect(home: Path):
         yield c
 
 
+# Hermes refuses with a bare reason code. The phone shows a sentence that says what happened and what to do,
+# with the code kept in brackets at the end (callers match on it, and it is what to search the logs for).
+_REFUSAL_TEXT = {
+    "invalid_params": "Hermes rejected this request as malformed.",
+    "permission_denied": "Hermes refused this request from the phone's bridge.",
+    "session_busy": "Hermes is still replying in this chat. Try again when it finishes.",
+    "session_not_found": "Hermes can't find this chat any more. Refresh the chat list.",
+    "revision_conflict": "This chat changed on your Mac a moment ago. Try again.",
+    "runtime_draining": "Hermes is restarting. Try again in a few seconds.",
+    "runtime_retired": "Hermes is restarting. Try again in a few seconds.",
+    "storage_unavailable": "Hermes can't reach its chat storage right now. Try again shortly.",
+    "profile_mismatch": "This chat belongs to a different bot than the one asked.",
+    "admission_conflict": "Hermes already took a different message with this ID.",
+    "unknown_method": "This Hermes version doesn't support that action. Update Hermes on your Mac.",
+}
+
+
+def refusal_text(method, reason, params=None, data=None):
+    """A readable sentence for a gateway refusal; unknown codes still say which action failed."""
+    reason = str(reason)
+    if method == "prompt.submit" and reason == "invalid_params" and (params or {}).get("attachments"):
+        text = ("Hermes refused the attached photos. Each one must be a single, unshared PNG, JPEG, GIF or WebP "
+                "file in its image folder, with at most %d per message. Send them again; if it keeps happening, "
+                "run the bridge doctor on your Mac." % bridge_media.native_image_limit())
+    else:
+        text = _REFUSAL_TEXT.get(reason) or "Hermes refused this request."
+    detail = ", ".join("%s: %s" % (k, data[k]) for k in ("field", "detail") if isinstance(data, dict) and data.get(k))
+    return "%s (%s: %s%s)" % (text, method, reason, "; " + detail if detail else "")
+
+
 async def _rpc(c, method, **params):
     from hermes_cli.gateway_client import GatewayRPCError
     try:
         return await c.rpc(method, **params)
     except GatewayRPCError as e:
-        raise TurnError("%s: %s" % (method, e), 409 if str(e) in ("session_busy", "revision_conflict") else 400)
+        raise TurnError(refusal_text(method, e, params, getattr(e, "data", None)),
+                        409 if str(e) in ("session_busy", "revision_conflict") else 400)
 
 
 @functools.lru_cache(maxsize=1)

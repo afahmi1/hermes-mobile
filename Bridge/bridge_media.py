@@ -452,14 +452,20 @@ def stage(frames, home):
             else:
                 directory, ext = _file_dir(home), _extension(name)
             if isinstance(raw, Path):
-                # An uploaded file: hard-link it into place (instant, no second copy), copy across volumes.
+                # An uploaded file. A photo is COPIED: Hermes refuses a native attachment that has a second name
+                # (session_ingress_media._attachment_hashes, st_nlink != 1) as a bare invalid_params, so a hard
+                # link to the upload made every uploaded photo batch fail. Other files go by path and can be
+                # hard-linked (instant, no second copy), falling back to a copy across volumes.
+                import shutil
                 import uuid
                 target = Path(directory) / ("hm_send_%s%s" % (uuid.uuid4().hex[:12], ext))
-                try:
-                    os.link(raw, target)
-                except OSError:
-                    import shutil
+                if mime == JPEG:
                     shutil.copyfile(raw, target)
+                else:
+                    try:
+                        os.link(raw, target)
+                    except OSError:
+                        shutil.copyfile(raw, target)
                 target.chmod(0o600)
                 paths.append({"path": str(target), "mime": mime, "name": name, "size": target.stat().st_size})
             else:
