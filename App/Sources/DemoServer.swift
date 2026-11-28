@@ -331,6 +331,7 @@ enum DemoFixtures {
             ["event": "tool.started", "seq": 1, "tool_name": "terminal", "preview": "Tests/run-swift.sh"],
         ]
         if UserDefaults.standard.bool(forKey: "HMDemoKaomoji") {
+            list.append(["event": "reasoning.delta", "seq": list.count, "delta": "(◔_◔) Comparing the colors on Light and Dark."])
             list.append(["event": "status", "seq": list.count, "text": "(｡◕‿◕｡) Checking colors…"])
         }
         if DemoMode.approval {

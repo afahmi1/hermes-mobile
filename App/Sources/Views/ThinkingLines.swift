@@ -105,12 +105,24 @@ struct ThinkingStatus: View {
     @State private var showThinking = false
     @State private var seed = Int.random(in: 0..<10_000)
 
+    private var preview: String {
+        guard stream else { return "" }
+        let raw = chat.thinkingText
+        let end = raw.lastIndex(where: { !$0.isNewline }).map { raw.index(after: $0) } ?? raw.startIndex
+        let lines = raw[..<end]
+        let start = lines.lastIndex(where: \.isNewline).map { lines.index(after: $0) } ?? lines.startIndex
+        // The sheet keeps the complete stream. Don't repeat its newest status right below the same status row.
+        let distinct = String(lines[start...] == status ? lines[..<start] : lines)
+        let shown = kawaiiFaces ? distinct : KawaiiFilter.strip(distinct)
+        return String(shown.suffix(280)).trimmingCharacters(in: .newlines)
+    }
+
     var body: some View {
         let playful = ThinkingWords(rawValue: wordsRaw) != .plain
         let displayed = kawaiiFaces ? status : KawaiiFilter.strip(status)
         let status = displayed.isEmpty ? "Thinking…" : displayed
         let specific = !ThinkingLines.isGeneric(status)
-        let preview = stream ? String((kawaiiFaces ? chat.thinkingText : KawaiiFilter.strip(chat.thinkingText)).suffix(280)) : ""
+        let preview = self.preview
         Button { showThinking = true } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
