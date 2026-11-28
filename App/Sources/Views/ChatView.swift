@@ -1454,7 +1454,7 @@ struct MessageRow: View {
         Text(words)
             .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
             .foregroundStyle(HMDesign.bubbleText)
-            .background(HMDesign.bubbleFill, in: bubbleShape)
+            .hmBubble(bubbleShape)
             .overlay(bubbleShape.strokeBorder(HMTheme.isThermocline ? Thermocline.text : HMDesign.accent,
                                               lineWidth: highlighted ? 2 : 0))
     }

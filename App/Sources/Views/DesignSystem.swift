@@ -474,12 +474,11 @@ struct HMDepthField: View {
 // MARK: - Deep-sea glow
 
 /// Thermocline Dark only: colored objects glow in their own color, like deep-sea creatures. That means bubbles,
-/// primary buttons, the send button, selected chips (the accent's tint) and bot avatars (the bot's color). Neutral
-/// cards and the canvas don't glow (his call, build 46: "around the colored objects", not in the corners). 18%
-/// (v1.2 shipped 10%, build 45 tried 25%). Never on text, never inside another glow.
+/// primary and send buttons, selected chips and the Color orb (accent tint), plus bot avatars (their own fill).
+/// Neutral cards and the canvas don't glow. Never on text or inside another glow.
 enum HMGlow {
-    static let opacity = 0.18
-    static let radius: CGFloat = 14
+    static let opacity = 0.25
+    static let radius: CGFloat = 20
 }
 
 private struct HMInsideGlowKey: EnvironmentKey { static let defaultValue = false }
@@ -493,7 +492,7 @@ extension EnvironmentValues {
 }
 
 extension View {
-    /// The halo: a shadow in `color` at 18%, radius 14, no offset. Apply it to a shape or fill, never to text.
+    /// The halo: a shadow in `color` at 25%, radius 20, no offset. Apply it to a shape or fill, never to text.
     @ViewBuilder func hmHalo(_ color: Color, active: Bool) -> some View {
         if active { shadow(color: color.opacity(HMGlow.opacity), radius: HMGlow.radius) } else { self }
     }
@@ -921,7 +920,7 @@ struct HMTag: View {
 }
 
 /// Buttons for empty and error states. Primary: the accent's fill, its on-fill label, a soft glow behind the fill
-/// (never on text): 25% in Light, the 18% deep-sea halo in the tint in Dark. Quiet: a hairline capsule in text.
+/// (never on text): 25% in Light, the standard tint halo (25%, radius 20) in Dark. Quiet: a hairline capsule in text.
 struct HMButtonStyle: ButtonStyle {
     enum Kind { case primary, quiet }
     var kind: Kind = .quiet
@@ -1036,7 +1035,7 @@ extension View {
 }
 
 /// Thermocline's send button: the accent's fill with an on-fill arrow and a soft glow behind the disc (never on
-/// text): 25% in Light, the 18% deep-sea halo in the tint in Dark. Disabled: a surface-3 disc with a text-3 arrow.
+/// text): 25% in Light, the standard tint halo (25%, radius 20) in Dark. Disabled: a surface-3 disc with a text-3 arrow.
 struct HMSendGlyph: View {
     var enabled: Bool
     @Environment(\.colorScheme) private var scheme
@@ -1055,20 +1054,29 @@ struct HMSendGlyph: View {
 // MARK: - Thinking orb
 
 /// The original colorful orb: a blurred spinning gradient with a moving highlight, slow breath and soft glow.
-/// It uses Classic colors in every theme and respects Reduce Motion.
+/// Thermocline uses the live accent; Classic keeps its original two colors and shadow.
 struct ThinkingOrb: View {
     var size: CGFloat = 18
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.thermoclineAccent) private var selection
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.hmInsideGlow) private var insideGlow
 
     var body: some View {
-        let accent = HMThemeSpec.classic.accent, success = HMThemeSpec.classic.success
+        let thermocline = HMTheme.isThermocline
+        let dark = thermocline && scheme == .dark
+        let accent = thermocline ? selection.tint(for: scheme) : HMThemeSpec.classic.accent
+        // The fill is the deep step for Crown/Wing. For tint-as-fill accents, lower the
+        // stop's opacity instead, so it still reads as depth in the same hue.
+        let depth = thermocline ? selection.fill(for: scheme) : HMThemeSpec.classic.success
         TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             ZStack {
                 Circle()
-                    .fill(AngularGradient(colors: [accent, accent.opacity(0.35), success.opacity(0.7), accent],
+                    .fill(AngularGradient(colors: [accent, accent.opacity(0.35), depth.opacity(0.7), accent],
                                           center: .center, angle: .degrees(t * 90)))
                     .blur(radius: size * 0.12)
+                    .hmHalo(accent, active: dark && !insideGlow)
                 Circle()
                     .fill(RadialGradient(colors: [.white.opacity(0.55), .clear],
                                          center: UnitPoint(x: 0.35 + 0.1 * sin(t * 1.3), y: 0.3 + 0.1 * cos(t * 1.1)),
@@ -1076,7 +1084,7 @@ struct ThinkingOrb: View {
             }
             .frame(width: size, height: size)
             .scaleEffect(reduceMotion ? 1 : 1 + 0.06 * sin(t * 2.2))
-            .shadow(color: accent.opacity(0.45), radius: size * 0.35)
+            .shadow(color: dark ? .clear : accent.opacity(0.45), radius: size * 0.35)
         }
         .accessibilityHidden(true)
     }
@@ -1103,16 +1111,19 @@ enum ThinkingStyle: String, CaseIterable, Identifiable {
 struct ThinkingIndicator: View {
     var size: CGFloat = 16
     @AppStorage(ThinkingStyle.key) private var raw = ThinkingStyle.orbs.rawValue
+    @Environment(\.thermoclineAccent) private var selection
+    @Environment(\.colorScheme) private var scheme
     var style: ThinkingStyle? = nil
     /// What Hermes is doing ("Using web_search…", "Thinking…", "Writing…"): live orbs change shape with it.
     var activity: String = ""
 
     var body: some View {
+        let tint = HMTheme.isThermocline ? selection.tint(for: scheme) : nil
         switch style ?? ThinkingStyle(rawValue: raw) ?? .orbs {
-        case .orbs: LiveOrb(size: size, activity: activity)
-        case .matrix: DotMatrixLoader(size: size)
-        case .sprite: PixelFlame(size: size + 4)
-        case .braille: BrailleSpinner(size: size)
+        case .orbs: LiveOrb(size: size, activity: activity, tint: tint)
+        case .matrix: DotMatrixLoader(size: size, tint: tint)
+        case .sprite: PixelFlame(size: size + 4, tint: tint)
+        case .braille: BrailleSpinner(size: size, tint: tint)
         case .orb: ThinkingOrb(size: size)
         }
     }
@@ -1122,15 +1133,26 @@ struct ThinkingIndicator: View {
 struct LiveOrb: View {
     var size: CGFloat
     var activity: String
+    var tint: Color? = nil
 
     var body: some View {
         #if canImport(ThinkingOrbs)
-        ThinkingOrbs.ThinkingOrb(Self.design(for: activity), diameter: max(size + 4, 20))
-            .id(Self.design(for: activity))
-            .transition(.opacity)
-            .animation(.easeInOut(duration: 0.25), value: Self.design(for: activity))
+        let design = Self.design(for: activity)
+        let orb = ThinkingOrbs.ThinkingOrb(design, diameter: max(size + 4, 20))
+        Group {
+            if let tint {
+                // The library has no ink parameter. Use its bright grayscale ramp and
+                // multiply by the already resolved tint, preserving shading and alpha.
+                orb.environment(\.colorScheme, .dark).colorMultiply(tint)
+            } else {
+                orb
+            }
+        }
+        .id(design)
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.25), value: design)
         #else
-        DotMatrixLoader(size: size)
+        DotMatrixLoader(size: size, tint: tint)
         #endif
     }
 
@@ -1152,6 +1174,7 @@ struct LiveOrb: View {
 /// A 3×3 grid of square dots; a diagonal wave lights them in turn, like an LED panel thinking.
 struct DotMatrixLoader: View {
     var size: CGFloat = 16
+    var tint: Color? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -1165,7 +1188,7 @@ struct DotMatrixLoader: View {
                         let lit = reduceMotion ? 0.7 : max(0.18, 1 - abs(phase - 0.6) * 1.1)
                         let r = CGRect(x: CGFloat(col) * cell + (cell - dot) / 2, y: CGFloat(row) * cell + (cell - dot) / 2,
                                        width: dot, height: dot)
-                        ctx.fill(Path(roundedRect: r, cornerRadius: dot * 0.22), with: .color(HMDesign.accent.opacity(lit)))
+                        ctx.fill(Path(roundedRect: r, cornerRadius: dot * 0.22), with: .color((tint ?? HMDesign.accent).opacity(lit)))
                     }
                 }
             }
@@ -1178,6 +1201,7 @@ struct DotMatrixLoader: View {
 /// An 8×8 pixel-art flame (Prometheus's fire), four frames, nearest-neighbour crisp.
 struct PixelFlame: View {
     var size: CGFloat = 20
+    var tint: Color? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     // 0 empty, 1 outer (accent), 2 mid (warm), 3 core (light)
     private static let frames: [[String]] = [
@@ -1194,7 +1218,7 @@ struct PixelFlame: View {
                 let px = box.width / 8
                 for (y, line) in Self.frames[frame].enumerated() {
                     for (x, ch) in line.enumerated() where ch != "." {
-                        let color: Color = ch == "1" ? HMDesign.accent : ch == "2" ? Color(red: 1, green: 0.62, blue: 0.3) : Color(red: 1, green: 0.93, blue: 0.75)
+                        let color = ink(ch)
                         ctx.fill(Path(CGRect(x: CGFloat(x) * px, y: CGFloat(y) * px, width: px + 0.3, height: px + 0.3)), with: .color(color))
                     }
                 }
@@ -1203,11 +1227,17 @@ struct PixelFlame: View {
         }
         .accessibilityHidden(true)
     }
+
+    private func ink(_ level: Character) -> Color {
+        if let tint { return tint.opacity(level == "1" ? 0.55 : level == "2" ? 0.8 : 1) }
+        return level == "1" ? HMDesign.accent : level == "2" ? Color(red: 1, green: 0.62, blue: 0.3) : Color(red: 1, green: 0.93, blue: 0.75)
+    }
 }
 
 /// The terminal spinner: braille frames in the monospaced font.
 struct BrailleSpinner: View {
     var size: CGFloat = 16
+    var tint: Color? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private static let frames = Array("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
@@ -1216,7 +1246,7 @@ struct BrailleSpinner: View {
             let i = Int(context.date.timeIntervalSinceReferenceDate * 12) % Self.frames.count
             Text(String(Self.frames[reduceMotion ? 0 : i]))
                 .font(.system(size: size, weight: .bold, design: .monospaced))
-                .foregroundStyle(HMDesign.accent)
+                .foregroundStyle(tint ?? HMDesign.accent)
                 .frame(width: size, height: size)
         }
         .accessibilityHidden(true)
