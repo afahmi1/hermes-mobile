@@ -105,9 +105,75 @@ enum MediaImportTests {
         let check2 = try FileImport.safeName(URL(fileURLWithPath: "/tmp/a:b.txt"))
         precondition(check2 == "ab.txt")
 
+        try fullResolutionPhotos()
+        try originalPhotos()
         print("Media import decode, paste split, source types and budget boundaries passed")
     }
     /// A large, per-pixel-noise PNG: uncompressible, like a real photo or dense screenshot.
+    /// The full-quality path: a 48 MP-class photo with a sideways orientation flag and GPS must arrive at full
+    /// size, turned upright, with the location removed; fifteen of them must all fit the upload limit.
+    static func fullResolutionPhotos() throws {
+        let raw = try render(CGSize(width: 6048, height: 4032))
+        guard let src = CGImageSourceCreateWithData(raw as CFData, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil)
+        else { fatalError("fixture") }
+        let tagged = NSMutableData()
+        let dest = CGImageDestinationCreateWithData(tagged, UTType.jpeg.identifier as CFString, 1, nil)!
+        CGImageDestinationAddImage(dest, img, [
+            kCGImagePropertyOrientation: 6,  // the iPhone portrait flag: pixels landscape, shown rotated
+            kCGImagePropertyGPSDictionary: [kCGImagePropertyGPSLatitude: 37.77, kCGImagePropertyGPSLongitude: 122.41],
+            kCGImageDestinationLossyCompressionQuality: 0.95,
+        ] as CFDictionary)
+        precondition(CGImageDestinationFinalize(dest))
+        let limit = 2 * 1024 * 1024 * 1024
+        var total = 0
+        for i in 0..<15 {
+            let a = try ChatMedia.fullImage(from: tagged as Data, uploadMax: limit)
+            precondition(a.isUpload && a.mime == "image/jpeg", "rides the upload, not inline")
+            precondition(a.base64.isEmpty, "never held as base64")
+            let url = a.fileURL!
+            let out = CGImageSourceCreateWithURL(url as CFURL, nil)!
+            let p = CGImageSourceCopyPropertiesAtIndex(out, 0, nil) as! [CFString: Any]
+            let w = p[kCGImagePropertyPixelWidth] as! Int, h = p[kCGImagePropertyPixelHeight] as! Int
+            precondition(w == 4032 && h == 6048, "full resolution, upright: got \(w)x\(h)")
+            precondition((p[kCGImagePropertyOrientation] as? Int ?? 1) == 1, "no leftover rotation flag")
+            precondition(p[kCGImagePropertyGPSDictionary] == nil, "location must not travel with the photo")
+            precondition((a.size ?? 0) > 2 * 1024 * 1024, "not recompressed to a thumbnail")
+            precondition(a.sha256?.count == 64)
+            total += a.size ?? 0
+            if i > 0 { try? FileManager.default.removeItem(at: url) }
+        }
+        precondition(total < limit)
+        // A batch's share of the message: quality steps down first, then size. The fixture is worst-case detail,
+        // so it may step down far; a real photo stays at 12 MP or more. It must fit, never be dropped.
+        let budget = 8 * 1024 * 1024
+        let fitted = try ChatMedia.fullImage(from: tagged as Data, uploadMax: limit, budget: budget)
+        let fp = CGImageSourceCopyPropertiesAtIndex(CGImageSourceCreateWithURL(fitted.fileURL! as CFURL, nil)!, 0, nil) as! [CFString: Any]
+        let longEdge = max(fp[kCGImagePropertyPixelWidth] as! Int, fp[kCGImagePropertyPixelHeight] as! Int)
+        precondition((fitted.size ?? .max) <= budget, "fits its share of the message")
+        precondition(longEdge >= 2048, "still a usable photo: got \(longEdge) px")
+        do { _ = try ChatMedia.fullImage(from: tagged as Data, uploadMax: 1024); fatalError("ignored the upload limit") }
+        catch ChatMedia.Failure.tooLarge {}
+        print("Full-resolution photos: 15 x 24 MP upright, location stripped, \(total / 1_048_576) MB via upload")
+    }
+
+    /// A Mac that takes originals gets the HEIC itself, byte for byte; over its share it falls back to a fitted JPEG.
+    static func originalPhotos() throws {
+        guard let heic = try heicFixture(3024) else { print("Original photos: skipped, no HEIC encoder here"); return }
+        let a = try ChatMedia.original(from: heic, uploadMax: 1 << 30, budget: 1 << 30, name: "IMG_2783.HEIC")
+        precondition(a.mime == "image/heic" && a.filename == "IMG_2783.heic", "\(a.mime) \(a.filename)")
+        let sent = try Data(contentsOf: a.fileURL!)
+        precondition(sent == heic, "the original bytes, untouched")
+        precondition(a.sourceFormat == "HEIC")
+        // Over its share of the message it never sends the original anyway: it goes to the fitted-JPEG path,
+        // which refuses when even that can't fit.
+        do { _ = try ChatMedia.original(from: heic, uploadMax: 1 << 30, budget: 16); fatalError("sent past its share") }
+        catch ChatMedia.Failure.tooLarge {}
+        let png = try render(CGSize(width: 1200, height: 900))
+        let p = try ChatMedia.original(from: png, uploadMax: 1 << 30, budget: 1 << 30)
+        precondition(p.mime == "image/png" && p.filename.hasSuffix(".png"), "a PNG stays a PNG")
+        print("Original photos: HEIC and PNG sent as themselves, over-budget falls back to a fitted JPEG")
+    }
+
     static func render(_ size: CGSize) throws -> Data {
         let w = Int(size.width), h = Int(size.height)
         var noise = Data(capacity: w * h * 4)

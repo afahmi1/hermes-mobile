@@ -796,7 +796,8 @@ struct ChatScreen: View {
     private func issue(for assets: [SendAttachment]) -> String? {
         AttachmentSelection.issue(assets, fileLimit: mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024,
                                    videoLimit: mediaCapabilities?.maxVideoBytes ?? 4 * 1024 * 1024,
-                                   uploadLimit: mediaCapabilities?.maxUploadBytes)
+                                   uploadLimit: mediaCapabilities?.maxUploadBytes,
+                                   messageLimit: mediaCapabilities?.maxMessageBytes)
     }
 
     private func appendMedia(_ assets: [SendAttachment], account: String?) {
@@ -826,6 +827,21 @@ struct ChatScreen: View {
         return out
     }
 
+    /// Full resolution through the Mac's resumable upload when it has one; otherwise the small inline JPEG.
+    /// `share`: how many photos split the message's room, so a batch of fifteen fits Hermes's per-message cap.
+    private func photoAttachment(_ data: Data, share: Int = 1) async throws -> SendAttachment {
+        let uploadMax = mediaCapabilities?.maxUploadBytes
+        let room = (mediaCapabilities?.maxMessageBytes ?? 128 * 1024 * 1024) * 9 / 10
+            - chat.draftAttachments.filter(\.isUpload).reduce(0) { $0 + $1.byteCount }
+        let budget = max(2 * 1024 * 1024, room / max(1, share))
+        let originals = mediaCapabilities?.originalImages == true
+        return try await Task.detached(priority: .userInitiated) {
+            if let uploadMax, originals { return try ChatMedia.original(from: data, uploadMax: uploadMax, budget: budget) }
+            if let uploadMax { return try ChatMedia.fullImage(from: data, uploadMax: uploadMax, budget: budget) }
+            return try ChatMedia.image(from: data)
+        }.value
+    }
+
     /// Several photos at once, like a Telegram album. A video still goes on its own (it has its own
     /// consent choice), so a mixed pick keeps the photos and says what it skipped.
     private func importPicked(_ items: [PhotosPickerItem]) async {
@@ -838,15 +854,26 @@ struct ChatScreen: View {
         preparingMedia = true
         defer { preparingMedia = false }
         var assets: [SendAttachment] = []
+        var failed: [String] = []
         for item in photos {
             do {
                 let data = try await MediaImport.imageData(from: item)
                 if Task.isCancelled { return }
-                assets.append(try await Task.detached(priority: .userInitiated) { try ChatMedia.image(from: data) }.value)
-            } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
+                assets.append(try await photoAttachment(data, share: photos.count))
+            } catch {
+                if Task.isCancelled { return }
+                failed.append(error.localizedDescription)
+            }
         }
         appendMedia(assets, account: account)
-        if skipped > 0 { chat.error = "Videos go one per message, so \(skipped == 1 ? "the video was" : "\(skipped) videos were") left out." }
+        // Say what happened to every photo, not just the last error: "Added 13 of 15 photos. 2 couldn't…".
+        var notes: [String] = []
+        if !failed.isEmpty {
+            let reason = Dictionary(grouping: failed, by: { $0 }).max { $0.value.count < $1.value.count }?.key ?? ""
+            notes.append("Added \(assets.count) of \(photos.count) photos. \(failed.count) couldn't be loaded. \(reason)")
+        }
+        if skipped > 0 { notes.append("Videos go one per message, so \(skipped == 1 ? "the video was" : "\(skipped) videos were") left out.") }
+        if !notes.isEmpty { chat.error = notes.joined(separator: " ") }
     }
 
     private func importMedia(_ item: PhotosPickerItem) async {
@@ -866,8 +893,7 @@ struct ChatScreen: View {
             } else {
                 let data = try await MediaImport.imageData(from: item)
                 if Task.isCancelled { return }
-                let asset = try await Task.detached(priority: .userInitiated) { try ChatMedia.image(from: data) }.value
-                appendMedia([asset], account: account)
+                appendMedia([try await photoAttachment(data)], account: account)
             }
         } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
     }
@@ -938,8 +964,9 @@ struct ChatScreen: View {
                             return
                         }
                         let uploadMax = mediaCapabilities?.maxUploadBytes
+                        let originals = mediaCapabilities?.originalImages == true
                         let asset = try await Task.detached(priority: .userInitiated) {
-                            try FileImport.attachment(from: url, maxBytes: cap, uploadMax: uploadMax)
+                            try FileImport.attachment(from: url, maxBytes: cap, uploadMax: uploadMax, originals: originals)
                         }.value
                         guard account == app.inboxAccount else { return }
                         guard chat.draftAttachments.count < ChatMedia.maxAttachments,

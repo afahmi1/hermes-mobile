@@ -653,8 +653,18 @@ def _media_notes(media, images_by_path=False):
                                                           item.get("transcript_error") or "no transcript",
                                                           json.dumps(item["path"])))
             continue
+        if item.get("copy_of"):
+            continue  # the JPEG copy of a HEIC/PNG photo: described with its original
+        if item.get("jpeg_copy"):
+            copy = next((m for m in media if m.get("copy_of") == item["path"]), {})
+            seen = copy.get("native", True) and not images_by_path
+            text += ("\n\nThe user attached a photo named %s (%s, the original file, untouched). It is saved at %s. %s" % (
+                json.dumps(name), item["mime"], json.dumps(item["path"]),
+                "A full-resolution JPEG copy is attached so you can see it." if seen else
+                "A full-resolution JPEG copy to look at is at %s; use vision_analyze on it." % json.dumps(item["jpeg_copy"])))
+            continue
         if item["mime"] == bridge_media.JPEG:
-            if images_by_path:
+            if images_by_path or not item.get("native", True):
                 text += ("\n\nThe user attached an image named %s. It is saved at the following local path. "
                          "Use vision_analyze on it to see it. Local file path: %s" % (json.dumps(name), json.dumps(item["path"])))
             continue
@@ -712,7 +722,7 @@ async def _drive_connection(turn: Turn):
             await asyncio.to_thread(turn.journal.prepared, turn)
             turn.prepared = True
         params = {"session_id": turn.sid, "submission_id": turn.submission or uuid.uuid4().hex, "text": _turn_text(turn)}
-        images = [m for m in turn.media if m["mime"] == bridge_media.JPEG]
+        images = [m for m in turn.media if m["mime"] == bridge_media.JPEG and m.get("native", True)]
         if images:
             params["attachments"] = [{"path": m["path"], "mime": m["mime"]} for m in images]
         params.update(_admission_runtime(turn.choice))
@@ -1200,7 +1210,7 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
         return await asyncio.shield(delivery)
 
     staged = await asyncio.to_thread(lambda: transcribe_media(bridge_media.stage(frames, turn.home), turn.home)) if frames else []
-    images = [m for m in staged if m["mime"] == bridge_media.JPEG]
+    images = [m for m in staged if m["mime"] == bridge_media.JPEG and m.get("native", True)]
     params = {"session_id": turn.canonical_sid, "text": (text + _media_notes(staged)).strip(),
               "submission_id": submission, **_admission_runtime(choice)}
     if images:
