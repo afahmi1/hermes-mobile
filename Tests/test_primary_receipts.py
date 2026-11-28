@@ -1,4 +1,6 @@
 import asyncio
+import os
+import time
 import threading
 import hashlib
 import base64
@@ -294,6 +296,15 @@ class PrimaryReceipts(unittest.TestCase):
         with patch.object(bridge_media, "supported", return_value=False), self.assertRaises(bridge_media.MediaError):
             bridge_media.decode([row])
 
+    def assert_pruned_after_retention(self, path):
+        """attachments/mobile is swept after HERMES_MOBILE_ATTACHMENT_DAYS (30), not at the end of a reply."""
+        old = time.time() - 31 * 86400
+        os.utime(path, (old, old))
+        import bridge_media
+        bridge_media._PRUNED.clear()
+        bridge_media.prune(self.directory)
+        self.assertFalse(path.exists())
+
     def test_file_retry_recovers_original_bytes_and_one_admission(self):
         import base64
         raw = b"ID3" + bytes(range(127))
@@ -312,8 +323,9 @@ class PrimaryReceipts(unittest.TestCase):
             asyncio.run(engine._drive(restored))
             self.assertEqual(self.attempts[0], self.attempts[1])
             self.assertEqual(len(self.native), 1)
-            self.assertFalse(path.exists())
             self.assertEqual(restored._terminal["event"], "run.completed")
+        self.assertTrue(path.exists(), "a file read by path outlives the reply, so a later message can use it")
+        self.assert_pruned_after_retention(path)
 
     def test_video_consent_capability_private_file_and_recovery(self):
         import base64
@@ -367,4 +379,7 @@ class PrimaryReceipts(unittest.TestCase):
         self.assertIn("video_analyze", self.attempts[0]["text"])
         self.assertIn(json.dumps(str(path)), self.attempts[0]["text"])
         self.assertIsNone(self.journal.get(first.id)["media"])
-        self.assertFalse(path.exists())
+        self.assertTrue(path.is_file(), "the video outlives the reply")
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assert_pruned_after_retention(path)
