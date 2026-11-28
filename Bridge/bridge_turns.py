@@ -388,6 +388,74 @@ def set_runtime(home, sid, choice):
     return run(_set_runtime(home, sid, choice, ask))
 
 
+async def _branch(home, sid, message_id, title):
+    """Hermes's own branch (the desktop's "Branch from here"): a new chat with this one's history through
+    `message_id` (an assistant message brings its tool results), nested under this chat on every device."""
+    # Hermes branches only from a live row. A message in a part it has since compressed (active=0, still shown on
+    # the phone) branches from where the compressed part resumes: its summary carries everything up to there.
+    through, compressed = await asyncio.to_thread(_live_boundary, home, sid, message_id)
+    payload = {"through_message_id": through}
+    if title:
+        payload["title"] = title
+    async with connect(home) as c:
+        try:
+            res = await _mutate(c, sid, "branch", payload)
+        except TurnError as exc:
+            text = str(exc)
+            if "invalid_params" in text:
+                raise TurnError("That message isn't saved in this chat yet, so it can't be branched from. "
+                                "Reload the chat and try again.", 400)
+            if "already in use" in text or "request_failed" in text and title:
+                raise TurnError("Another chat already has that name. Pick a different one.", 409)
+            if "session_busy" in text or "require_idle" in text or "busy" in text:
+                raise TurnError("Hermes is replying in this chat. Branch once the reply finishes.", 409)
+            raise
+    child = res.get("branched_session_id") or res.get("session_id")
+    if not isinstance(child, str) or not child:
+        raise TurnError("Hermes didn't say which chat the branch became. Check the chat list.", 502)
+    return {"session_id": child, "parent_session_id": sid, "copied_messages": res.get("copied_messages"),
+            "title": res.get("title") or _session_title(home, child), "compressed": compressed}
+
+
+def _live_boundary(home, sid, message_id):
+    """(row to branch through, whether the asked-for message was in a compressed part)."""
+    try:
+        import sqlite3
+        con = sqlite3.connect(Path(home, "state.db").resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT active FROM messages WHERE id=? AND session_id=?", (message_id, sid)).fetchone()
+            if row is None or row[0]:
+                return message_id, False
+            nxt = con.execute("SELECT MIN(id) FROM messages WHERE session_id=? AND active=1 AND id>?",
+                              (sid, message_id)).fetchone()
+        finally:
+            con.close()
+        return (nxt[0], True) if nxt and nxt[0] else (message_id, False)
+    except Exception:
+        return message_id, False
+
+
+def _session_title(home, sid):
+    try:
+        import sqlite3
+        con = sqlite3.connect(Path(home, "state.db").resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT title FROM sessions WHERE id=?", (sid,)).fetchone()
+        finally:
+            con.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def branch(home, sid, message_id, title=None):
+    """Branch a chat at one stored message. `message_id`: the messages.id the phone already has (ChatItem.id)."""
+    if type(message_id) is not int or not 0 < message_id < 2 ** 63:
+        raise TurnError("Bad message id.")
+    title = title.strip()[:120] if isinstance(title, str) and title.strip() else None
+    return run(_branch(home, sid, message_id, title))
+
+
 async def _interrupt(turn):
     """Stop a turn. session.interrupt is generation-fenced; a turn still queued is cancelled instead."""
     if not turn.admission:
@@ -1344,6 +1412,9 @@ def approve(turn: Turn, choice, prompt_id, generation=None):
     return run(_approve(turn, choice, prompt_id, gen))
 
 
+_DELIVERED = ("completed", "steered", "steering")
+
+
 async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
     frames = list(frames or [])
     media_key = _frames_digest(frames)
@@ -1356,7 +1427,9 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
         except ValueError:
             raise TurnError("A stable submission ID is required.")
         with TURNS_LOCK:
-            prior = next((t for t in TURNS.values() if t.profile == turn.profile and
+            # A finished follower is only a memory: Hermes's own ledger decides a retry (a cancelled one must not
+            # come back as "queued" from here).
+            prior = next((t for t in TURNS.values() if t.profile == turn.profile and not t.done and
                           t.sid == turn.sid and t.submission == submission), None)
         if prior:
             if prior.text != text or prior.choice != choice or prior.media_key != media_key:
@@ -1406,6 +1479,12 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
             return await steer(turn.generation)
         delivery = asyncio.create_task(steer(turn.generation))
         turn.steer_receipts[steer_id] = ((text, media_key), delivery)
+
+        def forget_failure(task, key=steer_id):
+            # Only a delivered guide is a receipt; a failed one stays retryable under the same id.
+            if task.cancelled() or task.exception() is not None:
+                turn.steer_receipts.pop(key, None)
+        delivery.add_done_callback(forget_failure)
         return await asyncio.shield(delivery)
 
     staged = await asyncio.to_thread(lambda: transcribe_media(bridge_media.stage(frames, turn.home), turn.home)) if frames else []
@@ -1428,6 +1507,11 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
     if not admission or receipt.get("status") not in ("queued", "started", "terminal"):
         await asyncio.to_thread(bridge_media.discard, staged)
         raise TurnError("Hermes could not confirm admission. Check the chat before retrying.", 409)
+    if receipt.get("status") == "terminal" and receipt.get("outcome") and receipt["outcome"] not in _DELIVERED:
+        # Hermes's idempotency handed back an earlier, cancelled admission under this id: nothing was queued now.
+        await asyncio.to_thread(bridge_media.discard, staged)
+        raise TurnError("submission_reused: this message was cancelled earlier under the same id. "
+                        "Send it again as a new message.", 409)
     # The gateway copies native images at admission (as for a first send); other files are read by path later.
     await asyncio.to_thread(bridge_media.discard, images)
     with TURNS_LOCK:
