@@ -7,6 +7,10 @@ struct SettingsView: View {
     @State private var addingGateway = false
     @State private var gatewayError: String?
     @State private var capabilities: BridgeCapabilities?
+    #if DEBUG
+    /// Screenshot QA: `-HMOpenAddons 1` opens Add-ons at launch.
+    @State private var debugAddons = UserDefaults.standard.bool(forKey: "HMOpenAddons")
+    #endif
     @State private var forgetting: URL?
 
     private var appVersion: String {
@@ -62,6 +66,12 @@ struct SettingsView: View {
                     }
                     .accessibilityIdentifier("settings.bots")
                     .accessibilityHint("Shows every bot and whether it is reachable")
+                    if capabilities?.addons == true {
+                        NavigationLink { AddonsView(profile: "default") } label: {
+                            SettingsRow("Add-ons", "puzzlepiece.extension.fill", .teal, value: "Skills, plugins, MCP")
+                        }
+                        .accessibilityHint("Browse and install Skills Hub skills, plugins and MCP servers")
+                    }
                     if let caps = capabilities, caps.features.contains("device_grants") {
                         NavigationLink { DeviceAccessView(capabilities: caps) } label: {
                             SettingsRow("Devices", "iphone", .blue)
@@ -88,6 +98,9 @@ struct SettingsView: View {
             .hmCanvas()
             .navigationTitle("Settings")
             .sheet(isPresented: $showWhatsNew) { WhatsNewSheet() }
+            #if DEBUG
+            .navigationDestination(isPresented: $debugAddons) { AddonsView(profile: "default") }
+            #endif
             .sheet(isPresented: $addingGateway) { SignInView(adding: true) }
             .task(id: app.inboxAccount) {
                 capabilities = nil

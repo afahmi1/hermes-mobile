@@ -77,6 +77,7 @@ struct BotDetailView: View {
     @State private var showAutomations = false
     @State private var skills: [String] = []
     @State private var skillEditor: SkillEditor?
+    @State private var addons = false
 
     var body: some View {
         List {
@@ -88,6 +89,11 @@ struct BotDetailView: View {
             Section {
                 Button { skillEditor = SkillEditor(name: "", appending: false) } label: {
                     Label("Teach a skill", systemImage: "plus")
+                }
+                if addons {
+                    NavigationLink { AddonsView(profile: bot.id, botName: bot.name) } label: {
+                        Label("Browse Add-ons", systemImage: "puzzlepiece.extension")
+                    }
                 }
                 ForEach(skills, id: \.self) { name in
                     Button { skillEditor = SkillEditor(name: name, appending: true) } label: {
@@ -122,6 +128,7 @@ struct BotDetailView: View {
         .hmCanvas()
         .navigationTitle(bot.name)
         .task(id: showAutomations) { skills = bot.skills; await load() }
+        .task { addons = (try? await API.shared.capabilities())?.addons == true }
         .refreshable { await load() }
         .sheet(item: $skillEditor) { editor in
             SkillEditorSheet(bot: bot, editor: editor) { skills = $0 }

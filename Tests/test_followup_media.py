@@ -1,3 +1,4 @@
+import asyncio
 """Follow-ups (Send next / Guide this reply) can carry the files staged in the composer."""
 import base64
 import sys
@@ -73,6 +74,60 @@ class FollowUpMediaTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(engine.TurnError):
                 await engine._follow_up(turn, "queue", "look at these", request, {}, other)
             self.assertEqual(rpc.await_count, 1)
+
+    async def test_a_cancelled_admission_under_the_same_id_is_not_success(self):
+        # Hermes hands back the earlier, cancelled admission for a reused submission id: nothing is queued now.
+        turn = self.turn()
+        with patch.dict(engine.TURNS, {turn.id: turn}, clear=True), patch.object(engine, "_drive", AsyncMock()), \
+                patch.object(engine, "_rpc", AsyncMock(return_value={"status": "terminal", "outcome": "cancelled",
+                                                                     "admission_id": "a9"})):
+            with self.assertRaises(engine.TurnError) as e:
+                await engine._follow_up(turn, "queue", "again", uuid4().hex, {}, [])
+        self.assertEqual(e.exception.code, 409)
+        self.assertIn("submission_reused", str(e.exception))
+        # A transferred (steered) or completed admission is a real delivery and still answers as queued.
+        for outcome in ("completed", "steered"):
+            with patch.dict(engine.TURNS, {turn.id: turn}, clear=True), patch.object(engine, "_drive", AsyncMock()), \
+                    patch.object(engine, "_rpc", AsyncMock(return_value={"status": "terminal", "outcome": outcome,
+                                                                         "admission_id": "b" + outcome})):
+                self.assertEqual((await engine._follow_up(turn, "queue", "ok", uuid4().hex, {}, []))["status"], "queued")
+
+    async def test_a_finished_follower_does_not_answer_a_retry_itself(self):
+        turn = self.turn()
+        request = uuid4().hex
+        old = engine.Turn("default", Path("."), "chat", "again", {})
+        old.submission, old.admission, old.done = request, "dead", True
+        with patch.dict(engine.TURNS, {turn.id: turn, old.id: old}, clear=True), \
+                patch.object(engine, "_drive", AsyncMock()), \
+                patch.object(engine, "_rpc", AsyncMock(return_value={"status": "terminal", "outcome": "cancelled",
+                                                                     "admission_id": "dead"})) as rpc:
+            with self.assertRaises(engine.TurnError):
+                await engine._follow_up(turn, "queue", "again", request, {}, [])
+        self.assertEqual(rpc.await_count, 1, "Hermes's ledger was asked instead of the bridge's memory")
+
+    async def test_a_reconnecting_turn_is_not_called_finished(self):
+        # While the bridge reconnects to the gateway the turn is alive: 503 (retry), never 409 (ended).
+        turn = self.turn()
+        turn.client = None
+        with self.assertRaises(engine.TurnError) as e:
+            await engine._follow_up(turn, "steer", "turn left", uuid4().hex, None, [])
+        self.assertEqual(e.exception.code, 503)
+        turn.done = True
+        with self.assertRaises(engine.TurnError) as e:
+            await engine._follow_up(turn, "steer", "turn left", uuid4().hex, None, [])
+        self.assertEqual(e.exception.code, 409)
+
+    async def test_a_failed_guide_can_be_retried_under_the_same_id(self):
+        turn = self.turn()
+        steer = uuid4().hex
+        with patch.object(engine, "_rpc", AsyncMock(side_effect=[engine.TurnError("gateway hiccup", 502),
+                                                                  {"status": "queued"}])) as rpc:
+            with self.assertRaises(engine.TurnError):
+                await engine._follow_up(turn, "steer", "turn left", steer, None, [])
+            await asyncio.sleep(0)
+            result = await engine._follow_up(turn, "steer", "turn left", steer, None, [])
+        self.assertEqual(result["status"], "steer_accepted")
+        self.assertEqual(rpc.await_count, 2)
 
     async def test_attachment_only_queue_needs_no_text(self):
         turn = self.turn()

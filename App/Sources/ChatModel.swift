@@ -326,6 +326,7 @@ final class ChatModel {
         sessionId.flatMap { app?.inboxKey(profile: profile, filter: "transcript/" + $0) }
     }
     private var loadingTranscript = false
+    private var loadAgain = false
     private(set) var hasOlder = false
     /// Raw-row offset already consumed. Projected rows are fewer, so this is not `stored.count`.
     private var historyOffset = 0
@@ -372,9 +373,14 @@ final class ChatModel {
 
     func load(quiet: Bool = false, resumeLive: Bool = true) async {
         if outgoingLoadedFor != sendKey { Task { await loadOutgoing() } }
+        if loadingTranscript, !isRunning { loadAgain = true; return }
         guard let sid = sessionId, !isRunning, !loadingTranscript, !loadingOlder else { return }
         loadingTranscript = true
-        defer { loadingTranscript = false }
+        defer {
+            loadingTranscript = false
+            // A reload asked for while this one ran (a reply ending, a queued message starting) is not lost.
+            if loadAgain { loadAgain = false; Task { await self.load(quiet: true, resumeLive: false) } }
+        }
         if !quiet { isLoading = items.isEmpty }
         defer { isLoading = false }
         if !loadedReceipts, let key = receiptKey {
@@ -535,11 +541,21 @@ final class ChatModel {
         // truth: once that message is in it (with its "Guided this reply" label), the receipt is a duplicate and goes.
         // A receipt older than the loaded pages waits for its page, instead of piling up at the top with no replies.
         let earliest = rows.compactMap(\.timestamp).min()
-        let delivered = Set(rows.filter { $0.kind == .user }.map { Self.receiptMatchKey($0.text) })
+        // Matched by words AND time: an earlier "ok" or "continue" must not settle a new one.
+        var delivered: [String: [Double]] = [:]
+        for row in rows where row.kind == .user { delivered[Self.receiptMatchKey(row.text), default: []].append(row.timestamp ?? .infinity) }
+        let latestUser = rows.filter { $0.kind == .user }.compactMap(\.timestamp).max() ?? 0
         var settled: [UUID] = []
         for receipt in receipts.sorted(by: { $0.at < $1.at }) {
             let t = receipt.at.timeIntervalSince1970
-            if delivered.contains(Self.receiptMatchKey(receipt.text)) { settled.append(receipt.id); continue }
+            if let times = delivered[Self.receiptMatchKey(receipt.text)], let hit = times.firstIndex(where: { $0 >= t - 5 }) {
+                delivered[Self.receiptMatchKey(receipt.text)]?.remove(at: hit)   // one row settles one receipt
+                settled.append(receipt.id)
+                continue
+            }
+            // A queued message that never showed up while later messages did was taken back elsewhere (the desktop
+            // cancelled it): its receipt goes rather than saying "Up next" forever.
+            if receipt.mode == "queue", latestUser > t + 600 { settled.append(receipt.id); continue }
             if hasOlder, let earliest, t < earliest { continue }
             let next = rows.firstIndex { ($0.timestamp ?? 0) > t } ?? rows.endIndex
             rows.insert(receipt.item, at: next)
@@ -789,6 +805,30 @@ final class ChatModel {
 
     /// Loads earlier pages until the pinned message is in the transcript. Returns false when Hermes no
     /// longer has it (compressed or deleted); the pin's own snapshot still shows the text.
+    /// A message Hermes has stored (its id is the messages.id), so a chat can branch from it.
+    func canBranch(from item: ChatItem) -> Bool {
+        sessionId != nil && !isRunning && !branching && (item.kind == .user || item.kind == .assistant) && Int(item.id) != nil
+    }
+    private(set) var branching = false
+
+    /// Branch this chat at a message and open the new chat. Same branch as the desktop's: nested under this
+    /// chat everywhere, titled "<this chat> #2" unless Hermes is told otherwise.
+    func branch(from item: ChatItem) async {
+        guard canBranch(from: item), let sid = sessionId, let message = Int(item.id) else { return }
+        branching = true
+        defer { branching = false }
+        do {
+            let made = try await api.branch(profile: profile, session: sid, message: message)
+            if made.compressed == true, let app {
+                let next = app.chat(for: ChatRef(profile: profile, sessionId: made.sessionId))
+                next.error = "That message was in a part of the chat Hermes had compressed, so the branch starts from its summary."
+            }
+            app?.inboxPath = [ChatRef(profile: profile, sessionId: made.sessionId)]
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
     func reveal(_ pin: MessagePin) async -> Bool { await reveal(itemID: pin.itemID) }
 
     /// Load earlier pages until this stored message is in `items` (a pin, a search hit). False when it isn't in
@@ -900,7 +940,8 @@ final class ChatModel {
             clearStagedComposer(send)
             var local = ChatItem(id: send.id.uuidString, kind: .user, text: shown ?? text)
             if projectContext != nil { local.contextNote = "Project instructions + reference files sent with this message" }
-            items.append(local)
+            // A retried queued message already has its row (same id): replace it, never a second one.
+            if let row = items.firstIndex(where: { $0.id == local.id }) { items[row] = local } else { items.append(local) }
             if attachments.contains(where: { $0.mime.hasPrefix("image/") }) {
                 // Show the photos in the sent message right away, with the upload's progress over them.
                 let sendID = send.id.uuidString, words = text
@@ -1111,7 +1152,8 @@ final class ChatModel {
         outgoingLoadedFor = key
         // Anything typed before the chat had an id (the first seconds of a new chat) joins the saved list.
         let fresh = outgoing.filter { o in !saved.contains { $0.id == o.id } }
-        outgoing = saved + fresh
+        // A crash between handing a queued message to the send path and dropping it here leaves it in both places.
+        outgoing = (saved + fresh).filter { $0.id != pendingSend?.id }
         outgoingFiles = UploadFiles.names(saved.flatMap { $0.attachments ?? [] })
         if !fresh.isEmpty { await persistOutgoing() }
         if !outgoing.isEmpty { await pump() }
@@ -1348,15 +1390,33 @@ final class ChatModel {
             await persistOutgoing()
             Task { await refreshQueue() }
             return true
+        } catch APIError.http(409, let message) where message.contains("submission_reused") {
+            // Hermes had an earlier, cancelled copy under this id (a guide taken back, a cancel then retry). Nothing
+            // is queued: the same words go again under a fresh id, straight away.
+            renameOutgoing(item.id, to: UUID())
+            await persistOutgoing()
+            pumpAgain = true
+            return false
+        } catch APIError.http(409, let message) where message.contains("not started") {
+            // The reply this follows is itself waiting (behind a desktop turn): it hasn't ended. Keep the message,
+            // keep following the reply, and try again shortly.
+            return false
         } catch APIError.http(let code, let message) where code == 404 || code == 409 {
             // The reply ended (or this bridge restarted) between the tap and the request. Never an error to
             // the person: the message waits for the next safe moment and goes as the next message.
-            if code == 409, !message.contains("no longer") && !message.contains("not started") && !message.contains("Refresh") {
+            if code == 409, !message.contains("no longer") && !message.contains("Refresh") && !message.contains("next turn") {
                 return refuse(item, message)
             }
             update(item.id) { $0 = $0.demotedToQueue(note: "The reply had finished, so this goes as the next message.") }
             await persistOutgoing()
-            if isRunning, runId == run { runId = nil; isRunning = false; status = nil }
+            // Only the Mac knows whether the reply really ended. If it did, end it properly here (saves the reply,
+            // settles the send, reloads); never just drop the run, which left the chat frozen as "replying".
+            if isRunning, runId == run,
+               let live = try? await api.liveTurns(), !live.contains(where: { $0.turnId == run && !$0.done }) {
+                streamTask?.cancel()
+                streamTask = nil
+                await finishRun(gaveUp: false)
+            }
             pumpAgain = true
             return false
         } catch APIError.http(let code, let message) where [400, 413, 415, 422].contains(code) {
@@ -1371,6 +1431,14 @@ final class ChatModel {
             await persistOutgoing()
             return false
         }
+    }
+
+    /// Give a waiting message a new submission id (its photo previews follow it).
+    private func renameOutgoing(_ old: UUID, to new: UUID) {
+        guard let i = outgoing.firstIndex(where: { $0.id == old }) else { return }
+        outgoing[i].id = new
+        outgoing[i].attempts = 0
+        SentPreviews.rekey(from: old.uuidString, to: new.uuidString)
     }
 
     private func refuse(_ item: Outgoing, _ message: String) -> Bool {
@@ -1474,17 +1542,30 @@ final class ChatModel {
             guard sid == sessionId else { return }
             queue = state
             let before = outgoing.count
-            outgoing.removeAll { o in
-                guard let adm = o.admission, !adm.hasPrefix("turn:"), o.edit == nil else { return false }
-                return state.row(adm).map { $0.status != "queued" } ?? true
+            var started: [Outgoing] = []
+            var vanished: [Outgoing] = []
+            for o in outgoing {
+                guard let adm = o.admission, !adm.hasPrefix("turn:"), o.edit == nil else { continue }
+                switch state.row(adm)?.status {
+                case "queued", "steering", "unknown": continue     // still waiting, or mid-transfer: stays visible
+                case nil: vanished.append(o)                         // not listed: started and done, or cancelled
+                default: started.append(o)
+                }
             }
+            // A started message leaves the tray but stays in the chat (as its receipt) until Hermes's transcript
+            // shows it, so it never disappears from the phone that sent it.
+            for o in started + vanished {
+                await recordReceipt(ControlReceipt(id: o.id, mode: "queue", text: o.text, at: o.created, files: o.files, stage: "next"))
+            }
+            let gone = Set((started + vanished).map(\.id))
+            outgoing.removeAll { gone.contains($0.id) }
             // An admission id from an older bridge ("turn:…") is reconciled once no reply runs.
             if !isRunning, state.rows.allSatisfy({ $0.status != "queued" }) {
                 outgoing.removeAll { $0.admission?.hasPrefix("turn:") == true }
             }
             if outgoing.count != before {
                 await persistOutgoing()
-                if !isRunning { await load(quiet: true) }
+                await load(quiet: true)     // after this reply if one runs (load waits its turn)
             }
         } catch {}
     }
@@ -1760,11 +1841,20 @@ final class ChatModel {
     /// When the live stream last heard from the bridge (an event or its ~15 s heartbeat).
     @ObservationIgnored private var streamHeard = Date.distantPast
     @ObservationIgnored private var streamGeneration = 0
+    @ObservationIgnored private var streamRun: String?
     /// What the reply was doing before a reconnect, so the status line can go back to it.
     @ObservationIgnored private var workingStatus: String?
 
     private func follow() {
-        guard let run = runId, streamTask == nil else { return }
+        guard let run = runId else { return }
+        if streamTask != nil {
+            if streamRun == run { return }
+            // A stream still open for an earlier run must not block following this one (it would leave the chat
+            // "replying" with nothing listening until some other event woke it).
+            streamTask?.cancel()
+            streamTask = nil
+        }
+        streamRun = run
         let account = app?.inboxAccount
         streamGeneration &+= 1
         let generation = streamGeneration
