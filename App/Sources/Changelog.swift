@@ -32,6 +32,11 @@ enum WhatsNew {
 
     /// Newest first. Add a release at the top for each build that changes something you'd notice.
     static let releases: [WhatsNewRelease] = [
+        WhatsNewRelease(build: 55, items: [
+            WhatsNewItem(symbol: "photo.on.rectangle", text: "Your photos stay in the message you sent, with upload progress"),
+            WhatsNewItem(symbol: "square.stack.3d.up", text: "Over 10 photos go as messages of 10, so Hermes sees every one"),
+            WhatsNewItem(symbol: "externaldrive.badge.checkmark", text: "Photos past 10 and originals are kept on the Mac, not deleted"),
+        ]),
         WhatsNewRelease(build: 54, items: [
             WhatsNewItem(symbol: "folder.badge.plus", text: "Make any chat a project in one tap"),
             WhatsNewItem(symbol: "sparkles", text: "Hermes drafts projects for topics you keep coming back to"),

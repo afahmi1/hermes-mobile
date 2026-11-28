@@ -14,6 +14,8 @@ struct MediaCapabilities: Decodable {
     var maxMessageBytes: Int = 128 * 1024 * 1024
     /// The Mac takes photos as their original files (HEIC, PNG, ...), not only JPEG.
     var originalImages = false
+    /// Hermes's native image limit per message (newer bridges). Bigger batches go as several messages.
+    var nativeImages: Int? = nil
     /// Optional, from bridges that state them: the inline image cap, and the largest request body it reads.
     var maxImageBytes: Int? = nil
     var maxBodyBytes: Int? = nil
@@ -25,6 +27,7 @@ struct MediaCapabilities: Decodable {
         case maxUploadBytes = "max_upload_bytes"
         case maxMessageBytes = "max_message_bytes"
         case originalImages = "original_images"
+        case nativeImages = "native_images"
         case maxImageBytes = "max_image_bytes"
         case maxBodyBytes = "max_body_bytes"
         case maxChunkBytes = "max_chunk_bytes"
@@ -55,6 +58,7 @@ struct MediaCapabilities: Decodable {
         let message = try c.decodeIfPresent(Int.self, forKey: .maxMessageBytes) ?? 0
         if message > 0 { maxMessageBytes = message }
         originalImages = try c.decodeIfPresent(Bool.self, forKey: .originalImages) ?? false
+        nativeImages = try c.decodeIfPresent(Int.self, forKey: .nativeImages)
         maxImageBytes = (try? c.decodeIfPresent(Int.self, forKey: .maxImageBytes)).flatMap { $0 > 0 ? $0 : nil }
         maxBodyBytes = (try? c.decodeIfPresent(Int.self, forKey: .maxBodyBytes)).flatMap { $0 > 0 ? $0 : nil }
         maxChunkBytes = (try? c.decodeIfPresent(Int.self, forKey: .maxChunkBytes)).flatMap { $0 > 0 ? $0 : nil }

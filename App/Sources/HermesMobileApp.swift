@@ -46,6 +46,7 @@ struct HermesMobileApp: App {
                   let outbox = await InboxDisk.shared.referencedUploads() else { return }
             let keep = drafts.union(outbox)
             await Task.detached(priority: .background) { UploadFiles.prune(keep: keep) }.value
+            await Task.detached(priority: .background) { SentPreviews.prune() }.value
         }
     }
 

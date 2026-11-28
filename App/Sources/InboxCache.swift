@@ -46,6 +46,7 @@ struct ControlReceipt: Codable, Identifiable {
         var row = ChatItem(id: id.uuidString, kind: .control, text: text.isEmpty ? "Attachments" : text,
                            footer: base + ((files ?? 0) > 0 ? attached : ""), timestamp: (readAt ?? at).timeIntervalSince1970)
         row.annotation = stage ?? "sent"
+        row.previews = SentPreviews.files(send: id.uuidString)
         return row
     }
 }

@@ -1299,12 +1299,44 @@ struct ChatScreen: View {
         }
     }
 
+    /// Split a big photo batch into messages Hermes can see whole. The words and any files go with the first;
+    /// every message says which photos it holds. They queue in order (saved on this phone first, like any
+    /// queued message), so each goes after the reply to the one before.
+    private func sendInBatches(_ text: String, attachments: [SendAttachment], perMessage: Int) {
+        let photos = attachments.filter { $0.mime.hasPrefix("image/") }
+        let others = attachments.filter { !$0.mime.hasPrefix("image/") }
+        let batches = BatchPlan.split(photos.count, perMessage: perMessage)
+        let draftAtSend = chat.draft, pastedAtSend = chat.pastedTexts
+        followLatest = true
+        sendTick += 1
+        Task {
+            for (n, range) in batches.enumerated() {
+                let words = BatchPlan.text(text, range: range, total: photos.count, first: n == 0)
+                let files = Array(photos[range]) + (n == 0 ? others : [])
+                guard await chat.enqueue(words, mode: "queue", attachments: files) else { return }
+            }
+            if chat.draft == draftAtSend, chat.pastedTexts == pastedAtSend {
+                chat.draft = ""
+                chat.pastedTexts = []
+            }
+            if chat.draftAttachments == attachments { chat.draftAttachments = [] }
+            app.adopt(chat, draftKey: draftKey)
+        }
+    }
+
     private func send() {
         if runModelCommand() { return }
         let attachments = fitToBudget(chat.draftAttachments)
         let text = chat.combinedDraft
         if let problem = issue(for: attachments) {
             chat.error = problem
+            return
+        }
+        // Hermes looks at 10 images per message (more are only handed over as paths, which models often can't
+        // hold). A bigger batch goes as several messages of 10, in order, each with all its photos seen.
+        let perMessage = max(1, mediaCapabilities?.nativeImages ?? 10)
+        if attachments.filter({ $0.mime.hasPrefix("image/") }).count > perMessage {
+            sendInBatches(text, attachments: attachments, perMessage: perMessage)
             return
         }
         if attachments.isEmpty, chat.acceptsSlash(text) {
@@ -1710,7 +1742,9 @@ struct MessageRow: View {
                             .font(.caption.weight(.semibold)).foregroundStyle(HMDesign.text2)
                             .frame(minHeight: HMDesign.touch)
                     }
-                    TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .trailing)
+                    TranscriptImages(refs: item.media, profile: profile, session: session, alignment: .trailing,
+                                     previews: item.previews,
+                                     upload: chat?.uploadingItem == item.id ? chat?.uploadFraction : nil)
                     let note = item.annotation.flatMap { $0.isEmpty ? nil : $0 }
                     if note != nil || (showTime && item.timestamp != nil) {
                         HStack(spacing: 4) {
@@ -1808,6 +1842,10 @@ struct MessageRow: View {
                             .padding(.horizontal, HMDesign.gutter).padding(.vertical, HMDesign.medium)
                             .foregroundStyle(HMDesign.bubbleText)
                             .hmBubble(bubbleShape)
+                    }
+                    if !item.previews.isEmpty {
+                        TranscriptImages(refs: [], profile: profile, session: session, alignment: .trailing,
+                                         previews: item.previews)
                     }
                     // Where the message is: hollow while waiting, filled once Hermes has read it.
                     let stage = item.annotation ?? "sent"
@@ -2067,21 +2105,43 @@ private struct TranscriptImages: View {
     let profile: String
     let session: String?
     var alignment: HorizontalAlignment = .leading
+    /// The phone's own copies of these photos (`SentPreviews`): shown while sending, and wherever the Mac's
+    /// copy can't be loaded. Matched to the Mac's images by position, like T3, only when the counts agree.
+    var previews: [URL] = []
+    /// Upload progress over the photos while this message is still going up (0...1).
+    var upload: Double? = nil
     @State private var preview: UIImage?
 
-    private var images: [ChatMediaRef] { refs.filter { $0.kind == "image" } }
+    private var images: [ChatMediaRef] { session == nil ? [] : refs.filter { $0.kind == "image" } }
+    private var files: [ChatMediaRef] { session == nil ? [] : refs.filter { $0.kind != "image" } }
+    /// Mac images when there are any; otherwise the phone's copies.
+    private var tiles: [Tile] {
+        if !images.isEmpty {
+            let paired = previews.count == images.count
+            return images.enumerated().map { n, ref in .remote(ref, fallback: paired ? previews[n] : nil) }
+        }
+        return previews.map { .local($0) }
+    }
+
+    enum Tile: Hashable {
+        case remote(ChatMediaRef, fallback: URL?)
+        case local(URL)
+        var id: String {
+            switch self {
+            case .remote(let ref, _): ref.digest
+            case .local(let url): url.lastPathComponent
+            }
+        }
+    }
 
     var body: some View {
-        if !refs.isEmpty, session != nil {
+        if !tiles.isEmpty || !files.isEmpty {
             VStack(alignment: alignment, spacing: 6) {
-                if images.count >= 2 {
+                if tiles.count >= 2 {
                     // Several images in one message: one even-height row you swipe through, in the order sent.
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            ForEach(images, id: \.digest) { ref in
-                                TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name,
-                                                tileHeight: 150) { preview = $0 }
-                            }
+                            ForEach(tiles, id: \.id) { tile in view(tile, height: 150) }
                         }
                         .scrollTargetLayout()
                     }
@@ -2089,23 +2149,94 @@ private struct TranscriptImages: View {
                     .defaultScrollAnchor(alignment == .trailing ? .trailing : .leading)
                     .frame(height: 150)
                     .overlay(alignment: alignment == .trailing ? .bottomLeading : .bottomTrailing) {
-                        Text("\(images.count) images").font(.caption2.weight(.semibold))
+                        Text(upload == nil ? "\(tiles.count) photos" : "\(tiles.count) photos · uploading")
+                            .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 7).padding(.vertical, 3)
                             .background(.ultraThinMaterial, in: Capsule()).padding(6)
                     }
+                    .overlay { uploadVeil }
                 } else {
-                    ForEach(images, id: \.digest) { ref in
-                        TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name) { preview = $0 }
-                    }
+                    ForEach(tiles, id: \.id) { tile in view(tile, height: nil) }
+                        .overlay { uploadVeil }
                 }
-                ForEach(refs.filter { $0.kind != "image" }, id: \.digest) { ref in
+                ForEach(files, id: \.digest) { ref in
                     TranscriptFile(ref: ref, profile: profile, session: session ?? "")
                 }
             }
+            .animation(HMMotion.standard, value: upload == nil)
             .fullScreenCover(isPresented: Binding(get: { preview != nil }, set: { if !$0 { preview = nil } })) {
                 if let preview { FullImagePreview(image: preview) }
             }
         }
+    }
+
+    @ViewBuilder private func view(_ tile: Tile, height: CGFloat?) -> some View {
+        switch tile {
+        case .remote(let ref, let fallback):
+            TranscriptImage(profile: profile, session: session ?? "", digest: ref.digest, name: ref.name,
+                            tileHeight: height, fallback: fallback) { preview = $0 }
+        case .local(let url):
+            LocalPhoto(url: url, tileHeight: height) { preview = $0 }
+        }
+    }
+
+    /// While uploading: the photos dim slightly under one percentage, like T3's tray.
+    @ViewBuilder private var uploadVeil: some View {
+        if let upload {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12).fill(.black.opacity(0.28))
+                Text("\(Int(upload * 100))%").font(.subheadline.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(.ultraThinMaterial, in: Capsule())
+            }
+            .allowsHitTesting(false)
+            .transition(.opacity)
+            .accessibilityLabel("Uploading, \(Int(upload * 100)) percent")
+        }
+    }
+}
+
+/// A photo from this phone's own copies (a message you sent).
+private struct LocalPhoto: View {
+    let url: URL
+    var tileHeight: CGFloat? = nil
+    let open: (UIImage) -> Void
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image { PhotoTile(image: image, name: url.lastPathComponent, tileHeight: tileHeight, open: open) }
+            else { RoundedRectangle(cornerRadius: 12).fill(HMDesign.card).frame(width: 110, height: tileHeight ?? 110) }
+        }
+        .task(id: url) {
+            let loaded = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: url.path) }.value
+            image = loaded
+        }
+    }
+}
+
+/// One image in a message: tap to open full screen. Never blown up past its real size.
+private struct PhotoTile: View {
+    let image: UIImage
+    let name: String
+    var tileHeight: CGFloat? = nil
+    let open: (UIImage) -> Void
+
+    var body: some View {
+        Button { open(image) } label: {
+            if let h = tileHeight {
+                Image(uiImage: image).resizable().scaledToFill()
+                    .frame(width: min(240, max(90, h * image.size.width / max(image.size.height, 1))), height: h)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            } else {
+                Image(uiImage: image).resizable().scaledToFit()
+                    .frame(maxWidth: min(240, image.size.width), maxHeight: min(220, image.size.height))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(name)
     }
 }
 
@@ -2116,8 +2247,11 @@ private struct TranscriptImage: View {
     let name: String
     /// Set inside a multi-image row: every tile the same height, width from the image's shape.
     var tileHeight: CGFloat? = nil
+    /// The phone's own copy: shown while the Mac's loads and in its place if that fails (expired on the Mac).
+    var fallback: URL? = nil
     let open: (UIImage) -> Void
     @State private var image: UIImage?
+    @State private var local: UIImage?
     @State private var failed = false
 
     var body: some View {
@@ -2137,6 +2271,8 @@ private struct TranscriptImage: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(name)
+            } else if let local {
+                PhotoTile(image: local, name: name, tileHeight: tileHeight, open: open)
             } else if failed {
                 Label(name, systemImage: "photo").font(.caption).foregroundStyle(HMDesign.text2)
             } else {
@@ -2144,6 +2280,9 @@ private struct TranscriptImage: View {
             }
         }
         .task {
+            if let fallback, local == nil {
+                local = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: fallback.path) }.value
+            }
             guard image == nil, !failed else { return }
             do {
                 let data = try await API.shared.chatMedia(profile: profile, session: session, digest: digest)

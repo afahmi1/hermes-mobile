@@ -59,9 +59,15 @@ _ANCHOR_RE = re.compile("\ue000(\\d+)\ue001")
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\((?:file://)?(/[^)\s]+)\)")
 # The bridge's own hand-off notes (bridge_turns._media_notes): files, clips, audio, and images sent with a steer.
 # One line each, ending in a JSON-quoted path. The person never typed them, so the whole note goes.
+# Images a message can show: the phone sends up to 20 (ChatMedia.maxAttachments).
+MAX_REFS = 20
 _BRIDGE_NOTE = re.compile(r"(?m)^[ \t]*The user (?:attached|sent) (?:an image|a file|a video clip|an audio file)\b"
                           r"(?: named (\"(?:[^\"\\\n]|\\.)*\"))?[^\n]*?"
                           r"Local file path: (\"(?:[^\"\\\n]|\\.)*\")[ \t]*$")
+# The note for a photo sent as its original file (HEIC, PNG, a JPEG over the size cap): one line, the original's path
+# after "It is saved at", then where its JPEG copy is. The original is what the phone shows (iOS decodes HEIC).
+_PHOTO_NOTE = re.compile(r"(?m)^[ \t]*The user attached a photo named (\"(?:[^\"\\\n]|\\.)*\") \([^\n]*?\)\. "
+                         r"It is saved at (\"(?:[^\"\\\n]|\\.)*\")\.[^\n]*$")
 # Older desktop builds stored the model's image part after the text: a base64 data URL nobody should read.
 _INLINE_DATA_PART = re.compile(r'\{"type":\s*"image_url",\s*"image_url":\s*\{"url":\s*"data:[^"]*"\s*(?:,[^{}]*)?\}\s*\}')
 # Hermes's voice-note format: the transcript stays as the person's words, the recording becomes playable.
@@ -495,6 +501,7 @@ def _marker_paths(text):
     text = text or ""
     paths = _IMAGE_AT.findall(text) + [_media_path(m) for m in _MEDIA.finditer(text)] + _MD_IMAGE.findall(text)
     paths += [p for p in (_json_path(raw) for _, raw in _BRIDGE_NOTE.findall(text)) if p]
+    paths += [p for p in (_json_path(raw) for _, raw in _PHOTO_NOTE.findall(text)) if p]
     paths += mentioned_images(text)
     return paths + _AUDIO_NOTE.findall(text) + _PASTE_NOTE.findall(text)
 
@@ -517,7 +524,7 @@ def _refs(text, roots, bare=False):
         if path in seen:
             return gone
         seen.add(path)
-        if len(found) < 12:
+        if len(found) < MAX_REFS:
             if anchor:
                 gone = "\n%s%d%s\n" % (_ANCHOR, len(found), _ANCHOR_END)
             shown = label.strip() if isinstance(label, str) and label.strip() and "/" not in label and "\\" not in label else path.name
@@ -539,6 +546,8 @@ def _refs(text, roots, bare=False):
     # A hand-off note is never the person's words: it goes whether or not the file is still there.
     cleaned = _BRIDGE_NOTE.sub(lambda m: take(_json_path(m.group(2)), keep=gone_note(m),
                                               label=_json_path(m.group(1)) if m.group(1) else None), cleaned)
+    cleaned = _PHOTO_NOTE.sub(lambda m: take(_json_path(m.group(2)), keep=gone_note(m),
+                                             label=_json_path(m.group(1))), cleaned)
     cleaned = _AUDIO_NOTE.sub(lambda m: take(m.group(1).strip(), keep=""), cleaned)
     cleaned = _PASTE_NOTE.sub(lambda m: take(m.group(1).strip(), keep=m.group(0), gone=m.group(0)), cleaned)
     if bare:

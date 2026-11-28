@@ -176,6 +176,26 @@ class PhotoBatchTests(unittest.TestCase):
             if m.get("native"):
                 self.assertFalse(Path(m["path"]).exists(), "native copies are cleaned up")
 
+    def test_sent_photos_show_in_the_chat(self):
+        """A user message shows every photo it carried: native ones, ones past the limit, and originals
+        (whose note says "a photo"), up to the 20 the phone can send."""
+        import bridge_transcript as bt, bridge_turns
+        small = jpeg((800, 600))
+        items = [self.send_photo(i, variant(small, i))[0] for i in range(14)]
+        staged = media.stage(media.decode(items), self.home)
+        text = "look at these" + bridge_turns._media_notes(staged)
+        text += "".join("\n[Image attached at: %s]" % m["path"] for m in staged if m.get("native"))
+        original = Path(self.home) / "attachments" / "mobile" / "abc_IMG_1.heic"
+        original.write_bytes(variant(small, 99))
+        text += ('\n\nThe user attached a photo named "IMG_1.HEIC" (image/heic, the original file, untouched). '
+                 'It is saved at "%s". A full-resolution JPEG copy is attached so you can see it.' % original)
+        row = bt.project_timeline_message({"role": "user", "content": text}, roots=[Path(self.home)])
+        names = [m["name"] for m in row["media"]]
+        self.assertEqual(len(names), 15, names)
+        self.assertIn("img_1.heic", [n.lower() for n in names])
+        self.assertNotIn("The user attached", row["content"], "hand-off notes never show as the person's words")
+        self.assertTrue(bt.file_for_digest([text], row["media"][-1]["digest"], [Path(self.home)]))
+
     def test_heic_original_arrives_untouched_with_a_jpeg_copy(self):
         try:
             import pillow_heif
