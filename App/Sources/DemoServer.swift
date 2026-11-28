@@ -502,11 +502,16 @@ enum DemoFixtures {
                                       ["name": "API server", "state": "connected"]]],
             "agents": (DemoMode.live
                 ? [["kind": "phone", "title": "Thermocline polish for Prometheus", "profile": "default",
-                    "model": "claude-opus-5-5", "started_at": iso(-180), "session_id": DemoMode.chatID]] : [])
-                + [["kind": "cron", "title": "Relay drain", "profile": "default", "model": "deepseek-v4-flash",
-                    "started_at": iso(-20)],
+                    "source": "local", "source_label": "Phone", "model": "claude-opus-5-5", "provider": "anthropic",
+                    "started_at": iso(-180), "session_id": DemoMode.chatID]] : [])
+                + [["kind": "chat", "title": "STEM briefing format", "profile": "research",
+                    "source": "desktop", "source_label": "Desktop", "model": "openai/gpt-6.2-sol", "provider": "openai-codex",
+                    "started_at": iso(-120), "session_id": "demo-brief"],
+                   ["kind": "cron", "title": "Relay drain", "profile": "default", "source": "cron", "source_label": "Cron",
+                    "model": "deepseek-v4-flash", "provider": "deepseek", "started_at": iso(-20)],
                    ["kind": "subagent", "title": "Render light and dark contact sheets", "profile": "default",
-                    "model": "deepseek-v4-flash", "started_at": iso(-95), "parent_session_id": "demo-echo"]],
+                    "source": "subagent", "model": "deepseek-v4-flash", "provider": "deepseek", "started_at": iso(-95),
+                    "parent_session_id": DemoMode.chatID, "parent_title": "Thermocline polish for Prometheus"]],
             "jobs": [
                 "jobs": jobs, "recent": recent,
                 "incidents": [["name": "STEM briefing", "state": "open", "profile": "research", "failure_type": "rate limit",

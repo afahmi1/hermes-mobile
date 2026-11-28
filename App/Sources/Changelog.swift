@@ -32,6 +32,9 @@ enum WhatsNew {
 
     /// Newest first. Add a release at the top for each build that changes something you'd notice.
     static let releases: [WhatsNewRelease] = [
+        WhatsNewRelease(build: 58, items: [
+            WhatsNewItem(symbol: "bubble.left.and.bubble.right", text: "Status: chat names, models, and each subagent’s parent"),
+        ]),
         WhatsNewRelease(build: 57, items: [
             WhatsNewItem(symbol: "arrow.triangle.branch", text: "Branch from any message: hold it, then Branch from Here"),
             WhatsNewItem(symbol: "puzzlepiece.extension", text: "Add-ons: browse and install skills, plugins and MCP servers"),

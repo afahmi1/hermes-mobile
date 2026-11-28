@@ -31,6 +31,7 @@ from pathlib import Path
 HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "Bridge"))
+from bridge_agent_status import AgentSessions, title_snippet
 from bridge_process import pid_alive
 HERMES_BIN = os.environ.get("HERMES_BIN", str(Path.home() / ".local/bin/hermes"))
 PROVIDER_TTL = 60  # seconds between `hermes auth list` refreshes
@@ -236,6 +237,7 @@ def jobs_status():
                 "failure_streak": j.get("failure_streak") or 0,
                 "completed": (j.get("repeat") or {}).get("completed"),
                 "model": j.get("model"),
+                "provider": j.get("provider"),
                 "script_only": j.get("no_agent"),
                 "deliver": j.get("deliver"),
                 "claimed": j.get("fire_claim") is not None,
@@ -395,47 +397,45 @@ def agents_status(jobs_payload):
     subagents that are still working, and cron runs in flight."""
     now = time.time()
     agents = []
-    for prof, h in profile_homes():
-        db = h / "state.db"
+    profiles = dict(profile_homes())
+    defaults = _model_default(HOME / "config.yaml")
+    sessions = {}
+    for prof, h in profiles.items():
+        model, provider = defaults if prof == "default" else _model_default(h / "config.yaml")
+        state = sessions[prof] = AgentSessions(h, model or defaults[0], provider or defaults[1])
         for e in (read_json(h / "runtime" / "active_sessions.json", {}) or {}).get("entries", []):
-            md = e.get("metadata") or {}
-            if e.get("pid") and not pid_alive(e.get("pid")):
-                continue  # a lease left behind by a process that died; Hermes prunes it on its next write
-            # Gateway leases carry the session key (agent:<profile>:<platform>:...); CLI, TUI and desktop
-            # leases carry the state.db id itself.
-            key = e.get("session_id") or md.get("live_session_id") or ""
-            row = {}
-            if key:
-                row = (ro_query(db, "SELECT id, title, model, source FROM sessions WHERE session_key=? "
-                                    "ORDER BY started_at DESC LIMIT 1", (key,))
-                       or ro_query(db, "SELECT id, title, model, source FROM sessions WHERE id=?", (key,))
-                       or ro_query(db, "SELECT id, title, model, source FROM sessions WHERE id=?",
-                                   (md.get("chat_id") or "",)) or [{}])[0]
+            pid = e.get("pid")
+            if pid and not pid_alive(pid):
+                continue  # Hermes prunes leases left behind by a dead process on its next write.
             agents.append({
-                "kind": "chat", "profile": prof, "session_id": row.get("id"),
-                "title": row.get("title") or "Untitled chat", "model": row.get("model"),
-                "source": row.get("source") or md.get("platform"), "surface": e.get("surface"),
-                "started_at": iso_from_epoch(e.get("started_at")), "pid": e.get("pid"),
-                "pid_alive": pid_alive(e.get("pid")) if e.get("pid") else None,
+                **state.chat(e.get("session_id"), metadata=e.get("metadata"), surface=e.get("surface"),
+                             started_at=e.get("started_at")),
+                "kind": "chat", "profile": prof, "surface": e.get("surface"), "pid": pid,
+                "started_at": iso_from_epoch(e.get("started_at")), "pid_alive": True if pid else None,
             })
-        for r in ro_query(db, "SELECT id, title, model, billing_provider, message_count, parent_session_id, started_at, "
-                              "(SELECT substr(content, 1, 400) FROM messages m WHERE m.session_id = sessions.id "
-                              " AND m.role = 'user' ORDER BY m.id LIMIT 1) AS goal, "
-                              "coalesce(last_activity_at, started_at) AS last FROM sessions "
-                              "WHERE source='subagent' AND ended_at IS NULL "
-                              "AND coalesce(last_activity_at, started_at) > ? ORDER BY last DESC LIMIT 20",
-                          (now - 900,)):
+        for r in state.query("SELECT *, coalesce(last_activity_at, started_at) AS last FROM sessions "
+                             "WHERE source='subagent' AND ended_at IS NULL "
+                             "AND coalesce(last_activity_at, started_at) > ? ORDER BY last DESC LIMIT 20",
+                             (now - 900,)):
+            goal = state.first_user(r["id"])
+            title = (r.get("title") or "").strip().removeprefix("Subagent:").strip()
             agents.append({
-                "kind": "subagent", "profile": prof, "session_id": r["id"],
-                "title": (r.get("title") or "Subagent").removeprefix("Subagent: "), "model": r.get("model"),
-                "parent_session_id": r.get("parent_session_id"), "provider": r.get("billing_provider"),
-                "steps": r.get("message_count"), "goal": " ".join(str(r.get("goal") or "").split())[:300] or None,
+                **state.model_route(r, {}, r.get("started_at")),
+                "kind": "subagent", "profile": prof, "session_id": r["id"], "source": "subagent",
+                "title": title or title_snippet(goal) or "Delegated task", "parent_title": state.parent_title(r),
+                "parent_session_id": r.get("parent_session_id"), "steps": r.get("message_count"), "goal": goal,
                 "started_at": iso_from_epoch(r.get("started_at")), "last_active": iso_from_epoch(r.get("last")),
             })
+    jobs = {(j["profile"], j["id"]): j for j in jobs_payload.get("jobs", [])}
     for r in jobs_payload.get("live") or []:
+        prof = r.get("profile")
+        job = jobs.get((prof, r.get("job_id")), {})
+        state = sessions.get(prof)
+        route = (state.model_route({}, job, None) if state and not job.get("script_only")
+                 else {"model": None, "provider": None})
         agents.append({
-            "kind": "cron", "profile": r.get("profile"), "job_id": r.get("job_id"),
-            "title": r.get("name"), "status": r.get("status"),
+            **route, "kind": "cron", "source": "cron", "source_label": "Cron", "profile": prof,
+            "job_id": r.get("job_id"), "title": r.get("name") or r.get("job_id") or "Cron run", "status": r.get("status"),
             "started_at": r.get("started_at") or r.get("claimed_at"), "pid": r.get("pid"),
             "pid_alive": r.get("pid_alive"),
         })
