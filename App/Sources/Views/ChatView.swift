@@ -801,9 +801,29 @@ struct ChatScreen: View {
 
     private func appendMedia(_ assets: [SendAttachment], account: String?) {
         guard !Task.isCancelled, let account, account == app.inboxAccount else { return }
-        let proposed = chat.draftAttachments + assets
+        let proposed = fitToBudget(chat.draftAttachments + assets)
         if let problem = issue(for: proposed) { chat.error = problem; return }
         chat.draftAttachments = proposed
+    }
+
+    /// Photos ride inline by default, and a message's inline bytes share one small budget. Fifteen photos blow
+    /// it, so the biggest ones move to the Mac's resumable upload (which takes up to 50 MB) instead of the
+    /// send being refused. Nothing is recompressed: the same JPEG travels by a different road.
+    private func fitToBudget(_ assets: [SendAttachment]) -> [SendAttachment] {
+        let limit = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
+        guard let uploadLimit = mediaCapabilities?.maxUploadBytes else { return assets }
+        var out = assets
+        func inlineTotal() -> Int { out.filter { !$0.isUpload }.reduce(0) { $0 + $1.byteCount } }
+        guard inlineTotal() > limit else { return out }
+        // Biggest first, so the fewest moves get under the budget.
+        let order = out.indices.filter { !out[$0].isUpload && out[$0].mime.hasPrefix("image/") }
+            .sorted { out[$0].byteCount > out[$1].byteCount }
+        for i in order {
+            guard inlineTotal() > limit else { break }
+            guard out[i].byteCount <= uploadLimit else { continue }
+            if let moved = try? UploadFiles.promote(out[i], filename: out[i].filename, mime: out[i].mime) { out[i] = moved }
+        }
+        return out
     }
 
     /// Several photos at once, like a Telegram album. A video still goes on its own (it has its own
@@ -1060,7 +1080,7 @@ struct ChatScreen: View {
         let draftAtSend = chat.draft
         let pastedAtSend = chat.pastedTexts
         let text = chat.combinedDraft
-        let files = chat.draftAttachments
+        let files = fitToBudget(chat.draftAttachments)
         if let problem = issue(for: files) { chat.error = problem; return }
         Task {
             // Saved to this phone first, then sent. Closing the app or losing signal never loses it.
@@ -1074,7 +1094,7 @@ struct ChatScreen: View {
 
     private func send() {
         if runModelCommand() { return }
-        let attachments = chat.draftAttachments
+        let attachments = fitToBudget(chat.draftAttachments)
         let text = chat.combinedDraft
         if let problem = issue(for: attachments) {
             chat.error = problem
