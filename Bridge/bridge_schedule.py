@@ -1,6 +1,6 @@
-"""Messages that send later: "Try again when limits reset".
+"""Composer messages and retries that send at a set time.
 
-A failed turn (usage limit, provider outage) can be retried at a set time. The row lives on the Mac in its own SQLite
+The row lives on the Mac in its own SQLite
 file (``STATE_DIR/schedule/schedule.db``, 0700 dir, 0600 file), so it fires even when the phone is closed and survives
 bridge restarts. Each row is sent once through the bridge's durable send (the same admissions journal as a phone
 send), keyed by the row's own id, so a crash between "submitted" and "marked sent" can't double-send.
@@ -10,6 +10,8 @@ Stdlib only.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import sqlite3
 import threading
@@ -26,7 +28,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scheduled(
   id TEXT PRIMARY KEY, profile TEXT NOT NULL, session TEXT NOT NULL, text TEXT NOT NULL,
   due REAL NOT NULL, next_try REAL NOT NULL, created REAL NOT NULL,
-  status TEXT NOT NULL DEFAULT 'waiting', reason TEXT, error TEXT, sent_at REAL);
+  status TEXT NOT NULL DEFAULT 'waiting', reason TEXT, error TEXT, sent_at REAL, options TEXT);
 CREATE INDEX IF NOT EXISTS scheduled_due ON scheduled(status, next_try);
 CREATE INDEX IF NOT EXISTS scheduled_chat ON scheduled(profile, session);
 """
@@ -48,11 +50,12 @@ class Schedule:
         os.close(fd)
         os.chmod(self.path, 0o600)
         self.lock = threading.Lock()
-        db = sqlite3.connect(self.path, timeout=5)
-        try:
-            db.executescript(_SCHEMA)  # runs its own commit, so not inside _Tx
-        finally:
-            db.close()
+        with self._db() as db:
+            for statement in _SCHEMA.strip().split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            if "options" not in {r[1] for r in db.execute("PRAGMA table_info(scheduled)")}:
+                db.execute("ALTER TABLE scheduled ADD COLUMN options TEXT")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -63,17 +66,22 @@ class Schedule:
     def _public(r):
         return {k: r[k] for k in ("id", "text", "due", "status", "reason", "error", "sent_at", "created")}
 
-    def add(self, profile, session, text, due, reason=None, now=None):
+    def add(self, profile, session, text, due, reason=None, now=None, options=None):
         now = time.time() if now is None else now
-        text = (text or "").strip()
+        text = text.strip() if isinstance(text, str) else ""
+        reason = reason[:80] if isinstance(reason, str) else None
         if not text or len(text.encode("utf-8", "replace")) > MAX_TEXT:
             raise ScheduleError("Nothing to send.")
         try:
             due = float(due)
         except (TypeError, ValueError):
             raise ScheduleError("Bad time.") from None
+        if not math.isfinite(due):
+            raise ScheduleError("Bad time.")
+        if due <= now and reason in ("scheduled", "reset"):
+            raise ScheduleError("Choose a future time.")
         if due > now + MAX_AHEAD:
-            raise ScheduleError("That's too far ahead.")
+            raise ScheduleError("That's more than 8 days ahead.")
         due = max(due, now)
         with self.lock, self._db() as db:
             waiting = db.execute("SELECT count(*) FROM scheduled WHERE profile=? AND session=? AND status='waiting'",
@@ -81,8 +89,9 @@ class Schedule:
             if waiting >= MAX_WAITING:
                 raise ScheduleError("This chat already has %d messages waiting to send." % MAX_WAITING, 409)
             sid = str(uuid.uuid4())
-            db.execute("INSERT INTO scheduled(id, profile, session, text, due, next_try, created, reason) "
-                       "VALUES(?,?,?,?,?,?,?,?)", (sid, profile, session, text, due, due, now, (reason or "")[:80] or None))
+            db.execute("INSERT INTO scheduled(id, profile, session, text, due, next_try, created, reason, options) "
+                       "VALUES(?,?,?,?,?,?,?,?,?)", (sid, profile, session, text, due, due, now, reason,
+                                                    json.dumps(options) if options else None))
             return self._public(db.execute("SELECT * FROM scheduled WHERE id=?", (sid,)).fetchone())
 
     def list(self, profile, session, include_done=False):
@@ -125,17 +134,15 @@ class Schedule:
             return db.execute("UPDATE scheduled SET next_try=? WHERE id=? AND status='waiting' AND next_try<=?",
                               (now + RETRY_AFTER, row["id"], now)).rowcount == 1
 
-    def tick(self, send, busy=lambda profile, session: False, now=None):
-        """Send everything due. `send(row)` starts the turn (raises on failure); `busy` defers a chat mid-reply."""
+    def tick(self, send, now=None):
+        """Hand due messages to durable send. Transient handoff failures stay in the schedule."""
         now = time.time() if now is None else now
         done = 0
         for row in self.due(now):
             if not self._claim(row, now):
                 continue
-            if busy(row["profile"], row["session"]):
-                self.postpone(row, "Hermes was still replying in this chat.", now)
-                continue
             try:
+                row["options"] = json.loads(row["options"]) if row["options"] else {}
                 send(row)
             except Exception as exc:  # noqa: BLE001  (any failure retries; the reason is kept for the phone)
                 self.postpone(row, "%s: %s" % (type(exc).__name__, exc), now)

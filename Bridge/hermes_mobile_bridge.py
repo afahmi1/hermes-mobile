@@ -1872,14 +1872,11 @@ def _send_scheduled(row):
     pid, sid = row["profile"], row["session"]
     if pid not in profile_ids():
         raise bridge_schedule.ScheduleError("That bot isn't on this Mac anymore.")
-    body = {}
-    turns.start_primary(pid, profile_home(pid), sid, row["text"], body, row["id"], None, admissions_dir(),
-                        lambda: persona_scope(pid, sid, prepare_workspace_turn(pid, sid, body)), restore_send_workspace)
-    log("Sent a scheduled message in %s/%s" % (pid, sid[:12]))
-
-
-def _phone_turn_running(pid, sid):
-    return any(t.get("profile") == pid and t.get("session_id") == sid and not t.get("done") for t in turns.live_turns())
+    body = row["options"]
+    turns.start_primary(pid, profile_home(pid), sid, row["text"], body, row["id"], body.get("project_context"),
+                        admissions_dir(), lambda: persona_scope(pid, sid, prepare_workspace_turn(pid, sid, body)),
+                        restore_send_workspace, allow_queue=True)
+    log("Handed off a scheduled message in %s/%s" % (pid, sid[:12]))
 
 
 def _schedule_loop():
@@ -1892,7 +1889,7 @@ def _schedule_loop():
         if store is None:
             continue
         try:
-            store.tick(_send_scheduled, busy=_phone_turn_running)
+            store.tick(_send_scheduled)
         except Exception as exc:  # noqa: BLE001  (the loop must never die)
             log("Schedule tick failed: %s" % type(exc).__name__)
 
@@ -3182,7 +3179,7 @@ class H(BaseHTTPRequestHandler):
                                        "original_images": True,
                                        # Hermes's native image limit per message; the phone splits bigger batches.
                                        "native_images": turns.bridge_media.native_image_limit()})
-            m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|send-receipt|runtime))$", path)
+            m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|send-receipt|runtime|schedule|scheduled|unschedule))$", path)
             if not m or self.command != "POST":
                 return self.send(404, {"error": "not found"})
             pid = m.group(1)
@@ -3276,7 +3273,16 @@ class H(BaseHTTPRequestHandler):
             return self.send(503, {"error": "Scheduling isn't available on this Mac right now."})
         try:
             if action == "schedule":
-                row = store.add(pid, sid, d.get("text"), d.get("at"), reason=d.get("reason"))
+                if d.get("attachments"):
+                    return self.send(400, {"error": "Send later doesn't support attachments."})
+                options = turns.clean_choice(d)
+                if (project := d.get("project_context")) is not None:
+                    if not isinstance(project, str) or not _WS_ID.fullmatch(project):
+                        return self.send(400, {"error": "Bad project."})
+                    if pid not in workspace_grants().get(project, ()) or workspace_store().project_for(pid, sid) != project:
+                        return self.send(403, {"error": "That chat doesn't belong to this project."})
+                    options["project_context"] = project
+                row = store.add(pid, sid, d.get("text"), d.get("at"), reason=d.get("reason"), options=options)
                 return self.send(201, {"scheduled": row, "waiting": store.list(pid, sid)})
             if action == "unschedule":
                 gone = store.cancel(pid, sid, str(d.get("id") or ""))
