@@ -3067,7 +3067,9 @@ class H(BaseHTTPRequestHandler):
                                        "max_message_bytes": turns.bridge_media.message_limit(),
                                        # Photos and files arrive as their original type (HEIC stays HEIC); the Mac
                                        # makes a JPEG copy only for the model to look at.
-                                       "original_images": True})
+                                       "original_images": True,
+                                       # Hermes's native image limit per message; the phone splits bigger batches.
+                                       "native_images": turns.bridge_media.native_image_limit()})
             m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|send-receipt|runtime))$", path)
             if not m or self.command != "POST":
                 return self.send(404, {"error": "not found"})

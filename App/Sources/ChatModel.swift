@@ -20,6 +20,9 @@ struct ChatItem: Identifiable, Hashable {
     var tools: [String] = []
     var activities: [ToolActivity] = []
     var media: [ChatMediaRef] = []
+    /// Small copies on this phone of the photos this message carried (`SentPreviews`): shown at once while it
+    /// uploads, and kept after a reload until (or instead of, if it's gone) the Mac's copy.
+    var previews: [URL] = []
     /// The reply split at its images (bridge `content_parts`), so each image shows where Hermes put it.
     var parts: [ReplyPart]? = nil
     /// Structured background work behind an activity card (empty on older bridges: `detail` is shown).
@@ -527,6 +530,7 @@ final class ChatModel {
 
     private func transcriptWithReceipts() -> [ChatItem] {
         var rows = Self.transcript(stored)
+        SentPreviews.attach(&rows, session: sessionId)
         // A receipt is the phone's note that Hermes took a queued or guiding message. Hermes's own transcript is the
         // truth: once that message is in it (with its "Guided this reply" label), the receipt is a duplicate and goes.
         // A receipt older than the loaded pages waits for its page, instead of piling up at the top with no replies.
@@ -893,6 +897,18 @@ final class ChatModel {
             var local = ChatItem(id: send.id.uuidString, kind: .user, text: shown ?? text)
             if projectContext != nil { local.contextNote = "Project instructions + reference files sent with this message" }
             items.append(local)
+            if attachments.contains(where: { $0.mime.hasPrefix("image/") }) {
+                // Show the photos in the sent message right away, with the upload's progress over them.
+                let sendID = send.id.uuidString, words = text
+                uploadingItem = sendID
+                uploadFraction = 0
+                Task {
+                    let urls = await Task.detached(priority: .userInitiated) {
+                        SentPreviews.make(send: sendID, session: sid, text: words, attachments: attachments)
+                    }.value
+                    if let i = items.firstIndex(where: { $0.id == sendID }), items[i].previews.isEmpty { items[i].previews = urls }
+                }
+            }
             await deliver(send, session: sid, key: key, allowLegacy: true)
         } catch {
             isRunning = false
@@ -954,11 +970,17 @@ final class ChatModel {
         if send.composerText != nil, draftAttachments == (send.attachments ?? []) { draftAttachments = [] }
     }
 
+    /// The sent message whose photos are uploading now, and how far along (shown over its photos).
+    var uploadingItem: String?
+    var uploadFraction: Double?
+
     /// "Uploading 42%…" while a big file goes up. Resumes, so the number never goes backwards much.
     private var uploadProgress: @Sendable (Double) -> Void {
         { [weak self] fraction in
             Task { @MainActor in
-                guard let self, fraction < 1 else { return }
+                guard let self else { return }
+                guard fraction < 1 else { self.uploadFraction = nil; return }
+                self.uploadFraction = fraction
                 self.status = "Uploading \(Int(fraction * 100))%…"
             }
         }
@@ -984,6 +1006,8 @@ final class ChatModel {
                                                     choice: send.choice, projectContext: send.project)
             }
             guard key == sendKey else { throw APIError.notSignedIn }
+            uploadingItem = nil
+            uploadFraction = nil
             error = nil
             receiptBackoff = 1
             nextReceiptAttempt = .distantPast
@@ -996,6 +1020,8 @@ final class ChatModel {
         } catch {
             isRunning = false
             status = nil
+            uploadingItem = nil
+            uploadFraction = nil
             // Queued follow-ups stay saved; they go once this send is confirmed or returned.
             guard sendKey == key else { return }
             if outgoing.contains(where: { $0.id == send.id }) {
@@ -1242,6 +1268,10 @@ final class ChatModel {
                             choice: pick, created: Date(), files: attachments.count)
         outgoing.append(item)
         await persistOutgoing()
+        if attachments.contains(where: { $0.mime.hasPrefix("image/") }) {
+            let id = item.id.uuidString, session = sessionId
+            Task.detached(priority: .utility) { SentPreviews.make(send: id, session: session, text: text, attachments: attachments) }
+        }
         if draftAttachments == attachments { draftAttachments = [] }
         ReplyNotifier.shared.askOnce()
         Task { await pump() }
