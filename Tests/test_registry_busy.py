@@ -85,6 +85,9 @@ class RegistryBusyTest(unittest.TestCase):
         expired = object()
         streams._check([(live, ("did-a", time.time() + 60, ())), (expired, ("did-b", time.time() - 1, ()))])
         self.assertEqual(closed, [expired])
+        streams.failing_since = time.time() - bridge_devices.REGISTRY_GRACE - 1
+        streams._check([(live, ("did-a", time.time() + 60, ()))])
+        self.assertEqual(closed, [expired, live])
 
 
 if __name__ == "__main__":

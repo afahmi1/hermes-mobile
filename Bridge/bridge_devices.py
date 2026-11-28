@@ -163,6 +163,10 @@ def push_summary(directory: Path):
     return {"phones": len(rows), "envs": envs, "own_topic": sum(1 for _, t in rows if t)}
 
 
+# How long live streams outlast an unreadable device registry before the check fails closed.
+REGISTRY_GRACE = 30
+
+
 class Streams:
     """Close live streams, including idle upstream reads, on token revocation or expiry."""
     def __init__(self, permitted):
@@ -198,13 +202,17 @@ class Streams:
     def _check(self, entries):
         # Signatures were checked at entry. Continue enforcing the individual token
         # deadline and read current grants every tick, even for a completely idle socket.
+        now = time.time()
         try:
             allowed = self.permitted(key for _, (key, _, _) in entries)
+            self.failing_since = None
         except (sqlite3.Error, OSError):
-            # The registry is busy or unreadable for a moment. That is not a revocation: keep every stream
-            # (revoke() still closes a revoked device's streams at once) and enforce only the token deadline.
-            allowed = None
-        now = time.time()
+            # A busy or briefly unreadable registry is not a revocation, so a blip must not cut every live reply.
+            # A revocation made in THIS process closes its streams at once (revoked()); one made elsewhere waits
+            # at most REGISTRY_GRACE seconds: past that the check fails closed, as it always did.
+            since = getattr(self, "failing_since", None) or now
+            self.failing_since = since
+            allowed = None if now - since < REGISTRY_GRACE else set()
         for handle, (key, expiry, _) in entries:
             if expiry <= now or (allowed is not None and key not in allowed):
                 self._disconnect(handle)
