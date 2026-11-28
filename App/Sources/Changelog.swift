@@ -32,6 +32,9 @@ enum WhatsNew {
 
     /// Newest first. Add a release at the top for each build that changes something you'd notice.
     static let releases: [WhatsNewRelease] = [
+        WhatsNewRelease(build: 50, items: [
+            WhatsNewItem(symbol: "sparkles", text: "Sprites: a salmon, a macaw, and optional kawaii faces"),
+        ]),
         WhatsNewRelease(build: 49, items: [
             WhatsNewItem(symbol: "sparkles", text: "Silver accent and a brighter, wider glow in Dark"),
         ]),
@@ -47,7 +50,7 @@ enum WhatsNew {
         ]),
         WhatsNewRelease(build: 43, items: [
             WhatsNewItem(symbol: "list.bullet.rectangle", text: "What's new is a real changelog, shown once per build"),
-            WhatsNewItem(symbol: "circle.hexagongrid", text: "The colorful orb is back: Appearance › Thinking › Color orb"),
+            WhatsNewItem(symbol: "circle.hexagongrid", text: "The colorful orb is back: Appearance › Sprites › Color orb"),
             WhatsNewItem(symbol: "bell.slash", text: "\"Still working\" shows once per reply, silently"),
         ]),
         WhatsNewRelease(build: 42, items: [

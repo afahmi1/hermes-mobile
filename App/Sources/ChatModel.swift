@@ -1816,8 +1816,13 @@ final class ChatModel {
             if let d = ev.string("delta"), !d.isEmpty { appendThinking(d) }
             if streamingIndex == nil && status != "Thinking…" { status = "Thinking…"; activityTick &+= 1 }
         case "status":
-            if let t = ev.string("text"), !t.isEmpty { appendThinking(t) }
-            if streamingIndex == nil { status = "Thinking…" }
+            if let text = ev.string("text"), !text.isEmpty {
+                // Status events are complete labels, not reasoning deltas. Keep each on its own line.
+                appendThinking((thinkingText.isEmpty || thinkingText.last?.isNewline == true ? "" : "\n") + text + "\n")
+                if streamingIndex == nil { status = text }
+            } else if streamingIndex == nil {
+                status = "Thinking…"
+            }
         case "notice":
             items.append(ChatItem(id: "n-\(UUID().uuidString)", kind: .notice, text: ev.string("text") ?? ""))
         case "clarify.request":

@@ -484,6 +484,7 @@ struct AppearanceSection: View {
     @AppStorage(ThinkingStyle.key) private var thinkingRaw = ThinkingStyle.orbs.rawValue
     @AppStorage(ThinkingWords.key) private var wordsRaw = ThinkingWords.playful.rawValue
     @AppStorage(ThinkingWords.streamKey) private var streamThinking = false
+    @AppStorage(KawaiiFilter.key) private var kawaiiFaces = true
     @AppStorage(ChatIconStyle.key) private var iconRaw = ChatIconStyle.auto.rawValue
     @AppStorage(Thermocline.Palette.darkCanvasKey) private var darkCanvas = "black"
     @AppStorage(StatusPulse.key) private var pulse = true
@@ -586,24 +587,27 @@ struct AppearanceSection: View {
                 }
             }
             VStack(alignment: .leading, spacing: 8) {
-                Text("Thinking").font(.subheadline)
-                let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 8)) : AnyLayout(HStackLayout(spacing: 8))
-                layout {
+                Text("Sprites").font(.subheadline).accessibilityAddTraits(.isHeader)
+                let accessible = typeSize.isAccessibilitySize
+                let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: accessible ? 1 : 4)
+                LazyVGrid(columns: columns, spacing: 8) {
                     ForEach(ThinkingStyle.allCases) { style in
+                        let layout = accessible ? AnyLayout(HStackLayout(spacing: 8)) : AnyLayout(VStackLayout(spacing: 6))
                         Button { thinkingRaw = style.rawValue } label: {
-                            VStack(spacing: 6) {
+                            layout {
                                 ThinkingIndicator(size: 18, style: style).frame(height: 24)
-                                Text(style.title).font(.caption2).lineLimit(1).minimumScaleFactor(0.8)
+                                Text(style.title).font(.caption2).lineLimit(accessible ? nil : 1).minimumScaleFactor(0.8)
                                     .foregroundStyle(thinkingRaw == style.rawValue ? Color.primary : .secondary)
                             }
-                            .frame(maxWidth: .infinity).padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: accessible ? .leading : .center)
+                            .padding(.horizontal, accessible ? 12 : 4).padding(.vertical, 4)
                             .background(thinkingRaw == style.rawValue ? HMDesign.accent.opacity(0.14) : Color.clear,
                                         in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
                                 .strokeBorder(thinkingRaw == style.rawValue ? HMDesign.accent : HMDesign.separator, lineWidth: 1))
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel(style.title + " thinking indicator")
+                        .accessibilityLabel(style.title + " sprite")
                         .accessibilityAddTraits(thinkingRaw == style.rawValue ? .isSelected : [])
                     }
                 }
@@ -614,6 +618,13 @@ struct AppearanceSection: View {
                 ForEach(ThinkingWords.allCases) { Text($0.title).tag($0.rawValue) }
             }
             Toggle("Stream Hermes's thinking", isOn: $streamThinking)
+            Toggle(isOn: $kawaiiFaces) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Kawaii faces")
+                    Text("The little faces Hermes adds to its thinking lines.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             Picker("Chat icons", selection: $iconRaw) {
                 ForEach(ChatIconStyle.allCases) { Text($0.title).tag($0.rawValue) }
             }

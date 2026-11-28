@@ -101,12 +101,16 @@ struct ThinkingStatus: View {
     let status: String
     @AppStorage(ThinkingWords.key) private var wordsRaw = ThinkingWords.playful.rawValue
     @AppStorage(ThinkingWords.streamKey) private var stream = false
+    @AppStorage(KawaiiFilter.key) private var kawaiiFaces = true
     @State private var showThinking = false
     @State private var seed = Int.random(in: 0..<10_000)
 
     var body: some View {
         let playful = ThinkingWords(rawValue: wordsRaw) != .plain
+        let displayed = kawaiiFaces ? status : KawaiiFilter.strip(status)
+        let status = displayed.isEmpty ? "Thinking…" : displayed
         let specific = !ThinkingLines.isGeneric(status)
+        let preview = stream ? String((kawaiiFaces ? chat.thinkingText : KawaiiFilter.strip(chat.thinkingText)).suffix(280)) : ""
         Button { showThinking = true } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
@@ -129,8 +133,8 @@ struct ThinkingStatus: View {
                         Image(systemName: "brain").font(.caption).foregroundStyle(.tertiary)
                     }
                 }
-                if stream, !chat.thinkingText.isEmpty {
-                    Text(String(chat.thinkingText.suffix(280)))
+                if !preview.isEmpty {
+                    Text(preview)
                         .font(.caption).foregroundStyle(.tertiary).lineLimit(3)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -147,24 +151,26 @@ struct ThinkingStatus: View {
 /// Hermes's reasoning for the current reply, streaming in as it arrives.
 struct ThinkingSheet: View {
     @Bindable var chat: ChatModel
+    @AppStorage(KawaiiFilter.key) private var kawaiiFaces = true
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        let thinking = kawaiiFaces ? chat.thinkingText : KawaiiFilter.strip(chat.thinkingText)
         NavigationStack {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        if chat.thinkingText.isEmpty {
+                        if thinking.isEmpty {
                             Text("Hermes hasn't shared any thinking for this reply yet. Some models don't stream it; tool steps are in the Worked card.")
                                 .font(.subheadline).foregroundStyle(HMDesign.text2)
                         } else {
-                            Text(chat.thinkingText).font(.callout).foregroundStyle(HMDesign.text2).textSelection(.enabled)
+                            Text(thinking).font(.callout).foregroundStyle(HMDesign.text2).textSelection(.enabled)
                         }
                         Color.clear.frame(height: 1).id("end")
                     }
                     .padding()
                 }
-                .onChange(of: chat.thinkingText.count) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
+                .onChange(of: thinking.count) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
             }
             .hmCanvas()
             .navigationTitle("Thinking")

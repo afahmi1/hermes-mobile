@@ -1373,6 +1373,7 @@ final class PasteTextView: UITextView {
 struct MessageRow: View {
     @State private var toolsExpanded = false
     @State private var activityExpanded = false
+    @AppStorage(KawaiiFilter.key) private var kawaiiFaces = true
     let item: ChatItem
     var profile: String = ""
     var session: String?
@@ -1404,6 +1405,8 @@ struct MessageRow: View {
             : "\(seconds / 3600)h \(seconds % 3600 / 60)m"
         return "Worked \(span) · " + base
     }
+
+    private func workLabel(_ text: String) -> String { kawaiiFaces ? text : KawaiiFilter.strip(text) }
 
     private func quoteSelection(_ words: String) {
         onCompose?(ReplyQuote.markdown(ReplyQuote.excerpt(words)) + "\n\n", false)
@@ -1630,10 +1633,11 @@ struct MessageRow: View {
                 VStack(alignment: .leading, spacing: 8) {
                     if item.activities.isEmpty {
                         ForEach(Array(item.tools.enumerated()), id: \.offset) { _, tool in
-                            Text(tool.replacingOccurrences(of: "_", with: " ")).font(.caption.monospaced())
+                            Text(workLabel(tool).replacingOccurrences(of: "_", with: " ")).font(.caption.monospaced())
                         }
                     } else {
                         ForEach(item.activities) { row in
+                            let label = ToolLanguage.title(row, display: workLabel)
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
                                 Image(systemName: row.state == "failed" ? "xmark.circle.fill" : ToolLanguage.icon(row.name))
                                     .font(.caption).frame(width: 16)
@@ -1641,7 +1645,7 @@ struct MessageRow: View {
                                     .symbolEffect(.pulse, isActive: row.state == "running" && !reduceMotion)
                                 VStack(alignment: .leading, spacing: 2) {
                                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                        Text(ToolLanguage.title(row))
+                                        Text(label)
                                             .font(.caption)
                                             .foregroundStyle(row.state == "failed" ? HMDesign.dangerText : HMDesign.ink)
                                         Spacer(minLength: 4)
@@ -1653,7 +1657,7 @@ struct MessageRow: View {
                                 }
                             }
                             .accessibilityElement(children: .combine)
-                            .accessibilityLabel(ToolLanguage.title(row) + (row.state == "failed" ? ", failed" : row.state == "running" ? ", running" : ""))
+                            .accessibilityLabel(label + (row.state == "failed" ? ", failed" : row.state == "running" ? ", running" : ""))
                         }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -1669,11 +1673,11 @@ struct MessageRow: View {
         case .activity:
             DisclosureGroup(isExpanded: $activityExpanded) {
                 if !item.detail.isEmpty {
-                    Text(item.detail).font(.caption).textSelection(.enabled)
+                    Text(workLabel(item.detail)).font(.caption).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } label: {
-                Label(item.text, systemImage: item.failed ? "exclamationmark.triangle" : "arrow.triangle.branch")
+                Label(workLabel(item.text), systemImage: item.failed ? "exclamationmark.triangle" : "arrow.triangle.branch")
                     .font(.subheadline)
                     .labelStyle(HMTintedIconLabel(icon: item.failed ? HMDesign.danger : HMDesign.text2))
                     .foregroundStyle(item.failed ? HMDesign.dangerText : HMDesign.text2)
@@ -1756,8 +1760,8 @@ private enum ToolLanguage {
         }
     }
 
-    static func title(_ row: ToolActivity) -> String {
-        let preview = row.preview
+    static func title(_ row: ToolActivity, display: (String) -> String) -> String {
+        let preview = display(row.preview)
         switch row.name {
         case "skill_view": return preview.isEmpty ? "Loaded a skill" : "Loaded skill · \(preview)"
         case "terminal", "execute_code": return preview.isEmpty ? "Ran a command" : "Ran · \(preview)"
@@ -1766,7 +1770,7 @@ private enum ToolLanguage {
         case "delegate_task": return preview.isEmpty ? "Delegated a task" : "Delegated · \(preview)"
         case "tool_search": return "Looked up tools"
         default:
-            let spoken = row.name.replacingOccurrences(of: "_", with: " ")
+            let spoken = display(row.name).replacingOccurrences(of: "_", with: " ")
             return preview.isEmpty ? spoken : "\(spoken) · \(preview)"
         }
     }
@@ -2092,6 +2096,9 @@ struct PinsSheet: View {
 struct ActivityCard: View {
     let item: ChatItem
     @Binding var expanded: Bool
+    @AppStorage(KawaiiFilter.key) private var kawaiiFaces = true
+
+    private func workLabel(_ text: String) -> String { kawaiiFaces ? text : KawaiiFilter.strip(text) }
 
     private var worst: String {
         if item.entries.contains(where: \.failed) { return "failed" }
@@ -2105,7 +2112,7 @@ struct ActivityCard: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     StatusGlyph(status: worst)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(item.text).font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.ink)
+                        Text(workLabel(item.text)).font(.subheadline.weight(.semibold)).foregroundStyle(HMDesign.ink)
                             .multilineTextAlignment(.leading).lineLimit(expanded ? nil : 2)
                         if let ts = item.timestamp {
                             Text(Date(timeIntervalSince1970: ts), style: .time).hmTime(classic: HMDesign.text2)
@@ -2128,7 +2135,7 @@ struct ActivityCard: View {
                 }
                 .padding(.leading, 26)
             } else if let entry = item.entries.first, !entry.meta.isEmpty {
-                Text(entry.meta).font(.caption).foregroundStyle(HMDesign.text2).padding(.leading, 26)
+                Text(workLabel(entry.meta)).font(.caption).foregroundStyle(HMDesign.text2).padding(.leading, 26)
             }
         }
         .padding(12)
@@ -2143,22 +2150,25 @@ struct ActivityCard: View {
     private struct EntryRow: View {
         let entry: ActivityEntry
         let expanded: Bool
+        @AppStorage(KawaiiFilter.key) private var kawaiiFaces = true
+
+        private func workLabel(_ text: String) -> String { kawaiiFaces ? text : KawaiiFilter.strip(text) }
 
         var body: some View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     StatusGlyph(status: entry.status, small: true)
                     Image(systemName: entry.isProcess ? "terminal" : "person.2").font(.caption2).foregroundStyle(HMDesign.text2)
-                    Text(entry.label)
+                    Text(workLabel(entry.label))
                         .font(entry.isProcess ? .footnote.monospaced() : .footnote)
                         .lineLimit(expanded ? 4 : 1)
                     Spacer(minLength: 4)
                     if !expanded, !entry.meta.isEmpty {
-                        Text(entry.meta).font(.caption2).foregroundStyle(entry.failed ? HMDesign.dangerText : HMDesign.text2).lineLimit(1)
+                        Text(workLabel(entry.meta)).font(.caption2).foregroundStyle(entry.failed ? HMDesign.dangerText : HMDesign.text2).lineLimit(1)
                     }
                 }
                 if expanded {
-                    if !entry.meta.isEmpty { Text(entry.meta).font(.caption).foregroundStyle(entry.failed ? HMDesign.dangerText : HMDesign.text2) }
+                    if !entry.meta.isEmpty { Text(workLabel(entry.meta)).font(.caption).foregroundStyle(entry.failed ? HMDesign.dangerText : HMDesign.text2) }
                     if let command = entry.command, !command.isEmpty {
                         CodeBlockView(language: "shell", code: command, foldAfter: 8, title: "command")
                     }
@@ -2987,12 +2997,14 @@ struct SubagentInfo: Identifiable {
 /// Tap to open its own transcript and follow it.
 struct SubagentCard: View {
     let task: SubagentInfo
+    @AppStorage(KawaiiFilter.key) private var kawaiiFaces = true
 
     var body: some View {
+        let title = task.title.replacingOccurrences(of: "Subagent: ", with: "")
         let card = VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 ThinkingIndicator(size: 14, activity: task.goal ?? task.title)
-                Text(task.title.replacingOccurrences(of: "Subagent: ", with: "")).font(.subheadline.weight(.semibold))
+                Text(kawaiiFaces ? title : KawaiiFilter.strip(title)).font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 if let started = task.started {

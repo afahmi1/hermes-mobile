@@ -43,7 +43,7 @@ checks every step and prints the exact fix for anything missing.
 <tr><td><b>Watch it work</b></td><td>Playful thinking lines (tap to read the real thinking), a timestamp and duration on every tool step, and subagent cards with their goal, model, provider and steps.</td></tr>
 <tr><td><b>Status, from anywhere</b></td><td>What's running, cron jobs, incidents, provider usage and resets. Restart Hermes or the bridge from the phone, now or when replies finish.</td></tr>
 <tr><td><b>Notifications</b></td><td>A reply in another chat notifies even while the app is open; long-press to answer from the notification. With an APNs key on your computer, the bridge pushes when a reply is ready or Hermes needs an approval. No reply text leaves your machine.</td></tr>
-<tr><td><b>Made to be lived in</b></td><td>Thermocline (true black or ash) and Classic themes, Liquid Glass, five thinking indicators including the pixel flame and the color orb, and a What's new changelog once per build.</td></tr>
+<tr><td><b>Made to be lived in</b></td><td>Thermocline (true black or ash) and Classic themes, Liquid Glass, seven sprites including a swimming salmon and a flapping macaw, optional kawaii faces, and a What's new changelog once per build.</td></tr>
 </table>
 
 ## Screenshots
