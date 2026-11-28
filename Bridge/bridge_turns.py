@@ -296,8 +296,13 @@ def _created_draft(home, request_id, title):
     """Read the native creation receipt left behind when the WebSocket reply is lost."""
     try:
         from gateway.owner_identity import host_owner_subject
-        from hermes_state_keys import local_identity
-        from hermes_state_local import POLICY_PREFIX
+        try:
+            # Hermes moved its state keys into the persistence package with the old session store's removal.
+            from persistence.sqlite._state.keys import local_identity
+            from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+        except ImportError:
+            from hermes_state_keys import local_identity
+            from hermes_state_local import POLICY_PREFIX
         from hermes_cli.gateway_runtime import gateway_profile_home
         profile_id = str(gateway_profile_home(home))
         subject = host_owner_subject()
