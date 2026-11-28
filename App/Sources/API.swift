@@ -14,6 +14,10 @@ struct MediaCapabilities: Decodable {
     var maxMessageBytes: Int = 128 * 1024 * 1024
     /// The Mac takes photos as their original files (HEIC, PNG, ...), not only JPEG.
     var originalImages = false
+    /// Optional, from bridges that state them: the inline image cap, and the largest request body it reads.
+    var maxImageBytes: Int? = nil
+    var maxBodyBytes: Int? = nil
+    var maxChunkBytes: Int? = nil
     enum CodingKeys: String, CodingKey {
         case images, files, video
         case maxVideoBytes = "max_video_bytes"
@@ -21,6 +25,23 @@ struct MediaCapabilities: Decodable {
         case maxUploadBytes = "max_upload_bytes"
         case maxMessageBytes = "max_message_bytes"
         case originalImages = "original_images"
+        case maxImageBytes = "max_image_bytes"
+        case maxBodyBytes = "max_body_bytes"
+        case maxChunkBytes = "max_chunk_bytes"
+    }
+
+    /// What the phone sends inline and how big each upload chunk is, from what this bridge said it takes.
+    /// The 8 MB defaults stand when the bridge says nothing; nothing ever goes over its stated caps.
+    var uploadLimits: UploadFiles.Limits {
+        var limits = UploadFiles.Limits()
+        let floor = 256 * 1024
+        limits.inline = max(floor, min(limits.inline, maxFileBytes, maxImageBytes ?? .max))
+        // The bridge reads a request body up to its media cap in base64 plus 2 MB (hermes_mobile_bridge
+        // _media_body_cap); a raw chunk under the media cap always fits. A stated body or chunk cap wins.
+        let body = maxBodyBytes.map { $0 - 64 * 1024 } ?? maxFileBytes
+        limits.chunk = max(floor, min(limits.chunk, body, maxChunkBytes ?? .max))
+        if let maxUploadBytes { limits.copy = max(limits.copy, maxUploadBytes) }
+        return limits
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -34,7 +55,34 @@ struct MediaCapabilities: Decodable {
         let message = try c.decodeIfPresent(Int.self, forKey: .maxMessageBytes) ?? 0
         if message > 0 { maxMessageBytes = message }
         originalImages = try c.decodeIfPresent(Bool.self, forKey: .originalImages) ?? false
+        maxImageBytes = (try? c.decodeIfPresent(Int.self, forKey: .maxImageBytes)).flatMap { $0 > 0 ? $0 : nil }
+        maxBodyBytes = (try? c.decodeIfPresent(Int.self, forKey: .maxBodyBytes)).flatMap { $0 > 0 ? $0 : nil }
+        maxChunkBytes = (try? c.decodeIfPresent(Int.self, forKey: .maxChunkBytes)).flatMap { $0 > 0 ? $0 : nil }
     }
+}
+
+/// Why a big file didn't make it to the Mac. Each says what happened and what to do, never a status code.
+enum UploadProblem: LocalizedError, Equatable {
+    /// The phone's copy is gone (cleaned up, or the app was reinstalled). Nothing can bring it back.
+    case missingFile(String)
+    /// The Mac kept refusing the bytes after a few fresh starts.
+    case rejected(String)
+    /// The Mac has no room for it.
+    case macFull
+    /// The Mac answered but is busy (502/503). Waiting and trying again fixes it.
+    case macBusy
+
+    var errorDescription: String? {
+        switch self {
+        case .missingFile(let name): "“\(name)” is no longer on this phone. Attach it again, then send."
+        case .rejected(let name): "Your Mac couldn’t take “\(name)”. Try sending it again, or send a smaller file."
+        case .macFull: "Your Mac is out of disk space. Free some space on the Mac, then send again."
+        case .macBusy: "Your Mac is busy. Your message is saved and sends when it’s ready."
+        }
+    }
+
+    /// Waiting fixes it; everything else needs the person.
+    var isTransient: Bool { self == .macBusy }
 }
 
 enum APIError: LocalizedError {
@@ -287,7 +335,9 @@ final class API: @unchecked Sendable {
     // MARK: reads
 
     func mediaCapabilities(profile: String) async throws -> MediaCapabilities {
-        try await get("/m/chat/\(Self.esc(profile))/media-capabilities", as: MediaCapabilities.self)
+        let caps = try await get("/m/chat/\(Self.esc(profile))/media-capabilities", as: MediaCapabilities.self)
+        UploadFiles.limits = caps.uploadLimits
+        return caps
     }
 
     func health() async throws -> HealthInfo {
@@ -708,27 +758,42 @@ final class API: @unchecked Sendable {
         return out
     }
 
-    /// Send one big file in 8 MB chunks at the offset the bridge reports, resuming after any drop.
-    /// The id is derived from the file itself, so a relaunch or retry picks up where the last attempt stopped.
+    /// Send one big file in chunks (8 MB, or less when the bridge takes smaller bodies) at the offset the bridge
+    /// reports, resuming after any drop. The id is derived from the file itself, so a relaunch or retry picks up
+    /// where the last attempt stopped. Gives up with a plain `UploadProblem` instead of retrying forever.
     func upload(_ a: SendAttachment, sent: (@Sendable (Int) -> Void)? = nil) async throws -> String {
         guard let url = a.fileURL, let sha = a.sha256, let size = a.size else { throw APIError.badResponse }
+        guard FileManager.default.fileExists(atPath: url.path) else { throw UploadProblem.missingFile(a.filename) }
         let id = UploadFiles.uploadID(a)
         let announce: [String: Any] = ["upload_id": id, "filename": a.filename, "mime": a.mime, "size": size, "sha256": sha]
-        var state: [String: Any]
-        do { state = try await json("/m/uploads", method: "POST", body: announce) }
-        catch APIError.http(404, _) {
-            throw APIError.http(426, "Your Mac's bridge is too old for big files. Update it, or choose a file under 8 MB.")
+        var state: [String: Any] = [:]
+        var busy = 0
+        while true {
+            do {
+                state = try await json("/m/uploads", method: "POST", body: announce)
+                break
+            } catch APIError.http(404, _) {
+                throw APIError.http(426, "Your Mac's bridge is too old for big files. Update it, or choose a file under 8 MB.")
+            } catch APIError.http(let code, let message) {
+                let problem = Self.uploadProblem(code, name: a.filename)
+                guard problem == .macBusy, busy < 4 else { throw problem ?? APIError.http(code, message) }
+                busy += 1
+                try await Task.sleep(for: .seconds(min(30, 2 << busy)))
+            }
         }
         var offset = (state["offset"] as? NSNumber)?.intValue ?? 0
         var complete = state["complete"] as? Bool ?? false
-        let handle = try FileHandle(forReadingFrom: url)
+        let handle: FileHandle
+        do { handle = try FileHandle(forReadingFrom: url) } catch { throw UploadProblem.missingFile(a.filename) }
         defer { try? handle.close() }
+        let chunkSize = UploadFiles.limits.chunk
         var failures = 0
+        var restarts = 0   // 409/422 in a row: the Mac keeps asking for a fresh start
         while !complete {
             try Task.checkCancellation()
             sent?(offset)
             try handle.seek(toOffset: UInt64(offset))
-            guard let chunk = try handle.read(upToCount: 8 * 1024 * 1024), !chunk.isEmpty else { throw APIError.badResponse }
+            guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else { throw UploadProblem.missingFile(a.filename) }
             var r = try request("/m/uploads/\(id)", method: "PATCH")
             r.httpBody = chunk
             r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
@@ -742,15 +807,22 @@ final class API: @unchecked Sendable {
                     offset = (obj["offset"] as? NSNumber)?.intValue ?? offset + chunk.count
                     complete = obj["complete"] as? Bool ?? false
                     failures = 0
+                    restarts = 0
                 } else if [409, 422].contains(http.statusCode), let real = (obj["offset"] as? NSNumber)?.intValue {
-                    offset = real   // a lost acknowledgment or a damaged file: continue where the Mac actually is
+                    // A lost acknowledgment or a damaged file: continue where the Mac actually is. A Mac that keeps
+                    // saying so is not converging, so stop after a few instead of looping for ever.
+                    restarts += 1
+                    guard restarts <= 3 else { throw UploadProblem.rejected(a.filename) }
+                    offset = real
+                } else if let problem = Self.uploadProblem(http.statusCode, name: a.filename) {
+                    throw problem
                 } else {
                     throw APIError.http(http.statusCode, Self.errorText(data))
                 }
-            } catch let error as URLError where failures < 8 && !Task.isCancelled {
-                // Wi-Fi to cellular, a tunnel blip, the Mac waking: wait a little, ask where it got to, continue.
+            } catch let error where failures < 8 && !Task.isCancelled
+                        && (error is URLError || (error as? UploadProblem)?.isTransient == true) {
+                // Wi-Fi to cellular, a tunnel blip, the Mac waking or busy: wait a little, ask where it got to, continue.
                 failures += 1
-                _ = error
                 try await Task.sleep(for: .seconds(min(30, 1 << failures)))
                 if let now = try? await json("/m/uploads/\(id)", method: "GET", body: nil) {
                     offset = (now["offset"] as? NSNumber)?.intValue ?? offset
@@ -760,6 +832,16 @@ final class API: @unchecked Sendable {
         }
         sent?(size)
         return id
+    }
+
+    /// Upload answers the person can act on. 409 on announce means the id clashes with a different file.
+    static func uploadProblem(_ code: Int, name: String) -> UploadProblem? {
+        switch code {
+        case 507: .macFull
+        case 502, 503, 504: .macBusy
+        case 409, 422: .rejected(name)
+        default: nil
+        }
     }
 
     /// Start a turn. The Mac holds it; it keeps running if the phone locks or loses signal.

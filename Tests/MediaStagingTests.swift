@@ -29,6 +29,13 @@ struct MediaStagingTests {
             do { try MediaStaging.checkCopy(size: limit, available: capacity); fatalError("accepted insufficient space") }
             catch MediaStaging.Failure.lowSpace {}
         }
+        // A Files video that can't be cloned is copied up to what the Mac takes as one upload, not a fixed 256 MB.
+        let uploadMax = 2 * 1024 * 1024 * 1024
+        try MediaStaging.checkCopy(size: limit + 1, available: Int.max, limit: uploadMax)
+        do { try MediaStaging.checkCopy(size: uploadMax + 1, available: Int.max, limit: uploadMax); fatalError("accepted copy over the upload cap") }
+        catch MediaStaging.Failure.copyTooLarge {}
+        do { try MediaStaging.checkCopy(size: limit + 1, available: limit, limit: uploadMax); fatalError("accepted a copy with no room") }
+        catch MediaStaging.Failure.lowSpace {}
         print("Media staging snapshot, source validation, and storage boundaries passed")
     }
 }

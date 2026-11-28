@@ -95,7 +95,13 @@ struct ComposerDraftTests {
         let alias = URL(string: "https://DRAFT-TEST.invalid:443/")!
         await host.forgetGateway(alias)
         precondition(host.signedIn && vault.credential(alias) == firstLogin && !disk.scopes(firstKey).isEmpty)
+        // One 401 only starts a re-check; a Mac that can't be reached (this fixture's host never resolves) is not
+        // proof the login is gone, so nothing is forgotten.
         host.sessionExpired()
+        try await Task.sleep(for: .seconds(3))
+        precondition(host.signedIn && vault.credential(alias) == firstLogin, "a single 401 forgot the saved login")
+        // Signing in again (the confirmed path) forgets the login but keeps the account's drafts.
+        host.signInAgain()
         precondition(!host.signedIn && vault.credential(account.server) == nil)
         try host.connect(nextLogin)
         let replacement = host.chat(for: existing)

@@ -39,8 +39,14 @@ struct HermesMobileApp: App {
 
     init() {
         HMTheme.applyChrome()
-        // Upload copies a month old (sent long ago, or a draft abandoned) are removed in the background.
-        Task.detached(priority: .background) { UploadFiles.prune(keep: []) }
+        // Upload copies a month old (sent long ago, or a draft abandoned) are removed in the background. Files a
+        // draft or an unsent message still needs are kept however old; if either list can't be read, nothing goes.
+        Task { @MainActor in
+            guard let drafts = ComposerDisk.shared.referencedUploads(),
+                  let outbox = await InboxDisk.shared.referencedUploads() else { return }
+            let keep = drafts.union(outbox)
+            await Task.detached(priority: .background) { UploadFiles.prune(keep: keep) }.value
+        }
     }
 
     /// Everything that changes how colors resolve. The root rebuilds once when it changes.
@@ -334,7 +340,7 @@ struct ConnectionBadge: View {
                 if !app.checkedConnection {
                     Text("Checking the bridge and gateway.")
                 } else if app.needsLogin {
-                    Button("Sign in again") { app.sessionExpired() }
+                    Button("Sign in again") { app.signInAgain() }
                 } else if let failure = app.healthFailure {
                     Text(failure)
                     if let last = app.health?.phase { Text("Last known gateway state: " + last).font(.caption) }

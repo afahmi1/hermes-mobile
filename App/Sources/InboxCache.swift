@@ -72,8 +72,23 @@ struct SendAttachment: Codable, Hashable {
 
 /// The app's private folder for files waiting to upload. Survives relaunch; excluded from backups.
 enum UploadFiles {
-    /// Files at or under this size ride inline; bigger ones use the resumable upload when the bridge has it.
-    static let inlineLimit = 8 * 1024 * 1024
+    /// Sizes the connected Mac's bridge takes, refreshed from its media capabilities. The defaults are what every
+    /// bridge so far accepts, so a send restored before the capabilities arrive still fits.
+    struct Limits: Equatable {
+        /// Files at or under this size ride inline; bigger ones use the resumable upload when the bridge has it.
+        var inline = 8 * 1024 * 1024
+        /// One PATCH of a resumable upload. Must fit the bridge's request body cap.
+        var chunk = 8 * 1024 * 1024
+        /// The most a Files-app video may be copied (not cloned) on the phone before it is sent.
+        var copy = 256 * 1024 * 1024
+    }
+    private static let limitsLock = NSLock()
+    nonisolated(unsafe) private static var current = Limits()
+    static var limits: Limits {
+        get { limitsLock.withLock { current } }
+        set { limitsLock.withLock { current = newValue } }
+    }
+    static var inlineLimit: Int { limits.inline }
 
     static var folder: URL {
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -95,6 +110,9 @@ enum UploadFiles {
         let target = folder.appendingPathComponent(name)
         if move { try FileManager.default.moveItem(at: source, to: target) }
         else { try FileManager.default.copyItem(at: source, to: target) }
+        // A copy keeps the source's date (a photo from 2019). The month-old cleanup reads this date, so it must
+        // say when the file joined the upload folder, or a draft's attachment would look stale on day one.
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: target.path)
         #if !os(macOS)
         try? (target as NSURL).setResourceValue(URLFileProtection.completeUntilFirstUserAuthentication, forKey: .fileProtectionKey)
         #endif
@@ -129,13 +147,31 @@ enum UploadFiles {
     }
 
     /// Remove upload copies a month old. Anything still waiting that long is stale; the person can pick it again.
-    static func prune(keep: Set<String>) {
-        let cutoff = Date().addingTimeInterval(-30 * 86400)
+    /// `keep`: files a draft or an unsent message still points at. They stay however old they are.
+    static func prune(keep: Set<String>, now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-30 * 86400)
         let urls = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
         for url in urls where !keep.contains(url.lastPathComponent) {
             let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             if date < cutoff { try? FileManager.default.removeItem(at: url) }
         }
+    }
+
+    /// The upload-folder names these attachments use.
+    static func names(_ attachments: [SendAttachment]) -> Set<String> { Set(attachments.compactMap(\.localFile)) }
+
+    /// Delete the phone's copies of these attachments, except files still listed in `inUse`.
+    static func discard(_ attachments: [SendAttachment], keeping inUse: Set<String> = []) {
+        for name in names(attachments).subtracting(inUse) {
+            // Only plain names inside the folder: a damaged record must never point the delete elsewhere.
+            guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else { continue }
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+        }
+    }
+
+    /// The uploaded attachments whose file is no longer on the phone.
+    static func missing(_ attachments: [SendAttachment]) -> [SendAttachment] {
+        attachments.filter { a in a.isUpload && !(a.fileURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false) }
     }
 }
 
@@ -310,6 +346,30 @@ actor InboxDisk {
 
     func acknowledge(_ id: UUID, key: String) throws {
         if try pending(key)?.id == id { try FileManager.default.removeItem(at: pendingURL(key)) }
+    }
+
+    /// Upload-folder files that a send or follow-up saved on this phone still needs. Nil when a record can't be
+    /// read (the phone is locked, say): the caller must then keep every file rather than guess.
+    func referencedUploads() -> Set<String>? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: outbox.path) else { return [] }
+        guard let accounts = try? fm.contentsOfDirectory(at: outbox, includingPropertiesForKeys: nil) else { return nil }
+        var names = Set<String>()
+        for folder in accounts {
+            var isFolder: ObjCBool = false
+            guard fm.fileExists(atPath: folder.path, isDirectory: &isFolder), isFolder.boolValue else { continue }
+            guard let records = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return nil }
+            for record in records {
+                guard let data = try? Data(contentsOf: record) else { return nil }
+                if record.pathExtension == "followups" {
+                    let list = (try? JSONDecoder().decode([Outgoing].self, from: data)) ?? []
+                    names.formUnion(UploadFiles.names(list.flatMap { $0.attachments ?? [] }))
+                } else if let send = try? JSONDecoder().decode(PendingSend.self, from: data) {
+                    names.formUnion(UploadFiles.names(send.attachments ?? []))
+                }
+            }
+        }
+        return names
     }
 
     private func transcriptURL(_ key: String) -> URL {
@@ -523,6 +583,37 @@ final class ComposerDisk {
         return snapshot
     }
 
+    /// Upload-folder files any saved draft (every account) still shows as an attachment. Nil when a draft
+    /// database can't be read: the caller must then keep every file rather than guess.
+    func referencedUploads() -> Set<String>? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: root.path) else { return [] }
+        guard let folders = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return nil }
+        var names = Set<String>()
+        for folder in folders {
+            var isFolder: ObjCBool = false
+            guard fm.fileExists(atPath: folder.path, isDirectory: &isFolder), isFolder.boolValue else { continue }
+            do {
+                guard let db = try open(folder.lastPathComponent, create: false) else { continue }
+                let found = try withStatement(db, "SELECT value FROM drafts WHERE part=?", [Part.media.rawValue]) { stmt -> Set<String> in
+                    var found = Set<String>()
+                    var status = sqlite3_step(stmt)
+                    while status == SQLITE_ROW {
+                        let data = Data(bytes: sqlite3_column_blob(stmt, 0), count: Int(sqlite3_column_bytes(stmt, 0)))
+                        found.formUnion(UploadFiles.names((try? JSONDecoder().decode([SendAttachment].self, from: data)) ?? []))
+                        status = sqlite3_step(stmt)
+                    }
+                    guard status == SQLITE_DONE else { throw CocoaError(.fileReadUnknown) }
+                    return found
+                }
+                names.formUnion(found)
+            } catch {
+                return nil
+            }
+        }
+        return names
+    }
+
     /// Every scope ("bot|session/id") holding unsent text, pastes or files, for the inbox marker.
     func scopes(_ account: String) -> Set<String> {
         guard let db = try? open(account, create: false) else { return [] }
@@ -628,6 +719,7 @@ final class ActionQueue {
     /// True when the error means "couldn't reach the Mac", as opposed to the Mac saying no.
     static func isOffline(_ error: Error) -> Bool {
         if error is URLError { return true }
+        if (error as? UploadProblem)?.isTransient == true { return true }
         if case APIError.http(let code, _) = error { return code == 0 || code == 502 || code == 503 || code == 504 }
         return false
     }

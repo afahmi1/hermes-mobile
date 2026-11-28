@@ -61,15 +61,39 @@ enum MediaImport {
 /// stages the bytes; nothing is transcoded, so an MP3 stays an MP3.
 enum FileImport {
     enum Failure: LocalizedError {
-        case unreadable, empty, tooLarge(Int)
+        case unreadable, empty, tooLarge(Int), notDownloaded
         var errorDescription: String? {
             switch self {
             case .unreadable: "This file could not be opened. Try choosing it again."
             case .empty: "This file is empty."
             case .tooLarge(let max):
                 "This file is larger than \(ByteCountFormatter.string(fromByteCount: Int64(max), countStyle: .file)). Choose a smaller file."
+            case .notDownloaded: "This file couldn’t be downloaded from its cloud storage. Check your connection and try again."
             }
         }
+    }
+
+    /// Read a Files-app item through a file coordinator, then turn it into an attachment. The coordinator
+    /// downloads an iCloud Drive or File Provider placeholder first, and hands a package (a Pages, Keynote or
+    /// Numbers document, an .rtfd) or a folder over as one .zip, so it can travel like any other file.
+    /// The coordinated URL only lives inside the block, so the attachment is built there.
+    static func coordinated<T>(_ url: URL, _ body: (_ local: URL, _ filename: String, _ zipped: Bool) throws -> T) throws -> T {
+        let isFolder = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        var outcome: Result<T, Error> = .failure(Failure.unreadable)
+        var coordination: NSError?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: .forUploading, error: &coordination) { local in
+            outcome = Result {
+                let original = try safeName(url)
+                // Packages and folders arrive zipped; say so in the name so the Mac knows what it holds.
+                let zipped = isFolder || (local.pathExtension.lowercased() == "zip" && url.pathExtension.lowercased() != "zip")
+                return try body(local, zipped ? try safeName(original + ".zip") : original, zipped)
+            }
+        }
+        if let coordination {
+            if coordination.domain == NSCocoaErrorDomain && coordination.code == NSUserCancelledError { throw CancellationError() }
+            throw Failure.notDownloaded
+        }
+        return try outcome.get()
     }
 
     /// Read a security-scoped file and turn it into the one attachment the bridge accepts.
@@ -77,22 +101,31 @@ enum FileImport {
     /// other regular file rides as its original bytes and MIME type.
     /// `uploadMax`: the bridge takes big files through resumable uploads, up to this size. Anything over the
     /// inline limit is then kept as a file on the phone and uploaded in chunks, never read into memory.
-    static func attachment(from url: URL, maxBytes: Int, uploadMax: Int? = nil, originals: Bool = false) throws -> SendAttachment {
+    /// `filename`: the name to send (a coordinated copy can have a temporary name). Defaults to the URL's own.
+    static func attachment(from url: URL, filename: String? = nil, maxBytes: Int, uploadMax: Int? = nil,
+                           originals: Bool = false, inlineLimit: Int = UploadFiles.inlineLimit) throws -> SendAttachment {
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentTypeKey])
         guard values.isRegularFile == true else { throw Failure.unreadable }
         let size = values.fileSize ?? 0
         guard size > 0 else { throw Failure.empty }
-        let type = values.contentType ?? UTType(filenameExtension: url.pathExtension)
+        var name = try filename ?? safeName(url)
+        var type = values.contentType ?? UTType(filenameExtension: (name as NSString).pathExtension)
+            ?? UTType(filenameExtension: url.pathExtension)
+        // The extension can lie (a HEIC saved as .jpg) or name a format ImageIO knows better (DNG, AVIF, TIFF).
+        // For anything that claims to be an image, the bytes decide the type and the extension follows.
+        if type?.conforms(to: .image) ?? false, let real = ChatMedia.imageType(at: url), real != type {
+            type = real
+            name = ChatMedia.renamed(name, to: real)
+        }
+        let mime = type?.preferredMIMEType ?? "application/octet-stream"
         // A Mac that takes originals gets every file as it is, images included: no conversion, no size cap but its own.
         if originals, let uploadMax {
             guard size <= uploadMax else { throw Failure.tooLarge(uploadMax) }
-            return try UploadFiles.adopt(url, filename: try safeName(url),
-                                         mime: type?.preferredMIMEType ?? "application/octet-stream", move: false)
+            return try UploadFiles.adopt(url, filename: name, mime: mime, move: false)
         }
-        if let uploadMax, size > UploadFiles.inlineLimit, !(type?.conforms(to: .image) ?? false) {
+        if let uploadMax, size > inlineLimit, !(type?.conforms(to: .image) ?? false) {
             guard size <= uploadMax else { throw Failure.tooLarge(uploadMax) }
-            return try UploadFiles.adopt(url, filename: try safeName(url),
-                                         mime: type?.preferredMIMEType ?? "application/octet-stream", move: false)
+            return try UploadFiles.adopt(url, filename: name, mime: mime, move: false)
         }
         if let type, type.conforms(to: .image) {
             // Downsample the file at its URL. A large original can produce a small valid upload.
@@ -101,7 +134,9 @@ enum FileImport {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             let header = try handle.read(upToCount: 12) ?? Data()
-            let attachment = try ChatMedia.jpeg(UIImage(cgImage: preview), name: "Photo", sourceType: ChatMedia.originalTypeName(header), originalName: try safeName(url))
+            let attachment = try ChatMedia.jpeg(UIImage(cgImage: preview), name: "Photo",
+                                                sourceType: ChatMedia.originalTypeName(header) ?? ChatMedia.formatName(type),
+                                                originalName: name)
             guard attachment.byteCount <= maxBytes else { throw Failure.tooLarge(maxBytes) }
             return attachment
         }
@@ -114,19 +149,79 @@ enum FileImport {
         if let type, type.conforms(to: .movie) {
             throw Failure.unreadable  // the app routes clips through Photos, where consent is explained
         }
-        return SendAttachment(mime: type?.preferredMIMEType ?? "application/octet-stream",
-                              filename: try safeName(url), base64: data.base64EncodedString())
+        return SendAttachment(mime: mime, filename: name, base64: data.base64EncodedString())
     }
 
     /// A bridge- and filesystem-safe display/staging name: last path component, printable,
-    /// no separators or quotes, at most 120 characters.
-    static func safeName(_ url: URL) throws -> String {
+    /// no separators or quotes, at most 120 Unicode scalars with the extension kept.
+    static func safeName(_ url: URL) throws -> String { try safeName(url.lastPathComponent) }
+
+    static func safeName(_ raw: String) throws -> String {
         let banned = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/\\:\""))
-        let cleaned = String(url.lastPathComponent.unicodeScalars.filter { !banned.contains($0) })
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = String(cleaned.prefix(120))
+        // macOS screenshots put a narrow no-break space (U+202F) before "PM"; other names carry U+00A0. Every
+        // kind of space becomes a plain one, and the name is NFC so "é" is one character on both sides.
+        var scalars = String.UnicodeScalarView()
+        for scalar in raw.precomposedStringWithCanonicalMapping.unicodeScalars where !banned.contains(scalar) {
+            scalars.append(scalar.properties.generalCategory == .spaceSeparator ? " " : scalar)
+        }
+        let cleaned = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = capped(cleaned, scalars: 120)
         guard !name.isEmpty, name != ".", name != ".." else { throw Failure.unreadable }
         return name
+    }
+
+    /// At most `limit` Unicode scalars, cutting the name before its extension (never mid-character) so
+    /// "Quarterly report ... final.pdf" stays a .pdf.
+    static func capped(_ name: String, scalars limit: Int) -> String {
+        guard name.unicodeScalars.count > limit else { return name }
+        let ext = (name as NSString).pathExtension
+        let keepExt = !ext.isEmpty && ext.unicodeScalars.count <= 16
+        let stem = keepExt ? (name as NSString).deletingPathExtension : name
+        let suffix = keepExt ? "." + ext : ""
+        let room = limit - suffix.unicodeScalars.count
+        var out = ""
+        var used = 0
+        for character in stem {
+            let n = character.unicodeScalars.count
+            guard used + n <= room else { break }
+            out.append(character)
+            used += n
+        }
+        return out.trimmingCharacters(in: .whitespaces) + suffix
+    }
+}
+
+/// What the pasteboard holds when it isn't text or a picture: a copied file (a PDF from Files, a document).
+enum PastedFile {
+    /// The type to read, or nil when nothing on the pasteboard is a file.
+    static func type(in identifiers: [String]) -> UTType? {
+        for identifier in identifiers {
+            guard !identifier.hasPrefix("dyn."), let type = UTType(identifier) else { continue }
+            if type.conforms(to: .text) || type.conforms(to: .url) || type.conforms(to: .image) { continue }
+            if type.conforms(to: .data) || type.conforms(to: .package) { return type }
+        }
+        return nil
+    }
+
+    /// Copy the pasted file into a private temporary folder (the provider's URL only lives inside its callback).
+    static func load(_ provider: NSItemProvider, type: UTType) async throws -> URL {
+        let suggested = provider.suggestedName
+        return try await withCheckedThrowingContinuation { (done: CheckedContinuation<URL, Error>) in
+            _ = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, error in
+                guard let url else { return done.resume(throwing: error ?? FileImport.Failure.unreadable) }
+                do {
+                    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    var name = suggested.flatMap { try? FileImport.safeName($0) } ?? url.lastPathComponent
+                    if (name as NSString).pathExtension.isEmpty, let ext = type.preferredFilenameExtension { name += "." + ext }
+                    let target = folder.appendingPathComponent((try? FileImport.safeName(name)) ?? "Pasted file")
+                    try FileManager.default.copyItem(at: url, to: target)
+                    done.resume(returning: target)
+                } catch {
+                    done.resume(throwing: FileImport.Failure.unreadable)
+                }
+            }
+        }
     }
 }
 
@@ -134,9 +229,12 @@ enum FileImport {
 enum AttachmentSelection {
     static func issue(_ assets: [SendAttachment], fileLimit: Int, videoLimit: Int, uploadLimit: Int? = nil,
                       messageLimit: Int? = nil) -> String? {
-        if let messageLimit, assets.reduce(0, { $0 + $1.byteCount }) > messageLimit {
+        // Hermes's per-message cap is for the photos it hands the model natively. Other files are staged on the
+        // Mac one by one and only have the upload limit below.
+        let photoBytes = assets.filter { $0.mime.hasPrefix("image/") }.reduce(0) { $0 + $1.byteCount }
+        if let messageLimit, photoBytes > messageLimit {
             let limit = ByteCountFormatter.string(fromByteCount: Int64(messageLimit), countStyle: .file)
-            return "These attachments are over the \(limit) your Mac takes in one message. Send them in two messages."
+            return "These photos are over the \(limit) your Mac takes in one message. Send them in two messages."
         }
         if assets.count > ChatMedia.maxAttachments { return "Choose up to \(ChatMedia.maxAttachments) attachments for one message." }
         let hasVideo = assets.contains { $0.mime == "video/mp4" }
@@ -181,7 +279,7 @@ enum ChatMedia {
     /// size (6000, 4032, 3024, 2048 px) until it fits. A photo sent smaller always beats a photo left out.
     static let maxPixels = 50_000_000  // matches the bridge (bridge_media.MAX_PIXELS)
 
-    static func fullImage(from data: Data, uploadMax: Int, budget: Int = .max) throws -> SendAttachment {
+    static func fullImage(from data: Data, uploadMax: Int, budget: Int = .max, name: String = "Photo") throws -> SendAttachment {
         guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int
@@ -206,30 +304,57 @@ enum ChatMedia {
         }
         guard size > 0 else { throw Failure.unreadable }
         guard size <= limit else { throw Failure.tooLarge }
-        var out = try UploadFiles.adopt(target, filename: "Photo-" + UUID().uuidString.prefix(6) + ".jpg", mime: "image/jpeg", move: true)
-        out.sourceFormat = originalTypeName(data)
+        var out = try UploadFiles.adopt(target, filename: name + "-" + UUID().uuidString.prefix(6) + ".jpg", mime: "image/jpeg", move: true)
+        out.sourceFormat = originalTypeName(data) ?? imageType(of: data).flatMap(formatName)
         return out
     }
 
     /// The photo exactly as the iPhone stored it (HEIC stays HEIC, with its metadata), for a Mac that takes originals.
-    /// Over the batch's share of the message it falls back to a full-resolution JPEG sized to fit.
-    static func original(from data: Data, uploadMax: Int, budget: Int, name: String? = nil) throws -> SendAttachment {
-        guard data.count <= min(uploadMax, budget) else { return try fullImage(from: data, uploadMax: uploadMax, budget: budget) }
-        let kind = originalTypeName(data)
-        let (mime, ext): (String, String) = switch kind {
-        case "HEIC": ("image/heic", "heic")
-        case "PNG": ("image/png", "png")
-        case "GIF": ("image/gif", "gif")
-        case "WebP": ("image/webp", "webp")
-        default: ("image/jpeg", "jpg")
+    /// Over the batch's share of the message, or over the bridge's 50 MP, it falls back to a full-resolution JPEG
+    /// sized to fit. The type comes from the bytes (DNG, AVIF, TIFF, BMP keep their own), never guessed as JPEG.
+    static func original(from data: Data, uploadMax: Int, budget: Int, name: String? = nil, prefix: String = "Photo") throws -> SendAttachment {
+        guard data.count <= min(uploadMax, budget) else { return try fullImage(from: data, uploadMax: uploadMax, budget: budget, name: prefix) }
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let type = CGImageSourceGetType(source).flatMap({ UTType($0 as String) }) else { throw Failure.unreadable }
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int, w * h > maxPixels {
+            return try fullImage(from: data, uploadMax: uploadMax, budget: budget, name: prefix)
         }
-        let stem = name.map { ($0 as NSString).deletingPathExtension } ?? ("Photo-" + UUID().uuidString.prefix(6))
+        let mime = type.preferredMIMEType ?? "image/jpeg"
+        let ext = type.preferredFilenameExtension.map { $0 == "jpeg" ? "jpg" : $0 } ?? "jpg"
+        let stem = name.map { ($0 as NSString).deletingPathExtension } ?? (prefix + "-" + UUID().uuidString.prefix(6))
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + ext)
         try data.write(to: tmp, options: .atomic)
         defer { try? FileManager.default.removeItem(at: tmp) }
-        var out = try UploadFiles.adopt(tmp, filename: String(stem.prefix(115)) + "." + ext, mime: mime, move: false)
-        out.sourceFormat = kind
+        var out = try UploadFiles.adopt(tmp, filename: FileImport.capped(stem + "." + ext, scalars: 120), mime: mime, move: false)
+        out.sourceFormat = originalTypeName(data) ?? (type == .jpeg ? nil : formatName(type))
         return out
+    }
+
+    /// The image format ImageIO reads in these bytes or this file, whatever the name says.
+    static func imageType(of data: Data) -> UTType? {
+        CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+            .flatMap(CGImageSourceGetType).flatMap { UTType($0 as String) }
+    }
+
+    static func imageType(at url: URL) -> UTType? {
+        CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+            .flatMap(CGImageSourceGetType).flatMap { UTType($0 as String) }
+    }
+
+    /// "IMG_0042.jpg" holding HEIC bytes becomes "IMG_0042.heic".
+    static func renamed(_ name: String, to type: UTType) -> String {
+        guard var ext = type.preferredFilenameExtension else { return name }
+        if ext == "jpeg" { ext = "jpg" }
+        let current = (name as NSString).pathExtension.lowercased()
+        if current == ext || (type == .jpeg && current == "jpeg") { return name }
+        return FileImport.capped((name as NSString).deletingPathExtension + "." + ext, scalars: 120)
+    }
+
+    /// A short badge name for a format: "DNG", "TIFF", "AVIF". Nil for plain JPEG.
+    static func formatName(_ type: UTType) -> String? {
+        if type == .jpeg { return nil }
+        return (type.preferredFilenameExtension ?? type.localizedDescription)?.uppercased()
     }
 
     static func image(from data: Data) throws -> SendAttachment {
@@ -255,6 +380,21 @@ enum ChatMedia {
         return nil
     }
 
+    /// A picture of an image attachment, whether its bytes ride inline or wait in the upload folder.
+    /// Downsampled, so a 48 MP original never decodes at full size just to be looked at.
+    static func previewImage(_ attachment: SendAttachment, pixels: Int) -> UIImage? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        let source: CGImageSource?
+        if let url = attachment.fileURL {
+            source = CGImageSourceCreateWithURL(url as CFURL, options)
+        } else if let data = Data(base64Encoded: attachment.base64) {
+            source = CGImageSourceCreateWithData(data as CFData, options)
+        } else {
+            source = nil
+        }
+        return source.flatMap { thumbnail($0, pixels: pixels) }.map { UIImage(cgImage: $0) }
+    }
+
     static func thumbnail(_ source: CGImageSource, pixels: Int) -> CGImage? {
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
                                        kCGImageSourceCreateThumbnailWithTransform: true,
@@ -264,8 +404,8 @@ enum ChatMedia {
 
     /// JPEG bytes within the 1 MiB send budget; the uploaded filename matches its bytes.
     static func jpeg(_ image: UIImage, name: String, sourceType: String? = nil, originalName: String? = nil) throws -> SendAttachment {
-        let stem = originalName.map { String(($0 as NSString).deletingPathExtension.prefix(115)) } ?? (name + "-" + UUID().uuidString.prefix(6))
-        let filename = stem + ".jpg"
+        let stem = originalName.map { ($0 as NSString).deletingPathExtension } ?? (name + "-" + UUID().uuidString.prefix(6))
+        let filename = FileImport.capped(stem + ".jpg", scalars: 120)
         for quality in [0.82, 0.62, 0.45, 0.3, 0.18] {
             if let bytes = image.jpegData(compressionQuality: quality), bytes.count <= 1024 * 1024 {
                 return SendAttachment(mime: "image/jpeg", filename: filename,
@@ -277,7 +417,7 @@ enum ChatMedia {
 
     /// The video exactly as recorded (a screen recording, a .mov), as a file for the resumable upload. No
     /// re-encoding: Hermes gets every frame and the audio, and can process it with its own tools.
-    static func original(from url: URL, uploadMax: Int) throws -> SendAttachment {
+    static func original(from url: URL, uploadMax: Int, move: Bool = false) throws -> SendAttachment {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         guard size > 0 else { throw Failure.unreadable }
         guard size <= uploadMax else { throw Failure.tooLarge }
@@ -286,7 +426,7 @@ enum ChatMedia {
             .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: ".")
         let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension.lowercased()
         return try UploadFiles.adopt(url, filename: "Video \(stamp).\(ext)",
-                                     mime: type?.preferredMIMEType ?? "video/quicktime", move: false)
+                                     mime: type?.preferredMIMEType ?? "video/quicktime", move: move)
     }
 
     static func clip(from url: URL, maxBytes: Int, uploadMax: Int? = nil) async throws -> SendAttachment {
@@ -421,7 +561,8 @@ struct AttachmentChip: View {
         case "png": return "PNG"
         case "webp": return "WebP"
         case "heic": return "HEIC"
-        default: return nil
+        case "", "jpg", "jpeg": return nil
+        case let other: return other.uppercased()
         }
     }
 
@@ -445,10 +586,9 @@ struct AttachmentChip: View {
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
         .task(id: attachment) {
             thumbnail = nil
-            guard isImage, let data = Data(base64Encoded: attachment.base64),
-                  let source = CGImageSourceCreateWithData(data as CFData, nil),
-                  let pixel = ChatMedia.thumbnail(source, pixels: 96) else { return }
-            thumbnail = UIImage(cgImage: pixel)
+            guard isImage else { return }
+            let attachment = attachment
+            thumbnail = await Task.detached(priority: .utility) { ChatMedia.previewImage(attachment, pixels: 96) }.value
         }
     }
 
