@@ -789,6 +789,30 @@ final class ChatModel {
 
     /// Loads earlier pages until the pinned message is in the transcript. Returns false when Hermes no
     /// longer has it (compressed or deleted); the pin's own snapshot still shows the text.
+    /// A message Hermes has stored (its id is the messages.id), so a chat can branch from it.
+    func canBranch(from item: ChatItem) -> Bool {
+        sessionId != nil && !isRunning && !branching && (item.kind == .user || item.kind == .assistant) && Int(item.id) != nil
+    }
+    private(set) var branching = false
+
+    /// Branch this chat at a message and open the new chat. Same branch as the desktop's: nested under this
+    /// chat everywhere, titled "<this chat> #2" unless Hermes is told otherwise.
+    func branch(from item: ChatItem) async {
+        guard canBranch(from: item), let sid = sessionId, let message = Int(item.id) else { return }
+        branching = true
+        defer { branching = false }
+        do {
+            let made = try await api.branch(profile: profile, session: sid, message: message)
+            if made.compressed == true, let app {
+                let next = app.chat(for: ChatRef(profile: profile, sessionId: made.sessionId))
+                next.error = "That message was in a part of the chat Hermes had compressed, so the branch starts from its summary."
+            }
+            app?.inboxPath = [ChatRef(profile: profile, sessionId: made.sessionId)]
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
     func reveal(_ pin: MessagePin) async -> Bool { await reveal(itemID: pin.itemID) }
 
     /// Load earlier pages until this stored message is in `items` (a pin, a search hit). False when it isn't in

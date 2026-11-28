@@ -1679,6 +1679,12 @@ struct MessageRow: View {
         if let onPin {
             Button(action: onPin) { Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin") }
         }
+        if let chat, chat.canBranch(from: item) {
+            // A new chat with everything up to here; this one stays as it is.
+            Button { Task { await chat.branch(from: item) } } label: {
+                Label("Branch from Here", systemImage: "arrow.triangle.branch")
+            }
+        }
         ShareLink(item: item.text)
     }
 

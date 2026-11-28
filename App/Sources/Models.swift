@@ -793,8 +793,12 @@ struct BridgeCapabilities: Decodable {
     /// Owner phones may restart Hermes and the bridge (`POST /m/restart`). Older bridges don't send it.
     var canRestart: Bool? = nil
     var restartable: Bool { features.contains("restart_v1") && canRestart == true }
+    /// The owner phone on a bridge with the Add-ons routes.
+    var canManageAddons: Bool? = nil
+    var addons: Bool { features.contains("addons_v1") && canManageAddons == true }
     enum CodingKeys: String, CodingKey {
         case features, deviceID = "device_id", manageDevices = "manage_devices", canRestart = "can_restart"
+        case canManageAddons = "can_manage_addons"
     }
 }
 

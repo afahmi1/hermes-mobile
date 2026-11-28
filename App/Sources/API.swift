@@ -253,6 +253,13 @@ final class API: @unchecked Sendable {
         try JSONDecoder().decode(T.self, from: try await send(try request(path)))
     }
 
+    /// For feature files outside this one (Addons.swift): the same signed GET / POST and error mapping.
+    func getJSON<T: Decodable>(_ path: String, as type: T.Type) async throws -> T { try await get(path, as: type) }
+    func postJSON<T: Decodable>(_ path: String, body: [String: Any], as type: T.Type) async throws -> T {
+        try JSONDecoder().decode(T.self, from: try await send(try request(path, method: "POST", body: body)))
+    }
+    static func escapePath(_ s: String) -> String { esc(s) }
+
     private func json(_ path: String, method: String, body: Any?) async throws -> [String: Any] {
         let data = try await send(try request(path, method: method, body: body))
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
@@ -678,6 +685,23 @@ final class API: @unchecked Sendable {
         parts.percentEncodedQuery = parts.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         guard let rel = parts.string else { throw APIError.badResponse }
         return try await send(try request(rel))
+    }
+
+    struct BranchResult: Decodable {
+        let sessionId: String
+        let title: String?
+        let copiedMessages: Int?
+        /// The message was in a part Hermes had compressed: the branch starts from that part's summary.
+        var compressed: Bool? = nil
+        enum CodingKeys: String, CodingKey { case title, compressed; case sessionId = "session_id"; case copiedMessages = "copied_messages" }
+    }
+
+    /// Hermes's own branch: a new chat with this one's history through `message` (a stored messages.id).
+    func branch(profile: String, session: String, message: Int, title: String? = nil) async throws -> BranchResult {
+        var body: [String: Any] = ["message_id": message]
+        if let title, !title.isEmpty { body["title"] = title }
+        let data = try await send(try request("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/branch", method: "POST", body: body))
+        return try JSONDecoder().decode(BranchResult.self, from: data)
     }
 
     /// Every message in a chat containing `query`, oldest first (the whole history, not just loaded pages).

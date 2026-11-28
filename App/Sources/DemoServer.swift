@@ -87,6 +87,20 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", let p) where p.count == 3 && p[0] == "chat" && p[2] == "media-capabilities":
             body = ["images": true, "files": true, "video": false, "max_file_bytes": 31_457_280, "max_video_bytes": 8_388_608]
         case ("GET", let p) where p.count == 4 && p[0] == "chat" && p[3] == "queue": body = ["pending": [Any](), "paused": false]
+        case ("GET", ["addons", "catalog"]):
+            body = DemoFixtures.addons(kind: q("kind") ?? "skills", query: q("q") ?? "")
+        case ("GET", ["addons", "detail"]):
+            let item = (DemoFixtures.addons(kind: q("kind") ?? "skills", query: "")["items"] as? [[String: Any]] ?? [])
+                .first { $0["id"] as? String == q("id") } ?? [:]
+            body = ["item": item, "readme": "# \(item["name"] ?? "Skill")\n\nWhat it does, when Hermes loads it, and the steps it follows.",
+                    "files": ["SKILL.md", "references/checklist.md"], "env": q("kind") == "mcp"
+                        ? [["name": "LINEAR_API_KEY", "description": "From Linear settings → API", "secret": true, "required": true]] : [],
+                    "capabilities": q("kind") == "plugins" ? ["Run shell commands", "Read files in your projects"] : [],
+                    "suggest": q("kind") == "mcp" ? ["What's assigned to me this week?"] : []]
+        case ("GET", ["addons", "scan"]):
+            body = ["verdict": "caution", "policy": "ask", "reason": "Runs shell commands in its examples.",
+                    "severity_counts": ["medium": 1, "low": 2], "scan_id": "scan_demo",
+                    "findings": [["severity": "medium", "title": "Shell command in an example", "file": "SKILL.md"]]]
         case ("GET", let p) where p.count == 4 && p[0] == "chat" && p[3] == "search":
             // Find in chat over the fixture transcript, shaped like the bridge's answer.
             let needle = (q("q") ?? "").lowercased()
@@ -112,7 +126,8 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", ["manage", "archived"]): body = ["projects": [Any](), "bots": [Any]()]
         case ("GET", ["manage", "pin"]): body = ["configured": true]
         case ("GET", ["capabilities"]):
-            body = ["features": ["device_grants", "restart_v1", "auto_projects_v1"], "device_id": "dev_demo", "manage_devices": true, "can_restart": true]
+            body = ["features": ["device_grants", "restart_v1", "auto_projects_v1", "addons_v1"], "device_id": "dev_demo",
+                    "manage_devices": true, "can_restart": true, "can_manage_addons": true]
         case ("POST", ["autoprojects", "from-chat"]):
             body = ["id": "apj_demo", "state": "queued", "result": NSNull()]
         case ("GET", ["autoprojects", "jobs", "apj_demo"]):
@@ -191,6 +206,33 @@ final class DemoURLProtocol: URLProtocol {
 
 /// Fixture payloads in the bridge's wire shapes. Times are relative to now, so the screenshots read fresh.
 enum DemoFixtures {
+    static func addons(kind: String, query: String) -> [String: Any] {
+        func item(_ id: String, _ name: String, _ desc: String, _ source: String, _ trust: String, installed: Bool = false,
+                  update: Bool = false, enabled: Bool? = nil, setup: Bool = false) -> [String: Any] {
+            ["id": id, "name": name, "description": desc, "source": source, "trust": trust, "repo": "hermes-agent/" + id,
+             "tags": [], "installed": installed, "enabled": enabled as Any, "update_available": update, "needs_setup": setup,
+             "version": "1.2.0"]
+        }
+        let all: [[String: Any]]
+        switch kind {
+        case "plugins":
+            all = [item("voice-notes", "Voice notes", "Transcribe and summarise voice memos", "curated", "curated", installed: true, enabled: true),
+                   item("browser-pilot", "Browser pilot", "Drive a real browser for research and forms", "curated", "curated"),
+                   item("calendar", "Calendar", "Read and plan around your calendar", "curated", "curated", installed: true, update: true, enabled: true)]
+        case "mcp":
+            all = [item("linear", "Linear", "Issues, projects and cycles", "curated", "curated", installed: true, enabled: true, setup: true),
+                   item("github", "GitHub", "Repos, PRs and issues", "curated", "curated"),
+                   item("notion", "Notion", "Pages and databases", "curated", "curated")]
+        default:
+            all = [item("pdf-wizard", "PDF wizard", "Fill, split and OCR PDFs", "official", "builtin", installed: true),
+                   item("arxiv-digest", "arXiv digest", "Daily papers in your fields, summarised", "official", "trusted"),
+                   item("3d-print-check", "3D print check", "Pre-flight checks for Bambu plates", "github", "community"),
+                   item("design-critic", "Design critic", "Harsh, useful UI critique", "clawhub", "community", installed: true, update: true)]
+        }
+        let items = query.isEmpty ? all : all.filter { (($0["name"] as? String) ?? "").localizedCaseInsensitiveContains(query) }
+        return ["kind": kind, "items": items, "featured": ["arxiv-digest"], "timed_out": [], "note": NSNull()]
+    }
+
     private static var now: Double { Date().timeIntervalSince1970 }
     private static func iso(_ offset: TimeInterval) -> String {
         ISO8601DateFormatter().string(from: Date().addingTimeInterval(offset))
