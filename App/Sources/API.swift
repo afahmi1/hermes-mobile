@@ -680,6 +680,14 @@ final class API: @unchecked Sendable {
         return try await send(try request(rel))
     }
 
+    /// Every message in a chat containing `query`, oldest first (the whole history, not just loaded pages).
+    func searchChat(profile: String, session: String, query: String) async throws -> ChatSearchResult {
+        var parts = URLComponents()
+        parts.queryItems = [URLQueryItem(name: "q", value: query)]
+        let qs = parts.percentEncodedQuery ?? ""
+        return try await get("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/search?\(qs)", as: ChatSearchResult.self)
+    }
+
     func chatMedia(profile: String, session: String, digest: String) async throws -> Data {
         try await send(try request("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/media/\(Self.esc(digest))"))
     }

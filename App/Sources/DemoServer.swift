@@ -87,6 +87,18 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", let p) where p.count == 3 && p[0] == "chat" && p[2] == "media-capabilities":
             body = ["images": true, "files": true, "video": false, "max_file_bytes": 31_457_280, "max_video_bytes": 8_388_608]
         case ("GET", let p) where p.count == 4 && p[0] == "chat" && p[3] == "queue": body = ["pending": [Any](), "paused": false]
+        case ("GET", let p) where p.count == 4 && p[0] == "chat" && p[3] == "search":
+            // Find in chat over the fixture transcript, shaped like the bridge's answer.
+            let needle = (q("q") ?? "").lowercased()
+            let hits: [[String: Any]] = DemoFixtures.transcript(session: p[2]).compactMap { row in
+                guard let role = row["role"] as? String, role == "user" || role == "assistant",
+                      let text = row["content"] as? String, needle.count >= 2,
+                      let r = text.lowercased().range(of: needle) else { return nil }
+                return ["message_id": row["id"] ?? 0, "role": role, "timestamp": row["timestamp"] ?? 0, "snippet": text,
+                        "offset": text.lowercased().distance(from: text.lowercased().startIndex, to: r.lowerBound),
+                        "length": needle.count]
+            }
+            body = ["query": needle, "results": hits, "total": hits.count, "truncated": false]
         case ("GET", let p) where p.count == 3 && p[0] == "pins":
             body = ["pins": p[2] == DemoMode.chatID ? DemoFixtures.pins : [], "limit": 50]
         case ("GET", ["turns"]):

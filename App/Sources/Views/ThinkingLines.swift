@@ -12,6 +12,43 @@ enum ThinkingWords: String, CaseIterable, Identifiable {
 
 enum ThinkingLines {
     static let all: [String] = [
+        "signal found in the static",
+        "memory is compressed time",
+        "something is watching back",
+        "pattern detected. ignored",
+        "the void has good posture",
+        "the machine is being dramatic",
+        "the room is thinking again",
+        "the silence has structure",
+        "someone alphabetized the dread",
+        "the static is doing paperwork",
+        "minor prophecy, major attitude",
+        "catastrophic success, loading",
+        "the void left a voicemail",
+        "trajectory bold. physics mad",
+        "the omen was mostly decorative",
+        "between the known and the knowing",
+        "warming up the vacuum tubes",
+        "good things load slowly",
+        "the scenic route, obviously",
+        "blame the cosmic rays",
+        "every byte earning its seat",
+        "the slugs insist on this pace",
+        "asking the archive nicely",
+        "the logs are whispering again",
+        "borrowing a thought from tomorrow",
+        "one moment. the stars are aligning",
+        "the gremlins are cooperating, for now",
+        "reading the room. the room is a server",
+        "negotiating with the latency",
+        "the fish is thinking. let him cook",
+        "quietly overachieving",
+        "consulting three timelines",
+        "the answer is on its way back from orbit",
+        "polishing the obvious",
+        "rehearsing the reply in a mirror",
+        "herding electrons",
+        "doing math in the dark",
         "noodling in the dark",
         "asking the void politely",
         "counting stars that already died",
@@ -125,26 +162,44 @@ struct ThinkingStatus: View {
         let preview = self.preview
         Button { showThinking = true } label: {
             VStack(alignment: .leading, spacing: 4) {
+                // One line, always: the sprite keeps its size, the phrase rolls in like a ticker (the old one leaves
+                // upward before the new one is read, so two never overlap), and the status tag gives way first.
                 HStack(spacing: 8) {
                     ThinkingIndicator(size: 16, activity: status)
+                        .fixedSize()
+                        .layoutPriority(3)
                     if playful {
                         TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                            ShimmerText(text: ThinkingLines.line(tick: chat.activityTick, at: ctx.date, seed: seed))
-                                .id(ThinkingLines.line(tick: chat.activityTick, at: ctx.date, seed: seed))
-                                .transition(.opacity)
+                            let line = ThinkingLines.line(tick: chat.activityTick, at: ctx.date, seed: seed)
+                            ZStack(alignment: .leading) {
+                                ShimmerText(text: line)
+                                    .lineLimit(1).truncationMode(.tail)
+                                    .id(line)
+                                    .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity),
+                                                            removal: .move(edge: .top).combined(with: .opacity)))
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .clipped()
+                            .animation(.easeInOut(duration: 0.35), value: line)
                         }
+                        .layoutPriority(2)
                         if specific {
                             Text(status.replacingOccurrences(of: "…", with: "").lowercased())
-                                .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary).lineLimit(1)
+                                .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
+                                .lineLimit(1).truncationMode(.tail)
+                                .frame(maxWidth: 150, alignment: .trailing)
+                                .layoutPriority(1)
+                                .contentTransition(.opacity)
                         }
                     } else {
-                        ShimmerText(text: status)
+                        ShimmerText(text: status).lineLimit(1).truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    Spacer(minLength: 0)
                     if !chat.thinkingText.isEmpty {
-                        Image(systemName: "brain").font(.caption).foregroundStyle(.tertiary)
+                        Image(systemName: "brain").font(.caption).foregroundStyle(.tertiary).fixedSize()
                     }
                 }
+                .frame(minHeight: 22)
                 if !preview.isEmpty {
                     Text(preview)
                         .font(.caption).foregroundStyle(.tertiary).lineLimit(3)
@@ -154,7 +209,6 @@ struct ThinkingStatus: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .animation(.easeInOut(duration: 0.35), value: chat.activityTick)
         .accessibilityHint("Shows Hermes's thinking")
         .sheet(isPresented: $showThinking) { ThinkingSheet(chat: chat) }
     }

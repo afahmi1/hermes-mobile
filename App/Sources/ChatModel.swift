@@ -789,9 +789,13 @@ final class ChatModel {
 
     /// Loads earlier pages until the pinned message is in the transcript. Returns false when Hermes no
     /// longer has it (compressed or deleted); the pin's own snapshot still shows the text.
-    func reveal(_ pin: MessagePin) async -> Bool {
+    func reveal(_ pin: MessagePin) async -> Bool { await reveal(itemID: pin.itemID) }
+
+    /// Load earlier pages until this stored message is in `items` (a pin, a search hit). False when it isn't in
+    /// the chat's history any more.
+    func reveal(itemID: String) async -> Bool {
         var pages = 0
-        while !items.contains(where: { $0.id == pin.itemID }) {
+        while !items.contains(where: { $0.id == itemID }) {
             guard hasOlder, pages < 40 else { return false }
             let before = stored.count
             await loadOlder()
@@ -1602,7 +1606,12 @@ final class ChatModel {
                     self.error = "Couldn't reach your Mac to move it. Try again in a moment."
                     return
                 }
-                update(id) { $0.mode = "steer"; $0.note = nil; $0.admission = nil; $0.attempts = 0 }
+                // A fresh submission id: Hermes keys repeats by it, so the old id would be answered with the
+                // admission just cancelled (and the message silently dropped) if the guide is refused and it
+                // falls back to the queue. 2026-11-28: two phone messages, one with a photo, were lost exactly so.
+                let fresh = UUID()
+                update(id) { $0.id = fresh; $0.mode = "steer"; $0.note = nil; $0.admission = nil; $0.attempts = 0 }
+                SentPreviews.rekey(from: id.uuidString, to: fresh.uuidString)
                 await persistOutgoing()
                 await pump()
                 return
