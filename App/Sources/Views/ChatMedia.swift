@@ -21,19 +21,23 @@ enum MediaImport {
     /// The photo's bytes. `Data` is the native transferable for library assets: the system picks
     /// the asset's real representation and downloads the iCloud original when needed, instead of
     /// negotiating a generic file representation that large or not-yet-local items fail to provide.
+    /// Tries three times: a photo kept only in iCloud ("Optimize iPhone Storage") often fails its first download.
     static func imageData(from item: PhotosPickerItem) async throws -> Data {
-        do {
-            guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
-                throw ChatMedia.Failure.downloadFailed
+        var lastError: Error = ChatMedia.Failure.downloadFailed
+        for attempt in 0..<3 {
+            do {
+                if attempt > 0 { try await Task.sleep(for: .milliseconds(600 * attempt)) }
+                guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                    throw ChatMedia.Failure.downloadFailed
+                }
+                return data
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
             }
-            return data
-        } catch let failure as ChatMedia.Failure {
-            throw failure
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw ChatMedia.Failure.downloadFailed
         }
+        throw (lastError as? ChatMedia.Failure) ?? ChatMedia.Failure.downloadFailed
     }
 
     static func videoFile(from item: PhotosPickerItem) async throws -> URL {
@@ -73,12 +77,18 @@ enum FileImport {
     /// other regular file rides as its original bytes and MIME type.
     /// `uploadMax`: the bridge takes big files through resumable uploads, up to this size. Anything over the
     /// inline limit is then kept as a file on the phone and uploaded in chunks, never read into memory.
-    static func attachment(from url: URL, maxBytes: Int, uploadMax: Int? = nil) throws -> SendAttachment {
+    static func attachment(from url: URL, maxBytes: Int, uploadMax: Int? = nil, originals: Bool = false) throws -> SendAttachment {
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentTypeKey])
         guard values.isRegularFile == true else { throw Failure.unreadable }
         let size = values.fileSize ?? 0
         guard size > 0 else { throw Failure.empty }
         let type = values.contentType ?? UTType(filenameExtension: url.pathExtension)
+        // A Mac that takes originals gets every file as it is, images included: no conversion, no size cap but its own.
+        if originals, let uploadMax {
+            guard size <= uploadMax else { throw Failure.tooLarge(uploadMax) }
+            return try UploadFiles.adopt(url, filename: try safeName(url),
+                                         mime: type?.preferredMIMEType ?? "application/octet-stream", move: false)
+        }
         if let uploadMax, size > UploadFiles.inlineLimit, !(type?.conforms(to: .image) ?? false) {
             guard size <= uploadMax else { throw Failure.tooLarge(uploadMax) }
             return try UploadFiles.adopt(url, filename: try safeName(url),
@@ -122,7 +132,12 @@ enum FileImport {
 
 /// Shared by all import sources and the final Send check, including drafts restored from disk.
 enum AttachmentSelection {
-    static func issue(_ assets: [SendAttachment], fileLimit: Int, videoLimit: Int, uploadLimit: Int? = nil) -> String? {
+    static func issue(_ assets: [SendAttachment], fileLimit: Int, videoLimit: Int, uploadLimit: Int? = nil,
+                      messageLimit: Int? = nil) -> String? {
+        if let messageLimit, assets.reduce(0, { $0 + $1.byteCount }) > messageLimit {
+            let limit = ByteCountFormatter.string(fromByteCount: Int64(messageLimit), countStyle: .file)
+            return "These attachments are over the \(limit) your Mac takes in one message. Send them in two messages."
+        }
         if assets.count > ChatMedia.maxAttachments { return "Choose up to \(ChatMedia.maxAttachments) attachments for one message." }
         let hasVideo = assets.contains { $0.mime == "video/mp4" }
         if hasVideo && assets.count != 1 { return "Send a video on its own, or choose still frames." }
@@ -159,6 +174,64 @@ enum ChatMedia {
 
     /// Decode the picked photo's bytes: PNG screenshots, HEIC camera originals and animated GIFs
     /// (first frame) all pass through ImageIO, whatever the library hands over.
+    /// A photo at its full resolution, for the Mac's resumable upload: decoded once, turned upright, saved as a
+    /// high-quality JPEG (models can't read HEIC) into the upload folder. Location and camera metadata are not
+    /// copied. Nothing is downscaled; Hermes shrinks a copy itself if a model needs it.
+    /// `budget` is this photo's share of the message: full resolution first, stepping JPEG quality down, then the
+    /// size (6000, 4032, 3024, 2048 px) until it fits. A photo sent smaller always beats a photo left out.
+    static let maxPixels = 50_000_000  // matches the bridge (bridge_media.MAX_PIXELS)
+
+    static func fullImage(from data: Data, uploadMax: Int, budget: Int = .max) throws -> SendAttachment {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int
+        else { throw Failure.unreadable }
+        let limit = min(uploadMax, budget)
+        let full = max(w, h)
+        let fit = w * h > maxPixels ? Int(Double(full) * (Double(maxPixels) / Double(w * h)).squareRoot()) : full
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".jpg")
+        defer { try? FileManager.default.removeItem(at: target) }
+        var size = 0
+        search: for edge in [fit, 6000, 4032, 3024, 2048] where edge <= fit {
+            guard let upright = thumbnail(source, pixels: edge) else { throw Failure.unreadable }
+            for quality in [0.92, 0.85, 0.75, 0.65] {
+                guard let dest = CGImageDestinationCreateWithURL(target as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+                else { throw Failure.unreadable }
+                CGImageDestinationAddImage(dest, upright, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+                guard CGImageDestinationFinalize(dest) else { throw Failure.unreadable }
+                // Read from disk every time: URL caches resource values, so a re-check would see the first size.
+                size = ((try? FileManager.default.attributesOfItem(atPath: target.path))?[.size] as? NSNumber)?.intValue ?? 0
+                if size > 0 && size <= limit { break search }
+            }
+        }
+        guard size > 0 else { throw Failure.unreadable }
+        guard size <= limit else { throw Failure.tooLarge }
+        var out = try UploadFiles.adopt(target, filename: "Photo-" + UUID().uuidString.prefix(6) + ".jpg", mime: "image/jpeg", move: true)
+        out.sourceFormat = originalTypeName(data)
+        return out
+    }
+
+    /// The photo exactly as the iPhone stored it (HEIC stays HEIC, with its metadata), for a Mac that takes originals.
+    /// Over the batch's share of the message it falls back to a full-resolution JPEG sized to fit.
+    static func original(from data: Data, uploadMax: Int, budget: Int, name: String? = nil) throws -> SendAttachment {
+        guard data.count <= min(uploadMax, budget) else { return try fullImage(from: data, uploadMax: uploadMax, budget: budget) }
+        let kind = originalTypeName(data)
+        let (mime, ext): (String, String) = switch kind {
+        case "HEIC": ("image/heic", "heic")
+        case "PNG": ("image/png", "png")
+        case "GIF": ("image/gif", "gif")
+        case "WebP": ("image/webp", "webp")
+        default: ("image/jpeg", "jpg")
+        }
+        let stem = name.map { ($0 as NSString).deletingPathExtension } ?? ("Photo-" + UUID().uuidString.prefix(6))
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + ext)
+        try data.write(to: tmp, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        var out = try UploadFiles.adopt(tmp, filename: String(stem.prefix(115)) + "." + ext, mime: mime, move: false)
+        out.sourceFormat = kind
+        return out
+    }
+
     static func image(from data: Data) throws -> SendAttachment {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let thumbnail = thumbnail(source, pixels: 2048) else { throw Failure.unreadable }

@@ -2795,7 +2795,12 @@ class H(BaseHTTPRequestHandler):
                                        "max_video_bytes": turns.bridge_media.MAX_BYTES,
                                        "max_file_bytes": turns.bridge_media.MAX_BYTES,
                                        # Big files go through resumable uploads (bridge_uploads), up to this each.
-                                       "max_upload_bytes": bridge_uploads.MAX_BYTES})
+                                       "max_upload_bytes": bridge_uploads.MAX_BYTES,
+                                       # Hermes's cap on all media in one message: the phone sizes photo batches to fit.
+                                       "max_message_bytes": turns.bridge_media.message_limit(),
+                                       # Photos and files arrive as their original type (HEIC stays HEIC); the Mac
+                                       # makes a JPEG copy only for the model to look at.
+                                       "original_images": True})
             m = re.match(r"^/m/chat/([^/]+)/(new|[^/]+/(?:send|send-once|send-receipt|runtime))$", path)
             if not m or self.command != "POST":
                 return self.send(404, {"error": "not found"})

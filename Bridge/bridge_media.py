@@ -33,6 +33,56 @@ MAX_BYTES = _max_bytes()
 JPEG = "image/jpeg"
 MP4 = "video/mp4"
 MAX_ITEMS = 20  # twice a Telegram album
+# The largest photo accepted, in pixels. An iPhone's 48 MP mode is 8064 x 6048 (48.8 MP); its default 12 MP
+# photo (4032 x 3024) is 12.19 MP, which the old 12,000,000 cap refused outright.
+MAX_PIXELS = 50_000_000
+
+
+def native_image_limit():
+    """How many images Hermes takes as native attachments in one message (gateway/session_ingress_media.py,
+    10 in Hermes 0.23). Past it, Hermes refuses the WHOLE message as invalid_params, so the rest go by path."""
+    try:
+        from gateway.session_ingress_media import _ATTACHMENT_LIMIT
+        return max(1, int(_ATTACHMENT_LIMIT))
+    except Exception:
+        return 10
+
+
+def message_limit():
+    """Hermes's own cap on all media in one message (gateway.max_inbound_media_bytes, 128 MB by default).
+    The phone sizes a photo batch to fit it instead of having the whole message refused."""
+    try:
+        from gateway.platforms.base import get_inbound_media_max_bytes
+        return max(0, int(get_inbound_media_max_bytes()))
+    except Exception:
+        return 128 * 1024 * 1024
+
+
+def _check_jpeg(source):
+    """A real JPEG within MAX_PIXELS. verify() parses every marker without decoding the pixels, so fifteen
+    48 MP photos don't need 2 GB of memory to admit."""
+    from PIL import Image
+    try:
+        with Image.open(source, formats=("JPEG",)) as image:
+            if image.width * image.height > MAX_PIXELS:
+                raise ValueError
+            image.verify()
+        # verify() checks the structure, not the pixel data: a photo cut off mid-scan still passes. A complete JPEG
+        # ends with the end-of-image marker (some cameras pad a few bytes after it).
+        if hasattr(source, "seek"):
+            source.seek(0, 2)
+            end = source.tell()
+            source.seek(max(0, end - 64))
+            tail = source.read()
+        else:
+            with open(source, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 64))
+                tail = f.read()
+        if b"\xff\xd9" not in tail:
+            raise ValueError
+    except (ValueError, OSError, SyntaxError, Image.DecompressionBombError):
+        raise MediaError("An image is damaged, is larger than %d megapixels, or is not a JPEG." % (MAX_PIXELS // 1_000_000)) from None
 MIME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}$")
 EXT = re.compile(r"^[A-Za-z0-9]{1,10}$")
 
@@ -51,7 +101,32 @@ def valid_name(name):
 
 
 def valid_mime(mime):
-    return isinstance(mime, str) and bool(MIME.match(mime)) and not (mime.startswith("image/") and mime != JPEG)
+    # Any real media type, images included: an iPhone photo is HEIC, and it should arrive as HEIC.
+    return isinstance(mime, str) and bool(MIME.match(mime))
+
+
+def _open_any_image(source):
+    """Pillow with HEIC/HEIF support when pillow-heif is installed (it ships with Hermes)."""
+    from PIL import Image
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+    return Image.open(source)
+
+
+def _check_other_image(source):
+    """A non-JPEG image is kept as its original file, so it only has to be within MAX_PIXELS when it can be read.
+    An image Pillow can't parse (a format it doesn't know) still goes through as a plain file."""
+    from PIL import Image
+    try:
+        with _open_any_image(source) as image:
+            pixels = image.width * image.height
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        return
+    if pixels > MAX_PIXELS:
+        raise MediaError("An image is larger than %d megapixels." % (MAX_PIXELS // 1_000_000))
 
 
 def _uploaded(item):
@@ -228,21 +303,16 @@ def decode(items):
             elif mime == JPEG:
                 if not supported():
                     raise MediaError("This Hermes installation does not support native image attachments.")
-                from PIL import Image
-                try:
-                    with Image.open(path, formats=("JPEG",)) as image:
-                        if image.width * image.height > 12_000_000:
-                            raise ValueError
-                        image.load()
-                except (ValueError, OSError, Image.DecompressionBombError):
-                    raise MediaError("An image is damaged, is too large, or is not a JPEG.") from None
+                _check_jpeg(path)
+            elif mime.startswith("image/"):
+                _check_other_image(path)
             frames.append((name, digest, path, mime))
             continue
         if not isinstance(item, dict) or set(item) != {"filename", "mime", "base64"}:
             raise MediaError("Invalid attachment fields.")
         name, encoded, mime = item["filename"], item["base64"], item["mime"]
-        if not isinstance(mime, str) or not MIME.match(mime) or mime.startswith("image/") and mime != JPEG:
-            raise MediaError("Attach images as JPEG and other files with a valid media type.")
+        if not isinstance(mime, str) or not MIME.match(mime):
+            raise MediaError("Attach files with a valid media type.")
         if mime == MP4 and len(items) != 1:
             raise MediaError("Attach one MP4 clip, or up to %d other files." % MAX_ITEMS)
         if (not isinstance(name, str) or not 0 < len(name) <= 140 or not name.isprintable()
@@ -264,14 +334,9 @@ def decode(items):
         elif mime == JPEG:
             if not supported():
                 raise MediaError("This Hermes installation does not support native image attachments.")
-            from PIL import Image
-            try:
-                with Image.open(BytesIO(raw), formats=("JPEG",)) as image:
-                    if image.width * image.height > 12_000_000:
-                        raise ValueError
-                    image.load()
-            except (ValueError, OSError, Image.DecompressionBombError):
-                raise MediaError("An image is damaged, is too large, or is not a JPEG.") from None
+            _check_jpeg(BytesIO(raw))
+        elif mime.startswith("image/"):
+            _check_other_image(BytesIO(raw))
         remaining -= len(raw)
         frames.append((name, hashlib.sha256(raw).hexdigest(), raw, mime))
     return frames
@@ -348,6 +413,34 @@ def prune_clips(home):
     prune(home)
 
 
+def _jpeg_copy(source, directory):
+    """A full-resolution JPEG copy of a HEIC/PNG/WebP/... photo, only so a model can look at it (models read JPEG).
+    Pillow first (with pillow-heif), macOS's own `sips` as a fallback. None if neither can read it."""
+    import uuid
+    target = Path(directory) / ("hm_send_%s.jpg" % uuid.uuid4().hex[:12])
+    try:
+        from PIL import ImageOps
+        with _open_any_image(source) as image:
+            ImageOps.exif_transpose(image).convert("RGB").save(target, "JPEG", quality=92)
+    except Exception:
+        target.unlink(missing_ok=True)
+        import shutil
+        import subprocess
+        if not shutil.which("sips"):
+            return None
+        try:
+            subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "92", str(source), "--out", str(target)],
+                           check=True, capture_output=True, timeout=120)
+        except Exception:
+            target.unlink(missing_ok=True)
+            return None
+    if not target.exists() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
+        return None
+    target.chmod(0o600)
+    return target
+
+
 def stage(frames, home):
     paths = []
     try:
@@ -369,12 +462,26 @@ def stage(frames, home):
                     shutil.copyfile(raw, target)
                 target.chmod(0o600)
                 paths.append({"path": str(target), "mime": mime, "name": name, "size": target.stat().st_size})
-                continue
-            with tempfile.NamedTemporaryFile(prefix="hm_send_", suffix=ext, dir=directory, delete=False) as f:
-                paths.append({"path": f.name, "mime": mime, "name": name, "size": len(raw)})
-                f.write(raw)
-                f.flush()
-                os.fsync(f.fileno())
+            else:
+                with tempfile.NamedTemporaryFile(prefix="hm_send_", suffix=ext, dir=directory, delete=False) as f:
+                    paths.append({"path": f.name, "mime": mime, "name": name, "size": len(raw)})
+                    f.write(raw)
+                    f.flush()
+                    os.fsync(f.fileno())
+            if mime.startswith("image/") and mime != JPEG:
+                # The original stays as sent; the model gets a JPEG copy it can actually see.
+                copy = _jpeg_copy(paths[-1]["path"], _image_dir(home))
+                if copy is not None:
+                    paths[-1]["jpeg_copy"] = str(copy)
+                    paths.append({"path": str(copy), "mime": JPEG, "name": name, "size": copy.stat().st_size,
+                                  "copy_of": paths[-1]["path"]})
+        # The first images ride natively (the model sees them at once); the rest are named by path in the
+        # message, so a 15-photo send arrives whole instead of being refused for having more than 10.
+        room = native_image_limit()
+        for item in paths:
+            if item["mime"] == JPEG:
+                item["native"] = room > 0
+                room -= 1
         return paths
     except BaseException:
         discard(paths)

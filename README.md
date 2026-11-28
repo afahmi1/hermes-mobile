@@ -208,8 +208,25 @@ on the phone appear in the desktop app's Recents.
 
 The composer's **+** menu accepts photos, the camera, video clips, and **Choose file** for anything else: an MP3, a PDF, a
 text file or an archive. Files keep their original bytes and media type; the bridge stages them privately and gives the
-agent the local path, so Hermes decides which tool reads them. Attachments share a 4 MiB total budget per message by
-default (`HERMES_MOBILE_MEDIA_MAX_BYTES`, up to 8 MiB). A single video from Files opens the same clip-or-frames review as a video from Photos.
+agent the local path, so Hermes decides which tool reads them.
+
+**Photos and files arrive as they are.** Any file type goes, and an iPhone photo arrives as its own HEIC, full size,
+uploaded in 1 MiB chunks that resume after a dropped connection and are verified by SHA-256 on arrival. Models can't read
+HEIC, so the Mac also makes a full-resolution JPEG copy for the model to look at, and tells Hermes where the original is.
+Hermes takes at most 10 images per message as native attachments (more makes it refuse the whole message), so the first
+10 ride natively and the rest are handed over by path for Hermes's vision tool: all of them arrive. Up to 20 per message.
+Photos kept only in iCloud are downloaded first (three tries), and if any still can't be read the chat says how many
+(*Added 13 of 15 photos. 2 couldn't be loaded.*) instead of dropping them quietly.
+
+| Limit | Default | Set by |
+|---|---|---|
+| All media in one message | 128 MB | Hermes, `gateway.max_inbound_media_bytes` in `config.yaml`. The phone reads it and lowers JPEG quality first, then size, so a big batch fits instead of being refused. |
+| One uploaded file | 2 GB | `HERMES_MOBILE_UPLOAD_MAX_BYTES` on the bridge |
+| One photo | 50 MP | The bridge (an iPhone's 48 MP mode is 48.8 MP) |
+| Native images per message | 10 | Hermes (`gateway/session_ingress_media.py`); the rest go by path |
+| Small files sent inline | 50 MB per message | `HERMES_MOBILE_MEDIA_MAX_BYTES` on the bridge (256 KiB to 128 MiB) |
+
+Against an older bridge the phone falls back: full-resolution JPEGs if the bridge has resumable uploads, otherwise photos at 2048 px, about 1 MB each.
 
 What you attach comes back as something you can open, from either side. Photos and files sent from the phone show under the name you picked, images dropped into the desktop composer show on the phone, a long paste opens from its **Pasted N lines** message, and a voice note keeps its words and plays. Files are served from your Hermes home and the desktop app's composer folders only; one that's since been deleted leaves its name (📎 plan.pdf). Tool runs open into what they did: the skill that loaded, the command, the delegate's goal, and a failed delegate reads as failed. A background task that is still going shows **Will resume when N background tasks finish**.
 

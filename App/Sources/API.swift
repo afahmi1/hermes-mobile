@@ -10,11 +10,17 @@ struct MediaCapabilities: Decodable {
     let maxFileBytes: Int
     /// The bridge takes big files through resumable uploads, up to this size each.
     var maxUploadBytes: Int? = nil
+    /// Hermes's cap on all media in one message (newer bridges). 128 MB is Hermes's default.
+    var maxMessageBytes: Int = 128 * 1024 * 1024
+    /// The Mac takes photos as their original files (HEIC, PNG, ...), not only JPEG.
+    var originalImages = false
     enum CodingKeys: String, CodingKey {
         case images, files, video
         case maxVideoBytes = "max_video_bytes"
         case maxFileBytes = "max_file_bytes"
         case maxUploadBytes = "max_upload_bytes"
+        case maxMessageBytes = "max_message_bytes"
+        case originalImages = "original_images"
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -25,6 +31,9 @@ struct MediaCapabilities: Decodable {
         maxVideoBytes = try c.decodeIfPresent(Int.self, forKey: .maxVideoBytes) ?? 4 * 1024 * 1024
         maxFileBytes = try c.decodeIfPresent(Int.self, forKey: .maxFileBytes) ?? maxVideoBytes
         maxUploadBytes = try c.decodeIfPresent(Int.self, forKey: .maxUploadBytes)
+        let message = try c.decodeIfPresent(Int.self, forKey: .maxMessageBytes) ?? 0
+        if message > 0 { maxMessageBytes = message }
+        originalImages = try c.decodeIfPresent(Bool.self, forKey: .originalImages) ?? false
     }
 }
 

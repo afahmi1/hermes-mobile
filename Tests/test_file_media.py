@@ -54,8 +54,8 @@ class FileAttachmentTests(unittest.TestCase):
             self.assertEqual(bridge_media.decode([self.item(name, mime)])[0][3], mime)
 
     def test_invalid_types_names_and_oversized_files_are_refused(self):
-        with self.assertRaises(bridge_media.MediaError):
-            bridge_media.decode([self.item(mime="image/webp")])
+        # Any real image type is accepted now (an iPhone photo is HEIC); it's staged as itself.
+        self.assertEqual(len(bridge_media.decode([self.item("pic.webp", mime="image/webp")])), 1)
         with self.assertRaises(bridge_media.MediaError):
             bridge_media.decode([self.item(mime="not a mime")])
         with self.assertRaises(bridge_media.MediaError):
