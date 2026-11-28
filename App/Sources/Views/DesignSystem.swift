@@ -477,8 +477,80 @@ struct HMDepthField: View {
 /// primary and send buttons, selected chips and the Color orb (accent tint), plus bot avatars (their own fill).
 /// Neutral cards and the canvas don't glow. Never on text or inside another glow.
 enum HMGlow {
-    static let opacity = 0.25
-    static let radius: CGFloat = 20
+    /// Two layers, like a light source under water: a tight core that defines the edge, and a wide bloom.
+    /// One 25% shadow (the old halo) disappeared on black, especially behind pale accents like Silver.
+    static let coreOpacity = 0.55
+    static let coreRadius: CGFloat = 5
+    static let bloomOpacity = 0.38
+    static let bloomRadius: CGFloat = 22
+}
+
+/// Silk silver, measured from the Starry Night bookmark printed in silk black-silver PLA (B02, 4032x3024):
+/// shadow #353438, midtone #696D72, a cool blue-silver highlight #AFBCC3 and a warm white peak #F3F1EA that
+/// runs along the layer lines. A flat #ABBBBC reads as grey; metal is the contrast between those, so the fill is
+/// a diagonal sheen with one narrow specular band plus fine horizontal "layer lines".
+/// Dark keeps the bright end (dark ink on it, >= 6:1 at the darkest stop); Light keeps a gunmetal range under
+/// the light ink.
+struct HMSilverSheen<S: Shape>: View {
+    let shape: S
+    @Environment(\.colorScheme) private var scheme
+
+    private var stops: [Gradient.Stop] {
+        scheme == .dark ? [
+            .init(color: Color(hex: 0x8E989E), location: 0.00),
+            .init(color: Color(hex: 0xAFBCC3), location: 0.30),
+            .init(color: Color(hex: 0xD9E2E6), location: 0.44),
+            .init(color: Color(hex: 0xF3F1EA), location: 0.50),
+            .init(color: Color(hex: 0xC3CED3), location: 0.57),
+            .init(color: Color(hex: 0x9BA6AC), location: 0.80),
+            .init(color: Color(hex: 0x8A9399), location: 1.00),
+        ] : [
+            .init(color: Color(hex: 0x353438), location: 0.00),
+            .init(color: Color(hex: 0x4E555B), location: 0.32),
+            .init(color: Color(hex: 0x6E7A80), location: 0.50),
+            .init(color: Color(hex: 0x525B61), location: 0.66),
+            .init(color: Color(hex: 0x3A3D42), location: 1.00),
+        ]
+    }
+
+    var body: some View {
+        shape.fill(LinearGradient(stops: stops, startPoint: .topLeading, endPoint: .bottomTrailing))
+            .overlay {
+                // Layer lines: a hairline every 2 pt, lighter then darker, like stepped silk catching the light.
+                Canvas { ctx, size in
+                    var y: CGFloat = 0
+                    var light = true
+                    let lineLight = scheme == .dark ? 0.10 : 0.05
+                    while y < size.height {
+                        ctx.fill(Path(CGRect(x: 0, y: y, width: size.width, height: 0.6)),
+                                 with: .color(light ? .white.opacity(lineLight) : .black.opacity(0.06)))
+                        y += 2; light.toggle()
+                    }
+                }
+                .clipShape(shape)
+                .allowsHitTesting(false)
+            }
+            .overlay {
+                // A rim of light along the top edge, so the bubble reads as a raised metal plate.
+                shape.strokeBorderIfPossible(LinearGradient(colors: [.white.opacity(scheme == .dark ? 0.7 : 0.35), .clear],
+                                                           startPoint: .top, endPoint: .center), lineWidth: 0.8)
+            }
+    }
+}
+
+private extension Color {
+    init(hex: UInt32) { self.init(uiColor: UIColor(hex: hex)) }
+}
+
+private extension Shape {
+    func strokeBorderIfPossible<SS: ShapeStyle>(_ style: SS, lineWidth: CGFloat) -> some View {
+        stroke(style, lineWidth: lineWidth).padding(lineWidth / 2)
+    }
+}
+
+/// The halo color for an accent. Silver glows in its cool highlight, brighter than its fill, so it shows on black.
+extension Thermocline.Accent {
+    var haloColor: Color { self == .silver ? Color(hex: 0xCFE0E8) : tint }
 }
 
 private struct HMInsideGlowKey: EnvironmentKey { static let defaultValue = false }
@@ -494,8 +566,13 @@ extension EnvironmentValues {
 extension View {
     /// The halo: a shadow in `color` at 25%, radius 20, no offset. Apply it to a shape or fill, never to text.
     @ViewBuilder func hmHalo(_ color: Color, active: Bool) -> some View {
-        if active { shadow(color: color.opacity(HMGlow.opacity), radius: HMGlow.radius) } else { self }
+        if active {
+            shadow(color: color.opacity(HMGlow.coreOpacity), radius: HMGlow.coreRadius)
+                .shadow(color: color.opacity(HMGlow.bloomOpacity), radius: HMGlow.bloomRadius)
+        } else { self }
     }
+
+
 
     /// The outgoing bubble's fill. Thermocline Dark adds the halo in the accent's tint behind it; Classic keeps
     /// its own fill exactly.
@@ -514,8 +591,11 @@ private struct HMBubbleFill<S: Shape>: View {
     @Environment(\.hmInsideGlow) private var insideGlow
 
     var body: some View {
-        shape.fill(HMDesign.bubbleFill)
-            .hmHalo(HMTheme.thermoclineAccent.tint, active: scheme == .dark && !insideGlow)
+        let accent = HMTheme.thermoclineAccent
+        Group {
+            if accent == .silver { HMSilverSheen(shape: shape) } else { shape.fill(HMDesign.bubbleFill) }
+        }
+        .hmHalo(accent.haloColor, active: scheme == .dark && !insideGlow)
     }
 }
 
@@ -939,9 +1019,14 @@ struct HMButtonStyle: ButtonStyle {
             .background {
                 if kind == .primary {
                     if scheme == .dark {
-                        shape.fill(accent.fill).hmHalo(accent.tint, active: enabled && !insideGlow)
+                        Group {
+                            if accent == .silver { HMSilverSheen(shape: shape) } else { shape.fill(accent.fill) }
+                        }
+                        .hmHalo(accent.haloColor, active: enabled && !insideGlow)
                     } else {
-                        shape.fill(accent.fill)
+                        Group {
+                            if accent == .silver { HMSilverSheen(shape: shape) } else { shape.fill(accent.fill) }
+                        }
                             .shadow(color: accent.tint.opacity(enabled ? 0.25 : 0), radius: 10)
                     }
                 } else {
@@ -1046,8 +1131,10 @@ struct HMSendGlyph: View {
         Image(systemName: "arrow.up.circle.fill").font(.title)
             .symbolRenderingMode(.palette)
             .foregroundStyle(enabled ? accent.onFill : Thermocline.text3, enabled ? accent.fill : Thermocline.surface3)
-            .shadow(color: accent.tint.opacity(enabled && !(dark && insideGlow) ? (dark ? HMGlow.opacity : 0.25) : 0),
-                    radius: dark ? HMGlow.radius : 9)
+            .shadow(color: accent.haloColor.opacity(enabled && !(dark && insideGlow) ? (dark ? HMGlow.coreOpacity : 0.25) : 0),
+                    radius: dark ? HMGlow.coreRadius : 9)
+            .shadow(color: accent.haloColor.opacity(enabled && dark && !insideGlow ? HMGlow.bloomOpacity : 0),
+                    radius: HMGlow.bloomRadius)
     }
 }
 
