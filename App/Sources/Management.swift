@@ -125,6 +125,9 @@ enum ManageFailure: Error, Equatable {
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let code = obj?["code"] as? String ?? ""
         let retry = (obj?["retry_after"] as? Int) ?? (obj?["retry_after"] as? Double).map(Int.init) ?? 0
+        // A busy Mac (503 with "retry": true, e.g. its device registry for a moment) is "try again", never a
+        // PIN problem or a sign-out.
+        if code.isEmpty, obj?["retry"] as? Bool == true { return .server }
         return from(status: status, code: code, retryAfter: retry)
     }
 

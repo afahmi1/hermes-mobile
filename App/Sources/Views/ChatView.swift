@@ -311,7 +311,8 @@ struct ChatScreen: View {
                       selectionBehavior: .ordered,
                       matching: imagesAvailable ? .any(of: [.images, .videos]) : .videos)
             .task(id: pickerItems) { if !pickerItems.isEmpty { await importPicked(pickerItems) } }
-            .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
+            // .package: Pages, Keynote and Numbers documents and .rtfd are folders on disk; they go up zipped.
+            .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data, .package], allowsMultipleSelection: true) { result in
             importFiles(result)
         }
             .sheet(isPresented: $showCamera) {
@@ -323,8 +324,13 @@ struct ChatScreen: View {
                 Task {
                     defer { preparingMedia = false }
                     do {
-                        guard let preview = await image.byPreparingThumbnail(ofSize: CGSize(width: 1600, height: 1600)) else { throw ChatMedia.Failure.unreadable }
-                        try appendMedia([ChatMedia.jpeg(preview, name: "Camera")], account: account)
+                        // Full resolution like a library photo. Re-encoding from the decoded image carries no
+                        // location or camera metadata.
+                        let data = try await Task.detached(priority: .userInitiated) {
+                            guard let data = image.jpegData(compressionQuality: 0.9) else { throw ChatMedia.Failure.unreadable }
+                            return data
+                        }.value
+                        appendMedia([try await photoAttachment(data, prefix: "Camera")], account: account)
                     } catch { chat.error = error.localizedDescription }
                 }
             }.ignoresSafeArea()
@@ -453,7 +459,8 @@ struct ChatScreen: View {
 
     private func composerField(expanded: Bool) -> some View {
         ComposerField(text: $chat.draft, placeholder: "Message \(bot?.name ?? "Hermes")",
-                      expanded: expanded, onPasteText: chat.absorbPaste, onPasteImage: importPastedImage)
+                      expanded: expanded, onPasteText: chat.absorbPaste, onPasteImage: importPastedImage,
+                      onPasteFile: importPastedFile)
     }
 
     @ViewBuilder private var draftShelf: some View {
@@ -505,11 +512,13 @@ struct ChatScreen: View {
                 HStack {
                     ForEach(Array(chat.draftAttachments.enumerated()), id: \.offset) { index, asset in
                         AttachmentChip(attachment: asset, preview: {
-                            if let data = Data(base64Encoded: asset.base64), let image = UIImage(data: data) {
-                                previewedImage = image
+                            // Uploaded photos live as files; both kinds open, downsampled to screen size.
+                            Task {
+                                let image = await Task.detached(priority: .userInitiated) { ChatMedia.previewImage(asset, pixels: 2400) }.value
+                                if let image { previewedImage = image } else { chat.error = "This photo couldn’t be opened. Remove it and attach it again." }
                             }
                         }) {
-                            if chat.draftAttachments.indices.contains(index) { chat.draftAttachments.remove(at: index) }
+                            chat.removeDraftAttachment(at: index)
                         }
                     }
                 }.padding(.horizontal, 12)
@@ -800,11 +809,24 @@ struct ChatScreen: View {
                                    messageLimit: mediaCapabilities?.maxMessageBytes)
     }
 
-    private func appendMedia(_ assets: [SendAttachment], account: String?) {
-        guard !Task.isCancelled, let account, account == app.inboxAccount else { return }
+    /// Add prepared attachments to the draft. False when they can't go in (the chat or account changed, the task
+    /// was cancelled, or a limit says no); their phone copies are then deleted, so nothing is left behind.
+    @discardableResult
+    private func appendMedia(_ assets: [SendAttachment], account: String?) -> Bool {
+        guard !assets.isEmpty else { return true }
+        guard !Task.isCancelled, let account, account == app.inboxAccount else {
+            UploadFiles.discard(assets, keeping: UploadFiles.names(chat.draftAttachments))
+            return false
+        }
         let proposed = fitToBudget(chat.draftAttachments + assets)
-        if let problem = issue(for: proposed) { chat.error = problem; return }
+        if let problem = issue(for: proposed) {
+            chat.error = problem
+            // Includes copies fitToBudget made of photos already in the draft; the draft keeps its own.
+            UploadFiles.discard(proposed + assets, keeping: UploadFiles.names(chat.draftAttachments))
+            return false
+        }
         chat.draftAttachments = proposed
+        return true
     }
 
     /// Photos ride inline by default, and a message's inline bytes share one small budget. Fifteen photos blow
@@ -829,15 +851,21 @@ struct ChatScreen: View {
 
     /// Full resolution through the Mac's resumable upload when it has one; otherwise the small inline JPEG.
     /// `share`: how many photos split the message's room, so a batch of fifteen fits Hermes's per-message cap.
-    private func photoAttachment(_ data: Data, share: Int = 1) async throws -> SendAttachment {
+    /// `prefix`: the file's name ("Photo-…", "Camera-…", "Pasted image-…").
+    private func photoAttachment(_ data: Data, share: Int = 1, prefix: String = "Photo") async throws -> SendAttachment {
         let uploadMax = mediaCapabilities?.maxUploadBytes
         let room = (mediaCapabilities?.maxMessageBytes ?? 128 * 1024 * 1024) * 9 / 10
-            - chat.draftAttachments.filter(\.isUpload).reduce(0) { $0 + $1.byteCount }
+            - chat.draftAttachments.filter { $0.isUpload && $0.mime.hasPrefix("image/") }.reduce(0) { $0 + $1.byteCount }
         let budget = max(2 * 1024 * 1024, room / max(1, share))
         let originals = mediaCapabilities?.originalImages == true
         return try await Task.detached(priority: .userInitiated) {
-            if let uploadMax, originals { return try ChatMedia.original(from: data, uploadMax: uploadMax, budget: budget) }
-            if let uploadMax { return try ChatMedia.fullImage(from: data, uploadMax: uploadMax, budget: budget) }
+            if let uploadMax, originals { return try ChatMedia.original(from: data, uploadMax: uploadMax, budget: budget, prefix: prefix) }
+            if let uploadMax { return try ChatMedia.fullImage(from: data, uploadMax: uploadMax, budget: budget, name: prefix) }
+            if prefix == "Pasted image" {
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                      let image = ChatMedia.thumbnail(source, pixels: 2048) else { throw ChatMedia.Failure.unreadable }
+                return try ChatMedia.pasted(UIImage(cgImage: image))
+            }
             return try ChatMedia.image(from: data)
         }.value
     }
@@ -856,21 +884,31 @@ struct ChatScreen: View {
         var assets: [SendAttachment] = []
         var failed: [String] = []
         for item in photos {
+            if Task.isCancelled { break }
             do {
                 let data = try await MediaImport.imageData(from: item)
-                if Task.isCancelled { return }
+                if Task.isCancelled { break }
                 assets.append(try await photoAttachment(data, share: photos.count))
             } catch {
-                if Task.isCancelled { return }
+                if Task.isCancelled { break }
                 failed.append(error.localizedDescription)
             }
         }
-        appendMedia(assets, account: account)
-        // Say what happened to every photo, not just the last error: "Added 13 of 15 photos. 2 couldn't…".
+        // Leaving the chat or picking again stops this batch. Its copies go, and the person hears about it.
+        if Task.isCancelled {
+            UploadFiles.discard(assets, keeping: UploadFiles.names(chat.draftAttachments))
+            chat.error = "Adding \(photos.count) photos stopped before it finished. Choose them again."
+            return
+        }
         var notes: [String] = []
+        // A limit can refuse the whole batch; that reason comes first, then what happened to each photo.
+        let fit = appendMedia(assets, account: account)
+        guard account == app.inboxAccount else { return }
+        if !fit, let refused = chat.error { notes.append(refused) }
+        // Say what happened to every photo, not just the last error: "Added 13 of 15 photos. 2 couldn't…".
         if !failed.isEmpty {
             let reason = Dictionary(grouping: failed, by: { $0 }).max { $0.value.count < $1.value.count }?.key ?? ""
-            notes.append("Added \(assets.count) of \(photos.count) photos. \(failed.count) couldn't be loaded. \(reason)")
+            notes.append("Added \(fit ? assets.count : 0) of \(photos.count) photos. \(failed.count) couldn't be loaded. \(reason)")
         }
         if skipped > 0 { notes.append("Videos go one per message, so \(skipped == 1 ? "the video was" : "\(skipped) videos were") left out.") }
         if !notes.isEmpty { chat.error = notes.joined(separator: " ") }
@@ -886,16 +924,22 @@ struct ChatScreen: View {
                 let file = try await MediaImport.videoFile(from: item)
                 guard !Task.isCancelled, let account, account == app.inboxAccount else {
                     try? FileManager.default.removeItem(at: file)
+                    if Task.isCancelled { chat.error = "Adding the video stopped before it finished. Choose it again." }
                     return
                 }
                 pickedVideo = file
                 chooseVideo = true
             } else {
                 let data = try await MediaImport.imageData(from: item)
-                if Task.isCancelled { return }
-                appendMedia([try await photoAttachment(data)], account: account)
+                try Task.checkCancellation()
+                let asset = try await photoAttachment(data)
+                // Cancelled: appendMedia deletes the copy instead of adding it.
+                if !appendMedia([asset], account: account), Task.isCancelled { throw CancellationError() }
             }
-        } catch { if !Task.isCancelled { chat.error = error.localizedDescription } }
+        } catch {
+            chat.error = Task.isCancelled || error is CancellationError
+                ? "Adding the photo stopped before it finished. Choose it again." : error.localizedDescription
+        }
     }
 
     /// An image pasted into the composer becomes a reviewable attachment. The pasteboard is read
@@ -917,14 +961,31 @@ struct ChatScreen: View {
         Task {
             defer { preparingMedia = false }
             do {
-                guard let preview = await image.byPreparingThumbnail(ofSize: CGSize(width: 2048, height: 2048)) else {
-                    throw ChatMedia.Failure.unreadable
-                }
+                // Full resolution, like a library photo. The re-encode carries no location metadata.
+                let data = try await Task.detached(priority: .userInitiated) {
+                    guard let data = image.jpegData(compressionQuality: 0.9) else { throw ChatMedia.Failure.unreadable }
+                    return data
+                }.value
                 try Task.checkCancellation()
-                let asset = try ChatMedia.pasted(preview)
-                appendMedia([asset], account: account)
+                appendMedia([try await photoAttachment(data, prefix: "Pasted image")], account: account)
             } catch {
                 if !Task.isCancelled { chat.error = error.localizedDescription }
+            }
+        }
+    }
+
+    /// A copied file (a PDF from Files, a document) pasted into the composer attaches like a file from Files.
+    private func importPastedFile(_ provider: NSItemProvider, type: UTType) {
+        guard !preparingMedia else { chat.error = "Wait for the current attachment to finish."; return }
+        preparingMedia = true
+        Task {
+            do {
+                let url = try await PastedFile.load(provider, type: type)
+                preparingMedia = false
+                importFileURLs([url], owned: true)
+            } catch {
+                preparingMedia = false
+                chat.error = "The pasted file couldn’t be read. Copy it again, or attach it from Files."
             }
         }
     }
@@ -935,55 +996,114 @@ struct ChatScreen: View {
         switch result {
         case .failure(let error):
             if (error as NSError).domain == NSCocoaErrorDomain && (error as NSError).code == NSUserCancelledError { return }
-            chat.error = error.localizedDescription
-            return
+            chat.error = "Files couldn’t open the selection. Try choosing it again."
         case .success(let urls):
-            guard !urls.isEmpty else { return }
-            let slots = max(0, ChatMedia.maxAttachments - chat.draftAttachments.count)
-            guard urls.count <= slots else { chat.error = "Choose up to \(slots) more attachments for this message."; return }
-            let account = app.inboxAccount
-            let cap = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
+            importFileURLs(urls, owned: false)
+        }
+    }
+
+    /// Add every file it can and report each one it couldn't, by name. `owned`: the URLs are this app's own
+    /// temporary copies (a pasted file), deleted once read.
+    private func importFileURLs(_ urls: [URL], owned: Bool) {
+        guard !urls.isEmpty else { return }
+        let account = app.inboxAccount
+        let cap = mediaCapabilities?.maxFileBytes ?? 4 * 1024 * 1024
+        let uploadMax = mediaCapabilities?.maxUploadBytes
+        let originals = mediaCapabilities?.originalImages == true
+        func display(_ url: URL) -> String { (try? FileImport.safeName(url)) ?? "A file" }
+        func isMovie(_ url: URL) -> Bool {
+            ((try? url.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? UTType(filenameExtension: url.pathExtension))?
+                .conforms(to: .movie) == true
+        }
+        // One video on its own opens the clip / original / frames choice, as from Photos.
+        if urls.count == 1, let url = urls.first, isMovie(url) {
             preparingMedia = true
             Task {
-                defer { preparingMedia = false }
-                var added: [SendAttachment] = []
-                var left = cap - chat.draftAttachments.reduce(0) { $0 + $1.byteCount }
-                for url in urls {
-                    if Task.isCancelled { return }
-                    let accessed = url.startAccessingSecurityScopedResource()
-                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                    do {
-                        let type = try url.resourceValues(forKeys: [.contentTypeKey]).contentType ?? UTType(filenameExtension: url.pathExtension)
-                        if type?.conforms(to: .movie) == true {
-                            guard urls.count == 1 else { chat.error = "Choose a video on its own to review the clip or frames."; return }
-                            let snapshot = try await Task.detached { try MediaStaging.stage(url) }.value
-                            guard !Task.isCancelled, account == app.inboxAccount else { try? FileManager.default.removeItem(at: snapshot); return }
-                            discardVideo()
-                            pickedVideo = snapshot
-                            chooseVideo = true
-                            return
-                        }
-                        let uploadMax = mediaCapabilities?.maxUploadBytes
-                        let originals = mediaCapabilities?.originalImages == true
-                        let asset = try await Task.detached(priority: .userInitiated) {
-                            try FileImport.attachment(from: url, maxBytes: cap, uploadMax: uploadMax, originals: originals)
-                        }.value
-                        guard account == app.inboxAccount else { return }
-                        guard chat.draftAttachments.count < ChatMedia.maxAttachments,
-                              !chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) else { return }
-                        guard asset.mime != "image/jpeg" || imagesAvailable else { chat.error = "This bot cannot receive images."; return }
-                        if !asset.isUpload {
-                            guard asset.byteCount <= left else { throw FileImport.Failure.tooLarge(cap) }
-                            left -= asset.byteCount
-                        }
-                        added.append(asset)
-                    } catch {
-                        if !Task.isCancelled { chat.error = error.localizedDescription }
-                        return
-                    }
+                defer { preparingMedia = false; if owned { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) } }
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let snapshot = try await Task.detached(priority: .userInitiated) {
+                        try FileImport.coordinated(url) { local, _, _ in try MediaStaging.stage(local) }
+                    }.value
+                    guard !Task.isCancelled, account == app.inboxAccount else { try? FileManager.default.removeItem(at: snapshot); return }
+                    discardVideo()
+                    pickedVideo = snapshot
+                    chooseVideo = true
+                } catch {
+                    if !(error is CancellationError) { chat.error = display(url) + ": " + error.localizedDescription }
                 }
-                appendMedia(added, account: account)
             }
+            return
+        }
+        preparingMedia = true
+        Task {
+            defer {
+                preparingMedia = false
+                if owned { for url in urls { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) } }
+            }
+            var added: [SendAttachment] = []
+            var problems: [String] = []
+            let slots = max(0, ChatMedia.maxAttachments - chat.draftAttachments.count)
+            var left = cap - chat.draftAttachments.filter { !$0.isUpload }.reduce(0) { $0 + $1.byteCount }
+            for (index, url) in urls.enumerated() {
+                if Task.isCancelled { break }
+                let name = display(url)
+                guard added.count < slots else {
+                    problems.append("\(urls.count - index) more left out: one message takes \(ChatMedia.maxAttachments) attachments.")
+                    break
+                }
+                if chat.draftAttachments.contains(where: { $0.mime == "video/mp4" }) {
+                    problems.append("\(name): remove the video first; a video goes on its own.")
+                    continue
+                }
+                if isMovie(url) {
+                    problems.append("\(name): choose a video on its own to send the original, a clip or frames.")
+                    continue
+                }
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let asset = try await Task.detached(priority: .userInitiated) {
+                        try FileImport.coordinated(url) { local, filename, _ in
+                            try FileImport.attachment(from: local, filename: filename, maxBytes: cap, uploadMax: uploadMax, originals: originals)
+                        }
+                    }.value
+                    if asset.mime.hasPrefix("image/") && !imagesAvailable {
+                        UploadFiles.discard([asset])
+                        problems.append("\(name): this bot can’t receive images.")
+                        continue
+                    }
+                    if !asset.isUpload {
+                        guard asset.byteCount <= left else {
+                            problems.append("\(name): " + FileImport.Failure.tooLarge(cap).localizedDescription)
+                            continue
+                        }
+                        left -= asset.byteCount
+                    }
+                    added.append(asset)
+                } catch is CancellationError {
+                    break
+                } catch {
+                    problems.append("\(name): " + error.localizedDescription)
+                }
+            }
+            if Task.isCancelled {
+                UploadFiles.discard(added, keeping: UploadFiles.names(chat.draftAttachments))
+                chat.error = "Adding files stopped before it finished. Choose them again."
+                return
+            }
+            var notes: [String] = []
+            if !appendMedia(added, account: account) {
+                if account != app.inboxAccount { return }
+                if let refused = chat.error { notes.append(refused) }
+                added = []
+            }
+            if !problems.isEmpty {
+                if urls.count > 1 { notes.append("Added \(added.count) of \(urls.count) files.") }
+                notes += problems
+            }
+            chat.error = notes.isEmpty ? chat.error : notes.joined(separator: " ")
         }
     }
 
@@ -1015,7 +1135,9 @@ struct ChatScreen: View {
         Task {
             defer { preparingMedia = false; try? FileManager.default.removeItem(at: url) }
             do {
-                let file = try await Task.detached(priority: .userInitiated) { try ChatMedia.original(from: url, uploadMax: uploadMax) }.value
+                // The staged snapshot is this app's own file: move it into the upload folder rather than copy
+                // a multi-gigabyte video a second time.
+                let file = try await Task.detached(priority: .userInitiated) { try ChatMedia.original(from: url, uploadMax: uploadMax, move: true) }.value
                 appendMedia([file], account: account)
             } catch { chat.error = error.localizedDescription }
         }
@@ -1227,6 +1349,7 @@ struct ComposerField: UIViewRepresentable {
     var expanded: Bool
     var onPasteText: (String) -> Void
     var onPasteImage: (UIImage) -> Void
+    var onPasteFile: (NSItemProvider, UTType) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -1251,6 +1374,7 @@ struct ComposerField: UIViewRepresentable {
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         view.onPasteText = onPasteText
         view.onPasteImage = onPasteImage
+        view.onPasteFile = onPasteFile
         view.focusOnAppearance = expanded
         view.accessibilityLabel = placeholder
         view.placeholder = placeholder
@@ -1267,6 +1391,7 @@ struct ComposerField: UIViewRepresentable {
         view.placeholder = placeholder
         view.onPasteText = onPasteText
         view.onPasteImage = onPasteImage
+        view.onPasteFile = onPasteFile
         view.updatePlaceholder()
     }
 
@@ -1293,6 +1418,7 @@ struct ComposerField: UIViewRepresentable {
 final class PasteTextView: UITextView {
     var onPasteText: ((String) -> Void)?
     var onPasteImage: ((UIImage) -> Void)?
+    var onPasteFile: ((NSItemProvider, UTType) -> Void)?
     var focusOnAppearance = false
 
     override func didMoveToWindow() {
@@ -1304,7 +1430,7 @@ final class PasteTextView: UITextView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        if action == #selector(paste(_:)), UIPasteboard.general.hasImages { return isEditable }
+        if action == #selector(paste(_:)), UIPasteboard.general.hasImages || pastedFileType != nil { return isEditable }
         return super.canPerformAction(action, withSender: sender)
     }
     var placeholder: String = "" {
@@ -1341,12 +1467,25 @@ final class PasteTextView: UITextView {
             onPasteImage?(image)
             return
         }
+        // A copied file (a PDF or document from Files) attaches as that file, like choosing it in Files.
+        if !board.hasStrings, let type = pastedFileType,
+           let provider = board.itemProviders.first(where: { $0.hasItemConformingToTypeIdentifier(type.identifier) }) {
+            onPasteFile?(provider, type)
+            return
+        }
         if let pasted = UIPasteboard.general.string, PasteSplit.collapse(pasted) {
             onPasteText?(pasted)
             if let selection = selectedTextRange, !selection.isEmpty { replace(selection, withText: "") }
             return
         }
         super.paste(sender)
+    }
+
+    /// The type of a copied file on the pasteboard. Reads only the type names, which never shows a paste prompt.
+    private var pastedFileType: UTType? {
+        let board = UIPasteboard.general
+        guard !board.hasStrings, !board.hasImages else { return nil }
+        return PastedFile.type(in: board.types)
     }
 
     func textHeight(forWidth width: CGFloat) -> CGFloat {

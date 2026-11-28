@@ -932,6 +932,9 @@ final class ChatModel {
             pastedTexts = snapshot.pastes
             draftAttachments = snapshot.media
             restoringComposer = false
+            // A file whose phone copy is gone can't be sent again: leave it out instead of failing the next send too.
+            let gone = UploadFiles.missing(draftAttachments)
+            if !gone.isEmpty { draftAttachments.removeAll { gone.contains($0) } }
             try await InboxDisk.shared.acknowledge(send.id, key: key)
             guard key == sendKey else { return }
             pendingSend = nil
@@ -1003,6 +1006,9 @@ final class ChatModel {
                 if case APIError.http(let code, let message) = error, [400, 413, 415, 422].contains(code) {
                     update(send.id) { $0.problem = message.isEmpty ? "Hermes refused this message." : message }
                     await persistOutgoing()
+                } else if let problem = error as? UploadProblem, !problem.isTransient {
+                    update(send.id) { $0.problem = problem.localizedDescription }
+                    await persistOutgoing()
                 } else {
                     Task { await reattach(); await pump() }
                 }
@@ -1013,12 +1019,19 @@ final class ChatModel {
             if case APIError.http(let code, _) = error,
                [400, 409, 413, 415, 422].contains(code) || (allowLegacy && [403, 404].contains(code)) {
                 await returnSend(send, key: key, reason: error.localizedDescription)
+            } else if let problem = error as? UploadProblem, !problem.isTransient {
+                // A file that is gone, a full Mac, a file the Mac keeps refusing: waiting won't fix any of them.
+                await returnSend(send, key: key, reason: problem.localizedDescription
+                                 + (problem == .macFull ? "" : " Your message is back in the message box."))
             } else if pendingSend?.returningToComposer != true {
                 nextReceiptAttempt = Date().addingTimeInterval(receiptBackoff)
                 // The first failure is news. Later silent retries must not buzz the phone once a minute.
                 let first = receiptBackoff <= 1
                 receiptBackoff = min(60, receiptBackoff * 2)
-                let waiting = "Waiting to confirm your send. Reopening this chat will check the same submission."
+                let busy = (error as? UploadProblem) == .macBusy
+                    || { if case APIError.http(let code, _) = error { return [502, 503, 504].contains(code) }; return false }()
+                let waiting = busy ? "Your Mac is busy. Your message is saved and sends when it’s ready."
+                    : "Waiting to confirm your send. Reopening this chat will check the same submission."
                 if first { fail(waiting) } else { self.error = waiting }
             } else {
                 await returnSend(send, key: key, reason: "The bridge could not confirm delivery. Check the saved chat before sending again.")
@@ -1069,14 +1082,45 @@ final class ChatModel {
         // Anything typed before the chat had an id (the first seconds of a new chat) joins the saved list.
         let fresh = outgoing.filter { o in !saved.contains { $0.id == o.id } }
         outgoing = saved + fresh
+        outgoingFiles = UploadFiles.names(saved.flatMap { $0.attachments ?? [] })
         if !fresh.isEmpty { await persistOutgoing() }
         if !outgoing.isEmpty { await pump() }
     }
 
     private func persistOutgoing() async {
         guard let key = sendKey else { return }   // a brand-new chat: saved as soon as it has an id
-        do { try await InboxDisk.shared.saveOutgoing(outgoing, key: key) }
+        let saving = outgoing
+        do {
+            try await InboxDisk.shared.saveOutgoing(saving, key: key)
+            // Files of messages that left the tray (started, guided, removed) are no longer needed on the phone.
+            let now = UploadFiles.names(saving.flatMap { $0.attachments ?? [] })
+            let left = outgoingFiles.subtracting(now)
+            outgoingFiles = now
+            if !left.isEmpty { releaseUploads(names: left) }
+        }
         catch { self.error = "Couldn't save your queued message on this phone. Keep the app open until it sends." }
+    }
+
+    /// Upload files the saved tray last pointed at.
+    @ObservationIgnored private var outgoingFiles = Set<String>()
+
+    /// Delete the phone's upload copies of these attachments unless this chat still uses them: in the draft,
+    /// a send waiting for confirmation, or the tray.
+    func releaseUploads(_ attachments: [SendAttachment]) { releaseUploads(names: UploadFiles.names(attachments)) }
+
+    private func releaseUploads(names: Set<String>) {
+        let inUse = UploadFiles.names(draftAttachments + (pendingSend?.attachments ?? []) + outgoing.flatMap { $0.attachments ?? [] })
+        let unused = names.subtracting(inUse)
+        guard !unused.isEmpty else { return }
+        UploadFiles.discard(unused.map { SendAttachment(mime: "", filename: "", base64: "", localFile: $0) })
+    }
+
+    /// The person removed an attachment chip: it leaves the draft and, unless something else here uses it,
+    /// its copy leaves the phone.
+    func removeDraftAttachment(at index: Int) {
+        guard draftAttachments.indices.contains(index) else { return }
+        let removed = draftAttachments.remove(at: index)
+        releaseUploads([removed])
     }
 
     private func update(_ id: UUID, _ change: (inout Outgoing) -> Void) {
@@ -1283,6 +1327,8 @@ final class ChatModel {
             return false
         } catch APIError.http(let code, let message) where [400, 413, 415, 422].contains(code) {
             return refuse(item, message)
+        } catch let problem as UploadProblem where !problem.isTransient {
+            return refuse(item, problem.localizedDescription)
         } catch {
             // Offline, timed out, the Mac asleep. It stays saved here and goes when the connection is back.
             if (outgoing.first { $0.id == item.id }?.attempts ?? 0) <= 1 {
@@ -1727,11 +1773,14 @@ final class ChatModel {
                     if status != "Reconnecting…" { workingStatus = status }
                     status = "Reconnecting…"
                     continue
-                } catch APIError.http(let code, _) where code == 404 || code == 401 {
+                } catch APIError.http(404, _) {
                     // The turn is gone from the Mac (finished long ago, or the bridge restarted): Hermes's
                     // transcript has the outcome, so reload it instead of retrying.
                     finished = true
-                    if code == 401, let account, app?.inboxAccount == account { app?.sessionExpired() }
+                } catch APIError.http(401, _) {
+                    // Possibly a momentary 401 from a busy bridge. The app re-checks the sign-in before forgetting
+                    // it; meanwhile this keeps retrying like any dropped connection (a real sign-out cancels it).
+                    if let account, app?.inboxAccount == account { app?.sessionExpired() }
                 } catch {
                     if Task.isCancelled { break }
                 }
@@ -1914,6 +1963,8 @@ final class ChatModel {
             do {
                 try await InboxDisk.shared.acknowledge(send.id, key: key)
                 pendingSend = nil
+                // Hermes has the files now: the phone's upload copies can go.
+                releaseUploads(send.attachments ?? [])
             } catch { self.error = "Could not clear this phone’s receipt. The same submission is safe to check again." }
         }
         confirmedPrimary = false

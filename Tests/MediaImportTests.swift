@@ -107,6 +107,7 @@ enum MediaImportTests {
 
         try fullResolutionPhotos()
         try originalPhotos()
+        try attachmentFixes(directory)
         print("Media import decode, paste split, source types and budget boundaries passed")
     }
     /// A large, per-pixel-noise PNG: uncompressible, like a real photo or dense screenshot.
@@ -174,6 +175,100 @@ enum MediaImportTests {
         print("Original photos: HEIC and PNG sent as themselves, over-budget falls back to a fitted JPEG")
     }
 
+    /// Limits, names, real types, huge photos, thumbnails from files, and packages from Files.
+    static func attachmentFixes(_ directory: URL) throws {
+        // Hermes's 128 MB per-message cap is for photos only; a 200 MB PDF is limited by the upload cap alone.
+        func upload(_ mime: String, _ size: Int) -> SendAttachment {
+            SendAttachment(mime: mime, filename: "f", base64: "", localFile: UUID().uuidString, sha256: "0", size: size)
+        }
+        let mb = 1024 * 1024
+        precondition(AttachmentSelection.issue([upload("application/pdf", 200 * mb), upload("application/zip", 300 * mb)],
+                                               fileLimit: 50 * mb, videoLimit: 50 * mb, uploadLimit: 2048 * mb, messageLimit: 128 * mb) == nil,
+                     "a big document was held to the photo cap")
+        precondition(AttachmentSelection.issue([upload("image/heic", 70 * mb), upload("image/png", 70 * mb)],
+                                               fileLimit: 50 * mb, videoLimit: 50 * mb, uploadLimit: 2048 * mb, messageLimit: 128 * mb) != nil,
+                     "photos over the per-message cap were let through")
+        precondition(AttachmentSelection.issue([upload("application/pdf", 3000 * mb)],
+                                               fileLimit: 50 * mb, videoLimit: 50 * mb, uploadLimit: 2048 * mb, messageLimit: 128 * mb) != nil)
+
+        // Names: macOS screenshot spaces become plain spaces, the name is NFC, and a long name keeps its extension.
+        let screenshot = try FileImport.safeName("Screenshot 2026-11-27 at 9.41.07\u{202F}PM.png")
+        precondition(screenshot == "Screenshot 2026-11-27 at 9.41.07 PM.png", screenshot)
+        let spaced = try FileImport.safeName("a\u{00A0}b\u{2009}c.txt")
+        precondition(spaced == "a b c.txt", spaced)
+        let nfc = try FileImport.safeName("Cafe\u{0301}.txt")
+        precondition(Array(nfc.unicodeScalars) == Array("Caf\u{00E9}.txt".unicodeScalars), "not NFC")
+        let long = try FileImport.safeName(String(repeating: "quarterly report ", count: 20) + "final.pdf")
+        precondition(long.unicodeScalars.count <= 120 && long.hasSuffix(".pdf"), long)
+        let emoji = try FileImport.safeName(String(repeating: "👍🏽", count: 90) + ".txt")
+        precondition(emoji.unicodeScalars.count <= 120 && emoji.hasSuffix(".txt"), "\(emoji.unicodeScalars.count)")
+        precondition(emoji.dropLast(4).allSatisfy { $0 == "👍🏽" }, "cut through a character")
+        let bare = try FileImport.safeName(String(repeating: "x", count: 300))
+        precondition(bare.unicodeScalars.count == 120)
+
+        // The bytes decide an image's type: TIFF saved as .jpg goes as TIFF, named .tiff, never labelled JPEG.
+        let tiffData = NSMutableData()
+        let tiffDest = CGImageDestinationCreateWithData(tiffData, UTType.tiff.identifier as CFString, 1, nil)!
+        let small = try render(CGSize(width: 64, height: 48))
+        let smallImage = CGImageSourceCreateImageAtIndex(CGImageSourceCreateWithData(small as CFData, nil)!, 0, nil)!
+        CGImageDestinationAddImage(tiffDest, smallImage, nil)
+        precondition(CGImageDestinationFinalize(tiffDest))
+        let liar = directory.appendingPathComponent("IMG_0042.jpg")
+        try (tiffData as Data).write(to: liar)
+        let honest = try FileImport.attachment(from: liar, maxBytes: 1 << 20, uploadMax: 1 << 30, originals: true)
+        precondition(honest.mime == "image/tiff" && honest.filename == "IMG_0042.tiff", "\(honest.mime) \(honest.filename)")
+        let tiffOriginal = try ChatMedia.original(from: tiffData as Data, uploadMax: 1 << 30, budget: 1 << 30)
+        precondition(tiffOriginal.mime == "image/tiff" && tiffOriginal.filename.hasSuffix(".tiff") && tiffOriginal.sourceFormat == "TIFF",
+                     "\(tiffOriginal.mime) \(tiffOriginal.filename)")
+        if let heic = try heicFixture(256) {
+            let fake = directory.appendingPathComponent("Holiday.jpg")
+            try heic.write(to: fake)
+            let real = try FileImport.attachment(from: fake, maxBytes: 1 << 20, uploadMax: 1 << 30, originals: true)
+            precondition(real.mime == "image/heic" && real.filename == "Holiday.heic", "\(real.mime) \(real.filename)")
+        }
+
+        // Uploaded photos have a picture for the chip and the preview, read from the file.
+        guard let thumb = ChatMedia.previewImage(tiffOriginal, pixels: 32) else { fatalError("no thumbnail for an uploaded photo") }
+        precondition(max(thumb.size.width, thumb.size.height) <= 32)
+        precondition(ChatMedia.previewImage(SendAttachment(mime: "image/png", filename: "a.png", base64: "", localFile: "missing.png"), pixels: 32) == nil)
+
+        // A photo over the bridge's 50 MP never goes as its original: it becomes a fitted JPEG under 50 MP.
+        let side = 7_200
+        let gray = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side,
+                             space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        gray.setFillColor(gray: 0.5, alpha: 1)
+        gray.fill(CGRect(x: 0, y: 0, width: side, height: side))
+        let hugeData = NSMutableData()
+        let hugeDest = CGImageDestinationCreateWithData(hugeData, UTType.png.identifier as CFString, 1, nil)!
+        CGImageDestinationAddImage(hugeDest, gray.makeImage()!, nil)
+        precondition(CGImageDestinationFinalize(hugeDest))
+        let fitted = try ChatMedia.original(from: hugeData as Data, uploadMax: 1 << 30, budget: 1 << 30)
+        let fp = CGImageSourceCopyPropertiesAtIndex(CGImageSourceCreateWithURL(fitted.fileURL! as CFURL, nil)!, 0, nil) as! [CFString: Any]
+        let pixels = (fp[kCGImagePropertyPixelWidth] as! Int) * (fp[kCGImagePropertyPixelHeight] as! Int)
+        precondition(fitted.mime == "image/jpeg" && pixels <= ChatMedia.maxPixels && pixels > 40_000_000, "\(fitted.mime) \(pixels)")
+        try? FileManager.default.removeItem(at: fitted.fileURL!)
+
+        // A package (an .rtfd, a Pages document) is a folder: Files hands it over zipped, named so.
+        let package = directory.appendingPathComponent("Notes.rtfd", isDirectory: true)
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try Data("{\\rtf1 hello}".utf8).write(to: package.appendingPathComponent("TXT.rtf"))
+        let zipped = try FileImport.coordinated(package) { local, filename, zipped in
+            (try FileImport.attachment(from: local, filename: filename, maxBytes: 1 << 20), zipped)
+        }
+        precondition(zipped.1 && zipped.0.filename == "Notes.rtfd.zip" && zipped.0.mime == "application/zip",
+                     "\(zipped.0.filename) \(zipped.0.mime)")
+        precondition(Data(base64Encoded: zipped.0.base64)?.starts(with: [0x50, 0x4B]) == true, "not a zip")
+        // A plain file goes through the coordinator unchanged.
+        let plain = try FileImport.coordinated(liar) { local, filename, zipped in (filename, zipped, try Data(contentsOf: local)) }
+        precondition(plain.0 == "IMG_0042.jpg" && !plain.1 && plain.2 == tiffData as Data)
+
+        // A copied PDF on the pasteboard is a file; text and pictures are not.
+        precondition(PastedFile.type(in: ["com.adobe.pdf"]) == .pdf)
+        precondition(PastedFile.type(in: ["public.utf8-plain-text", "public.png"]) == nil)
+        precondition(PastedFile.type(in: ["dyn.ah62d4rv4gu8y", "public.url"]) == nil)
+        print("Attachment fixes: photo-only message cap, names, real image types, 50 MP fallback, file thumbnails, packages, pasted files")
+    }
+
     static func render(_ size: CGSize) throws -> Data {
         let w = Int(size.width), h = Int(size.height)
         var noise = Data(capacity: w * h * 4)
@@ -196,7 +291,11 @@ enum MediaImportTests {
 
     /// A small solid-colour HEIC, or nil when the platform cannot encode HEIC (older simulator).
     static func heicFixture(_ pixels: Int) throws -> Data? {
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: pixels, height: pixels))
+        // Scale 1, so `pixels` is the real pixel size: at the screen's 3x a "3024" fixture would be 82 MP,
+        // over the bridge's 50 MP, and rightly sent as a fitted JPEG instead of the original.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: pixels, height: pixels), format: format)
         let image = renderer.image { context in
             UIColor.systemBlue.setFill()
             context.fill(CGRect(origin: .zero, size: CGSize(width: pixels, height: pixels)))

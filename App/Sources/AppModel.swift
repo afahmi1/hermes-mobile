@@ -21,6 +21,40 @@ struct ChatRef: Hashable, Identifiable {
     var id: String { sessionId.map { "\(profile)/\($0)" } ?? "draft/\(draft.uuidString)" }
 }
 
+/// One 401 is not proof the sign-in is gone: a bridge under load has answered 401 for a moment while it
+/// couldn't read its device registry. Before the saved login is forgotten, a second cheap request checks
+/// again after a short pause; only a second 401 counts. A burst of 401s shares one check.
+@MainActor
+final class SessionRecheck {
+    private var running: Task<Bool, Never>?
+    private let delay: Duration
+    init(delay: Duration = .milliseconds(1500)) { self.delay = delay }
+
+    var isChecking: Bool { running != nil }
+
+    /// True only when `probe` also fails with 401. Success, a 503 "busy", a timeout or no network are all
+    /// "not proven", and keep the person signed in.
+    func confirmExpired(_ probe: @escaping @Sendable () async throws -> Void) async -> Bool {
+        if let running { return await running.value }
+        let delay = delay
+        let task = Task<Bool, Never> {
+            try? await Task.sleep(for: delay)
+            do {
+                try await probe()
+                return false
+            } catch APIError.http(401, _) {
+                return true
+            } catch {
+                return false
+            }
+        }
+        running = task
+        let expired = await task.value
+        if running == task { running = nil }
+        return expired
+    }
+}
+
 @MainActor @Observable
 final class AppModel {
     var signedIn = API.shared.isSignedIn
@@ -260,7 +294,25 @@ final class AppModel {
         changeGateway(canonical)
     }
 
+    @ObservationIgnored let sessionRecheck = SessionRecheck()
+
+    /// A request answered 401. Re-checks once (see SessionRecheck) and forgets the saved login only if the Mac
+    /// says 401 again for the same login. Safe to call from every failing request at once.
     func sessionExpired() {
+        let client = API.shared
+        guard client.isSignedIn else { return }
+        Task {
+            let expired = await sessionRecheck.confirmExpired { _ = try await client.health() }
+            // The person may have switched gateways or signed out while the check ran.
+            guard expired, API.shared === client else { return }
+            forgetExpiredLogin()
+        }
+    }
+
+    /// The person asked to sign in again: no re-check, the saved login goes now.
+    func signInAgain() { forgetExpiredLogin() }
+
+    private func forgetExpiredLogin() {
         guard let server = API.shared.baseURL else { return }
         if accounts.credential(server)?.token == API.shared.token { _ = accounts.forget(server) }
         accounts.defaults.set(server.absoluteString, forKey: "server")
