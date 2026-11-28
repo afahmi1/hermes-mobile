@@ -247,6 +247,20 @@ def _tailscale():
     return None
 
 
+def hermes_version():
+    """Hermes's own version. Newer Hermes serves ``hermes_cli.__version__`` only from an install stamp,
+    so a git checkout reads "0.0.0" there; ``version_info.get_version_info()`` is the in-tree authority."""
+    import hermes_cli
+    try:
+        from hermes_cli.version_info import get_version_info
+        version = get_version_info().base_version
+        if version and version != "0.0.0":
+            return version
+    except Exception:
+        pass
+    return getattr(hermes_cli, "__version__", "unknown")
+
+
 def run(hermes_home: Path, port: int, profiles, profile_home, state_dir: Path | None = None) -> list[dict]:
     r: list[dict] = []
     system = platform.system()
@@ -273,8 +287,7 @@ def run(hermes_home: Path, port: int, profiles, profile_home, state_dir: Path | 
 
     # 2. Hermes itself.
     try:
-        import hermes_cli
-        version = getattr(hermes_cli, "__version__", "unknown")
+        version = hermes_version()
         status = OK if str(version).startswith("0.23.") else WARN
         _check(r, "hermes", status, "Hermes Agent %s." % version,
                "" if status == OK else "Tested with Hermes 0.23.x. Update Hermes or this bridge if anything misbehaves.")
