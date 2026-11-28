@@ -78,6 +78,22 @@ struct ChatScreen: View {
         }
     }
 
+    /// Split out of `body` so the type checker can finish (one expression that size times out).
+    @ViewBuilder private var trailingActions: some View {
+        HStack(spacing: HMDesign.small) {
+            makeProjectMenu
+            // One dot. Tap it for the gateway's state, Reload chat and Check again.
+            ConnectionBadge(compact: true, reloadDisabled: chat.isLoading || chat.isRunning) {
+                await chat.load(quiet: true)
+                landTick &+= 1
+            }
+        }
+    }
+
+    private var makeProjectFailed: Binding<Bool> {
+        Binding(get: { makeProjectError != nil }, set: { if !$0 { makeProjectError = nil } })
+    }
+
     /// Turn this chat into a project on the Mac (title, summary, instructions, context, files and the chat itself),
     /// then jump to it in the Projects tab.
     private func makeProject() async {
@@ -242,18 +258,9 @@ struct ChatScreen: View {
                     .accessibilityHint("Change model, provider and effort")
                     .disabled(chat.savingRuntime)
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: HMDesign.small) {
-                    makeProjectMenu
-                    // One dot. Tap it for the gateway's state, Reload chat and Check again.
-                    ConnectionBadge(compact: true, reloadDisabled: chat.isLoading || chat.isRunning) {
-                        await chat.load(quiet: true)
-                        landTick &+= 1
-                    }
-                }
-            }
+            ToolbarItem(placement: .topBarTrailing) { trailingActions }
         }
-        .alert("Couldn't make the project", isPresented: Binding(get: { makeProjectError != nil }, set: { if !$0 { makeProjectError = nil } })) {
+        .alert("Couldn't make the project", isPresented: makeProjectFailed) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(makeProjectError ?? "")

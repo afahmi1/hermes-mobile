@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreMotion
 #if canImport(ThinkingOrbs)
 import ThinkingOrbs
 #endif
@@ -485,57 +486,132 @@ enum HMGlow {
     static let bloomRadius: CGFloat = 22
 }
 
-/// Silk silver, measured from the Starry Night bookmark printed in silk black-silver PLA (B02, 4032x3024):
-/// shadow #353438, midtone #696D72, a cool blue-silver highlight #AFBCC3 and a warm white peak #F3F1EA that
-/// runs along the layer lines. A flat #ABBBBC reads as grey; metal is the contrast between those, so the fill is
-/// a diagonal sheen with one narrow specular band plus fine horizontal "layer lines".
-/// Dark keeps the bright end (dark ink on it, >= 6:1 at the darkest stop); Light keeps a gunmetal range under
-/// the light ink.
+/// Silk silver as metal, not a grey. Metal is read from three things a flat gradient lacks:
+/// 1. a reflection that moves when the phone tilts (CoreMotion; a slow drift where there's no motion sensor),
+/// 2. a hard "horizon" in that reflection, bright sky over a darker ground band, the way chrome mirrors a room,
+/// 3. brushed, anisotropic grain plus a sharp specular glint.
+/// Colors measured from the silk black-silver Starry Night print (B02, 4032x3024): shadow #353438, midtone
+/// #696D72, cool highlight #AFBCC3, warm peak #F3F1EA. Dark keeps text >= 4.5:1 on its darkest band with the
+/// dark ink; Light is gunmetal under the light ink.
 struct HMSilverSheen<S: Shape>: View {
     let shape: S
     @Environment(\.colorScheme) private var scheme
-
-    private var stops: [Gradient.Stop] {
-        scheme == .dark ? [
-            .init(color: Color(hex: 0x8E989E), location: 0.00),
-            .init(color: Color(hex: 0xAFBCC3), location: 0.30),
-            .init(color: Color(hex: 0xD9E2E6), location: 0.44),
-            .init(color: Color(hex: 0xF3F1EA), location: 0.50),
-            .init(color: Color(hex: 0xC3CED3), location: 0.57),
-            .init(color: Color(hex: 0x9BA6AC), location: 0.80),
-            .init(color: Color(hex: 0x8A9399), location: 1.00),
-        ] : [
-            .init(color: Color(hex: 0x353438), location: 0.00),
-            .init(color: Color(hex: 0x4E555B), location: 0.32),
-            .init(color: Color(hex: 0x6E7A80), location: 0.50),
-            .init(color: Color(hex: 0x525B61), location: 0.66),
-            .init(color: Color(hex: 0x3A3D42), location: 1.00),
-        ]
-    }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var tilt = HMTilt.shared
 
     var body: some View {
-        shape.fill(LinearGradient(stops: stops, startPoint: .topLeading, endPoint: .bottomTrailing))
-            .overlay {
-                // Layer lines: a hairline every 2 pt, lighter then darker, like stepped silk catching the light.
-                Canvas { ctx, size in
-                    var y: CGFloat = 0
-                    var light = true
-                    let lineLight = scheme == .dark ? 0.10 : 0.05
-                    while y < size.height {
-                        ctx.fill(Path(CGRect(x: 0, y: y, width: size.width, height: 0.6)),
-                                 with: .color(light ? .white.opacity(lineLight) : .black.opacity(0.06)))
-                        y += 2; light.toggle()
-                    }
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion || tilt.live)) { context in
+            let drift = reduceMotion ? 0 : (tilt.live ? 0 : sin(context.date.timeIntervalSinceReferenceDate * 0.45) * 0.35)
+            let x = CGFloat(tilt.live ? tilt.roll : drift)
+            let y = CGFloat(tilt.live ? tilt.pitch : drift * 0.4)
+            ZStack {
+                // The reflected room: sky, a sharp horizon, then the floor. Moves with tilt.
+                shape.fill(LinearGradient(stops: scheme == .dark ? HMChrome.dark : HMChrome.light,
+                                          startPoint: UnitPoint(x: 0.5 + x * 0.5, y: -0.15 + y * 0.6),
+                                          endPoint: UnitPoint(x: 0.5 - x * 0.5, y: 1.15 + y * 0.6)))
+                // Brushed metal: horizontal streaks, light catching individual grooves.
+                Image(uiImage: HMBrushed.tile).resizable(resizingMode: .tile)
+                    .blendMode(scheme == .dark ? .overlay : .softLight)
+                    .opacity(scheme == .dark ? 0.55 : 0.4)
+                    .clipShape(shape)
+                // Specular glint: a narrow hot streak that slides across opposite to the tilt.
+                GeometryReader { geo in
+                    let w = geo.size.width
+                    LinearGradient(stops: [.init(color: .clear, location: 0),
+                                           .init(color: .white.opacity(scheme == .dark ? 0.85 : 0.35), location: 0.5),
+                                           .init(color: .clear, location: 1)],
+                                   startPoint: .leading, endPoint: .trailing)
+                        .frame(width: max(18, w * 0.16), height: geo.size.height * 4)
+                        .rotationEffect(.degrees(18))
+                        .frame(height: geo.size.height)
+                        .offset(x: w * (0.5 - x * 0.9) - w * 0.08)
+                        .blendMode(.plusLighter)
                 }
                 .clipShape(shape)
-                .allowsHitTesting(false)
+                // A cool rim on top and a warm one at the bottom: the edge of a stamped plate.
+                shape.stroke(LinearGradient(colors: [.white.opacity(scheme == .dark ? 0.9 : 0.5),
+                                                     Color(hex: 0xAFBCC3).opacity(0.2),
+                                                     Color(hex: 0xF3F1EA).opacity(scheme == .dark ? 0.5 : 0.25)],
+                                            startPoint: .top, endPoint: .bottom), lineWidth: 1)
             }
-            .overlay {
-                // A rim of light along the top edge, so the bubble reads as a raised metal plate.
-                shape.strokeBorderIfPossible(LinearGradient(colors: [.white.opacity(scheme == .dark ? 0.7 : 0.35), .clear],
-                                                           startPoint: .top, endPoint: .center), lineWidth: 0.8)
-            }
+            .compositingGroup()
+        }
+        .onAppear { tilt.start() }
+        .allowsHitTesting(false)
     }
+
+}
+
+enum HMChrome {
+    static let dark: [Gradient.Stop] = [
+        .init(color: Color(hex: 0xFFFFFF), location: 0.00),
+        .init(color: Color(hex: 0xDCE6EB), location: 0.18),
+        .init(color: Color(hex: 0xAFBCC3), location: 0.40),
+        .init(color: Color(hex: 0xF3F1EA), location: 0.47),   // glare right above the horizon
+        .init(color: Color(hex: 0x7E888F), location: 0.50),   // the horizon: a hard step down
+        .init(color: Color(hex: 0x8F999F), location: 0.62),
+        .init(color: Color(hex: 0xC4CDD2), location: 0.84),
+        .init(color: Color(hex: 0xE9EEF0), location: 1.00),
+    ]
+    static let light: [Gradient.Stop] = [
+        .init(color: Color(hex: 0x7A858C), location: 0.00),
+        .init(color: Color(hex: 0x56606A), location: 0.30),
+        .init(color: Color(hex: 0x8C979E), location: 0.46),
+        .init(color: Color(hex: 0x2E3236), location: 0.50),
+        .init(color: Color(hex: 0x3F454B), location: 0.66),
+        .init(color: Color(hex: 0x666F76), location: 1.00),
+    ]
+}
+
+/// Device tilt for the metal's reflection, shared by every metal surface. Device motion needs no permission.
+final class HMTilt: ObservableObject {
+    static let shared = HMTilt()
+    @Published private(set) var roll = 0.0
+    @Published private(set) var pitch = 0.0
+    @Published private(set) var live = false
+    private let motion = CMMotionManager()
+    private var base: (Double, Double)?
+
+    func start() {
+        guard !motion.isDeviceMotionActive, motion.isDeviceMotionAvailable else { return }
+        motion.deviceMotionUpdateInterval = 1 / 30
+        motion.startDeviceMotionUpdates(to: .main) { [weak self] m, _ in
+            guard let self, let a = m?.attitude else { return }
+            // Relative to how the phone was first held, clamped to about +-35 degrees.
+            if self.base == nil { self.base = (a.roll, a.pitch) }
+            let b = self.base ?? (0, 0)
+            let dr: Double = (a.roll - b.0) / 0.6
+            let dp: Double = (a.pitch - b.1) / 0.6
+            let r: Double = max(-1, min(1, dr))
+            let p: Double = max(-1, min(1, dp))
+            if abs(r - self.roll) > 0.004 || abs(p - self.pitch) > 0.004 { self.roll = r; self.pitch = p }
+            if !self.live { self.live = true }
+        }
+    }
+}
+
+/// Brushed-metal grain: horizontal streaks of varying brightness, made once and deterministic.
+enum HMBrushed {
+    static let tile: UIImage = {
+        let w = 256, h = 64
+        var seed: UInt32 = 0x51_1C_E2
+        func rnd() -> Double { seed = seed &* 1_664_525 &+ 1_013_904_223; return Double(seed >> 8) / Double(1 << 24) }
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<h {
+            let row = rnd()                       // each groove has its own brightness
+            var streak = rnd()
+            for x in 0..<w {
+                if x % 7 == 0 { streak = streak * 0.6 + rnd() * 0.4 }   // long, smooth along the stroke
+                let lum: Double = 0.5 + (row - 0.5) * 0.55 + (streak - 0.5) * 0.35
+                let v = UInt8(max(0.0, min(255.0, lum * 255.0)))
+                let i = (y * w + x) * 4
+                px[i] = v; px[i + 1] = v; px[i + 2] = v; px[i + 3] = 255
+            }
+        }
+        let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        return UIImage(cgImage: ctx.makeImage()!, scale: 2, orientation: .up)
+    }()
 }
 
 private extension Color {

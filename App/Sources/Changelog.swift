@@ -36,6 +36,7 @@ enum WhatsNew {
             WhatsNewItem(symbol: "folder.badge.plus", text: "Make any chat a project in one tap"),
             WhatsNewItem(symbol: "sparkles", text: "Hermes drafts projects for topics you keep coming back to"),
             WhatsNewItem(symbol: "checkmark.circle", text: "Keep or dismiss a project Hermes made; dismissed stays dismissed"),
+            WhatsNewItem(symbol: "sparkles", text: "Silver is brushed metal that catches the light as you tilt"),
         ]),
         WhatsNewRelease(build: 52, items: [
             WhatsNewItem(symbol: "sparkles", text: "Silver is real metal now, measured from a silk print"),
