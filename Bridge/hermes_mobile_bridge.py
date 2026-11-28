@@ -2872,8 +2872,9 @@ class H(BaseHTTPRequestHandler):
                 if guard:
                     return self.send(200, {"applied": {}, "timing": "confirm", "confirm": guard})
                 # A deferred pick lands at the next claim; polling here delays the picker and
-                # still reads the old policy throughout a long-running turn.
-                deferred = any(row.get("status") == "deferred" for row in applied.values())
+                # still reads the old policy throughout a long-running turn. A pick Hermes can't resolve
+                # right now (next_send) rides the next message, which tries it again without blocking.
+                deferred = any(row.get("status") in ("deferred", "next_send") for row in applied.values())
                 return self.send(200, {"applied": applied, "timing": "next_turn" if deferred else "saved",
                                        "policy": (session_runtime(pid, sid) or {}).get("policy")})
             if action in ("schedule", "scheduled", "unschedule"):

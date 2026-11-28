@@ -76,18 +76,28 @@ class PrimaryReceipts(unittest.TestCase):
         self.assertEqual(rows[0]["source"], "gui")
 
     def test_creation_receipt_is_bound_to_the_profile_owner_source_and_request(self):
+        for layout in ("persistence", "legacy"):
+            with self.subTest(layout=layout):
+                self.check_creation_receipt(layout)
+
+    def check_creation_receipt(self, layout):
         import json
         import sqlite3
         from contextlib import closing
         from types import SimpleNamespace
-        home = self.directory
+        home = Path(self.enterContext(TemporaryDirectory()))
         key = self.submission
         sid = "frozen-session"
+        keys = SimpleNamespace(local_identity=lambda *identity: sid)
+        local = SimpleNamespace(POLICY_PREFIX="local:")
         modules = {
             "gateway.owner_identity": SimpleNamespace(host_owner_subject=lambda: "owner"),
-            "hermes_state_keys": SimpleNamespace(local_identity=lambda *identity: sid),
-            "hermes_state_local": SimpleNamespace(POLICY_PREFIX="local:"),
             "hermes_cli.gateway_runtime": SimpleNamespace(gateway_profile_home=lambda path: path),
+            # Current Hermes keeps these in its persistence package; older installs had top-level modules.
+            **({"persistence.sqlite._state.keys": keys, "persistence.sqlite.conversation._store.local": local}
+               if layout == "persistence" else
+               {"persistence.sqlite._state.keys": None, "persistence.sqlite.conversation._store.local": None,
+                "hermes_state_keys": keys, "hermes_state_local": local}),
         }
         with patch.dict(sys.modules, modules), closing(sqlite3.connect(home / "state.db")) as db:
             db.executescript("CREATE TABLE sessions(id PRIMARY KEY, title);"

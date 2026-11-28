@@ -9,7 +9,8 @@ be continued that way, and API sessions carry stored per-run settings that overr
 Model / provider / effort switching is what the desktop does: ``session.mutate`` (operations ``model``
 and ``reasoning``) persists the pick on the session in state.db, so every device sees it. The same pick
 also rides the turn as ``model_override`` (the CLI's ``/model --once`` path), so the turn runs on it even
-for session types that keep their own routing.
+for session types that keep their own routing. The phone re-sends a chat's pick with every message; the
+part that equals the chat's own setting is neither re-applied nor re-sent (see ``_prepare_pick``).
 
 Each turn runs on its own connection held by this process, so the phone can lock, lose signal or close
 the app; the turn keeps going and the phone re-attaches to the buffered event log by sequence number.
@@ -84,6 +85,8 @@ _REFUSAL_TEXT = {
     "profile_mismatch": "This chat belongs to a different bot than the one asked.",
     "admission_conflict": "Hermes already took a different message with this ID.",
     "unknown_method": "This Hermes version doesn't support that action. Update Hermes on your Mac.",
+    "model_resolution_failed": "Hermes couldn't switch to that model right now. Its plan may be out of quota "
+                               "or signed out; the chat keeps its current model.",
 }
 
 
@@ -177,6 +180,88 @@ def _admission_runtime(choice):
         ("model", "model"), ("provider", "provider"), ("reasoning", "effort")) if choice.get(field)}}
 
 
+POLICY_KEY = "gateway.local_policy.v1:"  # Hermes's per-chat route record in state.db (what session.mutate writes)
+
+
+def _session_setting(home, *sids):
+    """The route a chat runs by its own setting, ``{"model", "provider", "effort"}``, as Hermes last committed
+    it (a ``session.mutate`` pick, else the route frozen at creation), read-only from the profile's state.db.
+    ``effort`` is None when a per-model default may override it. None when only Hermes can tell: no local
+    policy (a messaging chat), a chat that follows its profile's current default, or an unreadable store."""
+    try:
+        uri = (Path(home) / "state.db").resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as db:
+            row = None
+            for sid in dict.fromkeys(s for s in sids if s):
+                row = db.execute("SELECT value FROM state_meta WHERE key=?", (POLICY_KEY + sid,)).fetchone()
+                if row:
+                    break
+        policy = (json.loads(row[0]) or {}).get("policy") if row else None
+        if not isinstance(policy, dict):
+            return None
+        config = json.loads(policy.get("config_json") or "{}")
+        request = json.loads(policy.get("request_json") or "{}")
+        block = config.get("model") if isinstance(config.get("model"), dict) else {}
+        model = str(policy.get("model") or block.get("default") or "").strip()
+        follows = (request.get("follow_profile_config") is True or config.get("follow_adopted") is True
+                   or (policy.get("source") == "bot_room" and not policy.get("ignore_user_config")))
+        if not model or follows:
+            return None
+        agent = config.get("agent") if isinstance(config.get("agent"), dict) else {}
+        effort = str(agent.get("reasoning_effort") or "").strip().lower()
+        return {"model": model, "provider": str(block.get("provider") or "").strip(),
+                "effort": effort if effort and not agent.get("reasoning_overrides") else None}
+    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
+        return None
+
+
+def _real_change(choice, setting):
+    """The part of a pick that changes what the chat runs. The phone re-sends a chat's pick with every message,
+    so a pick usually equals the chat's own setting; those fields change nothing and are left out. With no
+    known setting the whole pick stands."""
+    out = dict(choice)
+    if not setting:
+        return out
+    same_provider = not out.get("provider") or out["provider"].lower() == (setting.get("provider") or "").lower()
+    if out.get("model") and out["model"] == setting.get("model") and same_provider:
+        out.pop("model")
+        out.pop("provider", None)
+    if out.get("effort") and out["effort"] == setting.get("effort"):
+        out.pop("effort")
+    return out
+
+
+def _unresolvable(exc):
+    """Hermes couldn't resolve the picked model's route right now. ``session.mutate`` resolves a model's
+    credentials afresh, so this also covers a plan in a quota cooldown (the turn itself would fall back)."""
+    return isinstance(exc, TurnError) and "model_resolution_failed" in str(exc)
+
+
+async def _prepare_pick(c, turn):
+    """Put the phone's pick on the chat before its turn and freeze the turn's route in ``turn.runtime``.
+
+    A pick equal to the chat's own setting is not re-applied: while the plan behind it is in a quota cooldown,
+    Hermes refuses even the chat's current model with ``model_resolution_failed``. A real change Hermes can't
+    resolve right now doesn't block the message either: it goes out on the chat's current setting with a quiet
+    note, and the phone's next send tries the pick again."""
+    setting = await asyncio.to_thread(_session_setting, turn.home, turn.canonical_sid, turn.sid)
+    change = _real_change(turn.choice, setting)
+    try:
+        applied = await _apply(c, turn.sid, change) if change else {}
+    except TurnError as exc:
+        if not change.get("model") or not _unresolvable(exc):
+            raise
+        turn.runtime = {}
+        print("Kept %s/%s on its own model: %s is unresolvable right now (model_resolution_failed)"
+              % (turn.profile, turn.sid[:24], change["model"][:80]), file=sys.stderr, flush=True)
+        turn.push("notice", text="Hermes couldn't switch to %s right now, so this reply uses the chat's current "
+                  "model." % change["model"][:80])
+        return {}
+    # A committed switch also rides the admission, as before; an unchanged model needs no override.
+    turn.runtime = _admission_runtime(turn.choice) if change.get("model") else {}
+    return applied
+
+
 async def _apply(c, sid, choice: dict, ask=False) -> dict:
     applied = {}
     if choice.get("model"):
@@ -211,8 +296,13 @@ def _created_draft(home, request_id, title):
     """Read the native creation receipt left behind when the WebSocket reply is lost."""
     try:
         from gateway.owner_identity import host_owner_subject
-        from hermes_state_keys import local_identity
-        from hermes_state_local import POLICY_PREFIX
+        try:
+            # Hermes moved its state keys into the persistence package with the old session store's removal.
+            from persistence.sqlite._state.keys import local_identity
+            from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+        except ImportError:
+            from hermes_state_keys import local_identity
+            from hermes_state_local import POLICY_PREFIX
         from hermes_cli.gateway_runtime import gateway_profile_home
         profile_id = str(gateway_profile_home(home))
         subject = host_owner_subject()
@@ -274,8 +364,18 @@ def create_session(home, profile, title=None, request_id=None, cwd=None):
 
 
 async def _set_runtime(home, sid, choice, ask):
+    change = _real_change(choice, await asyncio.to_thread(_session_setting, home, sid))
+    if not change:
+        return {}  # already the chat's own setting: nothing to write, nothing to re-resolve
     async with connect(home) as c:
-        return await _apply(c, sid, choice, ask=ask)
+        try:
+            return await _apply(c, sid, change, ask=ask)
+        except TurnError as exc:
+            if not change.get("model") or not _unresolvable(exc):
+                raise
+            # Not resolvable right now (a quota cooldown, a signed-out plan). The phone keeps the pick and sends
+            # it with the next message, which tries again and never blocks on it (_prepare_pick).
+            return {"model": {"status": "next_send"}}
 
 
 def set_runtime(home, sid, choice):
@@ -360,6 +460,9 @@ class Turn:
         self.ended = 0.0
         self.journal = None
         self.prepared = False
+        # The admission's runtime fields (model_override), fixed when the pick is prepared so a retried or
+        # recovered submit repeats exactly what was first sent. None: derive from the pick (older receipts).
+        self.runtime = None
         self.frozen_text = None
         self.media = []
         self.ledger0 = None
@@ -808,7 +911,7 @@ async def _drive_connection(turn: Turn):
             turn.push("run.failed", error="This chat's identity could not be confirmed. Nothing was sent.")
             return
         following_queue = turn.admission is not None
-        applied = await _apply(c, turn.sid, turn.choice) if turn.choice and not following_queue and not turn.prepared else {}
+        applied = await _prepare_pick(c, turn) if turn.choice and not following_queue and not turn.prepared else {}
         if turn.journal and not turn.prepared:
             await asyncio.to_thread(turn.journal.prepared, turn)
             turn.prepared = True
@@ -816,7 +919,7 @@ async def _drive_connection(turn: Turn):
         images = [m for m in turn.media if m["mime"] == bridge_media.JPEG and m.get("native", True)]
         if images:
             params["attachments"] = [{"path": m["path"], "mime": m["mime"]} for m in images]
-        params.update(_admission_runtime(turn.choice))
+        params.update(turn.runtime if turn.runtime is not None else _admission_runtime(turn.choice))
         if following_queue:
             if await _recover_gap(c, turn, snapshot):
                 return
@@ -1054,6 +1157,8 @@ def restored_turn(row, home, journal, restore_workspace):
     turn.started, turn.steered = row["started"], bool(row["steered"])
     turn.prepared = row["canonical"] is not None
     turn.canonical_sid = row["canonical"] or turn.sid
+    if "runtime" in row.keys() and row["runtime"] is not None:
+        turn.runtime = json.loads(row["runtime"])
     turn.admission, turn.generation, turn.frozen_text = row["admission"], row["generation"], row["prompt"]
     if row["terminal"]:
         marker = json.loads(row["terminal"])
@@ -1302,8 +1407,13 @@ async def _follow_up(turn, mode, text, submission, choice=None, frames=()):
 
     staged = await asyncio.to_thread(lambda: transcribe_media(bridge_media.stage(frames, turn.home), turn.home)) if frames else []
     images = [m for m in staged if m["mime"] == bridge_media.JPEG and m.get("native", True)]
+    runtime = _admission_runtime(choice)
+    if runtime:
+        change = _real_change(choice, await asyncio.to_thread(_session_setting, turn.home, turn.canonical_sid, turn.sid))
+        if not change.get("model") and not change.get("effort"):
+            runtime = {}  # the chat already runs this pick; re-resolving it at the turn could only fail it
     params = {"session_id": turn.canonical_sid, "text": (text + _media_notes(staged)).strip(),
-              "submission_id": submission, **_admission_runtime(choice)}
+              "submission_id": submission, **runtime}
     if images:
         params["attachments"] = [{"path": m["path"], "mime": m["mime"]} for m in images]
     try:
