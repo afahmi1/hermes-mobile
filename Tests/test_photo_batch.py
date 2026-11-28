@@ -96,20 +96,37 @@ class PhotoBatchTests(unittest.TestCase):
             with Image.open(s["path"]) as im:
                 self.assertEqual(im.size, (6048, 4032), "full resolution on the Mac")
 
-    def test_iphone_photo_sizes_are_accepted_and_giants_refused(self):
+    def test_iphone_photo_sizes_are_accepted_and_giants_arrive_with_a_viewing_copy(self):
         for i, size in enumerate([(4032, 3024), (8064, 6048)]):  # 12.19 MP (the old cap refused it) and 48.8 MP
             item, _ = self.send_photo(i, jpeg(size))
-            self.assertEqual(len(media.decode([item])), 1, "%dx%d must be accepted" % size)
-        item, _ = self.send_photo(9, jpeg((9000, 6000)))  # 54 MP
-        with self.assertRaises(media.MediaError) as ctx:
-            media.decode([item])
-        self.assertIn("50 megapixels", str(ctx.exception))
+            self.assertEqual([f[3] for f in media.decode([item])], [media.JPEG], "%dx%d must be accepted" % size)
+        giant = jpeg((9000, 6000))  # 54 MP: a panorama. Never refused: the original is kept, the model gets a copy.
+        item, _ = self.send_photo(9, giant)
+        frames = media.decode([item])
+        staged = media.stage(frames, self.home)
+        original, copy = staged
+        self.assertEqual(Path(original["path"]).read_bytes(), giant)
+        self.assertIs(original["native"], False)
+        self.assertEqual(copy["copy_of"], original["path"])
+        self.assertTrue(copy["native"])
+        with Image.open(copy["path"]) as im:
+            self.assertLessEqual(im.width * im.height, media.MAX_PIXELS)
 
-    def test_a_damaged_photo_is_refused(self):
+    def test_a_damaged_photo_still_arrives_as_a_file(self):
         broken = self.photo[: len(self.photo) // 3]  # cut off mid-scan
         item, _ = self.send_photo(0, broken)
-        with self.assertRaises(media.MediaError):
-            media.decode([item])
+        frames = media.decode([item])
+        self.assertEqual(frames[0][3], "application/octet-stream", "kept, but never attached as a picture")
+
+    def test_a_mislabelled_photo_is_relabelled_not_refused(self):
+        from io import BytesIO
+        buf = BytesIO()
+        Image.new("RGB", (64, 64), "blue").save(buf, "PNG")
+        item, _ = self.send_photo(0, buf.getvalue())  # the phone said image/jpeg
+        frames = media.decode([item])
+        self.assertEqual(frames[0][3], "image/png")
+        staged = media.stage(frames, self.home)
+        self.assertEqual([s["mime"] for s in staged], ["image/png", media.JPEG])
 
     def test_batch_over_the_item_limit_is_refused_with_a_clear_message(self):
         small = jpeg((64, 64))

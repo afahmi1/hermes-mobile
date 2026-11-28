@@ -272,8 +272,10 @@ class PrimaryReceipts(unittest.TestCase):
                 self.assertEqual(self.attempts[0]["attachments"], self.attempts[1]["attachments"])
                 self.assertFalse(path.exists())
                 self.assertEqual(len(self.native), 1)
-            for bad in [dict(row, filename="../unsafe.jpg"), dict(row, mime="video/mp4"),
-                        dict(row, base64="AAAA"), dict(row, base64="A" * ((bridge_media.MAX_BYTES + 3) // 3 * 4 + 4)),
+            # A "photo" that isn't one still arrives (as a plain file), so the rest of the message isn't lost.
+            self.assertEqual(bridge_media.decode([dict(row, base64="AAAA")])[0][3], "application/octet-stream")
+            for bad in [dict(row, filename=".."), dict(row, mime="video/mp4"),
+                        dict(row, base64="A" * ((bridge_media.MAX_BYTES + 3) // 3 * 4 + 4)),
                         dict(row, path="/tmp/a")]:
                 with self.assertRaises(bridge_media.MediaError):
                     bridge_media.decode([bad])
@@ -334,8 +336,9 @@ class PrimaryReceipts(unittest.TestCase):
             first = self.start(attachments=[attachment], video_consent=True)
         path = Path(first.media[0]["path"])
         self.assertEqual(path.read_bytes(), clip())
-        self.assertNotIn(attachment["filename"], str(path))
-        self.assertEqual(path.parent, self.directory.resolve() / "mobile-video-inputs")
+        self.assertNotIn(attachment["filename"], str(path), "no spaces or shell characters reach the disk name")
+        self.assertTrue(path.name.endswith("_my_original_filename.mp4"))
+        self.assertEqual(path.parent, self.directory.resolve() / "attachments" / "mobile")
         if os.name != "nt":
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
