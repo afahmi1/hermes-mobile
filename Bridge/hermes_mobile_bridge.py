@@ -514,8 +514,13 @@ def token_ok(tok):
     return token_claims(tok) is not None
 
 
+class RegistryBusy(Exception):
+    """The device registry couldn't be read just now. The token may be perfectly valid, so this must never
+    become a 401: the phone treats 401 as "signed out" and forgets its login."""
+
+
 def token_claims(tok):
-    """Verified payload of a bearer token, or None."""
+    """Verified payload of a bearer token, or None. Raises RegistryBusy when the grant can't be checked."""
     try:
         ver, payload, sig = tok.split(".")
         if ver not in ("hm1", "hm2"):
@@ -524,11 +529,15 @@ def token_claims(tok):
         if not hmac.compare_digest(sig, hmac.new(SECRET, message.encode(), hashlib.sha256).hexdigest()):
             return None
         data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        if isinstance(data, dict) and int(data["exp"]) > time.time() and devices().accepts(data, tok):
-            return data
-        return None
+        if not (isinstance(data, dict) and int(data["exp"]) > time.time()):
+            return None
     except Exception:
         return None
+    try:
+        accepted = devices().accepts(data, tok)
+    except (sqlite3.Error, OSError) as exc:
+        raise RegistryBusy(type(exc).__name__) from exc
+    return data if accepted else None
 
 
 # ---------- owner management overlay (slice B) ----------
@@ -1970,7 +1979,12 @@ class H(BaseHTTPRequestHandler):
 
     def authed(self):
         h = self.headers.get("Authorization") or ""
-        self.device_claims = token_claims(h[7:].strip()) if h.startswith("Bearer ") else None
+        self.registry_busy = False
+        try:
+            self.device_claims = token_claims(h[7:].strip()) if h.startswith("Bearer ") else None
+        except RegistryBusy as exc:
+            log("device registry busy (%s); answered 503, not 401" % exc)
+            self.registry_busy, self.device_claims = True, None
         return self.device_claims is not None
 
     def login_elevates_to_owner(self):
@@ -2001,7 +2015,10 @@ class H(BaseHTTPRequestHandler):
         h = self.headers.get("Authorization") or ""
         if not (owner_managed() and h.startswith("Bearer ")):
             return False
-        return bridge_owner.claims_are_owner(token_claims(h[7:].strip()), owner_dir())
+        try:
+            return bridge_owner.claims_are_owner(token_claims(h[7:].strip()), owner_dir())
+        except RegistryBusy:
+            return False
 
     def route(self):
         if not self._read_body():
@@ -2019,6 +2036,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send(401, {"error": "Pairing code expired or already used. Request another code."})
             return self.send(200, {"token": token, "ttl": TOKEN_TTL})
         if not self.authed():
+            if self.registry_busy:
+                return self.send(503, {"error": "Your Mac is busy for a moment. Trying again.", "retry": True})
             return self.send(401, {"error": "Sign in again."})
         if path == "/m/capabilities" and self.command == "GET":
             features = ["device_grants", "pair_code", "push_v1"]
@@ -2915,6 +2934,8 @@ class H(BaseHTTPRequestHandler):
         try:
             with STREAMS.watch(self.device_claims, self.authed, self.connection) as valid:
                 if not valid:
+                    if getattr(self, "registry_busy", False):
+                        return self.send(503, {"error": "Your Mac is busy for a moment. Trying again.", "retry": True})
                     return self.send(401, {"error": "Sign in again."})
                 attach, detach = getattr(turn, "attach", None), getattr(turn, "detach", None)
                 if attach:

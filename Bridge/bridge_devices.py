@@ -15,6 +15,13 @@ class Devices:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.path = directory / "devices.sqlite3"
         with closing(self.connect()) as db:
+            # WAL: checking a phone's grant (every request) never waits behind a write (push token, presence,
+            # pairing). Under the old rollback journal a write held past the lock timeout made a valid
+            # phone's request fail, and the bridge answered that with "Sign in again".
+            try:
+                db.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.Error:
+                pass
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS devices (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, issued INTEGER NOT NULL,
@@ -32,7 +39,8 @@ class Devices:
             self.path.chmod(0o600)
 
     def connect(self):
-        return sqlite3.connect(self.path, timeout=3)
+        # A long wait is cheap; a timeout is not (see RegistryBusy in hermes_mobile_bridge).
+        return sqlite3.connect(self.path, timeout=15)
 
     def issue(self, claims, code=None):
         with closing(self.connect()) as db, db:
@@ -193,10 +201,12 @@ class Streams:
         try:
             allowed = self.permitted(key for _, (key, _, _) in entries)
         except (sqlite3.Error, OSError):
-            allowed = set()
+            # The registry is busy or unreadable for a moment. That is not a revocation: keep every stream
+            # (revoke() still closes a revoked device's streams at once) and enforce only the token deadline.
+            allowed = None
         now = time.time()
         for handle, (key, expiry, _) in entries:
-            if key not in allowed or expiry <= now:
+            if expiry <= now or (allowed is not None and key not in allowed):
                 self._disconnect(handle)
 
     def revoked(self, key):
