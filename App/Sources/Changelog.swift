@@ -32,6 +32,9 @@ enum WhatsNew {
 
     /// Newest first. Add a release at the top for each build that changes something you'd notice.
     static let releases: [WhatsNewRelease] = [
+        WhatsNewRelease(build: 49, items: [
+            WhatsNewItem(symbol: "sparkles", text: "Silver accent and a brighter, wider glow in Dark"),
+        ]),
         WhatsNewRelease(build: 48, items: [
             WhatsNewItem(symbol: "photo.stack", text: "Send 15+ photos at once; past 10 they go by path"),
             WhatsNewItem(symbol: "doc", text: "Any file type; iPhone photos arrive as HEIC, full size"),

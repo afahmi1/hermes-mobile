@@ -100,7 +100,7 @@ public enum Thermocline {
 
     // MARK: Accent (v1.1). Public `lead`, `onLead`, `spark` stay crown; `link` stays standalone.
     public enum Accent: String, CaseIterable, Identifiable {
-        case crown, wing, gold, cheek, chestnut, plum, green
+        case crown, wing, gold, cheek, chestnut, plum, green, silver
         public var id: String { rawValue }
         public var displayName: String {
             switch self {
@@ -111,6 +111,7 @@ public enum Thermocline {
             case .chestnut: return "Chestnut"
             case .plum: return "Plum"
             case .green: return "Green"
+            case .silver: return "Silver"
             }
         }
         /// Bird and feather the color was measured from.
@@ -123,6 +124,7 @@ public enum Thermocline {
             case .chestnut: return "Zebra finch chestnut flank"
             case .plum: return "Gouldian finch purple chest"
             case .green: return "Gouldian finch green back"
+            case .silver: return "Gouldian finch silver/pastel body plumage"
             }
         }
         /// Text, links, icons, toggles, `.tint`, marks and glows. In Dark, Crown and Wing follow Light's deep blues,
@@ -138,6 +140,7 @@ public enum Thermocline {
             case .chestnut: return Palette.chestnutToken
             case .plum: return Palette.plumToken
             case .green: return .init(light: 0x4B6801, dark: 0xA3C54F)
+            case .silver: return .init(light: 0x526162, dark: 0xABBBBC)
             }
         }
         /// Bubbles, primary buttons, selected chips, the send button and swatches. Crown and Wing fill with Light's

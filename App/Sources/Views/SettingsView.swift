@@ -137,7 +137,7 @@ struct SettingsView: View {
 }
 
 #if DEBUG
-/// Screenshot QA (debug builds only): `-HMSettingsScroll thinking` scrolls Settings to the thinking styles at launch.
+/// Screenshot QA (debug builds only): `-HMSettingsScroll accent` or `thinking` scrolls to that control at launch.
 private struct SettingsScrollHook: ViewModifier {
     private let target = UserDefaults.standard.string(forKey: "HMSettingsScroll")
 
@@ -513,17 +513,28 @@ struct AppearanceSection: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Accent").font(.subheadline)
-                    let layout = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10)) : AnyLayout(HStackLayout(spacing: 4))
-                    layout {
+                    let accessible = typeSize.isAccessibilitySize
+                    let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: accessible ? 1 : 4)
+                    LazyVGrid(columns: columns, spacing: 4) {
                         ForEach(Thermocline.Accent.allCases) { accent in
+                            let layout = accessible ? AnyLayout(HStackLayout(spacing: 8)) : AnyLayout(VStackLayout(spacing: 0))
                             Button { thermoclineAccentRaw = accent.rawValue } label: {
-                                AccentSwatch(accent: accent, selected: thermoclineAccentRaw == accent.rawValue)
+                                layout {
+                                    AccentSwatch(accent: accent, selected: thermoclineAccentRaw == accent.rawValue)
+                                    Text(accent.displayName).font(.caption2).foregroundStyle(HMDesign.ink)
+                                }
+                                .frame(maxWidth: .infinity, alignment: accessible ? .leading : .center)
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .accessibilityLabel(accent.displayName)
+                            .accessibilityHint(accent.source)
+                            .accessibilityAddTraits(thermoclineAccentRaw == accent.rawValue ? .isSelected : [])
                         }
                     }
                 }
                 .padding(.vertical, 4)
+                .id("hm.settings.accent")
             } else {
                 // Classic: Build 31's own looks, accents and Liquid Glass, unchanged.
                 ForEach(HMThemeChoice.allCases) { theme in
