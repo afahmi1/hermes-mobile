@@ -655,6 +655,20 @@ def stage(frames, home):
         raise
 
 
+def transient(paths, home):
+    """The staged files safe to delete once a turn ends: everything outside attachments/mobile."""
+    keep = Path(_attachments_dir(home)).resolve()
+    out = []
+    for item in paths or []:
+        try:
+            inside = Path(item["path"]).resolve().is_relative_to(keep)
+        except (OSError, ValueError, KeyError):
+            inside = False
+        if not inside:
+            out.append(item)
+    return out
+
+
 def discard(paths):
     for item in paths or []:
         Path(item["path"]).unlink(missing_ok=True)
