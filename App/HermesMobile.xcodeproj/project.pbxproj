@@ -38,12 +38,14 @@
 		A4A842B468F6E4BFD7629888 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBF6F2AB0BD3858AAAAF4FFA /* AppModel.swift */; };
 		B008ADF2A4507701EEF5A8AE /* ThinkingLines.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F6758DCD86ACDCB741631A1 /* ThinkingLines.swift */; };
 		B16507F21903C2EEF6219FFB /* Projects.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD07289071E7483A587F926 /* Projects.swift */; };
+		B6B9D9C9F8C210B93BD484A1 /* PixelSprites.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8933286E6CC11BD458893AA /* PixelSprites.swift */; };
 		B720454FD199801DFD0CDB87 /* ReplyNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D211C265CBAAADB19E83D77 /* ReplyNotifier.swift */; };
 		BB68DFC49A2486A264232013 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B7ADE2F1616D13629C51A3B /* PushRegistration.swift */; };
 		C6254CDC81B9E435FBB3B981 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77BE1304B3824EAD4CAE8086 /* SignInView.swift */; };
 		CE8872AD244AC2FE04FB85DB /* API.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1476455C52D00777817E0CF2 /* API.swift */; };
 		D89CC64A6860A59B692B8DC3 /* DemoServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58F51569AD63B884F3438036 /* DemoServer.swift */; };
 		DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2964B8E32E7A6E7CAE8E6CD /* Models.swift */; };
+		E9A8C2F56A19DBE24B124290 /* KawaiiFilter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70C90914453A6156397C039F /* KawaiiFilter.swift */; };
 		ED1266216A5741C7D9F1F39B /* StreamRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84E690DA9F04A70286E6A83B /* StreamRecovery.swift */; };
 		EEC89AC641DCF06A776F598D /* DesignReview.swift in Sources */ = {isa = PBXBuildFile; fileRef = A65F9AB1D73559C3D9D97606 /* DesignReview.swift */; };
 		F25287E5F6EA9306198EADD7 /* InboxCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E6169EEAB809871675DAC1 /* InboxCache.swift */; };
@@ -66,6 +68,7 @@
 		58F51569AD63B884F3438036 /* DemoServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoServer.swift; sourceTree = "<group>"; };
 		6686DC90CF4C5218AD9EE3C5 /* HermesMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesMobileApp.swift; sourceTree = "<group>"; };
 		66ACD344C8D0AAB1D4095EB2 /* WhatsNew.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhatsNew.swift; sourceTree = "<group>"; };
+		70C90914453A6156397C039F /* KawaiiFilter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KawaiiFilter.swift; sourceTree = "<group>"; };
 		74DC4319E52126D6153EF72E /* Thermocline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Thermocline.swift; sourceTree = "<group>"; };
 		77BE1304B3824EAD4CAE8086 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
 		785C4DB8C31E64EB728F4674 /* StatusModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusModel.swift; sourceTree = "<group>"; };
@@ -81,6 +84,7 @@
 		AAD07289071E7483A587F926 /* Projects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Projects.swift; sourceTree = "<group>"; };
 		AEDE9C050CDF0DF9C49E0B64 /* Management.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Management.swift; sourceTree = "<group>"; };
 		B2964B8E32E7A6E7CAE8E6CD /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		B8933286E6CC11BD458893AA /* PixelSprites.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixelSprites.swift; sourceTree = "<group>"; };
 		C87199BB4AB4041206610E84 /* MediaStaging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaStaging.swift; sourceTree = "<group>"; };
 		CAFA9E6B699E7BB76519F7CD /* ProviderUsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProviderUsageView.swift; sourceTree = "<group>"; };
 		CBA5B61C8421B891EEEAE3A8 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
@@ -120,6 +124,7 @@
 				A65F9AB1D73559C3D9D97606 /* DesignReview.swift */,
 				6686DC90CF4C5218AD9EE3C5 /* HermesMobileApp.swift */,
 				44E6169EEAB809871675DAC1 /* InboxCache.swift */,
+				70C90914453A6156397C039F /* KawaiiFilter.swift */,
 				AEDE9C050CDF0DF9C49E0B64 /* Management.swift */,
 				A7064B9C91B578271B8CD8CC /* ManagementAPI.swift */,
 				C87199BB4AB4041206610E84 /* MediaStaging.swift */,
@@ -184,6 +189,7 @@
 				E5C951BAAEA0B569AB229B9E /* DesignSystem.swift */,
 				FEDF83C8338A7C71FD8C2FB4 /* ManageViews.swift */,
 				AA8AF41DA7F59809B8B46AA5 /* MarkdownText.swift */,
+				B8933286E6CC11BD458893AA /* PixelSprites.swift */,
 				587EB11B4B0982F2A981F8F5 /* ProjectsView.swift */,
 				CAFA9E6B699E7BB76519F7CD /* ProviderUsageView.swift */,
 				4A6A9D75E969CDFA904BF436 /* RuntimeSheet.swift */,
@@ -290,12 +296,14 @@
 				08ED71C62E2C7AC742848AF9 /* DesignSystem.swift in Sources */,
 				569136F100411902E2211011 /* HermesMobileApp.swift in Sources */,
 				F25287E5F6EA9306198EADD7 /* InboxCache.swift in Sources */,
+				E9A8C2F56A19DBE24B124290 /* KawaiiFilter.swift in Sources */,
 				2A1AF0E938E8FF41B72770B0 /* ManageViews.swift in Sources */,
 				11047681052764C050F89289 /* Management.swift in Sources */,
 				38D5ABE86429FF25D8801AE5 /* ManagementAPI.swift in Sources */,
 				2DA9ED00AD66FD68506A0E7F /* MarkdownText.swift in Sources */,
 				6BFCE82C26EA31F0239C7BC8 /* MediaStaging.swift in Sources */,
 				DC49B7D33B67F372F3FA8773 /* Models.swift in Sources */,
+				B6B9D9C9F8C210B93BD484A1 /* PixelSprites.swift in Sources */,
 				B16507F21903C2EEF6219FFB /* Projects.swift in Sources */,
 				13EC70EBF845B6FBB26EADC7 /* ProjectsView.swift in Sources */,
 				9871CAA201B1E5134B060C34 /* ProviderUsageView.swift in Sources */,

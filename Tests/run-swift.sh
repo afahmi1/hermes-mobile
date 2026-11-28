@@ -8,7 +8,7 @@ out=$(mktemp -d "${TMPDIR:-/tmp}/hermes-swift-suites.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 export CFFIXED_USER_HOME="$out/test-home"
 mkdir -p "$CFFIXED_USER_HOME"
-lib=(App/Sources/{API,AppModel,InboxCache,ChatModel,Management,ManagementAPI,Models,Projects,StatusModel,RecentModels,StreamRecovery,Workspaces,MediaStaging,ReplyNotifier,Changelog}.swift)
+lib=(App/Sources/{API,AppModel,InboxCache,ChatModel,KawaiiFilter,Management,ManagementAPI,Models,Projects,StatusModel,RecentModels,StreamRecovery,Workspaces,MediaStaging,ReplyNotifier,Changelog}.swift)
 for source in Tests/*Tests.swift; do
   suite=$(basename "$source" Tests.swift)
   [[ "$suite" == MediaImport ]] && continue
@@ -19,7 +19,7 @@ done
 if [ -n "${1:-}" ]; then
   xcrun -sdk iphonesimulator swiftc -parse-as-library -target arm64-apple-ios17.0-simulator \
     "${lib[@]}" App/Sources/PushRegistration.swift App/Sources/Views/Thermocline.swift App/Sources/Views/DesignSystem.swift \
-    App/Sources/Views/ChatMedia.swift Tests/MediaImportTests.swift -o "$out/MediaImport"
+    App/Sources/Views/PixelSprites.swift App/Sources/Views/ChatMedia.swift Tests/MediaImportTests.swift -o "$out/MediaImport"
   env -u CFFIXED_USER_HOME xcrun simctl spawn "$1" "$out/MediaImport"
 else
   echo "SKIPPED MediaImport: pass a booted simulator UDID to run it"

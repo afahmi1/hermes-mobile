@@ -143,7 +143,10 @@ struct RootView: View {
 
     var body: some View {
         #if DEBUG
-        if DemoMode.isOn && UserDefaults.standard.bool(forKey: "HMShowSignIn") {
+        if DemoMode.isOn,
+           let kind = UserDefaults.standard.string(forKey: "HMSpriteFrames"), let art = SpriteArt(rawValue: kind) {
+            SpriteFrameStrip(art: art)
+        } else if DemoMode.isOn && UserDefaults.standard.bool(forKey: "HMShowSignIn") {
             SignInView()
         } else {
             signedInContent

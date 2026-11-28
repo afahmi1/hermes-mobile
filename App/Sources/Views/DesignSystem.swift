@@ -1094,7 +1094,7 @@ struct ThinkingOrb: View {
 
 /// How "Hermes is working" looks. Crisp pixels by default: they stay sharp at 16 pt, where a blurred orb smears.
 enum ThinkingStyle: String, CaseIterable, Identifiable {
-    case orbs, matrix, sprite, braille, orb
+    case orbs, matrix, sprite, braille, orb, salmon, macaw
     static let key = "hm.thinking"
     var id: String { rawValue }
     var title: String {
@@ -1104,6 +1104,8 @@ enum ThinkingStyle: String, CaseIterable, Identifiable {
         case .sprite: "Pixel flame"
         case .braille: "Terminal"
         case .orb: "Color orb"
+        case .salmon: "Salmon"
+        case .macaw: "Macaw"
         }
     }
 }
@@ -1125,6 +1127,8 @@ struct ThinkingIndicator: View {
         case .sprite: PixelFlame(size: size + 4, tint: tint)
         case .braille: BrailleSpinner(size: size, tint: tint)
         case .orb: ThinkingOrb(size: size)
+        case .salmon: PixelSprite(art: .salmon, size: size + 6, current: tint ?? HMDesign.accent, thermocline: tint != nil)
+        case .macaw: PixelSprite(art: .macaw, size: size + 6, current: .clear, thermocline: tint != nil)
         }
     }
 }

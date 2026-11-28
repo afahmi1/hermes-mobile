@@ -9,6 +9,7 @@ import Foundation
 /// - `-HMDemoDraft 1` puts a draft in that chat's composer, so the send button shows its live state.
 /// - `-HMDemoFallback 1` makes a different model the last to answer, so the chat header names both models.
 /// - `-HMDemoLive 1` makes that chat's reply still running on the "Mac": a live tool row and the stop button.
+/// - `-HMDemoKaomoji 1` (with Live) adds a Hermes-style status for checking the Kawaii faces switch.
 /// - `-HMDemoApproval 1` (with Live) adds an approval request to the running reply.
 /// - `-HMDemoFinishAfter N` (with Live) finishes that reply N seconds after its stream opens. Send the app to the
 ///   background first and the reply notification fires, as it would on a phone.
@@ -329,8 +330,12 @@ enum DemoFixtures {
             ["event": "run.started", "seq": 0, "turn_id": DemoMode.runID],
             ["event": "tool.started", "seq": 1, "tool_name": "terminal", "preview": "Tests/run-swift.sh"],
         ]
+        if UserDefaults.standard.bool(forKey: "HMDemoKaomoji") {
+            list.append(["event": "reasoning.delta", "seq": list.count, "delta": "(◔_◔) Comparing the colors on Light and Dark."])
+            list.append(["event": "status", "seq": list.count, "text": "(｡◕‿◕｡) Checking colors…"])
+        }
         if DemoMode.approval {
-            list.append(["event": "approval.request", "seq": 2, "request_id": "apr_demo_push",
+            list.append(["event": "approval.request", "seq": list.count, "request_id": "apr_demo_push",
                          "command": "git push origin feat/thermocline",
                          "description": "Push four commits to the open pull request branch.",
                          "choices": ["once", "session", "deny"]])
