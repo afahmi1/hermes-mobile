@@ -51,6 +51,9 @@ class Journal:
                 canonical TEXT, admission TEXT, generation INTEGER, terminal TEXT, steered INTEGER DEFAULT 0, media TEXT)""")
             if "media_types" not in {row[1] for row in db.execute("PRAGMA table_info(receipts)")}:
                 db.execute("ALTER TABLE receipts ADD COLUMN media_types TEXT")
+            if "runtime" not in {row[1] for row in db.execute("PRAGMA table_info(receipts)")}:
+                # The admission's model_override as first submitted: a recovered send repeats it exactly.
+                db.execute("ALTER TABLE receipts ADD COLUMN runtime TEXT")
             db.execute("CREATE TABLE IF NOT EXISTS mobile_origins(profile TEXT, sid TEXT, PRIMARY KEY(profile, sid)) WITHOUT ROWID")
             db.execute("CREATE INDEX IF NOT EXISTS pending_sends ON receipts(started) WHERE terminal IS NULL")
 
@@ -82,8 +85,10 @@ class Journal:
                        json.dumps([item["mime"] for item in turn.media]) if turn.media else None))
 
     def prepared(self, turn):
+        runtime = getattr(turn, "runtime", None)
         with closing(self.open()) as db, db:
-            db.execute("UPDATE receipts SET canonical=? WHERE id=?", (turn.canonical_sid, turn.id))
+            db.execute("UPDATE receipts SET canonical=?, runtime=? WHERE id=?",
+                       (turn.canonical_sid, None if runtime is None else json.dumps(runtime), turn.id))
 
     def admitted(self, turn):
         with closing(self.open()) as db, db:
