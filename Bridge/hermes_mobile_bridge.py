@@ -514,6 +514,19 @@ def token_ok(tok):
     return token_claims(tok) is not None
 
 
+def failure_reply(exc):
+    """(status, body) for an unexpected failure: what happened in words, the exception type kept for the log search."""
+    import errno
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return 507, {"error": "Your Mac is out of disk space. Free some space, then send again."}
+    if isinstance(exc, OSError) and exc.errno in (errno.EACCES, errno.EPERM):
+        return 500, {"error": "Your Mac refused to save this (no permission). Run the bridge doctor on the Mac. (%s)"
+                              % type(exc).__name__}
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return 503, {"error": "Hermes on your Mac didn't answer in time. Trying again.", "retry": True}
+    return 502, {"error": "Something went wrong on your Mac (%s). The bridge log has the details." % type(exc).__name__}
+
+
 class RegistryBusy(Exception):
     """The device registry couldn't be read just now. The token may be perfectly valid, so this must never
     become a 401: the phone treats 401 as "signed out" and forgets its login."""
@@ -2905,7 +2918,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(e.code, {"error": str(e)})
         except Exception as e:
             log("chat route %s failed: %s: %s" % (path, type(e).__name__, e))
-            return self.send(502, {"error": "%s: %s" % (type(e).__name__, str(e)[:200])})
+            return self.send(*failure_reply(e))
 
     def _schedule(self, pid, sid, action, d):
         store = schedule_store()

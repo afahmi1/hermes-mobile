@@ -95,9 +95,33 @@ class MediaError(ValueError):
 UPLOADS = None
 
 
+def clean_name(name):
+    """A safe display name for what the phone sent, or None. Names are cleaned, not refused: macOS screenshot names
+    carry U+202F before AM/PM, iOS hands over NFD Korean, and a long name keeps its extension when shortened."""
+    import unicodedata
+    if not isinstance(name, str) or not name or len(name) > 4096:
+        return None
+    out = []
+    for c in unicodedata.normalize("NFC", name):
+        kind = unicodedata.category(c)
+        if kind == "Zs" or c in "\t\n\r":
+            out.append(" ")
+        elif kind[0] == "C":
+            continue  # control, format, surrogate and unassigned characters
+        else:
+            out.append("_" if c in "/\\:" else c)
+    name = " ".join("".join(out).split())
+    if name in ("", ".", ".."):
+        return None
+    if len(name) > 140:
+        stem, dot, ext = name.rpartition(".")
+        ext = "." + ext if dot and stem and EXT.match(ext) else ""
+        name = name[:140 - len(ext)].rstrip() + ext
+    return name
+
+
 def valid_name(name):
-    return (isinstance(name, str) and 0 < len(name) <= 140 and name.isprintable()
-            and not any(c in name for c in "/\\:") and name not in (".", ".."))
+    return clean_name(name) is not None
 
 
 def valid_mime(mime):
@@ -129,6 +153,43 @@ def _check_other_image(source):
         raise MediaError("An image is larger than %d megapixels." % (MAX_PIXELS // 1_000_000))
 
 
+def _sniff_image(source):
+    """(real image MIME, pixel count) for anything Pillow can open (HEIC via pillow-heif), else (None, 0)."""
+    from PIL import Image
+    try:
+        with _open_any_image(source) as image:
+            fmt, pixels = image.format, image.width * image.height
+    except Exception:
+        return None, 0
+    finally:
+        if hasattr(source, "seek"):
+            source.seek(0)
+    mime = {"JPEG": JPEG, "MPO": JPEG, "HEIF": "image/heic", "AVIF": "image/avif", "PNG": "image/png",
+            "GIF": "image/gif", "WEBP": "image/webp", "TIFF": "image/tiff", "BMP": "image/bmp",
+            "DNG": "image/x-adobe-dng"}.get(fmt) or Image.MIME.get(fmt or "")
+    return mime, pixels
+
+
+def _classify_image(source, claimed):
+    """The MIME a photo really is. The phone guesses from extensions (a HEIC named .jpg, a DNG labelled JPEG), so the
+    bytes decide. Nothing here refuses a send: a photo too large to attach natively still arrives (stage() gives the
+    model a smaller copy), and one no decoder can read arrives as a plain file the model is told about."""
+    mime, pixels = _sniff_image(source)
+    if mime is None:
+        return "application/octet-stream" if claimed == JPEG else claimed
+    if mime == JPEG and pixels <= MAX_PIXELS:
+        try:
+            _check_jpeg(source)
+        except MediaError:
+            return "application/octet-stream"  # cut off mid-transfer or damaged: keep the bytes, don't attach them
+        finally:
+            if hasattr(source, "seek"):
+                source.seek(0)
+    if mime == JPEG and pixels > MAX_PIXELS:
+        return "image/x-large-jpeg"  # internal label: kept as a file, viewed through a smaller JPEG copy
+    return mime
+
+
 def _uploaded(item):
     """A frame for a file sent through the resumable upload path: (name, sha256, Path, mime)."""
     import bridge_uploads
@@ -140,7 +201,7 @@ def _uploaded(item):
         raise MediaError(str(exc)) from None
     if (item["filename"], item["mime"]) != (meta["filename"], meta["mime"]):
         raise MediaError("The attachment doesn't match its upload.")
-    return item["filename"], meta["sha256"], path, item["mime"]
+    return clean_name(item["filename"]), meta["sha256"], path, item["mime"]
 
 
 @lru_cache(maxsize=1)
@@ -300,12 +361,10 @@ def decode(items):
                         _validate_clip(view)
                 except (ValueError, OSError):
                     raise MediaError("The video must be a self-contained MP4 with a video track.") from None
-            elif mime == JPEG:
-                if not supported():
+            elif mime.startswith("image/") or mime == "application/octet-stream":
+                mime = _classify_image(path, mime)
+                if mime == JPEG and not supported():
                     raise MediaError("This Hermes installation does not support native image attachments.")
-                _check_jpeg(path)
-            elif mime.startswith("image/"):
-                _check_other_image(path)
             frames.append((name, digest, path, mime))
             continue
         if not isinstance(item, dict) or set(item) != {"filename", "mime", "base64"}:
@@ -315,9 +374,9 @@ def decode(items):
             raise MediaError("Attach files with a valid media type.")
         if mime == MP4 and len(items) != 1:
             raise MediaError("Attach one MP4 clip, or up to %d other files." % MAX_ITEMS)
-        if (not isinstance(name, str) or not 0 < len(name) <= 140 or not name.isprintable()
-                or any(c in name for c in "/\\:") or name in (".", "..")):
-            raise MediaError("Invalid attachment name.")
+        name = clean_name(name)
+        if name is None:
+            raise MediaError("An attachment has no usable file name.")
         if not isinstance(encoded, str) or len(encoded) > (remaining + 2) // 3 * 4:
             raise MediaError("Attachments must total %d MiB or less." % (MAX_BYTES // (1024 * 1024)))
         try:
@@ -331,12 +390,10 @@ def decode(items):
                 _validate_clip(raw)
             except ValueError:
                 raise MediaError("The video must be a self-contained MP4 with a video track.") from None
-        elif mime == JPEG:
-            if not supported():
-                raise MediaError("This Hermes installation does not support native image attachments.")
-            _check_jpeg(BytesIO(raw))
         elif mime.startswith("image/"):
-            _check_other_image(BytesIO(raw))
+            mime = _classify_image(BytesIO(raw), mime)
+            if mime == JPEG and not supported():
+                raise MediaError("This Hermes installation does not support native image attachments.")
         remaining -= len(raw)
         frames.append((name, hashlib.sha256(raw).hexdigest(), raw, mime))
     return frames
@@ -344,6 +401,7 @@ def decode(items):
 
 def _private_dir(home, name, label):
     directory = Path(home).resolve() / name
+    directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory.mkdir(mode=0o700, exist_ok=True)
     st = directory.lstat()
     if not stat.S_ISDIR(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:
@@ -381,26 +439,74 @@ def _image_dir(home):
     return directory.resolve()
 
 
+# Where everything the phone sends lives, except the JPEGs Hermes attaches natively (those must sit in its image
+# cache, which it sweeps after a day once it has its own copy). <profile>/attachments/ is where Hermes's desktop app
+# stages files too: every terminal backend mounts it, `@file:` refs accept it, and Hermes never sweeps it. Files
+# keep their real names, so "the PDF from this morning" still opens tomorrow and the model sees "Q3 deck.pptx",
+# not hm_send_3f9c.bin. The old 4-hour folders lost files mid-conversation.
+ATTACHMENTS = "attachments/mobile"
+_LEGACY_DIRS = ("mobile-video-inputs", "mobile-file-inputs")
+
+
+def _retention_days():
+    try:
+        days = float(os.environ.get("HERMES_MOBILE_ATTACHMENT_DAYS", "") or 30)
+    except ValueError:
+        days = 30
+    return max(1.0, days)
+
+
+def _attachments_dir(home):
+    return _private_dir(home, ATTACHMENTS, "attachments")
+
+
 def _clip_dir(home):
-    return _private_dir(home, "mobile-video-inputs", "video")
+    return _attachments_dir(home)
 
 
 def _file_dir(home):
-    return _private_dir(home, "mobile-file-inputs", "files")
+    return _attachments_dir(home)
 
 
-def _extension(name):
+def _extension(name, mime=None):
     ext = Path(name).suffix.lstrip(".")
-    return "." + ext.lower() if EXT.match(ext) else ".bin"
+    if EXT.match(ext):
+        return "." + ext.lower()
+    import mimetypes
+    guessed = {"image/heic": ".heic", "image/heif": ".heif", "image/x-adobe-dng": ".dng", "image/avif": ".avif",
+               "audio/x-m4a": ".m4a", "audio/mp4": ".m4a", "video/quicktime": ".mov"}.get(mime or "") or (
+        mimetypes.guess_extension(mime or "") or "")
+    return guessed if EXT.match(guessed.lstrip(".")) else ".bin"
+
+
+def _disk_name(name, mime):
+    """`<12 hex>_<the name the user sent>`: unique, readable, with an extension tools can trust."""
+    import uuid
+    # Word characters, dots and dashes only: no spaces, quotes, $, (), ; or backticks, so a path pasted into a shell
+    # command can neither split nor run anything ("$(rm -rf ~).pdf" lands as "_rm_-rf____.pdf").
+    stem = re.sub(r"[^\w.\-]", "_", name or "attachment").strip("._") or "attachment"
+    ext = _extension(stem, mime)
+    if not stem.lower().endswith(ext):
+        stem += ext
+    return "%s_%s" % (uuid.uuid4().hex[:12], stem[-120:])
+
+
+_PRUNED = {}
 
 
 def prune(home):
-    cutoff = time.time() - 4 * 3600
-    for name in ("mobile-video-inputs", "mobile-file-inputs"):
-        directory = Path(home).resolve() / name
-        if directory.resolve() != directory or not directory.is_dir():
+    """Drop what the phone sent more than HERMES_MOBILE_ATTACHMENT_DAYS (30) ago. At most once an hour per profile."""
+    root = Path(home).resolve()
+    now = time.time()
+    if now - _PRUNED.get(str(root), 0) < 3600:
+        return
+    _PRUNED[str(root)] = now
+    cutoff = now - _retention_days() * 86400
+    sweeps = [(root / name, "hm_send_*") for name in _LEGACY_DIRS] + [(root / ATTACHMENTS, "*")]
+    for directory, pattern in sweeps:
+        if not directory.is_dir() or directory.resolve() != directory:
             continue
-        for staged in directory.glob("hm_send_*"):
+        for staged in directory.glob(pattern):
             try:
                 if staged.is_file() and staged.lstat().st_mtime < cutoff:
                     staged.unlink(missing_ok=True)
@@ -414,13 +520,22 @@ def prune_clips(home):
 
 
 def _jpeg_copy(source, directory):
-    """A full-resolution JPEG copy of a HEIC/PNG/WebP/... photo, only so a model can look at it (models read JPEG).
+    """A JPEG copy of a HEIC/PNG/WebP/DNG/... photo, only so a model can look at it (models read JPEG). Full resolution
+    up to MAX_PIXELS; a bigger photo (a panorama, a 100 MP scan) is scaled down to fit, so it can still be attached.
     Pillow first (with pillow-heif), macOS's own `sips` as a fallback. None if neither can read it."""
     import uuid
     target = Path(directory) / ("hm_send_%s.jpg" % uuid.uuid4().hex[:12])
     try:
-        from PIL import ImageOps
+        from PIL import Image, ImageOps
+        Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS or 0, 4 * MAX_PIXELS)
         with _open_any_image(source) as image:
+            pixels = image.width * image.height
+            if pixels > MAX_PIXELS:
+                scale = (MAX_PIXELS / pixels) ** 0.5
+                size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+                if image.format == "JPEG":
+                    image.draft("RGB", size)
+                image = image.resize(size) if (image.width, image.height) != size else image
             ImageOps.exif_transpose(image).convert("RGB").save(target, "JPEG", quality=92)
     except Exception:
         target.unlink(missing_ok=True)
@@ -429,8 +544,8 @@ def _jpeg_copy(source, directory):
         if not shutil.which("sips"):
             return None
         try:
-            subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "92", str(source), "--out", str(target)],
-                           check=True, capture_output=True, timeout=120)
+            subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "92", "-Z", "8000", str(source),
+                            "--out", str(target)], check=True, capture_output=True, timeout=120)
         except Exception:
             target.unlink(missing_ok=True)
             return None
@@ -441,53 +556,99 @@ def _jpeg_copy(source, directory):
     return target
 
 
+IWORK = (".pages", ".key", ".numbers")
+
+
+def _iwork_preview(path):
+    """An iWork file is a ZIP bundle that usually carries a PDF preview. Pull it out next to the file so the model
+    can read the document with read_file instead of being stuck on an opaque archive."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as bundle:
+            names = {n.lower(): n for n in bundle.namelist()}
+            inner = names.get("quicklook/preview.pdf") or names.get("preview.pdf")
+            if not inner or bundle.getinfo(inner).file_size > 200 * 1024 * 1024:
+                return None
+            target = Path(str(path) + ".preview.pdf")
+            with bundle.open(inner) as src, open(target, "wb") as out:
+                import shutil
+                shutil.copyfileobj(src, out)
+            target.chmod(0o600)
+            return str(target)
+    except (OSError, zipfile.BadZipFile, KeyError, ValueError):
+        return None
+
+
+def _place(raw, target, copy):
+    """Write a frame's bytes (inline) or its upload (a Path) to target. Uploads are hard-linked when allowed (instant),
+    copied otherwise. A native photo is ALWAYS copied: Hermes refuses an attachment with a second name
+    (session_ingress_media._attachment_hashes, st_nlink != 1) as a bare invalid_params."""
+    import shutil
+    if isinstance(raw, Path):
+        if copy:
+            shutil.copyfile(raw, target)
+        else:
+            try:
+                os.link(raw, target)
+            except OSError:
+                shutil.copyfile(raw, target)
+    else:
+        with open(target, "xb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+    target.chmod(0o600)
+    os.utime(target)  # current mtime: every sweeper (ours, Hermes's) ages a file from when it arrived
+    return target
+
+
 def stage(frames, home):
     paths = []
     try:
         for name, _, raw, mime in frames:
-            if mime == MP4:
-                directory, ext = _clip_dir(home), ".mp4"
-            elif mime == JPEG:
-                directory, ext = _image_dir(home), ".jpg"
-            else:
-                directory, ext = _file_dir(home), _extension(name)
-            if isinstance(raw, Path):
-                # An uploaded file. A photo is COPIED: Hermes refuses a native attachment that has a second name
-                # (session_ingress_media._attachment_hashes, st_nlink != 1) as a bare invalid_params, so a hard
-                # link to the upload made every uploaded photo batch fail. Other files go by path and can be
-                # hard-linked (instant, no second copy), falling back to a copy across volumes.
-                import shutil
+            if mime == JPEG:
                 import uuid
-                target = Path(directory) / ("hm_send_%s%s" % (uuid.uuid4().hex[:12], ext))
-                if mime == JPEG:
-                    shutil.copyfile(raw, target)
-                else:
-                    try:
-                        os.link(raw, target)
-                    except OSError:
-                        shutil.copyfile(raw, target)
-                target.chmod(0o600)
-                paths.append({"path": str(target), "mime": mime, "name": name, "size": target.stat().st_size})
-            else:
-                with tempfile.NamedTemporaryFile(prefix="hm_send_", suffix=ext, dir=directory, delete=False) as f:
-                    paths.append({"path": f.name, "mime": mime, "name": name, "size": len(raw)})
-                    f.write(raw)
-                    f.flush()
-                    os.fsync(f.fileno())
-            if mime.startswith("image/") and mime != JPEG:
+                target = _place(raw, Path(_image_dir(home)) / ("hm_send_%s.jpg" % uuid.uuid4().hex[:12]), copy=True)
+                paths.append({"path": str(target), "mime": JPEG, "name": name, "size": target.stat().st_size})
+                continue
+            original = mime == "image/x-large-jpeg"
+            label = JPEG if original else mime
+            target = _place(raw, Path(_attachments_dir(home)) / _disk_name(name, label), copy=False)
+            item = {"path": str(target), "mime": label, "name": name, "size": target.stat().st_size}
+            paths.append(item)
+            if original:
+                item["native"] = False  # too large to attach as it is; the model looks at the copy below
+            if label.startswith("image/") and label != JPEG or original:
                 # The original stays as sent; the model gets a JPEG copy it can actually see.
-                copy = _jpeg_copy(paths[-1]["path"], _image_dir(home))
+                copy = _jpeg_copy(target, _image_dir(home))
                 if copy is not None:
-                    paths[-1]["jpeg_copy"] = str(copy)
+                    item["jpeg_copy"] = str(copy)
                     paths.append({"path": str(copy), "mime": JPEG, "name": name, "size": copy.stat().st_size,
-                                  "copy_of": paths[-1]["path"]})
-        # The first images ride natively (the model sees them at once); the rest are named by path in the
-        # message, so a 15-photo send arrives whole instead of being refused for having more than 10.
-        room = native_image_limit()
+                                  "copy_of": item["path"]})
+            elif target.suffix.lower() in IWORK:
+                preview = _iwork_preview(target)
+                if preview:
+                    item["preview"] = preview
+        # The first photos ride natively (the model sees them at once) while they fit Hermes's limits: at most
+        # native_image_limit() of them and message_limit() bytes in all. Past either limit Hermes refuses the WHOLE
+        # message, so the rest move to the attachments folder and are named by path: every photo arrives.
+        room, budget = native_image_limit(), int(message_limit() * 0.95) or float("inf")
         for item in paths:
-            if item["mime"] == JPEG:
-                item["native"] = room > 0
+            if item["mime"] != JPEG or item.get("native") is False:
+                continue
+            fits = room > 0 and item["size"] <= budget
+            item["native"] = fits
+            if fits:
                 room -= 1
+                budget -= item["size"]
+                continue
+            # Out of Hermes's image cache, which it sweeps after a day: a by-path photo must outlive the turn.
+            moved = Path(_attachments_dir(home)) / _disk_name(item["name"], JPEG)
+            os.replace(item["path"], moved)
+            for other in paths:
+                if other.get("jpeg_copy") == item["path"]:
+                    other["jpeg_copy"] = str(moved)
+            item["path"] = str(moved)
         return paths
     except BaseException:
         discard(paths)
@@ -497,6 +658,8 @@ def stage(frames, home):
 def discard(paths):
     for item in paths or []:
         Path(item["path"]).unlink(missing_ok=True)
+        if item.get("preview"):
+            Path(item["preview"]).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

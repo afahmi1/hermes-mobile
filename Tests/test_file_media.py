@@ -31,7 +31,8 @@ class FileAttachmentTests(unittest.TestCase):
         self.assertEqual(frames[0][3], "audio/mpeg")
         staged = bridge_media.stage(frames, self.home)
         path = Path(staged[0]["path"])
-        self.assertEqual(path.parent.resolve(), (self.home / "mobile-file-inputs").resolve())
+        self.assertEqual(path.parent.resolve(), (self.home / "attachments" / "mobile").resolve())
+        self.assertTrue(path.name.endswith("_song.mp3"), "kept under its real name")
         self.assertEqual(path.read_bytes(), base64.b64decode(item["base64"]))
         self.assertEqual(staged[0]["name"], "song.mp3")
         self.assertEqual(staged[0]["size"], len(base64.b64decode(item["base64"])))
@@ -58,10 +59,16 @@ class FileAttachmentTests(unittest.TestCase):
         self.assertEqual(len(bridge_media.decode([self.item("pic.webp", mime="image/webp")])), 1)
         with self.assertRaises(bridge_media.MediaError):
             bridge_media.decode([self.item(mime="not a mime")])
-        with self.assertRaises(bridge_media.MediaError):
-            bridge_media.decode([self.item(name="../song.mp3")])
-        with self.assertRaises(bridge_media.MediaError):
-            bridge_media.decode([self.item(name="song/name.mp3")])
+        # Names are cleaned, never trusted as paths: a slash can't climb out of the attachments folder.
+        self.assertEqual(bridge_media.decode([self.item(name="../song.mp3")])[0][0], ".._song.mp3")
+        self.assertEqual(bridge_media.decode([self.item(name="song/name.mp3")])[0][0], "song_name.mp3")
+        staged = bridge_media.stage(bridge_media.decode([self.item(name="../../$(rm -rf ~)`x`;.mp3")]), self.home)
+        path = Path(staged[0]["path"])
+        self.assertEqual(path.parent.resolve(), (self.home / "attachments" / "mobile").resolve())
+        self.assertRegex(path.name, r"^[0-9a-f]{12}_[\w.\-]+\.mp3$")
+        for name in ("", "..", "\u200b\u200b"):
+            with self.assertRaises(bridge_media.MediaError):
+                bridge_media.decode([self.item(name=name)])
         oversized = {"filename": "big.mp3", "mime": "audio/mpeg",
                      "base64": base64.b64encode(b"x" * (bridge_media.MAX_BYTES + 1)).decode()}
         with self.assertRaises(bridge_media.MediaError):
@@ -72,17 +79,25 @@ class FileAttachmentTests(unittest.TestCase):
                                       self.item("three.txt", "text/plain")])
         staged = bridge_media.stage(frames, self.home)
         self.assertEqual(len(staged), 3)
-        old = os.path.getmtime(staged[0]["path"]) - 5 * 3600
+        # Kept through a long conversation (the old 4-hour sweep lost files mid-chat), dropped after 30 days.
+        day = os.path.getmtime(staged[0]["path"]) - 86400
+        os.utime(staged[1]["path"], (day, day))
+        old = os.path.getmtime(staged[0]["path"]) - 31 * 86400
         os.utime(staged[0]["path"], (old, old))
+        bridge_media._PRUNED.clear()
         bridge_media.prune(self.home)
         self.assertFalse(Path(staged[0]["path"]).exists())
         self.assertTrue(Path(staged[1]["path"]).exists())
 
     def test_image_mime_still_uses_the_native_image_path(self):
         # A JPEG body is validated for the inline adapter, not staged as a generic file.
+        from io import BytesIO
+        from PIL import Image
+        buf = BytesIO()
+        Image.new("RGB", (32, 32), "red").save(buf, "JPEG")
         with patch.object(bridge_media, "supported", return_value=False), \
                 self.assertRaises(bridge_media.MediaError):
-            bridge_media.decode([self.item("photo.jpg", "image/jpeg")])
+            bridge_media.decode([self.item("photo.jpg", "image/jpeg", buf.getvalue())])
 
 
 if __name__ == "__main__":

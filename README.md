@@ -207,14 +207,27 @@ on the phone appear in the desktop app's Recents.
 ### Attachments
 
 The composer's **+** menu accepts photos, the camera, video clips, and **Choose file** for anything else: an MP3, a PDF, a
-text file or an archive. Files keep their original bytes and media type; the bridge stages them privately and gives the
-agent the local path, so Hermes decides which tool reads them.
+text file or an archive. Files keep their original bytes and media type, and reach the model the way Hermes's own
+Telegram and Discord adapters hand files over:
+
+- **Where they live.** Everything is kept in `<profile>/attachments/mobile/` (where the desktop app stages files too,
+  and which Hermes never sweeps) under its real name, `<id>_Q3_deck.pptx`, for 30 days
+  (`HERMES_MOBILE_ATTACHMENT_DAYS`). So "look at that PDF again" works later in the chat. Names are cleaned, not
+  refused: spaces and shell characters become `_` on disk, so a path pasted into a command can't split or run anything.
+- **Text and code** up to 100 KB (`.txt`, `.md`, `.csv`, `.json`, source files and so on) are included in the message
+  itself; bigger ones are referenced by path.
+- **PDF, Word, PowerPoint, Excel, OpenDocument, RTF and EPUB.** The model is told to read them with `read_file`, which
+  extracts their text (and to render a scanned PDF's pages with `pdftoppm` and look at them).
+- **Pages, Keynote and Numbers** files are ZIP bundles: the bridge pulls out their PDF preview next to them for the model
+  to read. **Archives** come with a "list it first, extract to a scratch folder, never run anything from it" note.
+- **Videos** other than a consented MP4 clip, and anything else, are named with what they are and how to open them.
 
 **Photos and files arrive as they are.** Any file type goes, and an iPhone photo arrives as its own HEIC, full size,
 uploaded in 1 MiB chunks that resume after a dropped connection and are verified by SHA-256 on arrival. Models can't read
 HEIC, so the Mac also makes a full-resolution JPEG copy for the model to look at, and tells Hermes where the original is.
-Hermes takes at most 10 images per message as native attachments (more makes it refuse the whole message), so the first
-10 ride natively and the rest are handed over by path for Hermes's vision tool: all of them arrive. Up to 20 per message.
+Hermes takes at most 10 images and 128 MB of them per message as native attachments (more makes it refuse the whole
+message), so photos ride natively while they fit both limits and the rest are handed over by path for Hermes's vision
+tool: all of them arrive. Up to 20 per message.
 Photos kept only in iCloud are downloaded first (three tries), and if any still can't be read the chat says how many
 (*Added 13 of 15 photos. 2 couldn't be loaded.*) instead of dropping them quietly.
 
@@ -222,7 +235,7 @@ Photos kept only in iCloud are downloaded first (three tries), and if any still 
 |---|---|---|
 | All media in one message | 128 MB | Hermes, `gateway.max_inbound_media_bytes` in `config.yaml`. The phone reads it and lowers JPEG quality first, then size, so a big batch fits instead of being refused. |
 | One uploaded file | 2 GB | `HERMES_MOBILE_UPLOAD_MAX_BYTES` on the bridge |
-| One photo | 50 MP | The bridge (an iPhone's 48 MP mode is 48.8 MP) |
+| One photo shown natively | 50 MP | The bridge (an iPhone's 48 MP mode is 48.8 MP). A bigger photo (a panorama) is never refused: the original is kept and the model sees a copy scaled to 50 MP. A photo that is mislabelled is relabelled from its bytes; one no decoder can read arrives as a plain file. |
 | Native images per message | 10 | Hermes (`gateway/session_ingress_media.py`); the rest go by path |
 | Small files sent inline | 50 MB per message | `HERMES_MOBILE_MEDIA_MAX_BYTES` on the bridge (256 KiB to 128 MiB) |
 
