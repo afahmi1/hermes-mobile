@@ -76,6 +76,7 @@ import bridge_pins  # pinned messages (own SQLite file, stdlib only)
 import bridge_uploads  # resumable uploads for big files (stdlib only)
 import bridge_titles  # title suggestions from Hermes's own generator
 import bridge_schedule  # "try again when limits reset": sends at a set time, from the Mac (stdlib only)
+import bridge_addons  # owner-only Skills Hub, plugin and MCP catalogs (Hermes calls run in a child process)
 try:
     import bridge_turns as turns  # needs Hermes's venv (hermes_cli.gateway_client)
     TURNS_ERROR = None
@@ -2260,6 +2261,7 @@ class H(BaseHTTPRequestHandler):
                 features.append("clarify_v1")
                 features.append("schedule_v1")  # POST /m/chat/<bot>/<chat>/schedule|scheduled|unschedule  # Hermes's questions answered from the phone: POST /m/turns/<id>/clarify  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
             features.append("restart_v1")  # POST /m/restart {target: hermes|bridge, now}
+            features.append("addons_v1")  # owner only: GET /m/addons/catalog|detail|scan|action/<id>, POST install|uninstall|enable|update
             if autoprojects_enabled():
                 features.append("auto_projects_v1")  # GET/POST /m/autoprojects, POST /m/autoprojects/from-chat
             if autoprojects is not None:
@@ -2267,9 +2269,11 @@ class H(BaseHTTPRequestHandler):
             owner = self.owner_ok()
             return self.send(200, {"protocol": 2, "features": features,
                                    "device_id": self.device_claims["did"], "manage_devices": owner,
-                                   "can_restart": owner})
+                                   "can_restart": owner, "can_manage_addons": owner})
         if path == "/m/restart" and self.command == "POST":
             return self.restart_route()
+        if path.startswith("/m/addons/"):
+            return self.addons_route(path, q)
         if path == "/m/devices" or path.startswith("/m/devices/"):
             return self.device_route(path)
         if path == "/m/push" or path.startswith("/m/push/"):
@@ -2348,6 +2352,45 @@ class H(BaseHTTPRequestHandler):
             return self.send(400, {"error": "target must be hermes or bridge"})
         log("restart %s requested from the phone (%s): %s" % (target, body.get("mode", "-"), status))
         return self.send(status, body)
+
+    def addons_route(self, path, q):
+        """Owner only: add-ons change what every chat on this Mac can do. Logic lives in bridge_addons."""
+        if not self.owner_ok():
+            return self.send(403, {"error": bridge_addons.OWNER_ONLY})
+        data = self.json_body() if self.command == "POST" else {}
+        get = (lambda k: q.get(k)) if self.command == "GET" else (lambda k: data.get(k))
+        pid = get("profile") or "default"
+        if not isinstance(pid, str) or pid not in profile_ids():
+            return self.send(404, {"error": "That bot isn't on this Mac."})
+        home = profile_home(pid)
+        kind, ident = get("kind"), get("id")
+        verb = path[len("/m/addons/"):]
+        A = bridge_addons
+        try:
+            if self.command == "GET" and verb == "catalog":
+                return self.send(200, A.catalog(home, pid, kind, q.get("q") or ""))
+            if self.command == "GET" and verb == "detail":
+                return self.send(200, A.detail(home, pid, kind, ident))
+            if self.command == "GET" and verb == "scan":
+                return self.send(200, A.scan(home, pid, kind, ident))
+            if self.command == "GET" and verb.startswith("action/"):
+                return self.send(200, A.action_status(verb[len("action/"):]))
+            if self.command == "POST" and verb == "install":
+                return self.send(200, A.install(home, pid, kind, ident, env=data.get("env"),
+                                                scan_id=data.get("scan_id"), consent=data.get("consent") is True))
+            if self.command == "POST" and verb == "uninstall":
+                return self.send(200, A.uninstall(home, pid, kind, ident))
+            if self.command == "POST" and verb == "enable":
+                return self.send(200, A.enable(home, pid, kind, ident, data.get("enabled")))
+            if self.command == "POST" and verb == "update":
+                return self.send(200, A.update(home, pid, kind, ident, consent=data.get("consent") is True))
+        except A.AddonError as e:
+            log("add-ons %s %s %s/%s: %s" % (self.command, verb, kind, ident, e.code))
+            return self.send(e.code, {"error": e.message})
+        except Exception as e:
+            log("add-ons %s %s failed: %s" % (self.command, verb, type(e).__name__))
+            return self.send(502, {"error": "Hermes couldn't do that just now."})
+        return self.send(404, {"error": "not found"})
 
     def device_route(self, path):
         current = self.device_claims["did"]
@@ -3023,6 +3066,17 @@ class H(BaseHTTPRequestHandler):
                 if not action and self.command == "GET":
                     return self.send(200, turn.summary())
                 return self.send(405, {"error": "method not allowed"})
+            branching = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/branch", path)
+            if branching:
+                if self.command != "POST":
+                    return self.send(405, {"error": "method not allowed"})
+                pid, sid = branching.groups()
+                if pid not in profile_ids():
+                    return self.send(404, {"error": "unknown bot"})
+                if not _WS_SID.fullmatch(sid):
+                    return self.send(400, {"error": "Bad chat id."})
+                body = self.json_body()
+                return self.send(200, turns.branch(profile_home(pid), sid, body.get("message_id"), body.get("title")))
             found = re.fullmatch(r"/m/chat/([^/]+)/([^/]+)/search", path)
             if found:
                 if self.command != "GET":
