@@ -108,5 +108,22 @@ enum RenderSnapshots {
             ClarifyRequest(id: "q2", runId: "r", generation: 1, question: "Where should the journal folder live?",
                            choices: ["~/Desktop/journal", "Obsidian vault", "iCloud Drive"], multiSelect: false)]
         render("question", QuestionPanel(chat: qchat, scrolls: false), to: dir, dark: true)
+        // Build 54: a project Hermes made (spotted), its list row badge, and the keep/dismiss section.
+        let spottedJSON = """
+        {"id":"birds","title":"Local birds","summary":"Field notes and photos for the personal site.",
+         "bot_ids":["research"],"sources":[],"related_files":[],"managed":true,
+         "auto":{"origin":"spotted","state":"spotted","chats":3,"days":5,"created":1700000000}}
+        """
+        if let spotted = try? JSONDecoder().decode(Project.self, from: Data(spottedJSON.utf8)) {
+            let bot = Bot(id: "research", name: "Research", blurb: "", model: "opus", provider: "anthropic", reachable: true, front: false)
+            render("project-spotted", ProjectRow(project: spotted, bots: [bot]).padding(.horizontal, 16), to: dir)
+            render("project-spotted-dark", ProjectRow(project: spotted, bots: [bot]).padding(.horizontal, 16), to: dir, dark: true)
+            // A List row collapses to its footer in ImageRenderer, so render the keep/dismiss card on a plain stack.
+            let spottedCard = VStack(alignment: .leading, spacing: 12) {
+                SpottedProjectCard(auto: spotted.auto!, busy: false, keep: {}, dismiss: {})
+            }
+            render("project-spotted-section", spottedCard.padding(16).background(Color(.secondarySystemGroupedBackground)), to: dir)
+            render("project-spotted-section-dark", spottedCard.padding(16).background(Color(.secondarySystemGroupedBackground)), to: dir, dark: true)
+        }
     }
 }

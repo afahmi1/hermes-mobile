@@ -10,6 +10,8 @@ struct ProjectsView: View {
     @State private var model: ProjectsModel
     @State private var path = NavigationPath()
     @State private var workspaces: WorkspaceIndexModel
+    @State private var pendingAutoProject: String?
+    @State private var autoProjectError: String?
 
     init() {
         // Bind both loaders to the client that is current when this view is created.
@@ -40,12 +42,34 @@ struct ProjectsView: View {
                 .onReceive(NotificationCenter.default.publisher(for: .workspaceOpenChat)) { note in
                     if let route = note.object as? WorkspaceChatRoute { path.append(route) }
                 }
+                .onReceive(NotificationCenter.default.publisher(for: .openAutoProject)) { note in
+                    guard let open = note.object as? AutoProjectOpen else { return }
+                    Task { await openAutoProject(open.id) }
+                }
         }
         .task { await model.load() }
         .task { await workspaces.load() }  // separate from the catalog: its failure never hides it
+        .onReceive(NotificationCenter.default.publisher(for: .manageChanged)) { _ in Task { await model.load() } }
         .onChange(of: model.state) { _, state in
             if state == .failed(.signedOut), API.shared === originClient { app.sessionExpired() }
+            if case .loaded = state, let id = pendingAutoProject {
+                pendingAutoProject = nil
+                path.append(Selection(id: id))
+            }
         }
+        .alert("Couldn't update this project", isPresented: Binding(get: { autoProjectError != nil }, set: { if !$0 { autoProjectError = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(autoProjectError ?? "") }
+    }
+
+    /// A chat just became a project: make sure it's in the list, then open it.
+    private func openAutoProject(_ id: String) async {
+        if case .loaded(let snapshot) = model.state, snapshot.projects.contains(where: { $0.id == id }) {
+            path.append(Selection(id: id))
+            return
+        }
+        pendingAutoProject = id
+        await model.load()
     }
 
     @ViewBuilder private var content: some View {
@@ -66,7 +90,13 @@ struct ProjectsView: View {
                 Button("Try again") { Task { await model.load() } }.hmButton(.quiet, classic: .bordered)
             }
         case .loaded(let snapshot):
-            let shown = snapshot.filtered(model.query)
+            let filtered = snapshot.filtered(model.query)
+            // Projects Hermes just made go to the top, spotted first, so a new one is never buried.
+            let shown = filtered.sorted { a, b in
+                let ar = a.auto?.isSpotted == true ? 0 : (a.auto != nil ? 1 : 2)
+                let br = b.auto?.isSpotted == true ? 0 : (b.auto != nil ? 1 : 2)
+                return ar != br ? ar < br : a.title < b.title
+            }
             List {
                 if HMTheme.isThermocline {
                     HMSearchField(prompt: "Search projects", query: Bindable(model).query)
@@ -106,13 +136,23 @@ struct ProjectsView: View {
     }
 }
 
-private struct ProjectRow: View {
+struct ProjectRow: View {
     let project: Project
     let bots: [Bot]
 
     var body: some View {
         VStack(alignment: .leading, spacing: HMDesign.micro) {
-            Text(project.title).font(HMDesign.rowTitle)
+            HStack(spacing: HMDesign.small) {
+                Text(project.title).font(HMDesign.rowTitle)
+                if let auto = project.auto {
+                    Label(auto.isSpotted ? "Spotted by Hermes" : "Made by Hermes",
+                          systemImage: auto.isSpotted ? "sparkles" : "wand.and.stars")
+                        .font(HMDesign.data.weight(.semibold))
+                        .foregroundStyle(HMDesign.accent)
+                        .lineLimit(1)
+                        .accessibilityLabel(auto.isSpotted ? "Spotted by Hermes" : "Made by Hermes")
+                }
+            }
             if let summary = project.summary, !summary.isEmpty {
                 Text(summary).font(.subheadline).foregroundStyle(HMDesign.text2).lineLimit(2)
             }
@@ -140,6 +180,8 @@ struct ProjectDetailView: View {
     let snapshot: ProjectsSnapshot
     var workspaces: WorkspaceIndexModel
     @State private var assignment: WorkspaceAssignmentModel
+    @State private var autoBusy = false
+    @State private var autoError: String?
 
     init(project: Project, snapshot: ProjectsSnapshot, workspaces: WorkspaceIndexModel) {
         self.project = project; self.snapshot = snapshot; self.workspaces = workspaces
@@ -152,6 +194,10 @@ struct ProjectDetailView: View {
         List {
             if let summary = project.summary, !summary.isEmpty {
                 Section { Text(summary) }.hmRows()
+            }
+            if let auto = project.auto, auto.isSpotted {
+                SpottedProjectSection(auto: auto, busy: autoBusy, keep: { Task { await autoAction("keep") } },
+                                      dismiss: { Task { await autoAction("dismiss") } })
             }
             if project.hermes != nil {
                 HermesProjectSection(project: project)
@@ -229,6 +275,67 @@ struct ProjectDetailView: View {
         .navigationTitle(project.title)
         .navigationBarTitleDisplayMode(.inline)
         .task(id: hasWorkspace) { if hasWorkspace { await assignment.load() } }
+        .alert("Couldn't update this project", isPresented: Binding(get: { autoError != nil }, set: { if !$0 { autoError = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(autoError ?? "") }
+    }
+
+    private func autoAction(_ action: String) async {
+        guard !autoBusy else { return }
+        autoBusy = true
+        defer { autoBusy = false }
+        do {
+            if action == "keep" { try await API.shared.keepAutoProject(id: project.id) }
+            else { try await API.shared.dismissAutoProject(id: project.id) }
+            NotificationCenter.default.post(name: .manageChanged, object: nil)
+        } catch let f as API.AutoProjectFailure {
+            autoError = f.message
+        } catch {
+            autoError = API.AutoProjectFailure.failed.message
+        }
+    }
+}
+
+/// A project Hermes just made from chats: the linked-chat count and the keep/dismiss actions.
+struct SpottedProjectSection: View {
+    let auto: AutoProjectInfo
+    let busy: Bool
+    let keep: () -> Void
+    let dismiss: () -> Void
+
+    var body: some View {
+        Section {
+            SpottedProjectCard(auto: auto, busy: busy, keep: keep, dismiss: dismiss)
+        } footer: {
+            Text("Hermes noticed this topic across your chats. Keep it as a project, or dismiss it so it isn't suggested again.")
+        }
+        .hmRows()
+    }
+}
+
+/// The keep/dismiss content on its own, so a screenshot can render it without a List.
+struct SpottedProjectCard: View {
+    let auto: AutoProjectInfo
+    let busy: Bool
+    let keep: () -> Void
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: HMDesign.small) {
+            Label(auto.chats == 1 ? "1 linked chat" : "\(auto.chats) linked chats",
+                  systemImage: "bubble.left.and.bubble.right")
+                .font(HMDesign.data).foregroundStyle(HMDesign.text2)
+            HStack(spacing: HMDesign.small) {
+                Button(action: keep) {
+                    Label("Keep", systemImage: "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity).frame(minHeight: HMDesign.touch)
+                }.hmButton(.primary).disabled(busy)
+                Button(action: dismiss) {
+                    Label("Dismiss", systemImage: "xmark.circle")
+                        .frame(maxWidth: .infinity).frame(minHeight: HMDesign.touch)
+                }.hmButton(.quiet).disabled(busy)
+            }
+        }
     }
 }
 

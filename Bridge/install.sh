@@ -84,6 +84,26 @@ fi
 ln -sfn "$REL" "$SHARE/current"
 HERE="$SHARE/current/Bridge"
 chmod +x "$HERE/run-bridge.sh"
+
+# `hm-project`: the CLI Hermes runs to make a project from a chat. Wrapper resolves Hermes's Python at run time
+# (like run-bridge.sh), so a Hermes update never strands it. It talks to the bridge on 127.0.0.1 with a signed
+# local-only header, so it needs no key or PIN.
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+cat > "$BIN_DIR/hm-project" <<WRAP
+#!/bin/bash
+exec "$PY" "$HERE/hm_project.py" "\$@"
+WRAP
+chmod +x "$BIN_DIR/hm-project"
+
+# The shared skill that tells every bot when and how to make a project from a chat.
+SKILL_SRC="$(cd "$SRC/.." && pwd)/SharedSkills/prometheus-projects/SKILL.md"
+SKILL_DST="$HERMES_HOME/shared-skills/common/prometheus-projects"
+if [[ -f "$SKILL_SRC" ]]; then
+  mkdir -p "$SKILL_DST"
+  cp "$SKILL_SRC" "$SKILL_DST/SKILL.md"
+  echo "Installed the prometheus-projects skill into $SKILL_DST"
+fi
 # Keep the three newest releases; older copies are dead weight. Never remove one a service still runs from.
 in_use="$(cat "$HOME"/Library/LaunchAgents/*hermes-mobile*.plist "$HOME"/.config/systemd/user/hermes-mobile*.service 2>/dev/null || true)"
 ls -1dt "$SHARE/releases"/*/ 2>/dev/null | tail -n +4 | while read -r old; do

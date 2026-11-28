@@ -92,6 +92,12 @@ except Exception:  # pragma: no cover
             super().__init__(message)
             self.code = code
 
+try:
+    import bridge_autoprojects as autoprojects  # projects that make themselves (Build 54)
+    AUTOPROJECTS_ERROR = None
+except Exception as _e:  # pragma: no cover
+    autoprojects, AUTOPROJECTS_ERROR = None, "%s: %s" % (type(_e).__name__, _e)
+
 
 def log(msg):
     sys.stderr.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
@@ -1596,8 +1602,140 @@ def safe_name(name):
     if not isinstance(name, str):
         return ""
     base = name.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip()
-    base = "".join(c for c in base if c.isprintable() and c not in '"\\')
+    base = "".join(c for c in base if c.isprintable() and c not in '\"\\')
     return "" if base in ("", ".", "..") else base[:200]
+
+
+# ---------- projects that make themselves (Build 54) ----------
+def autoprojects_profiles():
+    """The bots the background pass may scan: the workspace base set (operator allowlist, live, unprotected),
+    plus `default`. bridge_autoprojects re-filters out money and private bots before touching anything."""
+    base = workspace_base_eligible()
+    return sorted(set(base) | ({"default"} if "default" in profile_ids() and not profile_protected("default", True) else set()))
+
+
+class _AutoEnv:
+    """The live bridge, as bridge_autoprojects sees it. Every state touch goes through the bridge's own
+    read-only helpers and stores; nothing here reaches into Hermes's files except to read chats and config."""
+
+    lock = threading.Lock()
+
+    def __init__(self):
+        self.nonces = autoprojects.Nonces()
+
+    @staticmethod
+    def now():
+        return time.time()
+
+    @staticmethod
+    def log(message):
+        log("autoprojects: %s" % message)
+
+    @staticmethod
+    def profiles():
+        return autoprojects_profiles()
+
+    @staticmethod
+    def owned(profile, cwd):
+        """A money/private bot's project directory is its own, never pooled across profiles."""
+        if autoprojects.is_money_bot(profile):
+            return True
+        if not cwd:
+            return False
+        try:
+            return Path(cwd).resolve().is_relative_to(profile_home(profile).resolve())
+        except (OSError, AttributeError):
+            return False
+
+    @staticmethod
+    def ro(profile):
+        return _ro(profile)
+
+    @staticmethod
+    def manage():
+        return manage_overlay()
+
+    @staticmethod
+    def store():
+        if workspaces_mod is None:
+            raise WorkspaceError("Projects storage is unavailable.", 503)
+        return workspace_store()
+
+    def projects(self):
+        code, body = catalog_response()
+        if code != 200:
+            return []
+        try:
+            return json.loads(body).get("projects") or []
+        except ValueError:
+            return []
+
+    def catalog_ids(self):
+        return {p["id"] for p in self.projects() if isinstance(p.get("id"), str)}
+
+    @staticmethod
+    def eligible(project):
+        return workspace_eligible(project, workspace_catalog())
+
+    @staticmethod
+    def file_roots():
+        return user_media_roots() + assistant_media_roots()
+
+    @staticmethod
+    def bodies(profile, session_id):
+        return session_bodies(profile, session_id)
+
+    @staticmethod
+    def llm(profile, system, user):
+        return autoprojects.llm_call(HERMES if profile == "default" else profile_home(profile), system, user,
+                                     python=sys.executable)
+
+
+_AUTO_ENV = None
+
+
+def auto_env():
+    global _AUTO_ENV
+    if _AUTO_ENV is None:
+        _AUTO_ENV = _AutoEnv()
+    return _AUTO_ENV
+
+
+_JOBS = None
+
+
+def autoprojects_jobs():
+    global _JOBS
+    if _JOBS is None:
+        _JOBS = autoprojects.Jobs()
+    return _JOBS
+
+
+def autoprojects_enabled():
+    if autoprojects is None:
+        return False
+    return os.environ.get(autoprojects.SETTING, "1") != "0"
+
+
+def autoprojects_start(kind, work):
+    return autoprojects_jobs().start(kind, work)
+
+
+def _autoprojects_loop():
+    """Noticed projects: one cheap pass a day (and on bridge start, after a short settle), at most every
+    RUN_EVERY and at most one new suggestion. The loop must never die."""
+    if autoprojects is None or not autoprojects_enabled() or not autoprojects_profiles():
+        return
+    time.sleep(autoprojects.START_DELAY)
+    while True:
+        try:
+            result = autoprojects.detect(auto_env())
+            if result.get("created"):
+                names = ", ".join(c["title"] for c in result["created"])
+                log("autoprojects: made %s" % names)
+        except Exception as exc:  # noqa: BLE001  (the loop must never die)
+            log("autoprojects: pass failed (%s)" % type(exc).__name__)
+        time.sleep(autoprojects.RUN_EVERY)
 
 
 def content_disposition(name):
@@ -1966,7 +2104,7 @@ class H(BaseHTTPRequestHandler):
             n = -1
         path = urlsplit(self.path).path
         auth = path in ("/m/pair", "/m/login") or path.startswith("/m/devices")
-        scoped = auth or path.startswith(("/m/workspace", "/m/manage"))
+        scoped = auth or path.startswith(("/m/workspace", "/m/manage", "/m/autoprojects", "/m/local/"))
         cap = 4096 if auth else WS_MAX_BODY if scoped else MAX_BODY
         if n < 0 or n > cap:
             self.close_connection = True
@@ -2048,6 +2186,14 @@ class H(BaseHTTPRequestHandler):
             if token is None:
                 return self.send(401, {"error": "Pairing code expired or already used. Request another code."})
             return self.send(200, {"token": token, "ttl": TOKEN_TTL})
+        if path == "/m/local/autoprojects/from-chat" and self.command == "POST":
+            # Hermes's own `hm-project` CLI on this Mac: loopback only, signed with a key derived from the
+            # bridge secret, so no bearer token or PIN is needed and no remote client can reach it.
+            return self.auto_local_route()
+        if path in ("/m/local/autoprojects/detect",) and self.command == "POST":
+            return self.auto_local_route()
+        if path.startswith("/m/local/autoprojects/jobs/") and self.command == "GET":
+            return self.auto_local_route()
         if not self.authed():
             if self.registry_busy:
                 return self.send(503, {"error": "Your Mac is busy for a moment. Trying again.", "retry": True})
@@ -2067,6 +2213,10 @@ class H(BaseHTTPRequestHandler):
                 features.append("clarify_v1")
                 features.append("schedule_v1")  # POST /m/chat/<bot>/<chat>/schedule|scheduled|unschedule  # Hermes's questions answered from the phone: POST /m/turns/<id>/clarify  # POST /m/uploads, GET/PATCH /m/uploads/<id>  # GET/POST /m/chat/<bot>/<chat>/queue
             features.append("restart_v1")  # POST /m/restart {target: hermes|bridge, now}
+            if autoprojects_enabled():
+                features.append("auto_projects_v1")  # GET/POST /m/autoprojects, POST /m/autoprojects/from-chat
+            if autoprojects is not None:
+                features.append("local_cli_v1")  # signed loopback CLI: POST /m/local/autoprojects/from-chat
             owner = self.owner_ok()
             return self.send(200, {"protocol": 2, "features": features,
                                    "device_id": self.device_claims["did"], "manage_devices": owner,
@@ -2079,6 +2229,8 @@ class H(BaseHTTPRequestHandler):
             return self.push_route(path)
         if path == "/m/projects":
             return self.projects_route(u)
+        if path.startswith("/m/autoprojects"):
+            return self.autoprojects_route(path, q)
         m = re.match(r"^/m/projects/([a-z0-9][a-z0-9_-]{0,63})/chats$", path)
         if m:
             return self.hermes_project_chats(m.group(1))
@@ -2311,6 +2463,89 @@ class H(BaseHTTPRequestHandler):
             return self.send(400, {"error": "Bad request."})
         code, body = catalog_response()
         self.send(code, body)
+
+    # ---- projects that make themselves (Build 54) ----
+    def auto_local_route(self):
+        """The `hm-project` CLI Hermes runs from a chat: loopback only, signed with a key derived from the
+        bridge secret (any local process can read that secret, so the signature proves locality, not identity)."""
+        if autoprojects is None:
+            return self.send(503, {"error": "Auto-projects are unavailable on this Mac.", "code": "unavailable"})
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return self.send(403, {"error": "This is only for Hermes on this Mac.", "code": "local_only"})
+        header = self.headers.get(autoprojects.LOCAL_HEADER)
+        ok = header and auto_env().nonces.check(SECRET, header, self.command, self.path, self.body())
+        if not ok:
+            return self.send(401, {"error": "Bad or reused local signature.", "code": "bad_signature"})
+        if self.path == "/m/local/autoprojects/from-chat":
+            return self._autoprojects_from_chat(allow_local=True)
+        if self.path == "/m/local/autoprojects/detect":
+            d = self.json_body() or {}
+            report = autoprojects.detect(auto_env(), dry_run=d.get("dry_run") is not False,
+                                         force=d.get("force") is True)
+            return self.send(200, report)
+        m = re.fullmatch(r"/m/local/autoprojects/jobs/([A-Za-z0-9_-]{1,64})", self.path)
+        if m:
+            job = autoprojects_jobs().view(m.group(1))
+            return self.send(200, job) if job else self.send(404, {"error": "Not found."})
+        return self.send(404, {"error": "Not found."})
+
+    def autoprojects_route(self, path, q):
+        if autoprojects is None:
+            return self.send(503, {"error": "Auto-projects are unavailable on this Mac.", "code": "unavailable"})
+        if path == "/m/autoprojects/from-chat":
+            if self.command != "POST":
+                return self.send(405, {"error": "Method not allowed."})
+            return self._autoprojects_from_chat()
+        m = re.fullmatch(r"/m/autoprojects/jobs/([A-Za-z0-9_-]{1,64})", path)
+        if m:
+            if self.command != "GET":
+                return self.send(405, {"error": "Method not allowed."})
+            job = autoprojects_jobs().view(m.group(1))
+            return self.send(200, job) if job else self.send(404, {"error": "Not found."})
+        m = re.fullmatch(r"/m/autoprojects/([a-z0-9][a-z0-9_-]{0,63})", path)
+        if not m:
+            return self.send(404, {"error": "Not found."})
+        pid = m.group(1)
+        if self.command == "GET":
+            meta = manage_overlay().meta(pid)
+            return self.send(200, meta) if meta else self.send(404, {"error": "Not found."})
+        if self.command == "POST":
+            if not self.owner_ok():
+                return self._err(403, "Sign in as the owner to keep or dismiss.", "owner_required")
+            action = (self.json_body() or {}).get("action")
+            if action not in ("keep", "dismiss"):
+                return self._err(400, "Action must be keep or dismiss.", "bad_request")
+            try:
+                done = (manage_overlay().keep_project(pid) if action == "keep"
+                        else manage_overlay().dismiss_project(pid))
+            except bridge_manage.ManageError as e:
+                return self._err(e.status, str(e), e.code)
+            if not done:
+                return self._err(404, "No spotted project matches.", "not_found")
+            return self.send(200, {"ok": True, "id": pid, "action": action})
+        return self.send(405, {"error": "Method not allowed."})
+
+    def _autoprojects_from_chat(self, allow_local=False):
+        """Make the project for one chat because he asked. Returns the job the phone (or CLI) then polls."""
+        try:
+            d = self.json_body()
+            profile, sid = d.get("profile"), d.get("session_id")
+            if profile not in profile_ids() or not isinstance(sid, str):
+                return self._err(400, "Bad chat.", "bad_request")
+            if not _WS_SID.fullmatch(sid):
+                return self._err(400, "Bad chat.", "bad_request")
+            if profile_protected(profile, explicit=allow_local):
+                return self._err(403, "This bot stays off the projects tab.", "not_eligible")
+            if not (profile == "default" or profile in autoprojects_profiles()):
+                return self._err(403, "This bot isn't set up for projects on the Mac.", "not_eligible")
+            env = auto_env()
+            job = autoprojects_start("chat", lambda stage: autoprojects.from_chat(env, profile, sid, stage))
+            return self.send(202, job)
+        except autoprojects.AutoError as e:
+            return self._err(e.status, str(e), e.code)
+        except Exception as e:  # noqa: BLE001
+            log("autoprojects from-chat failed: %s" % type(e).__name__)
+            return self._err(502, "Making the project failed on your Mac.", "failed")
 
     # ---- owner management (slice B): every route needs owner_ok; PIN routes share one limiter ----
     def _err(self, status, message, code, **extra):
@@ -3212,6 +3447,7 @@ if __name__ == "__main__":
         sys.exit(0)
     threading.Thread(target=_key_watcher, name="key-watcher", daemon=True).start()
     threading.Thread(target=_schedule_loop, name="schedule", daemon=True).start()
+    threading.Thread(target=_autoprojects_loop, name="autoprojects", daemon=True).start()
     srv = ThreadingHTTPServer((os.environ.get("HERMES_MOBILE_BIND", "127.0.0.1"), PORT), H)
     if turns is not None:
         turns.bridge_media.UPLOADS = uploads_dir()

@@ -473,6 +473,61 @@ class WorkspaceStore:
         r = self._q("SELECT project FROM chats WHERE profile=? AND session_id=?", (profile, session_id))
         return r[0][0] if r else None
 
+    def chat_links(self):
+        """{(profile, session_id): project} for every chat any project holds (archived projects' too)."""
+        return {(p, s): pr for p, s, pr in self._q("SELECT profile,session_id,project FROM chats")}
+
+    def file_named(self, project, name):
+        """(id, sha) of the project's context file with this name (case-insensitive), or None."""
+        _check(PROJECT_RE, project, "project")
+        r = self._q("SELECT id,sha FROM files WHERE project=? AND name_lc=?", (project, str(name).lower()))
+        return (r[0][0], r[0][1]) if r else None
+
+    def import_artifact(self, project, profile, session_id, name, data):
+        """Keep a copy of a file a linked chat made or referenced, as that chat's artifact. Same storage, caps and
+        visibility rules as captured turn output (the chat must stay linked to this project to show it). Text
+        files whose type the workspace doesn't know are kept as plain text. Returns the row, or None when the
+        same bytes are already there."""
+        _check(PROJECT_RE, project, "project")
+        _check(PROFILE_RE, profile, "profile")
+        _check(SESSION_RE, session_id, "session id")
+        name = _validate_name(name)
+        if self.project_for(profile, session_id) != project:
+            raise WorkspaceError("Chat is not linked to this project.", 403)
+        if not isinstance(data, (bytes, bytearray)) or not data or len(data) > MAX_ARTIFACT_BYTES:
+            raise WorkspaceError("File is empty or too large.", 413)
+        data = bytes(data)
+        ext = _ext(name)
+        try:
+            mime = _validate_content(ext, data) if ext in MIME and name != ext else None
+        except (ValueError, RecursionError):
+            mime = None
+        if mime is None:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise WorkspaceError("Only text, PDF and image files can be kept.", 415)
+            if "\x00" in text:
+                raise WorkspaceError("Only text, PDF and image files can be kept.", 415)
+            mime = MIME[".txt"]
+        sha = hashlib.sha256(data).hexdigest()
+        art = {"id": "art_" + secrets.token_hex(16), "name": name, "size": len(data), "project_id": project,
+               "profile": profile, "session_id": session_id, "mime": mime}
+
+        def run(db):
+            if db.execute("SELECT 1 FROM artifacts WHERE profile=? AND session_id=? AND sha=?",
+                          (profile, session_id, sha)).fetchone():
+                return None
+            in_session = db.execute("SELECT COUNT(*) FROM artifacts WHERE profile=? AND session_id=?",
+                                    (profile, session_id)).fetchone()[0]
+            if (in_session + 1 > MAX_ARTIFACTS_PER_SESSION or self._over(db, project, 1, len(data))
+                    or self._over_total(db, 1, len(data))):
+                raise WorkspaceError("Project file storage is full.", STORAGE_FULL)
+            db.execute("INSERT INTO artifacts(id,name,size,project,profile,session_id,mime,sha,data) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (art["id"], name, len(data), project, profile, session_id, mime, sha, data))
+            return art
+        return self._tx(run)
+
     # -- detail / context ------------------------------------------------
     def detail(self, project):
         _check(PROJECT_RE, project, "project")

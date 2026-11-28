@@ -167,6 +167,9 @@ struct RootView: View {
             MainTabs(selectedTab: $selectedTab)
                 .id(app.gatewaySession)
                 .task(id: app.gatewaySession) { await app.refreshBots() }
+                .onReceive(NotificationCenter.default.publisher(for: .openAutoProject)) { _ in
+                    selectedTab = 2  // Projects
+                }
         } else {
             SignInView()
         }

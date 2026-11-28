@@ -3,6 +3,8 @@
 Own SQLite file (STATE_DIR/manage/manage.db). The operator's catalog file and Hermes's profiles/ are never
 written: archiving is a logical tombstone here, and deleting nothing means restore brings everything back.
 """
+import hashlib
+import json
 import os
 import re
 import secrets
@@ -26,7 +28,16 @@ CREATE TABLE IF NOT EXISTS personas(id TEXT PRIMARY KEY, name TEXT NOT NULL, per
 CREATE TABLE IF NOT EXISTS archived_bots(id TEXT PRIMARY KEY, ts REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS persona_chats(host TEXT NOT NULL, sid TEXT NOT NULL, persona TEXT NOT NULL,
     title TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(host, sid));
+CREATE TABLE IF NOT EXISTS project_meta(id TEXT PRIMARY KEY, origin TEXT NOT NULL, state TEXT NOT NULL,
+    terms TEXT NOT NULL DEFAULT '[]', chats TEXT NOT NULL DEFAULT '[]', written TEXT NOT NULL DEFAULT '{}',
+    days INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS dismissed_topics(fp TEXT PRIMARY KEY, terms TEXT NOT NULL, chats TEXT NOT NULL, ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS detector_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+# Projects Hermes made itself (bridge_autoprojects): origin "chat" (asked for) or "spotted" (noticed). A spotted one
+# stays "spotted" until kept or dismissed; dismissing archives it and remembers its topic so it never comes back.
+AUTO_ORIGINS = ("chat", "spotted")
+AUTO_STATES = ("spotted", "kept", "dismissed")
 
 
 class ManageError(Exception):
@@ -57,6 +68,19 @@ def slug(title):
     return base if PROJECT_ID_RE.fullmatch(base or "x") and base else "project"
 
 
+def _loads(raw, default):
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
+def topic_fp(terms):
+    """A stable name for a topic: its sorted terms, hashed."""
+    return hashlib.sha256("\x1f".join(sorted(set(terms))).encode("utf-8")).hexdigest()[:32]
+
+
 class Manage:
     def __init__(self, state_dir):
         self.dir = os.path.join(str(state_dir), "manage")
@@ -77,13 +101,18 @@ class Manage:
 
     # ---- projects ----
     @staticmethod
-    def _project(r):
-        return {"id": r["id"], "title": r["title"], "summary": r["summary"], "bot_ids": [], "sources": [],
-                "related_files": [], "managed": True}
+    def _project(r, meta=None):
+        out = {"id": r["id"], "title": r["title"], "summary": r["summary"], "bot_ids": [], "sources": [],
+               "related_files": [], "managed": True}
+        if meta is not None and meta["state"] != "dismissed":
+            out["auto"] = {"origin": meta["origin"], "state": meta["state"], "chats": len(_loads(meta["chats"], [])),
+                           "days": meta["days"], "created": meta["created"]}
+        return out
 
     def managed_projects(self):
         with self._db() as db:
-            return [self._project(r) for r in db.execute("SELECT * FROM projects ORDER BY created, id")]
+            meta = {m["id"]: m for m in db.execute("SELECT * FROM project_meta")}
+            return [self._project(r, meta.get(r["id"])) for r in db.execute("SELECT * FROM projects ORDER BY created, id")]
 
     def archived_projects(self):
         with self._db() as db:
@@ -138,7 +167,76 @@ class Manage:
 
     def restore_project(self, pid):
         with self.lock, self._db() as db:
-            return db.execute("DELETE FROM archived_projects WHERE id=?", (pid,)).rowcount > 0
+            db.execute("BEGIN IMMEDIATE")
+            restored = db.execute("DELETE FROM archived_projects WHERE id=?", (pid,)).rowcount > 0
+            meta = db.execute("SELECT * FROM project_meta WHERE id=?", (pid,)).fetchone()
+            if restored and meta is not None and meta["state"] == "dismissed":
+                # Bringing a dismissed suggestion back is keeping it: its topic may be suggested again later.
+                db.execute("DELETE FROM dismissed_topics WHERE fp=?", (topic_fp(_loads(meta["terms"], [])),))
+                db.execute("UPDATE project_meta SET state='kept', updated=? WHERE id=?", (time.time(), pid))
+            return restored
+
+    # ---- projects Hermes made (bridge_autoprojects) ----
+    @staticmethod
+    def _meta(r):
+        return {"id": r["id"], "origin": r["origin"], "state": r["state"], "terms": _loads(r["terms"], []),
+                "chats": [tuple(c) for c in _loads(r["chats"], []) if isinstance(c, list) and len(c) == 2],
+                "written": _loads(r["written"], {}), "days": r["days"], "created": r["created"], "updated": r["updated"]}
+
+    def meta(self, pid):
+        with self._db() as db:
+            r = db.execute("SELECT * FROM project_meta WHERE id=?", (pid,)).fetchone()
+            return self._meta(r) if r else None
+
+    def all_meta(self):
+        with self._db() as db:
+            return [self._meta(r) for r in db.execute("SELECT * FROM project_meta ORDER BY created, id")]
+
+    def save_meta(self, pid, origin, state, terms, chats, written, days):
+        if origin not in AUTO_ORIGINS or state not in AUTO_STATES:
+            raise ManageError("Bad project origin.", 400, "bad_request")
+        now = time.time()
+        row = (json.dumps(sorted(set(terms))), json.dumps(sorted({tuple(c) for c in chats})), json.dumps(written, sort_keys=True))
+        with self.lock, self._db() as db:
+            db.execute("INSERT INTO project_meta(id,origin,state,terms,chats,written,days,created,updated) "
+                       "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET terms=excluded.terms, "
+                       "chats=excluded.chats, written=excluded.written, days=excluded.days, updated=excluded.updated",
+                       (pid, origin, state, *row, int(days), now, now))
+
+    def keep_project(self, pid):
+        """A spotted project becomes an ordinary one (its badge goes). False when it isn't a spotted project."""
+        with self.lock, self._db() as db:
+            return db.execute("UPDATE project_meta SET state='kept', updated=? WHERE id=? AND state='spotted'",
+                              (time.time(), pid)).rowcount > 0
+
+    def dismiss_project(self, pid):
+        """Archive a spotted project and remember its topic (terms and chats) so it is never suggested again."""
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            r = db.execute("SELECT * FROM project_meta WHERE id=? AND state='spotted'", (pid,)).fetchone()
+            if r is None:
+                return False
+            now = time.time()
+            terms = _loads(r["terms"], [])
+            db.execute("INSERT OR REPLACE INTO dismissed_topics VALUES(?,?,?,?)", (topic_fp(terms), r["terms"], r["chats"], now))
+            db.execute("INSERT OR IGNORE INTO archived_projects VALUES(?,?)", (pid, now))
+            db.execute("UPDATE project_meta SET state='dismissed', updated=? WHERE id=?", (now, pid))
+            return True
+
+    def dismissed_topics(self):
+        with self._db() as db:
+            return [{"terms": set(_loads(r["terms"], [])),
+                     "chats": {tuple(c) for c in _loads(r["chats"], []) if isinstance(c, list) and len(c) == 2}}
+                    for r in db.execute("SELECT * FROM dismissed_topics")]
+
+    def detector_get(self, key, default=None):
+        with self._db() as db:
+            r = db.execute("SELECT value FROM detector_state WHERE key=?", (key,)).fetchone()
+            return _loads(r["value"], default) if r else default
+
+    def detector_set(self, key, value):
+        with self.lock, self._db() as db:
+            db.execute("INSERT OR REPLACE INTO detector_state VALUES(?,?)", (key, json.dumps(value, sort_keys=True)))
 
     # ---- live bots (tombstones only) ----
     def archived_bots(self):
