@@ -110,6 +110,18 @@ enum UploadFiles {
         return SendAttachment(mime: mime, filename: filename, base64: "", localFile: name, sha256: digest, size: size)
     }
 
+    /// Move an attachment that was built inline (a photo's JPEG bytes) into the upload folder, so a big batch
+    /// travels through the resumable upload instead of one JSON body. Bytes are unchanged.
+    static func promote(_ a: SendAttachment, filename: String, mime: String) throws -> SendAttachment {
+        guard !a.isUpload, let data = Data(base64Encoded: a.base64) else { return a }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try data.write(to: tmp, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        var out = try adopt(tmp, filename: filename, mime: mime, move: false)
+        out.sourceFormat = a.sourceFormat
+        return out
+    }
+
     /// The bridge-side id for this file: stable across retries and relaunches, so an upload always resumes.
     static func uploadID(_ a: SendAttachment) -> String {
         let key = [a.sha256 ?? "", a.filename, a.mime].joined(separator: "|")
