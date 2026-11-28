@@ -161,6 +161,21 @@ class PhotoBatchTests(unittest.TestCase):
         self.assertLessEqual(len(native), _ATTACHMENT_LIMIT)
         self.assertTrue(all(m["mime"] in _ATTACHMENT_MIMES for m in native))
 
+    def test_by_path_photos_outlive_the_turn(self):
+        """At the end of a reply only native images (already copied by Hermes) are deleted; photos past the
+        limit stay, so the next message can still refer to them."""
+        small = jpeg((800, 600))
+        items = [self.send_photo(i, variant(small, i))[0] for i in range(13)]
+        staged = media.stage(media.decode(items), self.home)
+        media.discard(media.transient(staged, self.home))
+        by_path = [m for m in staged if not m.get("native")]
+        self.assertEqual(len(by_path), 3)
+        for m in by_path:
+            self.assertTrue(Path(m["path"]).exists(), "a by-path photo survives the end of the turn")
+        for m in staged:
+            if m.get("native"):
+                self.assertFalse(Path(m["path"]).exists(), "native copies are cleaned up")
+
     def test_heic_original_arrives_untouched_with_a_jpeg_copy(self):
         try:
             import pillow_heif

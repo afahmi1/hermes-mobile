@@ -1108,7 +1108,10 @@ async def _drive(turn: Turn):
                 pass
         try:
             if turn.journal and turn._terminal:
-                await asyncio.to_thread(bridge_media.discard, turn.media)
+                # Native images were copied by Hermes at admission. Anything handed over by path (photos past
+                # Hermes's 10, originals, files) lives in attachments/mobile and must outlive the turn, so a later
+                # message can still refer to it; `prune` drops it after HERMES_MOBILE_ATTACHMENT_DAYS.
+                await asyncio.to_thread(bridge_media.discard, bridge_media.transient(turn.media, turn.home))
                 await asyncio.to_thread(turn.journal.terminal, turn, turn._terminal)
         finally:
             turn.finish()
