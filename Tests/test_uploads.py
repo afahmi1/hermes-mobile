@@ -70,7 +70,7 @@ class UploadTests(unittest.TestCase):
         with self.assertRaises(up.UploadError):
             self.announce(size=up.MAX_BYTES + 1)
         with self.assertRaises(up.UploadError):
-            self.announce(filename="../x")
+            self.announce(filename="..")
         with self.assertRaises(up.UploadError):
             up.status(self.root, "not-an-id")
 

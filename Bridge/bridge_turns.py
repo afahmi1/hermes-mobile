@@ -70,12 +70,44 @@ async def connect(home: Path):
         yield c
 
 
+# Hermes refuses with a bare reason code. The phone shows a sentence that says what happened and what to do,
+# with the code kept in brackets at the end (callers match on it, and it is what to search the logs for).
+_REFUSAL_TEXT = {
+    "invalid_params": "Hermes rejected this request as malformed.",
+    "permission_denied": "Hermes refused this request from the phone's bridge.",
+    "session_busy": "Hermes is still replying in this chat. Try again when it finishes.",
+    "session_not_found": "Hermes can't find this chat any more. Refresh the chat list.",
+    "revision_conflict": "This chat changed on your Mac a moment ago. Try again.",
+    "runtime_draining": "Hermes is restarting. Try again in a few seconds.",
+    "runtime_retired": "Hermes is restarting. Try again in a few seconds.",
+    "storage_unavailable": "Hermes can't reach its chat storage right now. Try again shortly.",
+    "profile_mismatch": "This chat belongs to a different bot than the one asked.",
+    "admission_conflict": "Hermes already took a different message with this ID.",
+    "unknown_method": "This Hermes version doesn't support that action. Update Hermes on your Mac.",
+}
+
+
+def refusal_text(method, reason, params=None, data=None):
+    """A readable sentence for a gateway refusal; unknown codes still say which action failed."""
+    reason = str(reason)
+    if method == "prompt.submit" and reason == "invalid_params" and (params or {}).get("attachments"):
+        text = ("Hermes refused the attached photos. It takes at most %d per message and %d MB in all, each a "
+                "PNG, JPEG, GIF or WebP file in its own image folder. Send them again; if it keeps happening, run "
+                "the bridge doctor on your Mac." % (bridge_media.native_image_limit(),
+                                                    bridge_media.message_limit() // (1024 * 1024)))
+    else:
+        text = _REFUSAL_TEXT.get(reason) or "Hermes refused this request."
+    detail = ", ".join("%s: %s" % (k, data[k]) for k in ("field", "detail") if isinstance(data, dict) and data.get(k))
+    return "%s (%s: %s%s)" % (text, method, reason, "; " + detail if detail else "")
+
+
 async def _rpc(c, method, **params):
     from hermes_cli.gateway_client import GatewayRPCError
     try:
         return await c.rpc(method, **params)
     except GatewayRPCError as e:
-        raise TurnError("%s: %s" % (method, e), 409 if str(e) in ("session_busy", "revision_conflict") else 400)
+        raise TurnError(refusal_text(method, e, params, getattr(e, "data", None)),
+                        409 if str(e) in ("session_busy", "revision_conflict") else 400)
 
 
 @functools.lru_cache(maxsize=1)
@@ -658,26 +690,85 @@ def _media_notes(media, images_by_path=False):
         if item.get("jpeg_copy"):
             copy = next((m for m in media if m.get("copy_of") == item["path"]), {})
             seen = copy.get("native", True) and not images_by_path
+            kind = "A JPEG copy scaled down to %d megapixels" % (bridge_media.MAX_PIXELS // 1_000_000) if (
+                item["mime"] == bridge_media.JPEG) else "A full-resolution JPEG copy"
             text += ("\n\nThe user attached a photo named %s (%s, the original file, untouched). It is saved at %s. %s" % (
                 json.dumps(name), item["mime"], json.dumps(item["path"]),
-                "A full-resolution JPEG copy is attached so you can see it." if seen else
-                "A full-resolution JPEG copy to look at is at %s; use vision_analyze on it." % json.dumps(item["jpeg_copy"])))
+                "%s is attached so you can see it." % kind if seen else
+                "%s to look at is at %s; use vision_analyze on it." % (kind, json.dumps(item["jpeg_copy"]))))
             continue
         if item["mime"] == bridge_media.JPEG:
             if images_by_path or not item.get("native", True):
                 text += ("\n\nThe user attached an image named %s. It is saved at the following local path. "
                          "Use vision_analyze on it to see it. Local file path: %s" % (json.dumps(name), json.dumps(item["path"])))
             continue
-        size = item.get("size")
-        if not isinstance(size, int) or size <= 0:
-            try:
-                size = Path(item["path"]).stat().st_size
-            except OSError:
-                size = 0
-        text += ("\n\nThe user attached a file named %s (%s, %d bytes). It is saved at the following "
-                 "local path. Use an appropriate available tool to read or process it; do not execute it. "
-                 "Local file path: %s" % (json.dumps(name), item["mime"], size, json.dumps(item["path"])))
+        text += "\n\n" + _document_note(item, name)
     return text
+
+
+# Hermes's own inbound-document conventions (gateway/run.py _build_document_context_note, Telegram's
+# MAX_TEXT_INJECT_BYTES and gateway/platforms/base.py _TEXT_INJECT_EXTENSIONS), so a file from the phone reaches the
+# model exactly the way one from Telegram or Discord does. Copied, not imported: gateway.run is the whole gateway.
+_TEXT_INLINE_BYTES = 100 * 1024
+_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".log", ".json", ".jsonl", ".ndjson", ".xml", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat",
+    ".c", ".h", ".cpp", ".cc", ".hpp", ".cs", ".java", ".kt", ".go", ".rs", ".rb", ".php", ".pl", ".lua", ".r",
+    ".jl", ".swift", ".m", ".scala", ".clj", ".ex", ".exs", ".erl", ".sql", ".graphql", ".proto", ".tf", ".hcl",
+    ".srt", ".vtt", ".tex", ".bib", ".rst", ".org", ".gcode", ".stl", ".obj", ".svg", ".ics", ".vcf", ".diff", ".patch"}
+# What Hermes's read_file turns into text by itself (tools/read_extract.py: built in, or through anydoc).
+_EXTRACTABLE = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xlsm", ".xls", ".odt", ".odp", ".ods",
+                ".rtf", ".epub", ".ipynb"}
+
+
+def _inline_text(item):
+    path = Path(item["path"])
+    if path.suffix.lower() not in _TEXT_EXTENSIONS and not str(item.get("mime") or "").startswith("text/"):
+        return None
+    try:
+        if path.stat().st_size > _TEXT_INLINE_BYTES:
+            return None
+        return path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _document_note(item, name):
+    path, mime = item["path"], str(item.get("mime") or "application/octet-stream")
+    suffix = Path(path).suffix.lower()
+    display = name.replace("'", "\u2019")
+    content = _inline_text(item)
+    if content is not None:
+        return ("[The user sent a text document: '%s'. Its content has been included below. The file is also saved at: "
+                "%s]\n[Content of %s]:\n%s" % (display, path, display, content))
+    if mime.startswith("text/") or suffix in _TEXT_EXTENSIONS:
+        return ("[The user sent a text document: '%s'. It is saved at: %s. Its content is not inlined here. Read the "
+                "cached file yourself before answering when the user's request involves its contents.]" % (display, path))
+    if mime.startswith("video/"):
+        return ("[The user sent a video: '%s' (%s). It is saved at: %s. Look at it with video_analyze, or pull frames "
+                "with ffmpeg and look at those with vision_analyze; ffmpeg can also extract its audio for "
+                "transcription.]" % (display, mime, path))
+    if mime.startswith("image/"):
+        return ("[The user sent an image file: '%s' (%s). It is saved at: %s, but no viewable copy could be made. "
+                "Try converting it with sips or ffmpeg, then look at the result with vision_analyze.]" % (display, mime, path))
+    hint = ("To read it, extract the document's text yourself, for example with the terminal tool or the "
+            "ocr-and-documents skill, before answering, instead of asking the user to paste the contents.")
+    if suffix in _EXTRACTABLE:
+        hint = ("read_file extracts its text directly (PDF, Word, PowerPoint, Excel, OpenDocument, RTF and EPUB). If "
+                "a PDF has no text layer it is a scan: render its pages with pdftoppm and look at them with "
+                "vision_analyze. Read it before answering, instead of asking the user to paste the contents.")
+    elif item.get("preview"):
+        hint = ("It is an Apple iWork document (a ZIP bundle). Its PDF preview was extracted to %s; read that with "
+                "read_file. For the raw contents, list the bundle with `unzip -l`." % item["preview"])
+    elif suffix in bridge_media.IWORK:
+        hint = ("It is an Apple iWork document (a ZIP bundle). List it with `unzip -l`; a QuickLook/Preview.pdf inside, "
+                "extracted to a scratch folder, can be read with read_file.")
+    elif suffix in (".zip", ".tar", ".gz", ".tgz", ".7z", ".rar"):
+        hint = ("It is an archive: list its contents first (for example `unzip -l` or `tar -tf`), then extract into a "
+                "scratch folder before reading. Never run anything from it.")
+    return ("[The user sent a document: '%s' (%s). It is saved at: %s. %s Do not execute it.]"
+            % (display, mime, path, hint))
 
 
 def _follow_up_frames(attachments):

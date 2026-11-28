@@ -248,7 +248,11 @@ class DeviceGrantTests(unittest.TestCase):
         sockets[1].shutdown.assert_not_called()
         allowed.side_effect = sqlite3.OperationalError("locked")
         streams._check(list(streams.live.items()))
-        self.assertFalse(streams.live)
+        self.assertEqual(set(streams.live), {1}, "a registry blip must not cut live streams")
+        sockets[1].shutdown.assert_not_called()
+        streams.failing_since = time.time() - self.b.bridge_devices.REGISTRY_GRACE - 1
+        streams._check(list(streams.live.items()))
+        self.assertFalse(streams.live, "a registry that stays unreadable fails closed")
         for sock in sockets:
             sock.shutdown.assert_called_once()
 
