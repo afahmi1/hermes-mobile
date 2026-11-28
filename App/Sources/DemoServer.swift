@@ -44,6 +44,9 @@ enum DemoMode {
 final class DemoURLProtocol: URLProtocol {
     /// Heartbeats for an open event stream, on the loading thread's run loop (where the client must be called).
     private var heartbeat: Timer?
+    private static let stateLock = NSLock()
+    nonisolated(unsafe) private static var schedules: [String: [[String: Any]]] = [:]
+    nonisolated(unsafe) private static var draftSessions: [String: String] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool { DemoMode.isOn }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -87,6 +90,18 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", let p) where p.count == 3 && p[0] == "chat" && p[2] == "media-capabilities":
             body = ["images": true, "files": true, "video": false, "max_file_bytes": 31_457_280, "max_video_bytes": 8_388_608]
         case ("GET", let p) where p.count == 4 && p[0] == "chat" && p[3] == "queue": body = ["pending": [Any](), "paused": false]
+        case ("POST", let p) where p.count == 3 && p[0] == "chat" && p[2] == "new":
+            let draft = jsonBody()["request_id"] as? String ?? UUID().uuidString
+            let session = Self.stateLock.withLock {
+                let key = p[1] + "/" + draft
+                if let s = Self.draftSessions[key] { return s }
+                let s = "demo-new-" + UUID().uuidString
+                Self.draftSessions[key] = s
+                return s
+            }
+            return respond(201, ["session_id": session])
+        case ("POST", let p) where p.count == 4 && p[0] == "chat" && ["schedule", "scheduled", "unschedule"].contains(p[3]):
+            return scheduledRequest(key: p[1] + "/" + p[2], action: p[3])
         case ("GET", ["addons", "catalog"]):
             body = DemoFixtures.addons(kind: q("kind") ?? "skills", query: q("q") ?? "")
         case ("GET", ["addons", "detail"]):
@@ -126,7 +141,7 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", ["manage", "archived"]): body = ["projects": [Any](), "bots": [Any]()]
         case ("GET", ["manage", "pin"]): body = ["configured": true]
         case ("GET", ["capabilities"]):
-            body = ["features": ["device_grants", "restart_v1", "auto_projects_v1", "addons_v1"], "device_id": "dev_demo",
+            body = ["features": ["device_grants", "restart_v1", "auto_projects_v1", "addons_v1", "schedule_v1"], "device_id": "dev_demo",
                     "manage_devices": true, "can_restart": true, "can_manage_addons": true]
         case ("POST", ["autoprojects", "from-chat"]):
             body = ["id": "apj_demo", "state": "queued", "result": NSNull()]
@@ -145,6 +160,50 @@ final class DemoURLProtocol: URLProtocol {
         }
         guard let body else { return respond(404, ["error": "not found"]) }
         respond(200, body)
+    }
+
+    private func jsonBody() -> [String: Any] {
+        var data = request.httpBody ?? Data()
+        if data.isEmpty, let stream = request.httpBodyStream {
+            let size = 4096
+            var buffer = [UInt8](repeating: 0, count: size)
+            stream.open()
+            defer { stream.close() }
+            while stream.hasBytesAvailable {
+                let n = stream.read(&buffer, maxLength: size)
+                if n <= 0 { break }
+                data.append(contentsOf: buffer.prefix(n))
+            }
+        }
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    private func scheduledRequest(key: String, action: String) {
+        let request = jsonBody()
+        let result: (Int, [String: Any]) = Self.stateLock.withLock {
+            var waiting = Self.schedules[key, default: []]
+            if action == "schedule" {
+                guard let text = request["text"] as? String, !text.isEmpty,
+                      let at = request["at"] as? Double, at > Date.now.timeIntervalSince1970 else {
+                    return (400, ["error": "Choose a message and a future time."])
+                }
+                let row: [String: Any] = ["id": UUID().uuidString, "text": text, "due": at,
+                                          "reason": request["reason"] as? String ?? "scheduled"]
+                waiting.append(row)
+                waiting.sort { ($0["due"] as? Double ?? 0) < ($1["due"] as? Double ?? 0) }
+                Self.schedules[key] = waiting
+                return (201, ["scheduled": row, "waiting": waiting])
+            }
+            if action == "unschedule" {
+                guard let id = request["id"] as? String, let i = waiting.firstIndex(where: { $0["id"] as? String == id }) else {
+                    return (404, ["error": "Message isn't waiting."])
+                }
+                waiting.remove(at: i)
+                Self.schedules[key] = waiting
+            }
+            return (200, ["waiting": waiting])
+        }
+        respond(result.0, result.1)
     }
 
     override func stopLoading() {
@@ -502,11 +561,16 @@ enum DemoFixtures {
                                       ["name": "API server", "state": "connected"]]],
             "agents": (DemoMode.live
                 ? [["kind": "phone", "title": "Thermocline polish for Prometheus", "profile": "default",
-                    "model": "claude-opus-5-5", "started_at": iso(-180), "session_id": DemoMode.chatID]] : [])
-                + [["kind": "cron", "title": "Relay drain", "profile": "default", "model": "deepseek-v4-flash",
-                    "started_at": iso(-20)],
+                    "source": "local", "source_label": "Phone", "model": "claude-opus-5-5", "provider": "anthropic",
+                    "started_at": iso(-180), "session_id": DemoMode.chatID]] : [])
+                + [["kind": "chat", "title": "STEM briefing format", "profile": "research",
+                    "source": "desktop", "source_label": "Desktop", "model": "openai/gpt-6.2-sol", "provider": "openai-codex",
+                    "started_at": iso(-120), "session_id": "demo-brief"],
+                   ["kind": "cron", "title": "Relay drain", "profile": "default", "source": "cron", "source_label": "Cron",
+                    "model": "deepseek-v4-flash", "provider": "deepseek", "started_at": iso(-20)],
                    ["kind": "subagent", "title": "Render light and dark contact sheets", "profile": "default",
-                    "model": "deepseek-v4-flash", "started_at": iso(-95), "parent_session_id": "demo-echo"]],
+                    "source": "subagent", "model": "deepseek-v4-flash", "provider": "deepseek", "started_at": iso(-95),
+                    "parent_session_id": DemoMode.chatID, "parent_title": "Thermocline polish for Prometheus"]],
             "jobs": [
                 "jobs": jobs, "recent": recent,
                 "incidents": [["name": "STEM briefing", "state": "open", "profile": "research", "failure_type": "rate limit",

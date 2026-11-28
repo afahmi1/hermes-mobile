@@ -44,6 +44,7 @@ struct ChatScreen: View {
     @State private var showRuntime = false
     @State private var sendTick = 0
     @State private var showFullComposer = false
+    @State private var showSendAt = false
     @State private var previewedImage: UIImage?
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var landTick = 0
@@ -266,6 +267,9 @@ struct ChatScreen: View {
                 Task { await chat.apply(choice) }
             }
         }
+        .sheet(isPresented: $showSendAt) {
+            ScheduleDateSheet { scheduleDraft(at: $0, atReset: false) }
+        }
         .sheet(item: $chat.approval) { req in
             ApprovalSheet(req: req, busy: chat.answeringApproval, error: chat.approvalError) { answer in Task { await chat.answer(req, choice: answer) } }
         }
@@ -295,6 +299,7 @@ struct ChatScreen: View {
         .task { await chat.loadPalette() }
         .modifier(VisibleChat(destination: chat.notificationDestination))
         .task(id: chat.sessionId) { await chat.loadPins() }
+        .task(id: chat.sessionId) { await chat.refreshScheduled() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
         .onReceive(NotificationCenter.default.publisher(for: .hermesOpenPath)) { note in
@@ -307,6 +312,7 @@ struct ChatScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .hermesForeground)) { _ in
             // Anything waiting to go tries again right away, then backs off quietly.
             chat.outboxWake()
+            Task { await chat.refreshScheduled() }
             // Back from the background: show what happened while away, then land on it.
             guard !chat.isRunning else { return }
             // Only land on the newest message if that's where you were. Reading higher up stays put.
@@ -618,6 +624,7 @@ struct ChatScreen: View {
             if !chat.questions.isEmpty { QuestionPanel(chat: chat) }
             if chat.queue?.paused == true { QueuePausedBanner(chat: chat) }
             if !chat.outgoing.isEmpty { OutboxTray(chat: chat) }
+            scheduledTray
             draftShelf
             if chat.isRunning, let notice = chat.runtimeNotice {
                 Text(notice).font(HMDesign.metadata).foregroundStyle(HMDesign.text2)
@@ -667,7 +674,7 @@ struct ChatScreen: View {
                     .accessibilityLabel("Stop reply")
                     // While Hermes replies, Send queues the message for right after this reply.
                     // Touch and hold to guide the current reply instead.
-                    let canQueue = !(preparingMedia || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
+                    let canQueue = !(preparingMedia || chat.updatingSchedule || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     Button { followUp("queue") } label: {
                         Group {
                             if HMTheme.isThermocline { HMSendGlyph(enabled: canQueue) }
@@ -681,15 +688,16 @@ struct ChatScreen: View {
                             }
                             .hmTouchTarget()
                     }
-                    .disabled(preparingMedia || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
+                    .disabled(!canQueue)
                     .contextMenu {
                         Button { followUp("queue") } label: { Label("Send next (after this reply)", systemImage: "text.line.last.and.arrowtriangle.forward") }
                         Button { followUp("steer") } label: { Label("Guide this reply now", systemImage: "arrow.turn.up.right") }
+                        Section { sendLaterActions }
                     }
                     .accessibilityLabel("Queue message")
-                    .accessibilityHint("Sends it right after the current reply. Touch and hold to guide this reply instead.")
+                    .accessibilityHint("Queues after this reply. Touch and hold to guide or send later.")
                 } else {
-                    let canSend = !(preparingMedia || chat.savingRuntime || chat.slashBusy
+                    let canSend = !(preparingMedia || chat.savingRuntime || chat.slashBusy || chat.updatingSchedule
                                     || (chat.combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && chat.draftAttachments.isEmpty))
                     Button { send() } label: {
                         Group {
@@ -699,7 +707,9 @@ struct ChatScreen: View {
                         .hmTouchTarget()
                     }
                     .disabled(!canSend)
+                    .contextMenu { sendLaterActions }
                     .accessibilityLabel("Send message")
+                    .accessibilityHint("Touch and hold to send later.")
                 }
             }
             .buttonStyle(.borderless)
@@ -721,6 +731,79 @@ struct ChatScreen: View {
         }
         .padding(.top, HMDesign.micro)
         .hmBar(.top)
+    }
+
+    private var scheduleBlocker: String? {
+        if !chat.draftAttachments.isEmpty { return "Remove attachments to send later" }
+        if chat.sessionId == nil, chat.isRunning { return "Wait for the chat to start" }
+        if chat.savingRuntime { return "Wait for the model to save" }
+        if chat.acceptsSlash(chat.combinedDraft)
+            || (chat.pastedTexts.isEmpty && ModelCommand.parse(chat.draft) != nil) { return "Commands can't be scheduled" }
+        return nil
+    }
+
+    /// Use the selected route or the session policy, not a different provider that wrote the last fallback reply.
+    private var nextUsageReset: Date? {
+        let model = chat.choice.model ?? chat.served?.policy?.model ?? bot?.model
+        let provider = chat.choice.provider
+            ?? (chat.served?.policy?.model == model ? chat.served?.policy?.provider : nil)
+            ?? (chat.served?.fallbackActive != true && chat.served?.model == model ? chat.served?.provider : nil)
+            ?? (bot?.model == model ? bot?.provider : nil)
+        return UsageReset.next(in: app.status.payload, provider: provider)?.date
+    }
+
+    @ViewBuilder private var sendLaterActions: some View {
+        let blocker = scheduleBlocker
+        Button {
+            Self.hideKeyboard()
+            showSendAt = true
+        } label: {
+            Label("Send at…", systemImage: "calendar.badge.clock")
+        }
+        .disabled(blocker != nil)
+        if let reset = nextUsageReset {
+            let relative = reset.formatted(.relative(presentation: .numeric, unitsStyle: .abbreviated))
+            Button { scheduleDraft(at: reset, atReset: true) } label: {
+                Label("Send at next reset (\(relative))", systemImage: "clock.arrow.circlepath")
+            }
+            .disabled(blocker != nil)
+        } else {
+            Button("Send at next reset (no reset time)", systemImage: "clock.arrow.circlepath") { }
+                .disabled(true)
+        }
+        if let blocker { Button(blocker) { }.disabled(true) }
+    }
+
+    private func scheduleDraft(at date: Date, atReset: Bool) {
+        guard !preparingMedia, scheduleBlocker == nil else { return }
+        let context = ProjectContext.chosen(scope: projectScope?.projectID, optedIn: includeProjectContext && !chat.isRunning)
+        Task {
+            let scheduled = await chat.scheduleDraft(at: date, atReset: atReset, projectContext: context)
+            app.adopt(chat, draftKey: draftKey)
+            if scheduled {
+                sendTick += 1
+                includeProjectContext = false
+            }
+        }
+    }
+
+    @ViewBuilder private var scheduledTray: some View {
+        let rows = chat.scheduled.filter { !$0.isRetry }
+        if !rows.isEmpty {
+            ScrollView {
+                VStack(spacing: HMDesign.micro) {
+                    ForEach(rows) { row in
+                        ScheduledMessageRow(row: row, busy: chat.updatingSchedule) {
+                            Task { await chat.cancelScheduled(row.id) }
+                        }
+                    }
+                }
+                .padding(.horizontal, HMDesign.medium)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(maxHeight: 144)
+            .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var attachmentMenu: some View {
@@ -1367,7 +1450,9 @@ struct ChatScreen: View {
     private func poll() async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(8))
-            if !Task.isCancelled && !chat.isRunning && chat.sessionId != nil { await chat.load(quiet: true) }
+            guard !Task.isCancelled else { return }
+            if !chat.scheduled.isEmpty { await chat.refreshScheduled() }
+            if !chat.isRunning && chat.sessionId != nil { await chat.load(quiet: true) }
         }
     }
 }
@@ -3434,6 +3519,68 @@ struct ToolStamp: View {
     }
 }
 
+private struct ScheduleDateSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var date = Date.now.addingTimeInterval(3600)
+    let onSchedule: (Date) -> Void
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            let now = context.date
+            let last = now.addingTimeInterval(API.ScheduledSend.maxAhead)
+            NavigationStack {
+                ScrollView {
+                    DatePicker("Send time", selection: $date, in: now...last, displayedComponents: [.date, .hourAndMinute])
+                        .datePickerStyle(.graphical)
+                        .padding(.horizontal)
+                }
+                .hmCanvas()
+                .navigationTitle("Send at…")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Cancel", role: .cancel) { dismiss() } }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Schedule") {
+                            guard date > .now else { return }
+                            onSchedule(date)
+                            dismiss()
+                        }
+                        .disabled(date <= now || date > last)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ScheduledMessageRow: View {
+    let row: API.ScheduledSend
+    let busy: Bool
+    let cancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: HMDesign.small) {
+            Image(systemName: "clock").foregroundStyle(HMDesign.accent).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.text).font(.footnote).lineLimit(1)
+                let label = row.reason == "reset" ? "At reset" : "Scheduled"
+                Text("\(label) · \(row.due.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption).foregroundStyle(HMDesign.text2)
+                if let error = row.error { Text(error).font(.caption2).foregroundStyle(HMDesign.caution).lineLimit(2) }
+            }
+            Spacer(minLength: 0)
+            Button("Cancel", action: cancel)
+                .font(.footnote.weight(.semibold))
+                .frame(minHeight: HMDesign.touch)
+                .disabled(busy)
+                .accessibilityLabel("Cancel scheduled message")
+        }
+        .padding(.horizontal, HMDesign.small)
+        .padding(.vertical, HMDesign.micro)
+        .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: HMDesign.panelRadius))
+    }
+}
+
 /// A reply that didn't go through (provider error, usage limit, lost connection): retry now, or have the Mac send
 /// it again later, by default when the provider's usage window resets. The scheduled send lives on the Mac.
 struct FailedTurnCard: View {
@@ -3446,24 +3593,13 @@ struct FailedTurnCard: View {
 
     /// The soonest future reset among usage windows that are nearly full (or the chat's provider's soonest reset).
     private var reset: (date: Date, label: String)? {
-        let providers = app.status.payload?["providers"]["providers"].array ?? []
-        let mine = chat.served?.provider
-        var best: (Date, String)?
-        for p in providers {
-            let name = p["provider"].string ?? ""
-            for w in p["usage"]["windows"].array {
-                guard let at = w["resets_at"].date, at > Date() else { continue }
-                let full = (w["used_percent"].double ?? 0) >= 90
-                guard full || (mine != nil && name == mine) else { continue }
-                if best == nil || at < best!.0 { best = (at, ProviderUsageSection.displayName(name)) }
-            }
-        }
-        return best
+        UsageReset.next(in: app.status.payload, provider: chat.served?.provider, includeNearlyFull: true)
+            .map { ($0.date, ProviderUsageSection.displayName($0.provider)) }
     }
 
     private var waiting: API.ScheduledSend? {
         guard let ask = chat.askBefore(itemID) else { return nil }
-        return chat.scheduled.first { $0.text == ask }
+        return chat.scheduled.first { $0.isRetry && $0.text == ask }
     }
 
     var body: some View {
@@ -3474,14 +3610,9 @@ struct FailedTurnCard: View {
                  : "The model didn't answer (often a usage limit or a dropped connection).")
                 .font(.footnote).foregroundStyle(HMDesign.text2)
             if let w = waiting {
-                HStack(spacing: 8) {
-                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(HMDesign.accent)
-                    (Text("Your Mac sends it again ") + Text(w.due, style: .relative) + Text(w.due < Date() ? " ago" : ""))
-                        .font(.footnote)
-                    Spacer()
-                    Button("Cancel") { Task { await chat.cancelScheduled(w.id) } }.font(.footnote.weight(.semibold))
+                ScheduledMessageRow(row: w, busy: chat.updatingSchedule) {
+                    Task { await chat.cancelScheduled(w.id) }
                 }
-                if let e = w.error { Text(e).font(.caption2).foregroundStyle(.tertiary).lineLimit(2) }
             } else if isLatest, chat.askBefore(itemID) != nil {
                 HStack(spacing: 8) {
                     Button { act { await chat.retryNow(itemID) } } label: {
@@ -3510,7 +3641,6 @@ struct FailedTurnCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(HMDesign.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(HMDesign.separator, lineWidth: 0.5))
-        .task(id: itemID) { if isLatest { await chat.refreshScheduled() } }
     }
 
     private func act(_ work: @escaping () async -> Void) {

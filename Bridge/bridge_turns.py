@@ -1012,6 +1012,7 @@ async def _drive_connection(turn: Turn):
             receipt = await _rpc(c, "prompt.submit", **params)
             turn.admission = receipt["admission_id"]
             turn.generation = receipt.get("execution_generation")
+            following_queue = receipt.get("status") == "queued"
             if turn.journal:
                 await asyncio.to_thread(turn.journal.admitted, turn)
                 await asyncio.to_thread(bridge_media.discard, images)
@@ -1270,7 +1271,8 @@ def match_receipt(profile, sid, text, request, directory):
     return {"turn_id": turn_id}
 
 
-def start_primary(profile, home, sid, text, choice, submission, project, directory, prepare, restore_workspace, attachments=None, video_consent=False, device_id=None):
+def start_primary(profile, home, sid, text, choice, submission, project, directory, prepare, restore_workspace,
+                  attachments=None, video_consent=False, device_id=None, *, allow_queue=False):
     try:
         id = "turn_" + uuid.UUID(str(submission)).hex
     except (TypeError, ValueError):
@@ -1300,7 +1302,10 @@ def start_primary(profile, home, sid, text, choice, submission, project, directo
                 raise TurnError("This submission ID belongs to a different send.", 409)
             return get_turn(id) or restored_turn(existing, home, journal, restore_workspace)
         with TURNS_LOCK:
-            if any(t.profile == profile and t.sid == sid and not t.done for t in TURNS.values()):
+            # Scheduled prompts may join Hermes's durable queue. Don't overtake a local send that
+            # hasn't reached the gateway yet; the scheduler will retry that short race.
+            if any(t.profile == profile and t.sid == sid and not t.done and (not allow_queue or t.admission is None)
+                   for t in TURNS.values()):
                 raise TurnError("This chat is still working on the last message.", 409)
         ws = prepare()
         turn = Turn(profile, home, sid, text, choice, ws)

@@ -1,5 +1,23 @@
 import SwiftUI
 
+/// The same provider usage windows drive both Send later and the failed-turn retry menu.
+enum UsageReset {
+    static func next(in status: JV?, provider: String?, includeNearlyFull: Bool = false,
+                     now: Date = .now) -> (date: Date, provider: String)? {
+        var best: (date: Date, provider: String)?
+        for row in status?["providers"]["providers"].array ?? [] {
+            guard let name = row["provider"].string, !name.isEmpty else { continue }
+            for window in row["usage"]["windows"].array {
+                let nearlyFull = includeNearlyFull && (window["used_percent"].double ?? 0) >= 90
+                guard nearlyFull || name.caseInsensitiveCompare(provider ?? "") == .orderedSame,
+                      let reset = window["resets_at"].date, reset > now else { continue }
+                if best.map({ reset < $0.date }) ?? true { best = (reset, name) }
+            }
+        }
+        return best
+    }
+}
+
 private struct ProviderEntry: Identifiable {
     let id: String
     let data: JV

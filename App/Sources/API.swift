@@ -1071,14 +1071,24 @@ final class API: @unchecked Sendable {
         return title
     }
 
-    /// Send later from the Mac ("try again when limits reset"). Returns the chat's waiting messages.
-    struct ScheduledSend: Identifiable, Hashable { let id: String; let text: String; let due: Date; let error: String? }
+    /// Send later from the Mac. Returns this chat's waiting messages.
+    struct ScheduledSend: Identifiable, Hashable {
+        static let maxAhead: TimeInterval = 8 * 24 * 3600  // bridge_schedule.MAX_AHEAD
+        let id: String
+        let text: String
+        let due: Date
+        let reason: String?
+        let error: String?
+        var isRetry: Bool { reason != "scheduled" && reason != "reset" }
+    }
     func schedule(profile: String, session: String, action: String, body: [String: Any] = [:]) async throws -> [ScheduledSend] {
         let obj = try await json("/m/chat/\(Self.esc(profile))/\(Self.esc(session))/\(action)", method: "POST", body: body)
-        return (obj["waiting"] as? [[String: Any]] ?? []).compactMap { r in
+        guard let waiting = obj["waiting"] as? [[String: Any]],
+              action != "schedule" || (obj["scheduled"] as? [String: Any])?["id"] is String else { throw APIError.badResponse }
+        return waiting.compactMap { r in
             guard let id = r["id"] as? String, let due = (r["due"] as? NSNumber)?.doubleValue else { return nil }
             return ScheduledSend(id: id, text: r["text"] as? String ?? "", due: Date(timeIntervalSince1970: due),
-                                 error: r["error"] as? String)
+                                 reason: r["reason"] as? String, error: r["error"] as? String)
         }
     }
 

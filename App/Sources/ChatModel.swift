@@ -853,7 +853,7 @@ final class ChatModel {
     /// Hermes runs the command. A `send` result becomes the next turn, with the short label in the bubble.
     func runSlash(_ raw: String) async {
         let command = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isRunning, !slashBusy, acceptsSlash(command) else { return }
+        guard !isRunning, !slashBusy, !updatingSchedule, acceptsSlash(command) else { return }
         let account = app?.inboxAccount
         let authored = draft
         let authoredPastes = pastedTexts
@@ -861,17 +861,7 @@ final class ChatModel {
         error = nil
         status = "Running /\(SlashCommand.name(in: command) ?? "command")…"
         do {
-            guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
-            if sessionId == nil {
-                let sid = try await api.createSession(profile: profile, draftID: draftID, project: startIn)
-                guard account == app?.inboxAccount else { throw APIError.notSignedIn }
-                try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
-                sessionId = sid
-                if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
-                // Anything queued during these first seconds can be saved to disk now that the chat has an id.
-                Task { await loadOutgoing() }
-            }
-            guard let sid = sessionId else { throw APIError.notSignedIn }
+            let sid = try await ensureSession(account: account)
             draft = ""
             pastedTexts = []
             let result = try await api.slash(profile: profile, session: sid, command: command)
@@ -898,6 +888,20 @@ final class ChatModel {
         }
     }
 
+    /// Creating a session doesn't send a message. All first sends can use the same draft ID and folder.
+    private func ensureSession(account: String?) async throws -> String {
+        guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
+        if let sessionId { return sessionId }
+        let sid = try await api.createSession(profile: profile, draftID: draftID, project: startIn)
+        guard account == app?.inboxAccount else { throw APIError.notSignedIn }
+        try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
+        sessionId = sid
+        if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
+        // Anything queued during these first seconds can be saved to disk now that the chat has an id.
+        Task { await loadOutgoing() }
+        return sid
+    }
+
     func send(_ raw: String, projectContext: String? = nil, attachments: [SendAttachment] = [], shown: String? = nil,
               id: UUID = UUID(), fromQueue: Bool = false) async {
         if needsDraftRestore && !fromQueue {
@@ -906,7 +910,7 @@ final class ChatModel {
             if needsDraftRestore || raw != combinedDraft || attachments != draftAttachments { return }
         }
         let message = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isRunning, !slashBusy, !message.isEmpty || !attachments.isEmpty else { return }
+        guard !isRunning, !slashBusy, !updatingSchedule, !message.isEmpty || !attachments.isEmpty else { return }
         let text = message.isEmpty ? "Describe the attached media." : message
         if pendingSend != nil {
             error = "Reconnecting the previous send. Your next message is saved in the composer."
@@ -921,17 +925,8 @@ final class ChatModel {
         status = "Sending…"
         do {
             if picked && sessionId != nil { await refreshServed() }
-            guard let account, account == app?.inboxAccount else { throw APIError.notSignedIn }
-            if sessionId == nil {
-                let sid = try await api.createSession(profile: profile, draftID: draftID, project: startIn)
-                guard account == app?.inboxAccount else { throw APIError.notSignedIn }
-                try ComposerDisk.shared.move(account, from: composerScope, to: profile + "|session/" + sid, id: draftID)
-                sessionId = sid
-                if !choice.isDefault { app?.saveChoice(choice, profile: profile, session: sid) }
-                // Anything queued during these first seconds can be saved to disk now that the chat has an id.
-                Task { await loadOutgoing() }
-            }
-            guard let sid = sessionId, let key = sendKey else { throw APIError.notSignedIn }
+            let sid = try await ensureSession(account: account)
+            guard let key = sendKey else { throw APIError.notSignedIn }
             let send = PendingSend(id: id, text: text, choice: picked ? choice : .botDefault, project: projectContext, attachments: attachments.isEmpty ? nil : attachments, composerText: authoredText, composerPastes: authoredPastes)
             try await InboxDisk.shared.stage(send, key: key)
             guard key == sendKey else { throw APIError.notSignedIn }
@@ -1208,7 +1203,48 @@ final class ChatModel {
     // MARK: failed replies
 
     /// Messages the Mac will send later in this chat (bridge `schedule_v1`).
-    var scheduled: [API.ScheduledSend] = []
+    private(set) var scheduled: [API.ScheduledSend] = []
+    private(set) var updatingSchedule = false
+    @ObservationIgnored private var scheduleRevision = UUID()
+
+    /// Schedule the composer, not a synthetic run. Only clear the draft after the Mac confirms it.
+    func scheduleDraft(at date: Date, atReset: Bool, projectContext: String?) async -> Bool {
+        guard !updatingSchedule, !savingRuntime, !slashBusy, sessionId != nil || !isRunning else { return false }
+        if needsDraftRestore { retryDraftStorage(); return false }
+        guard draftAttachments.isEmpty else { error = "Send later doesn't support attachments."; return false }
+        guard date > .now else { error = "Choose a future time."; return false }
+        let text = combinedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+        let authored = draft, pastes = pastedTexts
+        let account = app?.inboxAccount
+        let runtime = picked ? choice : .botDefault
+        updatingSchedule = true
+        scheduleRevision = UUID()
+        error = nil
+        defer { updatingSchedule = false }
+        do {
+            let sid = try await ensureSession(account: account)
+            var body: [String: Any] = ["text": text, "at": date.timeIntervalSince1970,
+                                       "reason": atReset ? "reset" : "scheduled"]
+            body["provider"] = runtime.provider
+            body["model"] = runtime.model
+            body["effort"] = runtime.effort
+            body["project_context"] = projectContext
+            let rows = try await api.schedule(profile: profile, session: sid, action: "schedule", body: body)
+            guard account == app?.inboxAccount else { return false }
+            scheduled = rows
+            if draft == authored, pastedTexts == pastes, draftAttachments.isEmpty {
+                draft = ""
+                pastedTexts = []
+            }
+            return true
+        } catch APIError.http(404, "not found") {
+            error = "Update the bridge on your Mac to send later."
+        } catch {
+            self.error = error.localizedDescription
+        }
+        return false
+    }
 
     static func isFailedTurn(_ text: String) -> Bool {
         text.hasPrefix("Your request was not processed") || text.hasPrefix("This turn did not complete")
@@ -1226,10 +1262,15 @@ final class ChatModel {
     }
 
     func retryLater(_ itemID: String, at date: Date, reason: String) async {
+        guard !updatingSchedule else { return }
         guard let ask = askBefore(itemID), let sid = sessionId else { error = "Couldn't find the message to resend."; return }
+        updatingSchedule = true
+        scheduleRevision = UUID()
+        defer { updatingSchedule = false }
         do {
-            scheduled = try await api.schedule(profile: profile, session: sid, action: "schedule",
-                                               body: ["text": ask, "at": date.timeIntervalSince1970, "reason": reason])
+            let rows = try await api.schedule(profile: profile, session: sid, action: "schedule",
+                                              body: ["text": ask, "at": date.timeIntervalSince1970, "reason": reason])
+            if app != nil { scheduled = rows }
         } catch APIError.http(404, _) {
             error = "Update the bridge on your Mac to schedule a retry."
         } catch {
@@ -1238,14 +1279,26 @@ final class ChatModel {
     }
 
     func cancelScheduled(_ id: String) async {
-        guard let sid = sessionId else { return }
-        scheduled.removeAll { $0.id == id }
-        scheduled = (try? await api.schedule(profile: profile, session: sid, action: "unschedule", body: ["id": id])) ?? scheduled
+        guard !updatingSchedule, let sid = sessionId else { return }
+        updatingSchedule = true
+        scheduleRevision = UUID()
+        defer { updatingSchedule = false }
+        do {
+            let rows = try await api.schedule(profile: profile, session: sid, action: "unschedule", body: ["id": id])
+            if app != nil { scheduled = rows }
+        } catch APIError.http(404, _) {
+            // It may have gone out just before the cancel reached the Mac.
+            if app != nil { scheduled.removeAll { $0.id == id } }
+        } catch {
+            self.error = "Couldn't cancel the scheduled message. " + error.localizedDescription
+        }
     }
 
     func refreshScheduled() async {
-        guard let sid = sessionId else { return }  // an older bridge answers 404; nothing shows
-        if let rows = try? await api.schedule(profile: profile, session: sid, action: "scheduled") { scheduled = rows }
+        guard !updatingSchedule, let sid = sessionId else { return }  // an older bridge answers 404; nothing shows
+        let revision = scheduleRevision
+        if let rows = try? await api.schedule(profile: profile, session: sid, action: "scheduled"),
+           revision == scheduleRevision, !Task.isCancelled, app != nil { scheduled = rows }
     }
 
     // MARK: thinking
