@@ -4,6 +4,16 @@ import UniformTypeIdentifiers
 import AVFoundation
 import QuickLook
 
+extension Notification.Name {
+    /// Posted when a chat became a project: the app switches to Projects and opens it.
+    static let openAutoProject = Notification.Name("hermes.autoProject.open")
+}
+
+/// The project a chat just became, carried by the `.openAutoProject` notification.
+struct AutoProjectOpen {
+    let id: String
+}
+
 struct ChatView: View {
     @Environment(AppModel.self) private var app
     let ref: ChatRef
@@ -48,8 +58,41 @@ struct ChatScreen: View {
     /// Which pin the bar shows; tapping the bar jumps to it, then moves to the next older pin (Telegram-style).
     @State private var pinCursor = 0
     @State private var highlighted: String?
+    @State private var makingProject = false
+    @State private var makeProjectError: String?
 
     private var bot: Bot? { app.bot(chat.profile) }
+
+    @ViewBuilder private var makeProjectMenu: some View {
+        Menu {
+            Button {
+                Task { await makeProject() }
+            } label: {
+                if makingProject { Label("Making a project…", systemImage: "gearshape.2") }
+                else { Label("Make a project", systemImage: "folder.badge.plus") }
+            }
+            .disabled(makingProject || chat.sessionId == nil)
+        } label: {
+            Image(systemName: makingProject ? "gearshape.2" : "ellipsis.circle")
+                .accessibilityLabel("Chat actions")
+        }
+    }
+
+    /// Turn this chat into a project on the Mac (title, summary, instructions, context, files and the chat itself),
+    /// then jump to it in the Projects tab.
+    private func makeProject() async {
+        guard let sid = chat.sessionId, !makingProject else { return }
+        makingProject = true
+        defer { makingProject = false }
+        do {
+            let made = try await API.shared.makeProject(profile: chat.profile, session: sid)
+            NotificationCenter.default.post(name: .openAutoProject, object: AutoProjectOpen(id: made.id))
+        } catch let f as API.AutoProjectFailure {
+            makeProjectError = f.message
+        } catch {
+            makeProjectError = API.AutoProjectFailure.failed.message
+        }
+    }
 
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -200,12 +243,20 @@ struct ChatScreen: View {
                     .disabled(chat.savingRuntime)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                // One dot. Tap it for the gateway's state, Reload chat and Check again.
-                ConnectionBadge(compact: true, reloadDisabled: chat.isLoading || chat.isRunning) {
-                    await chat.load(quiet: true)
-                    landTick &+= 1
+                HStack(spacing: HMDesign.small) {
+                    makeProjectMenu
+                    // One dot. Tap it for the gateway's state, Reload chat and Check again.
+                    ConnectionBadge(compact: true, reloadDisabled: chat.isLoading || chat.isRunning) {
+                        await chat.load(quiet: true)
+                        landTick &+= 1
+                    }
                 }
             }
+        }
+        .alert("Couldn't make the project", isPresented: Binding(get: { makeProjectError != nil }, set: { if !$0 { makeProjectError = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(makeProjectError ?? "")
         }
         .sheet(isPresented: $showRuntime) {
             RuntimeSheet(profile: chat.profile, bot: bot, current: chat.choice, served: chat.served,

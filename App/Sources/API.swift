@@ -702,6 +702,90 @@ final class API: @unchecked Sendable {
         _ = try await json(p(profile, "/api/sessions/\(Self.esc(session))"), method: "PATCH", body: fields)
     }
 
+    // MARK: projects that make themselves (Build 54)
+
+    /// Why "Make a project" could not finish. Fixed wording; the bridge's error text and codes stay on the Mac.
+    enum AutoProjectFailure: Error, Equatable {
+        case signedOut, unavailable, draftFailed, failed, malformed
+        var message: String {
+            switch self {
+            case .signedOut: "Your session ended. Sign in to Hermes again."
+            case .unavailable: "This Mac doesn't support auto-projects yet. Update the bridge, then try again."
+            case .draftFailed: "Hermes couldn't draft this project right now. Try again in a minute."
+            case .failed: "Making the project failed on your Mac. Try again."
+            case .malformed: "The Mac sent something this app couldn't read."
+            }
+        }
+        static func from(status: Int, code: String?) -> AutoProjectFailure {
+            if status == 401 { return .signedOut }
+            if code == "unavailable" || status == 503 { return .unavailable }
+            if code == "draft_failed" { return .draftFailed }
+            return .failed
+        }
+    }
+
+    /// One background job for making a project. `state` is queued/reading/drafting/saving/done/failed.
+    private struct AutoProjectJob: Decodable {
+        let id: String
+        let state: String
+        let error: String?
+        let code: String?
+        let result: AutoProjectResult?
+        struct AutoProjectResult: Decodable {
+            let projectId: String
+            let title: String
+            enum CodingKeys: String, CodingKey { case projectId = "project_id", title }
+        }
+    }
+
+    private func autoProjectCall(_ path: String, method: String = "GET", body: Any? = nil) async throws -> Data {
+        do {
+            let (status, data) = try await manageRaw(path, method: method, body: body)
+            guard (200..<300).contains(status) else {
+                let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+                throw AutoProjectFailure.from(status: status, code: code)
+            }
+            return data
+        } catch let f as AutoProjectFailure { throw f }
+        catch is CancellationError { throw CancellationError() }
+        catch APIError.notSignedIn { throw AutoProjectFailure.signedOut }
+        catch { throw AutoProjectFailure.failed }
+    }
+
+    /// Start "make this chat a project" and wait for it, then return the new project id and title.
+    func makeProject(profile: String, session: String) async throws -> (id: String, title: String) {
+        let started = try await autoProjectCall("/m/autoprojects/from-chat", method: "POST",
+                                                body: ["profile": profile, "session_id": session])
+        guard let startObj = try? JSONSerialization.jsonObject(with: started) as? [String: Any],
+              let jobID = startObj["id"] as? String, !jobID.isEmpty else { throw AutoProjectFailure.malformed }
+        // The draft can take a little while (reading the chat, one Hermes call). Poll until it settles.
+        for _ in 0..<60 {
+            let data = try await autoProjectCall("/m/autoprojects/jobs/" + Self.esc(jobID))
+            guard let job = try? JSONDecoder().decode(AutoProjectJob.self, from: data) else { throw AutoProjectFailure.malformed }
+            switch job.state {
+            case "done":
+                guard let result = job.result else { throw AutoProjectFailure.malformed }
+                return (result.projectId, result.title)
+            case "failed":
+                if job.code == "draft_failed" { throw AutoProjectFailure.draftFailed }
+                throw AutoProjectFailure.failed
+            default:
+                try await Task.sleep(for: .seconds(1))
+            }
+        }
+        throw AutoProjectFailure.failed
+    }
+
+    /// Keep a spotted project (clears its badge). Needs the owner's sign-in on this phone.
+    func keepAutoProject(id: String) async throws {
+        _ = try await autoProjectCall("/m/autoprojects/" + Self.esc(id), method: "POST", body: ["action": "keep"])
+    }
+
+    /// Dismiss a spotted project: the Mac archives it and remembers its topic so it is never re-suggested.
+    func dismissAutoProject(id: String) async throws {
+        _ = try await autoProjectCall("/m/autoprojects/" + Self.esc(id), method: "POST", body: ["action": "dismiss"])
+    }
+
     private static func choiceBody(_ choice: RuntimeChoice, previous: RuntimeChoice? = nil) -> [String: Any] {
         var body: [String: Any] = [:]
         if let v = choice.provider { body["provider"] = v }

@@ -32,6 +32,11 @@ enum WhatsNew {
 
     /// Newest first. Add a release at the top for each build that changes something you'd notice.
     static let releases: [WhatsNewRelease] = [
+        WhatsNewRelease(build: 54, items: [
+            WhatsNewItem(symbol: "folder.badge.plus", text: "Make any chat a project in one tap"),
+            WhatsNewItem(symbol: "sparkles", text: "Hermes drafts projects for topics you keep coming back to"),
+            WhatsNewItem(symbol: "checkmark.circle", text: "Keep or dismiss a project Hermes made; dismissed stays dismissed"),
+        ]),
         WhatsNewRelease(build: 52, items: [
             WhatsNewItem(symbol: "sparkles", text: "Silver is real metal now, measured from a silk print"),
             WhatsNewItem(symbol: "light.max", text: "The glow is visible on black: a core plus a wide bloom"),

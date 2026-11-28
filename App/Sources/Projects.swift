@@ -43,9 +43,11 @@ struct Project: Decodable, Hashable, Identifiable {
     let managed: Bool
     /// Set for Hermes's own Projects (the desktop app's), which the Mac reads from Hermes. Read-only here.
     let hermes: HermesProjectInfo?
+    /// Set for projects Hermes made itself (Build 54): origin "chat" (asked for) or "spotted" (noticed).
+    let auto: AutoProjectInfo?
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, summary, sources, managed, hermes
+        case id, title, summary, sources, managed, hermes, auto
         case botIds = "bot_ids", relatedFiles = "related_files"
     }
     init(from decoder: Decoder) throws {
@@ -58,7 +60,18 @@ struct Project: Decodable, Hashable, Identifiable {
         relatedFiles = try c.decodeIfPresent([ProjectFileRef].self, forKey: .relatedFiles) ?? []
         managed = (try? c.decodeIfPresent(Bool.self, forKey: .managed)) ?? false
         hermes = try? c.decodeIfPresent(HermesProjectInfo.self, forKey: .hermes)
+        auto = try? c.decodeIfPresent(AutoProjectInfo.self, forKey: .auto)
     }
+}
+
+/// A project Hermes made from chats, with how it came to be and whether he has kept or dismissed it yet.
+struct AutoProjectInfo: Decodable, Hashable {
+    let origin: String
+    let state: String
+    let chats: Int
+    let days: Int
+    let created: Double
+    var isSpotted: Bool { state == "spotted" }
 }
 
 /// A project from Hermes itself: chats belong to it when they run inside its folders.

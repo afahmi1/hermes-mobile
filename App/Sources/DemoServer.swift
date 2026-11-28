@@ -100,7 +100,13 @@ final class DemoURLProtocol: URLProtocol {
         case ("GET", ["manage", "archived"]): body = ["projects": [Any](), "bots": [Any]()]
         case ("GET", ["manage", "pin"]): body = ["configured": true]
         case ("GET", ["capabilities"]):
-            body = ["features": ["device_grants", "restart_v1"], "device_id": "dev_demo", "manage_devices": true, "can_restart": true]
+            body = ["features": ["device_grants", "restart_v1", "auto_projects_v1"], "device_id": "dev_demo", "manage_devices": true, "can_restart": true]
+        case ("POST", ["autoprojects", "from-chat"]):
+            body = ["id": "apj_demo", "state": "queued", "result": NSNull()]
+        case ("GET", ["autoprojects", "jobs", "apj_demo"]):
+            body = ["id": "apj_demo", "state": "done", "error": NSNull(), "code": NSNull(),
+                    "result": ["project_id": "birds", "title": "Local birds"]]
+        case ("POST", ["autoprojects", "birds"]): body = ["ok": true, "id": "birds", "action": "keep"]
         case ("POST", ["restart"]):
             body = ["ok": true, "target": "hermes", "mode": "when_idle",
                     "message": "Hermes will restart as soon as nothing is running. Replies in progress finish first."]
@@ -487,7 +493,8 @@ enum DemoFixtures {
             ["id": "fse2", "title": "FSE2 readiness", "summary": "Gaps, evidence and the path to Field Service Manager.",
              "bot_ids": ["career"]],
             ["id": "birds", "title": "Local birds", "summary": "Field notes and photos for the personal site.",
-             "bot_ids": ["research"]],
+             "bot_ids": ["research"], "managed": true,
+             "auto": ["origin": "spotted", "state": "spotted", "chats": 3, "days": 5, "created": 1_700_000_000]],
         ],
     ]
 
